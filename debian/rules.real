@@ -1,0 +1,427 @@
+#
+# This Makefile executes the unpack/build/binary targets for a single
+# subarch, which is passed in the subarch variable. Empty subarch
+# variable means that we are building for an arch without the subarch.
+# Additionally, variables version, abiname and ltver are
+# expected to be available (need to be exported from the parent process).
+#
+SHELL  := bash -e
+DEB_HOST_ARCH     := $(shell dpkg-architecture -a'$(ARCH)' -qDEB_HOST_ARCH)
+DEB_HOST_GNU_TYPE := $(shell dpkg-architecture -a'$(ARCH)' -qDEB_HOST_GNU_TYPE)
+DEB_BUILD_ARCH    := $(shell dpkg-architecture -a'$(ARCH)' -qDEB_BUILD_ARCH)
+UPLOADER  := $(shell dpkg-parsechangelog | sed -ne 's,^Maintainer: .[^<]*<\([^>]*\)>,\1,p')
+
+export PYTHONPATH = $(CURDIR)/debian/lib/python
+export DH_OPTIONS
+export DEB_HOST_ARCH DEB_HOST_GNU_TYPE DEB_BUILD_ARCH
+
+include debian/rules.defs
+
+ifdef DEBIAN_KERNEL_JOBS
+  JOBS_ARG = -j$(DEBIAN_KERNEL_JOBS)
+endif
+
+setup_env := env -u ABINAME -u ARCH -u FEATURESET -u FLAVOUR -u VERSION -u LOCALVERSION -u MAKEFLAGS
+setup_env += DISTRIBUTION_OFFICIAL_BUILD=1 DISTRIBUTION_UPLOADER=$(UPLOADER) DISTRIBUTION_VERSION="$(SOURCEVERSION)"
+
+MAKE_CLEAN = $(setup_env) $(MAKE)
+MAKE_SELF = $(MAKE) -f debian/rules.real
+
+kpkg_image := $(setup_env)
+ifdef DEBIAN_KERNEL_JOBS
+  kpkg_image += CONCURRENCY_LEVEL=$(DEBIAN_KERNEL_JOBS)
+endif
+kpkg_image += make-kpkg --arch '$(firstword $(KPKG_ARCH) $(ARCH))' --cross-compile=- --stem linux --config silentoldconfig
+ifneq ($(INITRAMFS),False)
+  kpkg_image += --initrd
+endif
+ifdef KPKG_SUBARCH
+  kpkg_image += --subarch '$(KPKG_SUBARCH)'
+endif
+
+#
+# Targets
+#
+binary-arch-arch: install-headers_$(ARCH)
+binary-arch-featureset: install-headers_$(ARCH)_$(FEATURESET)
+binary-arch-flavour: install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE)
+ifeq ($(MODULES),True)
+  binary-arch-flavour: install-headers_$(ARCH)_$(FEATURESET)_$(FLAVOUR)
+endif
+binary-arch-flavour: install-image-meta_$(ARCH)_$(FEATURESET)_$(FLAVOUR)
+binary-arch-flavour: install-headers-meta_$(ARCH)_$(FEATURESET)_$(FLAVOUR)
+
+binary-indep: install-patch
+binary-indep: install-source
+binary-indep: install-support
+binary-indep: install-support-meta
+binary-indep: install-tree
+
+build: $(STAMPS_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE)
+
+setup-flavour: $(STAMPS_DIR)/setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE)
+
+source-arch: $(STAMPS_DIR)/source
+source-featureset: $(STAMPS_DIR)/source_$(ARCH)_$(FEATURESET)
+
+$(BUILD_DIR)/config.$(ARCH)_$(FEATURESET)_$(FLAVOUR): $(KCONFIG)
+	python debian/bin/kconfig.py '$@' $(KCONFIG)
+
+$(BUILD_DIR)/linux-source-sidux-$(UPSTREAMVERSION).tar.bz2: SOURCE_DIR=$(BUILD_DIR)/source
+$(BUILD_DIR)/linux-source-sidux-$(UPSTREAMVERSION).tar.bz2: DIR = $(BUILD_DIR)/linux-source-sidux-$(UPSTREAMVERSION)
+$(BUILD_DIR)/linux-source-sidux-$(UPSTREAMVERSION).tar.bz2: $(STAMPS_DIR)/source
+	rm -rf '$@' '$(DIR)'
+	cp -al '$(SOURCE_DIR)' '$(DIR)'
+	chmod -R u+rw,go=rX '$(DIR)'
+	cd '$(BUILD_DIR)'; tar -cjf 'linux-source-sidux-$(UPSTREAMVERSION).tar.bz2' 'linux-source-sidux-$(UPSTREAMVERSION)'
+	rm -rf '$(DIR)'
+
+define patch_cmd
+cd '$(DIR)'; python '$(CURDIR)/debian/bin/patch.apply' --overwrite-home='$(CURDIR)/debian/patches'
+endef
+
+$(STAMPS_DIR)/source: SOURCE_FILES = $(filter-out debian, $(wildcard * .[^.]*))
+$(STAMPS_DIR)/source: DIR = $(BUILD_DIR)/source
+$(STAMPS_DIR)/source:
+	rm -rf '$(DIR)'
+	mkdir -p '$(DIR)'
+	cp -al $(SOURCE_FILES) '$(DIR)'
+	$(patch_cmd)
+	touch '$@'
+
+$(STAMPS_DIR)/source_$(ARCH)_$(FEATURESET): SOURCE_DIR=$(BUILD_DIR)/source
+$(STAMPS_DIR)/source_$(ARCH)_$(FEATURESET): DIR=$(BUILD_DIR)/source_$(ARCH)_$(FEATURESET)
+$(STAMPS_DIR)/source_$(ARCH)_$(FEATURESET): $(STAMPS_DIR)/source
+	rm -rf '$(DIR)'
+	cp -al '$(SOURCE_DIR)' '$(DIR)'
+	$(patch_cmd) -a $(ARCH) -s $(FEATURESET)
+	touch '$@'
+
+setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_all: CONFIG=$(BUILD_DIR)/config.$(ARCH)_$(FEATURESET)_$(FLAVOUR)
+setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_all: SOURCE_DIR=$(BUILD_DIR)/source_$(ARCH)_$(FEATURESET)
+setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_all: DIR=$(BUILD_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)
+setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_all: $(BUILD_DIR)/config.$(ARCH)_$(FEATURESET)_$(FLAVOUR)
+	rm -rf '$(DIR)'
+	cp -al '$(SOURCE_DIR)' '$(DIR)'
+	cp '$(CONFIG)' '$(DIR)/.config'
+	echo '$(ABINAME)$(LOCALVERSION)' > '$(DIR)/localversion'
+	echo 'override ARCH = $(KERNEL_ARCH)' >> '$(DIR)/.kernelvariables'
+	echo 'CCACHE = ccache' >> '$(DIR)/.kernelvariables'
+	echo 'CC = $$(if $$(DEBIAN_KERNEL_USE_CCACHE),$$(CCACHE)) $$(CROSS_COMPILE)$(COMPILER)' >> '$(DIR)/.kernelvariables'
+# TODO: Should we set CROSS_COMPILE always?
+ifdef OVERRIDE_HOST_TYPE
+	echo 'override CROSS_COMPILE = $(OVERRIDE_HOST_TYPE)-' >> '$(DIR)/.kernelvariables'
+else
+	echo 'ifneq ($$(DEB_BUILD_ARCH),$$(DEB_HOST_ARCH))' >> '$(DIR)/.kernelvariables'
+	echo 'override CROSS_COMPILE = $$(DEB_HOST_GNU_TYPE)-' >> '$(DIR)/.kernelvariables'
+	echo 'endif' >> '$(DIR)/.kernelvariables'
+endif
+ifdef CFLAGS
+	echo 'CFLAGS += $(CFLAGS)'  >> '$(DIR)/.kernelvariables'
+endif
+	$(MAKE_CLEAN) -C '$(DIR)' reportoldconfig
+
+$(STAMPS_DIR)/setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE): DIR=$(BUILD_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)
+$(STAMPS_DIR)/setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE): $(STAMPS_DIR)/source_$(ARCH)_$(FEATURESET)
+
+$(STAMPS_DIR)/setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_kernel-package:
+	$(MAKE_SELF) setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_all
+	mkdir -p '$(DIR)/debian'
+	cp debian/{changelog,control,copyright} '$(DIR)/debian'
+	touch '$(DIR)/debian/official'
+	cd '$(DIR)'; $(kpkg_image) configure
+	touch '$@'
+
+$(STAMPS_DIR)/setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_plain:
+	$(MAKE_SELF) setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_all
+	$(MAKE_CLEAN) -C '$(DIR)' $(JOBS_ARG) prepare
+	touch '$@'
+
+$(STAMPS_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE): DIR=$(BUILD_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)
+$(STAMPS_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE): $(STAMPS_DIR)/setup_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE)
+
+$(STAMPS_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_kernel-package:
+	cd '$(DIR)'; $(kpkg_image) build
+	python debian/bin/abicheck.py $(DIR) $(ARCH) $(FEATURESET) $(FLAVOUR)
+	touch '$@'
+
+$(STAMPS_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_plain:
+	$(MAKE_CLEAN) -C '$(DIR)' $(JOBS_ARG)
+	python debian/bin/abicheck.py $(DIR) $(ARCH) $(FEATURESET) $(FLAVOUR)
+	touch '$@'
+
+install-base:
+	dh_installchangelogs
+	dh_installdocs
+	dh_compress
+	dh_fixperms
+	dh_installdeb
+	dh_gencontrol -- $(GENCONTROL_ARGS)
+	dh_md5sums
+	dh_builddeb
+
+install-dummy:
+	dh_testdir
+	dh_testroot
+	dh_clean -d -k
+	$(MAKE_SELF) install-base
+
+install-headers_$(ARCH): PACKAGE_NAMES = linux-headers-$(UPSTREAMVERSION)$(ABINAME)-all linux-headers-$(UPSTREAMVERSION)$(ABINAME)-all-$(ARCH)
+install-headers_$(ARCH): DH_OPTIONS = $(foreach p, $(PACKAGE_NAMES), -p$(p))
+install-headers_$(ARCH):
+	dh_testdir
+	dh_testroot
+	$(MAKE_SELF) install-base GENCONTROL_ARGS='-Vkernel:Arch=$(ARCH)'
+
+install-headers_$(ARCH)_$(FEATURESET): PACKAGE_NAME = linux-headers-$(UPSTREAMVERSION)$(ABINAME)-common$(LOCALVERSION_HEADERS)
+install-headers_$(ARCH)_$(FEATURESET): DH_OPTIONS = -p$(PACKAGE_NAME)
+install-headers_$(ARCH)_$(FEATURESET): BASE_DIR = /usr/src/$(PACKAGE_NAME)
+install-headers_$(ARCH)_$(FEATURESET): SOURCE_DIR = $(BUILD_DIR)/source_$(ARCH)_$(FEATURESET)
+install-headers_$(ARCH)_$(FEATURESET): DIR = debian/$(PACKAGE_NAME)/$(BASE_DIR)
+install-headers_$(ARCH)_$(FEATURESET): $(STAMPS_DIR)/source_$(ARCH)_$(FEATURESET)
+	dh_testdir
+	dh_testroot
+	dh_clean -k -d
+	cd $(SOURCE_DIR); \
+	( \
+	  find . \
+	    -path './Documentation/*' -prune -o \
+	    -path './arch/*' -prune -o \
+	    -path './include/asm*' -prune -o \
+	    -path './scripts/*' -prune -o \
+	    -path './include/*' -print -o \
+	    \( -name 'Makefile*' -o -name 'Kconfig*' -o -name 'Rules.make' \) -print; \
+	  find include/asm-generic -print; \
+	  for i in $(KERNEL_HEADER_DIRS); do \
+	    find arch/$$i \
+	      \( -name 'Makefile*' -o -name 'Kconfig*' -o -name 'Rules.make' -o -name 'module.lds' \) -print; \
+	    find include/asm-$$i -print; \
+	  done; \
+	) \
+	| \
+	cpio -pd --preserve-modification-time '$(CURDIR)/$(DIR)'
+	$(MAKE_SELF) install-base
+
+install-headers_$(ARCH)_$(FEATURESET)_$(FLAVOUR): REAL_VERSION = $(UPSTREAMVERSION)$(ABINAME)$(LOCALVERSION)
+install-headers_$(ARCH)_$(FEATURESET)_$(FLAVOUR): PACKAGE_NAME = linux-headers-$(REAL_VERSION)
+install-headers_$(ARCH)_$(FEATURESET)_$(FLAVOUR): PACKAGE_NAME_HEADERS = linux-headers-$(UPSTREAMVERSION)$(ABINAME)-common$(LOCALVERSION_HEADERS)
+install-headers_$(ARCH)_$(FEATURESET)_$(FLAVOUR): PACKAGE_NAME_KBUILD = linux-kbuild-$(VERSION)
+install-headers_$(ARCH)_$(FEATURESET)_$(FLAVOUR): DH_OPTIONS = -p$(PACKAGE_NAME)
+install-headers_$(ARCH)_$(FEATURESET)_$(FLAVOUR): BASE_DIR = /usr/src/$(PACKAGE_NAME)
+install-headers_$(ARCH)_$(FEATURESET)_$(FLAVOUR): SOURCE_DIR = $(BUILD_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)
+install-headers_$(ARCH)_$(FEATURESET)_$(FLAVOUR): REF_DIR = $(BUILD_DIR)/source_$(ARCH)_$(FEATURESET)
+install-headers_$(ARCH)_$(FEATURESET)_$(FLAVOUR): PACKAGE_DIR = debian/$(PACKAGE_NAME)
+install-headers_$(ARCH)_$(FEATURESET)_$(FLAVOUR): DIR = $(PACKAGE_DIR)/$(BASE_DIR)
+install-headers_$(ARCH)_$(FEATURESET)_$(FLAVOUR): $(STAMPS_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE)
+	dh_testdir
+	dh_testroot
+	dh_clean -k -d
+
+	mkdir -p $(DIR)/arch/$(KERNEL_ARCH)/kernel
+	mkdir -p $(DIR)/include
+	cp -a $(SOURCE_DIR)/{.config,.kernel*,Module.symvers} $(DIR)
+
+	cd $(SOURCE_DIR); \
+	find . -mindepth 1 -maxdepth 1 \
+		! -name debian -a ! -name Documentation -a ! -name include -a \
+		! -name scripts -a ! -name arch -a \( -name Makefile -o -type d \) \
+		-printf "../$(PACKAGE_NAME_HEADERS)/%f\n" | \
+		xargs ln -s --target-directory='$(CURDIR)'/$(DIR)
+	
+	cd $(SOURCE_DIR); \
+	find arch/$(KERNEL_ARCH) -mindepth 1 -maxdepth 1 \
+		-type d -a ! -name include -a ! -name kernel -o \
+		-type f -a \( -name 'Makefile*' -o -name 'Kconfig*' -o -name "module.lds" \) \
+		-printf "../../../$(PACKAGE_NAME_HEADERS)/%p\n" | \
+		xargs ln -s --target-directory='$(CURDIR)'/$(DIR)/arch/$(KERNEL_ARCH)
+
+	cd $(SOURCE_DIR); \
+	find arch/$(KERNEL_ARCH)/kernel -mindepth 1 -maxdepth 1 \
+		-type f -a \( -name 'Makefile*' -o -name 'Kconfig*' -o -name "module.lds" \) \
+		-printf "../../../../$(PACKAGE_NAME_HEADERS)/%p\n" | \
+		xargs ln -s --target-directory='$(CURDIR)'/$(DIR)/arch/$(KERNEL_ARCH)/kernel
+
+	[ -d $(SOURCE_DIR)/arch/$(KERNEL_ARCH)/include ] && \
+		cp -a $(SOURCE_DIR)/arch/$(KERNEL_ARCH)/include $(DIR)/arch/$(KERNEL_ARCH)/include || :
+	cp -a $(SOURCE_DIR)/arch/$(KERNEL_ARCH)/kernel/asm-offsets.s $(DIR)/arch/$(KERNEL_ARCH)/kernel || :
+
+	cd $(SOURCE_DIR); \
+	find include -mindepth 1 -maxdepth 1 \
+		! -name config -a ! -name linux -a ! -name 'asm*' \
+		-printf "../../$(PACKAGE_NAME_HEADERS)/%p\n" | \
+		xargs ln -s --target-directory='$(CURDIR)'/$(DIR)/include
+	cp -a $(SOURCE_DIR)/include/config $(DIR)/include
+	
+	ln -sf asm-$(KERNEL_ARCH) $(DIR)/include/asm
+
+	cd $(SOURCE_DIR); \
+	for dir in linux asm-$(KERNEL_ARCH); do \
+		mkdir '$(CURDIR)'/$(DIR)/include/$$dir; \
+		for file in $$(find include/$$dir -mindepth 1 -maxdepth 1); do \
+			if [ -e '$(CURDIR)'/$(REF_DIR)/$$file ]; then \
+				ln -s --target-directory='$(CURDIR)'/$(DIR)/include/$$dir ../../../$(PACKAGE_NAME_HEADERS)/$$file; \
+			else \
+				ln -f --target-directory='$(CURDIR)'/$(DIR)/include/$$dir '$(CURDIR)'/$(SOURCE_DIR)/$$file; \
+			fi \
+		done \
+	done
+
+	cd $(SOURCE_DIR); \
+	for dir in asm-generic $(foreach t,$(filter-out $(KERNEL_ARCH),$(KERNEL_HEADER_DIRS)),asm-$(t)); do \
+		ln -s --target-directory='$(CURDIR)'/$(DIR)/include ../../$(PACKAGE_NAME_HEADERS)/include/$$dir; \
+	done
+
+	ln -s ../$(PACKAGE_NAME_KBUILD)/scripts $(DIR)
+
+	mkdir -p $(PACKAGE_DIR)/lib/modules/$(REAL_VERSION)
+	ln -s /usr/src/$(PACKAGE_NAME) $(PACKAGE_DIR)/lib/modules/$(REAL_VERSION)/build
+
+	$(MAKE_SELF) install-base
+
+install-image-meta_$(ARCH)_$(FEATURESET)_$(FLAVOUR): PACKAGE_NAME = linux-image-$(MAJOR)-$(FLAVOUR)
+install-image-meta_$(ARCH)_$(FEATURESET)_$(FLAVOUR): DH_OPTIONS = -p$(PACKAGE_NAME)
+install-image-meta_$(ARCH)_$(FEATURESET)_$(FLAVOUR): PACKAGE_DIR = debian/$(PACKAGE_NAME)
+install-image-meta_$(ARCH)_$(FEATURESET)_$(FLAVOUR):
+	dh_testdir
+	dh_testroot
+	dh_clean -d -k
+	$(MAKE_SELF) install-base
+
+install-headers-meta_$(ARCH)_$(FEATURESET)_$(FLAVOUR): PACKAGE_NAME = linux-headers-$(MAJOR)-$(FLAVOUR)
+install-headers-meta_$(ARCH)_$(FEATURESET)_$(FLAVOUR): DH_OPTIONS = -p$(PACKAGE_NAME)
+install-headers-meta_$(ARCH)_$(FEATURESET)_$(FLAVOUR): PACKAGE_DIR = debian/$(PACKAGE_NAME)
+install-headers-meta_$(ARCH)_$(FEATURESET)_$(FLAVOUR):
+	dh_testdir
+	dh_testroot
+	dh_clean -d -k
+	$(MAKE_SELF) install-base
+
+install-support: PACKAGE_NAME = linux-support-$(UPSTREAMVERSION)$(ABINAME)
+install-support: DH_OPTIONS = -p$(PACKAGE_NAME)
+install-support: PACKAGE_DIR = debian/$(PACKAGE_NAME)
+install-support: PACKAGE_ROOT = /usr/src/$(PACKAGE_NAME)
+install-support:
+	dh_testdir
+	dh_testroot
+	dh_clean -k -d
+	dh_installdirs $(PACKAGE_ROOT)/lib/python/debian_linux $(PACKAGE_ROOT)/modules
+	cp debian/config.defines.dump $(PACKAGE_DIR)$(PACKAGE_ROOT)
+	cp debian/lib/python/debian_linux/*.py $(PACKAGE_DIR)$(PACKAGE_ROOT)/lib/python/debian_linux
+	cp debian/modules/* $(PACKAGE_DIR)$(PACKAGE_ROOT)/modules
+	chmod a+x $(PACKAGE_DIR)$(PACKAGE_ROOT)/modules/gencontrol.py
+	dh_pycentral /usr/src/$(PACKAGE_NAME)/lib/python
+	$(MAKE_SELF) install-base
+
+install-support-meta: PACKAGE_NAME = linux-support-sidux-$(MAJOR)
+install-support-meta: DH_OPTIONS = -p$(PACKAGE_NAME)
+install-support-meta: PACKAGE_DIR = debian/$(PACKAGE_NAME)
+install-support-meta: PACKAGE_ROOT = /usr/src/$(PACKAGE_NAME)
+install-support-meta:
+	dh_testdir
+	dh_testroot
+	dh_clean -d -k
+	$(MAKE_SELF) install-base
+
+install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE): REAL_VERSION = $(UPSTREAMVERSION)$(ABINAME)$(LOCALVERSION)
+install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE): PACKAGE_NAME = linux-image-$(REAL_VERSION)
+install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE): PACKAGE_DIR = debian/$(PACKAGE_NAME)
+install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE): INSTALL_DIR = $(PACKAGE_DIR)/boot
+install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE): DIR = $(BUILD_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)
+install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE): DH_OPTIONS = -p$(PACKAGE_NAME)
+install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE): $(STAMPS_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_$(TYPE)
+
+install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_kernel-package:
+	cd '$(DIR)'; $(kpkg_image) kernel-image
+	cat '$(DIR)/debian/files' >> debian/files
+	@for i in $$(awk '{ print $$1; }' '$(DIR)/debian/files'); do	\
+	  echo "mv \"$(BUILD_DIR)/$$i\" ..";				\
+	  mv "$(BUILD_DIR)/$$i" ..;					\
+	done
+
+install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_plain:
+	dh_testdir
+	dh_testroot
+	dh_clean -d -k
+	dh_installdirs 'boot'
+	$(MAKE_SELF) \
+	  install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_plain_image \
+	  DIR='$(DIR)' PACKAGE_DIR='$(PACKAGE_DIR)' INSTALL_DIR='$(INSTALL_DIR)' REAL_VERSION='$(REAL_VERSION)'
+ifeq ($(MODULES),True)
+	$(MAKE_CLEAN) -C $(DIR) modules_install INSTALL_MOD_PATH='$(CURDIR)'/$(PACKAGE_DIR)
+	cp $(DIR)/.config $(PACKAGE_DIR)/boot/config-$(REAL_VERSION)
+	cp $(DIR)/System.map $(PACKAGE_DIR)/boot/System.map-$(REAL_VERSION)
+	rm $(PACKAGE_DIR)/lib/modules/$(REAL_VERSION)/{build,source,modules.*}
+endif
+	$(MAKE_SELF) \
+	  install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_plain_templates \
+	  PACKAGE_DIR='$(PACKAGE_DIR)' REAL_VERSION='$(REAL_VERSION)'
+	$(MAKE_SELF) \
+	  install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_plain_bug \
+	  PACKAGE_DIR='$(PACKAGE_DIR)' PACKAGE_NAME='$(PACKAGE_NAME)' REAL_VERSION='$(REAL_VERSION)'
+	$(MAKE_SELF) install-base
+
+install-image_amd64_$(FEATURESET)_$(FLAVOUR)_plain_image \
+install-image_i386_$(FEATURESET)_$(FLAVOUR)_plain_image:
+	install -m644 '$(DIR)/arch/$(KERNEL_ARCH)/boot/bzImage' $(INSTALL_DIR)/vmlinuz-$(REAL_VERSION)
+
+ifneq ($(INITRAMFS),False)
+install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_plain_templates: ARG_INITRD = YES
+endif
+
+install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_plain_templates:
+	install -d $(PACKAGE_DIR)/DEBIAN
+	for i in $(wildcard debian/templates/temp.image.plain/*); do \
+	  sed \
+	    -e 's,=D,/boot,g' \
+	    -e 's/=OF/YES/g' \
+	    -e 's/=ST/linux/g' \
+	    -e 's@=A@$(DEB_HOST_ARCH)@g' \
+	    -e 's@=B@$(KERNEL_ARCH)@g' \
+	    -e 's/=IB//g' \
+	    -e 's/=I/$(ARG_INITRD)/g' \
+	    -e 's/=K/$(ARG_KIMAGE)/g' \
+	    -e 's/=L/$(ARG_BOOTLOADER)/g' \
+	    -e 's@=MK@$(INITRD_CMD)@g' \
+	    -e 's/=V/$(REAL_VERSION)/g' \
+	    -e 's/=M//g' \
+	    -e 's/=MD//g' \
+	    -e 's/=R//g' \
+	    -e 's/=S//g' \
+	    $$i > $(PACKAGE_DIR)/DEBIAN/$$(basename $$i); \
+	done
+	chmod 755 $(PACKAGE_DIR)/DEBIAN/{config,{pre,post}*}
+	chmod 644 $(PACKAGE_DIR)/DEBIAN/templates
+
+install-image_$(ARCH)_$(FEATURESET)_$(FLAVOUR)_plain_bug:
+	dh_installdirs usr/share/bug/$(PACKAGE_NAME)
+	dh_install debian/templates/image.plain.bug/* usr/share/bug/$(PACKAGE_NAME)
+	chmod 755 $(PACKAGE_DIR)/usr/share/bug/$(PACKAGE_NAME)/script
+	echo "RELEASE='$(REAL_VERSION)'" > $(PACKAGE_DIR)/usr/share/bug/$(PACKAGE_NAME)/info
+
+install-patch: PACKAGE = linux-patch-sidux-$(VERSION)
+install-patch: pbase := /usr/src/kernel-patches/all/$(UPSTREAMVERSION)
+install-patch: pfull := debian/$(PACKAGE)$(pbase)
+install-patch: DH_OPTIONS = -p$(PACKAGE)
+install-patch:
+	dh_testdir
+	dh_testroot
+	dh_clean -d -k $(DH_OPTIONS)
+	dh_installdirs $(DH_OPTIONS) '$(pbase)/apply' '$(pbase)/debian' '$(pbase)/unpatch'
+	dh_install $(DH_OPTIONS) debian/patches/* '$(pbase)/debian'
+	install debian/bin/patch.apply '$(pfull)/apply/debian'
+	install debian/bin/patch.unpatch '$(pfull)/unpatch/debian'
+	find '$(pfull)/debian' ! -path '*/series/*' -type f -execdir bzip2 '{}' ';' -execdir chmod 644 '{}.bz2' ';'
+	$(MAKE_SELF) install-base DH_OPTIONS='$(DH_OPTIONS)'
+
+install-source: DH_OPTIONS = -plinux-source-sidux-$(VERSION)
+install-source: $(BUILD_DIR)/linux-source-sidux-$(UPSTREAMVERSION).tar.bz2
+	dh_testdir
+	dh_testroot
+	dh_install $(DH_OPTIONS) '$<' /usr/src
+	$(MAKE_SELF) install-base DH_OPTIONS='$(DH_OPTIONS)'
+
+install-tree: DH_OPTIONS = -plinux-tree-sidux-$(VERSION)
+install-tree:
+	$(MAKE_SELF) install-dummy DH_OPTIONS='$(DH_OPTIONS)'
+
+# vim: filetype=make

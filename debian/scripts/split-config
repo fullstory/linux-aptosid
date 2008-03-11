@@ -1,0 +1,295 @@
+#!/usr/bin/ruby -w
+# split-config - manage kernel configs split out for each arch
+#
+#    Copyright (C) 2005  Andres Salomon <dilinger@debian.org>
+#
+#    This program is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program; if not, write to the Free Software
+#    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+
+require 'getoptlong'
+require 'open3'
+
+def parse_config(file, kconf)
+	File.open(file).each { |line|
+		if line =~ /^(CONFIG_\w+)=(.+)$/
+			kconf[$1] = $2
+		elsif line =~ /^\s*#\s*(CONFIG_\w+) is removed\s*$/
+			kconf[$1] = 'XXX'
+		elsif line =~ /^\s*#\s*(CONFIG_\w+) is not set\s*$/
+			kconf[$1] = 'n'
+		end
+	}
+	kconf
+end
+
+def configline(key, val)
+	if val == 'n'
+		"# #{key} is not set\n"
+	elsif val == 'XXX'
+		"# #{key} is removed\n"
+	else
+		"#{key}=#{val}\n"
+	end
+end
+
+def collect(path, archdirs, flavour)
+	kconf = {}
+	path += '/' unless path =~ /\/$/
+	if File.exists?("#{path}/config")
+		kconf = parse_config("#{path}/config", kconf)
+	end
+	archdirs.split(Regexp.new('/+')).each { |piece|
+		path += piece + '/'
+		if File.exists?("#{path}/config")
+			kconf = parse_config("#{path}/config", kconf)
+		end
+	}
+	parse_config("#{path}/config.#{flavour}", kconf)
+end
+
+def mkconfig(kconf)
+	File.open('.config', 'w') { |f|
+		kconf.each { |key,val|
+			f << configline(key, val)
+		}
+	}
+	system("make #{OPTIONS['configtype']} ARCH=#{OPTIONS['arch']}")
+end
+
+def kdiff(from, to)
+	same = from.keys & to.keys
+
+	added = (to.keys - same).collect
+	removed = (from.keys - same).collect
+	changed = same.detect { |key| from[key] != to[key] }
+	[ added, removed, changed ]
+end
+
+def prompt_user
+	slong = OPTIONS['subarch'] ? 'per-[S]ubarch, ' : ''
+	sshort = OPTIONS['subarch'] ? 'S' : ''
+	while true
+		print 'Do you want to make this change [G]lobal, per-[A]rch, ' + slong + 'or per-[F]lavour? [GA' + sshort + 'F] '
+		answer = $stdin.gets.chomp.downcase
+		return answer if answer == 'g' || answer == 'a' || answer == 'f'
+		return answer if answer == 's' && OPTIONS['subarch']
+		puts 'Invalid response, please try again.'
+	end
+end
+
+def strip_key(file, key)
+	return unless File.exists?(file)
+
+	lines = File.open(file).readlines
+	remaining = lines - lines.grep(/^#*\s*#{key}[\s=]/)
+	File.open(file, 'w') { |f|
+		remaining.each { |l|
+			f << l
+		}
+	}
+end
+
+$archdirs = nil
+def archdirs
+	if $archdirs.nil?
+		base = OPTIONS['dir']
+		$archdirs = Dir.open(base) { |d|
+			d.find_all { |f|
+				File.directory?("#{base}/#{f}") && f !~ /^\./
+			}
+		}
+		#$archdirs = $archdirs - $archdirs.grep(/^\./)
+		$archdirs.collect! { |x| "#{base}/#{x}" }
+	end
+	$archdirs
+end
+
+def subarchdirs(archdir = nil)
+	subarchdirs = []
+	archdir = archdirs() if archdir.nil?
+	archdir.each { |d|
+		sa = Dir.open(d) { |e|
+			e.find_all { |f|
+				File.directory?("#{d}/#{f}") && f !~ /^\./
+			}
+		}
+		sa.collect! { |x| "#{d}/#{x}" }
+		subarchdirs.concat(sa)
+	}
+	subarchdirs
+end
+
+def flavourfiles(archdir = nil)
+	flavourfiles = []
+	if archdir.nil?
+		dirs = archdirs().clone.delete_if { |d|
+			d.find { |e|
+				# if the subarchdir contains the archdir, nuke
+				# the archdir from the list.
+				e.slice(d + '/')
+			}
+		}
+		dirs.concat(subarchdirs())
+	else
+		dirs = archdir
+	end
+	dirs.each { |d|
+		flavourfiles.concat(Dir.glob("#{d}/config.*"))
+	}
+	flavourfiles
+end
+
+def affected_files(answer)
+	files = []
+	base = OPTIONS['dir']
+	case answer
+		when 'g'
+			files << "#{base}/config"
+			files.concat(archdirs().collect { |x| "#{x}/config" })
+			files.concat(subarchdirs().collect { |x| "#{x}/config" })
+			files.concat(flavourfiles())
+		when 'a'
+			base += '/' + OPTIONS['arch']
+			files << "#{base}/config"
+			subarches = subarchdirs([base]).collect { |x| "#{x}/config" }
+			files.concat(subarches)
+			files.concat(flavourfiles(subarches))
+			files.concat(flavourfiles([base]))
+		when 's'
+			base += '/' + OPTIONS['arch'] + '/' + OPTIONS['subarch']
+			files << "#{base}/config"
+			files.concat(flavourfiles([base]))
+		when 'f'
+			if OPTIONS['subarch']
+				files << "#{base}/#{OPTIONS['arch']}/#{OPTIONS['subarch']}/config.#{OPTIONS['flavour']}"
+			else
+				files << "#{base}/#{OPTIONS['arch']}/config.#{OPTIONS['flavour']}"
+			end
+	end
+	files
+end
+
+def add_option(key, val)
+	puts "\n#{key}=#{val} has been added."
+	answer = prompt_user()
+	files = affected_files(answer)
+	files.each { |f|
+		strip_key(f, key)
+	}
+	File.open(files[0], 'a') { |f|
+			f << configline(key, val)
+	}
+end
+
+def remove_option(key, val)
+	return if val == 'XXX'
+	puts "\n#{key}=#{val} has been removed."
+	answer = prompt_user()
+	files = affected_files(answer)
+	files.each { |f|
+		strip_key(f, key)
+	}
+	return if answer == 'g'
+	File.open(files[0], 'a') { |f|
+			f << configline(key, 'XXX')
+	}
+end
+
+def update_option(key, oldval, newval)
+	puts "\n#{key} has been changed from '#{oldval}' to '#{newval}'."
+	answer = prompt_user()
+	files = affected_files(answer)
+	files.each { |f|
+		strip_key(f, key)
+	}
+	File.open(files[0], 'a') { |f|
+		f << configline(key, newval)
+	}
+end
+
+def usage(errno)
+	s = errno == 0 ? $stdout : $stderr
+	s.puts "Usage: #{$0} [options] <config dir> <flavour>\n"
+	s.puts "\t-a, --arch <arch>        select architecture [#{OPTIONS['arch']}]"
+	s.puts "\t-s, --subarch <arch>     select sub-architecture [#{OPTIONS['subarch']}]"
+	s.puts "\t-c, --configtype <type>  select config type [#{OPTIONS['configtype']}]"
+	s.puts "\t-h, --help               display this help screen"
+	exit(errno)
+end
+
+opts = GetoptLong.new(
+	[ '--arch',		'-a',	GetoptLong::REQUIRED_ARGUMENT ],
+	[ '--subarch',		'-s',	GetoptLong::REQUIRED_ARGUMENT ],
+	[ '--configtype',	'-c',	GetoptLong::REQUIRED_ARGUMENT ],
+	[ '--help',		'-h',	GetoptLong::NO_ARGUMENT ]
+)
+OPTIONS =
+{
+	'arch' => `dpkg-architecture -qDEB_HOST_ARCH`.chomp,
+	'subarch' => nil,
+	'configtype' => 'menuconfig',
+	'dir' => nil,
+	'flavour' => nil,
+}
+
+begin
+	opts.each { |opt, arg|
+		case opt
+			when '--arch'
+				OPTIONS['arch'] = arg
+			when '--subarch'
+				OPTIONS['subarch'] = arg
+			when '--configtype'
+				OPTIONS['configtype'] = arg
+			when '--help'
+				usage(0)
+		end
+	}
+
+	if ARGV.length == 2
+		OPTIONS['dir'] = ARGV[0]
+		OPTIONS['flavour'] = ARGV[1]
+	else
+		usage(1)
+	end
+
+	unless File.exists?('scripts/kconfig/conf.c')
+		$stderr.puts "#{$0}: script must be run from the top level of a kernel tree!"
+		exit(1)
+	end
+rescue => e
+	usage(1)
+end
+
+path = OPTIONS['arch']
+path += '/' + OPTIONS['subarch']	unless OPTIONS['subarch'].nil?
+kconf = collect(OPTIONS['dir'], path, OPTIONS['flavour'])
+mkconfig(kconf)
+newconf = parse_config('.config', {})
+added, removed, changed = kdiff(kconf, newconf)
+
+[added].flatten.each { |key|
+	add_option(key, newconf[key]) unless key.nil?
+}
+
+#[removed].flatten.each { |key|
+#	remove_option(key, kconf[key]) unless key.nil?
+#}
+
+[changed].flatten.each { |key|
+	update_option(key, kconf[key], newconf[key]) unless key.nil?
+}
+
+exit(0)
