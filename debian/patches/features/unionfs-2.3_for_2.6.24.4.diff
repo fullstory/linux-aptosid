@@ -29,10 +29,10 @@ index 0000000..96fdf67
 +	- Usage information and examples.
 diff --git a/Documentation/filesystems/unionfs/concepts.txt b/Documentation/filesystems/unionfs/concepts.txt
 new file mode 100644
-index 0000000..8d9a1c5
+index 0000000..b853788
 --- /dev/null
 +++ b/Documentation/filesystems/unionfs/concepts.txt
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,287 @@
 +Unionfs 2.x CONCEPTS:
 +=====================
 +
@@ -87,6 +87,42 @@ index 0000000..8d9a1c5
 +eliminate 'foo' from the namespace (as well as the whiteout itself.)
 +
 +
++Opaque Directories:
++===================
++
++Assume we have a unionfs mount comprising of two branches.  Branch 0 is
++empty; branch 1 has the directory /a and file /a/f.  Let's say we mount a
++union of branch 0 as read-write and branch 1 as read-only.  Now, let's say
++we try to perform the following operation in the union:
++
++	rm -fr a
++
++Because branch 1 is not writable, we cannot physically remove the file /a/f
++or the directory /a.  So instead, we will create a whiteout in branch 0
++named /.wh.a, masking out the name "a" from branch 1.  Next, let's say we
++try to create a directory named "a" as follows:
++
++	mkdir a
++
++Because we have a whiteout for "a" already, Unionfs behaves as if "a"
++doesn't exist, and thus will delete the whiteout and replace it with an
++actual directory named "a".
++
++The problem now is that if you try to "ls" in the union, Unionfs will
++perform is normal directory name unification, for *all* directories named
++"a" in all branches.  This will cause the file /a/f from branch 1 to
++re-appear in the union's namespace, which violates Unix semantics.
++
++To avoid this problem, we have a different form of whiteouts for
++directories, called "opaque directories" (same as BSD Union Mount does).
++Whenever we replace a whiteout with a directory, that directory is marked as
++opaque.  In Unionfs 2.x, it means that we create a file named
++/a/.wh.__dir_opaque in branch 0, after having created directory /a there.
++When unionfs notices that a directory is opaque, it stops all namespace
++operations (including merging readdir contents) at that opaque directory.
++This prevents re-exposing names from masked out directories.
++
++
 +Duplicate Elimination:
 +======================
 +
@@ -95,6 +131,31 @@ index 0000000..8d9a1c5
 +Given the fact that each branch has a priority associated with it, the
 +simplest solution is to take the instance from the highest priority
 +(numerically lowest value) and "hide" the others.
++
++
++Unlinking:
++=========
++
++Unlink operation on non-directory instances is optimized to remove the
++maximum possible objects in case multiple underlying branches have the same
++file name.  The unlink operation will first try to delete file instances
++from highest priority branch and then move further to delete from remaining
++branches in order of their decreasing priority.  Consider a case (F..D..F),
++where F is a file and D is a directory of the same name; here, some
++intermediate branch could have an empty directory instance with the same
++name, so this operation also tries to delete this directory instance and
++proceed further to delete from next possible lower priority branch.  The
++unionfs unlink operation will smoothly delete the files with same name from
++all possible underlying branches.  In case if some error occurs, it creates
++whiteout in highest priority branch that will hide file instance in rest of
++the branches.  An error could occur either if an unlink operations in any of
++the underlying branch failed or if a branch has no write permission.
++
++This unlinking policy is known as "delete all" and it has the benefit of
++overall reducing the number of inodes used by duplicate files, and further
++reducing the total number of inodes consumed by whiteouts.  The cost is of
++extra processing, but testing shows this extra processing is well worth the
++savings.
 +
 +
 +Copyup:
@@ -622,17 +683,94 @@ index e5580bc..6276cdf 100644
  	 * other metadata */
  	fsstack_copy_inode_size(inode, lower_inode);
 diff --git a/fs/namei.c b/fs/namei.c
-index 73e2e66..784ef51 100644
+index 73e2e66..ab68a08 100644
 --- a/fs/namei.c
 +++ b/fs/namei.c
 @@ -389,6 +389,7 @@ void release_open_intent(struct nameidata *nd)
  	else
  		fput(nd->intent.open.file);
  }
-+EXPORT_SYMBOL(release_open_intent);
++EXPORT_SYMBOL_GPL(release_open_intent);
  
  static inline struct dentry *
  do_revalidate(struct dentry *dentry, struct nameidata *nd)
+diff --git a/fs/splice.c b/fs/splice.c
+index e313478..05b8803 100644
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@ -893,8 +893,8 @@ EXPORT_SYMBOL(generic_splice_sendpage);
+ /*
+  * Attempt to initiate a splice from pipe to file.
+  */
+-static long do_splice_from(struct pipe_inode_info *pipe, struct file *out,
+-			   loff_t *ppos, size_t len, unsigned int flags)
++long vfs_splice_from(struct pipe_inode_info *pipe, struct file *out,
++		     loff_t *ppos, size_t len, unsigned int flags)
+ {
+ 	int ret;
+ 
+@@ -914,13 +914,14 @@ static long do_splice_from(struct pipe_inode_info *pipe, struct file *out,
+ 
+ 	return out->f_op->splice_write(pipe, out, ppos, len, flags);
+ }
++EXPORT_SYMBOL_GPL(vfs_splice_from);
+ 
+ /*
+  * Attempt to initiate a splice from a file to a pipe.
+  */
+-static long do_splice_to(struct file *in, loff_t *ppos,
+-			 struct pipe_inode_info *pipe, size_t len,
+-			 unsigned int flags)
++long vfs_splice_to(struct file *in, loff_t *ppos,
++		   struct pipe_inode_info *pipe, size_t len,
++		   unsigned int flags)
+ {
+ 	int ret;
+ 
+@@ -940,6 +941,7 @@ static long do_splice_to(struct file *in, loff_t *ppos,
+ 
+ 	return in->f_op->splice_read(in, ppos, pipe, len, flags);
+ }
++EXPORT_SYMBOL_GPL(vfs_splice_to);
+ 
+ /**
+  * splice_direct_to_actor - splices data directly between two non-pipes
+@@ -1009,7 +1011,7 @@ ssize_t splice_direct_to_actor(struct file *in, struct splice_desc *sd,
+ 		size_t read_len;
+ 		loff_t pos = sd->pos;
+ 
+-		ret = do_splice_to(in, &pos, pipe, len, flags);
++		ret = vfs_splice_to(in, &pos, pipe, len, flags);
+ 		if (unlikely(ret <= 0))
+ 			goto out_release;
+ 
+@@ -1067,7 +1069,7 @@ static int direct_splice_actor(struct pipe_inode_info *pipe,
+ {
+ 	struct file *file = sd->u.file;
+ 
+-	return do_splice_from(pipe, file, &sd->pos, sd->total_len, sd->flags);
++	return vfs_splice_from(pipe, file, &sd->pos, sd->total_len, sd->flags);
+ }
+ 
+ /**
+@@ -1141,7 +1143,7 @@ static long do_splice(struct file *in, loff_t __user *off_in,
+ 		} else
+ 			off = &out->f_pos;
+ 
+-		ret = do_splice_from(pipe, out, off, len, flags);
++		ret = vfs_splice_from(pipe, out, off, len, flags);
+ 
+ 		if (off_out && copy_to_user(off_out, off, sizeof(loff_t)))
+ 			ret = -EFAULT;
+@@ -1162,7 +1164,7 @@ static long do_splice(struct file *in, loff_t __user *off_in,
+ 		} else
+ 			off = &in->f_pos;
+ 
+-		ret = do_splice_to(in, off, pipe, len, flags);
++		ret = vfs_splice_to(in, off, pipe, len, flags);
+ 
+ 		if (off_in && copy_to_user(off_in, off, sizeof(loff_t)))
+ 			ret = -EFAULT;
 diff --git a/fs/stack.c b/fs/stack.c
 index 67716f6..4336f2b 100644
 --- a/fs/stack.c
@@ -703,11 +841,11 @@ index 67716f6..4336f2b 100644
  EXPORT_SYMBOL_GPL(fsstack_copy_attr_all);
 diff --git a/fs/unionfs/Makefile b/fs/unionfs/Makefile
 new file mode 100644
-index 0000000..35419f0
+index 0000000..8067348
 --- /dev/null
 +++ b/fs/unionfs/Makefile
 @@ -0,0 +1,17 @@
-+UNIONFS_VERSION="2.2.4 (for 2.6.24.2)"
++UNIONFS_VERSION="2.3 (for 2.6.24.4)"
 +
 +EXTRA_CFLAGS += -DUNIONFS_VERSION=\"$(UNIONFS_VERSION)\"
 +
@@ -726,10 +864,10 @@ index 0000000..35419f0
 +endif
 diff --git a/fs/unionfs/commonfops.c b/fs/unionfs/commonfops.c
 new file mode 100644
-index 0000000..2add167
+index 0000000..50f4eda
 --- /dev/null
 +++ b/fs/unionfs/commonfops.c
-@@ -0,0 +1,849 @@
+@@ -0,0 +1,841 @@
 +/*
 + * Copyright (c) 2003-2007 Erez Zadok
 + * Copyright (c) 2003-2006 Charles P. Wright
@@ -1034,7 +1172,7 @@ index 0000000..2add167
 + * @willwrite: true if caller may cause changes to the file; false otherwise.
 + * Caller must lock/unlock dentry's branch configuration.
 + */
-+int unionfs_file_revalidate_locked(struct file *file, bool willwrite)
++int unionfs_file_revalidate(struct file *file, bool willwrite)
 +{
 +	struct super_block *sb;
 +	struct dentry *dentry;
@@ -1044,6 +1182,7 @@ index 0000000..2add167
 +	int err = 0;
 +
 +	dentry = file->f_path.dentry;
++	verify_locked(dentry);
 +	sb = dentry->d_sb;
 +
 +	/*
@@ -1148,17 +1287,6 @@ index 0000000..2add167
 +out_nofree:
 +	if (!err)
 +		unionfs_check_file(file);
-+	return err;
-+}
-+
-+int unionfs_file_revalidate(struct file *file, bool willwrite)
-+{
-+	int err;
-+
-+	unionfs_lock_dentry(file->f_path.dentry, UNIONFS_DMUTEX_CHILD);
-+	err = unionfs_file_revalidate_locked(file, willwrite);
-+	unionfs_unlock_dentry(file->f_path.dentry);
-+
 +	return err;
 +}
 +
@@ -1364,6 +1492,8 @@ index 0000000..2add167
 +	int fgen, err = 0;
 +
 +	unionfs_read_lock(sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
++
 +	/*
 +	 * Yes, we have to revalidate this file even if it's being released.
 +	 * This is important for open-but-unlinked files, as well as mmap
@@ -1382,7 +1512,6 @@ index 0000000..2add167
 +	bstart = fbstart(file);
 +	bend = fbend(file);
 +
-+	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
 +	for (bindex = bstart; bindex <= bend; bindex++) {
 +		lower_file = unionfs_lower_file_idx(file, bindex);
 +
@@ -1397,7 +1526,6 @@ index 0000000..2add167
 +			unionfs_set_lower_dentry_idx(dentry, bindex, NULL);
 +		}
 +	}
-+	unionfs_unlock_dentry(dentry);
 +
 +	kfree(fileinfo->lower_files);
 +	kfree(fileinfo->saved_branch_ids);
@@ -1415,6 +1543,7 @@ index 0000000..2add167
 +	kfree(fileinfo);
 +
 +out:
++	unionfs_unlock_dentry(dentry);
 +	unionfs_read_unlock(sb);
 +	return err;
 +}
@@ -1461,7 +1590,6 @@ index 0000000..2add167
 +	struct vfsmount *mnt;
 +
 +	dentry = file->f_path.dentry;
-+	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
 +	orig_bstart = dbstart(dentry);
 +	orig_bend = dbend(dentry);
 +	err = unionfs_partial_lookup(dentry);
@@ -1503,15 +1631,16 @@ index 0000000..2add167
 +		err = -EFAULT;
 +
 +out:
-+	unionfs_unlock_dentry(dentry);
 +	return err < 0 ? err : bend;
 +}
 +
 +long unionfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 +{
 +	long err;
++	struct dentry *dentry = file->f_path.dentry;
 +
-+	unionfs_read_lock(file->f_path.dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_read_lock(dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
 +
 +	err = unionfs_file_revalidate(file, true);
 +	if (unlikely(err))
@@ -1539,7 +1668,8 @@ index 0000000..2add167
 +
 +out:
 +	unionfs_check_file(file);
-+	unionfs_read_unlock(file->f_path.dentry->d_sb);
++	unionfs_unlock_dentry(dentry);
++	unionfs_read_unlock(dentry->d_sb);
 +	return err;
 +}
 +
@@ -1553,7 +1683,7 @@ index 0000000..2add167
 +	unionfs_read_lock(dentry->d_sb, UNIONFS_SMUTEX_PARENT);
 +	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
 +
-+	err = unionfs_file_revalidate_locked(file, true);
++	err = unionfs_file_revalidate(file, true);
 +	if (unlikely(err))
 +		goto out;
 +	unionfs_check_file(file);
@@ -1575,7 +1705,7 @@ index 0000000..2add167
 +out:
 +	if (!err)
 +		unionfs_check_file(file);
-+	unionfs_unlock_dentry(file->f_path.dentry);
++	unionfs_unlock_dentry(dentry);
 +	unionfs_read_unlock(dentry->d_sb);
 +	return err;
 +}
@@ -3012,7 +3142,7 @@ index 0000000..d154c32
 +}
 diff --git a/fs/unionfs/dentry.c b/fs/unionfs/dentry.c
 new file mode 100644
-index 0000000..f8f65e1
+index 0000000..5e498c2
 --- /dev/null
 +++ b/fs/unionfs/dentry.c
 @@ -0,0 +1,578 @@
@@ -3424,7 +3554,7 @@ index 0000000..f8f65e1
 +	chain = kzalloc(chain_len * sizeof(struct dentry *), GFP_KERNEL);
 +	if (unlikely(!chain)) {
 +		printk(KERN_CRIT "unionfs: no more memory in %s\n",
-+		       __FUNCTION__);
++		       __func__);
 +		goto out;
 +	}
 +
@@ -3596,10 +3726,10 @@ index 0000000..f8f65e1
 +};
 diff --git a/fs/unionfs/dirfops.c b/fs/unionfs/dirfops.c
 new file mode 100644
-index 0000000..a613862
+index 0000000..8272fb6
 --- /dev/null
 +++ b/fs/unionfs/dirfops.c
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,296 @@
 +/*
 + * Copyright (c) 2003-2007 Erez Zadok
 + * Copyright (c) 2003-2006 Charles P. Wright
@@ -3699,19 +3829,21 @@ index 0000000..a613862
 +{
 +	int err = 0;
 +	struct file *lower_file = NULL;
++	struct dentry *dentry = file->f_path.dentry;
 +	struct inode *inode = NULL;
 +	struct unionfs_getdents_callback buf;
 +	struct unionfs_dir_state *uds;
 +	int bend;
 +	loff_t offset;
 +
-+	unionfs_read_lock(file->f_path.dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_read_lock(dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
 +
 +	err = unionfs_file_revalidate(file, false);
 +	if (unlikely(err))
 +		goto out;
 +
-+	inode = file->f_path.dentry->d_inode;
++	inode = dentry->d_inode;
 +
 +	uds = UNIONFS_F(file)->rdstate;
 +	if (!uds) {
@@ -3791,7 +3923,8 @@ index 0000000..a613862
 +	}
 +
 +out:
-+	unionfs_read_unlock(file->f_path.dentry->d_sb);
++	unionfs_unlock_dentry(dentry);
++	unionfs_read_unlock(dentry->d_sb);
 +	return err;
 +}
 +
@@ -3808,9 +3941,11 @@ index 0000000..a613862
 +static loff_t unionfs_dir_llseek(struct file *file, loff_t offset, int origin)
 +{
 +	struct unionfs_dir_state *rdstate;
++	struct dentry *dentry = file->f_path.dentry;
 +	loff_t err;
 +
-+	unionfs_read_lock(file->f_path.dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_read_lock(dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
 +
 +	err = unionfs_file_revalidate(file, false);
 +	if (unlikely(err))
@@ -3852,7 +3987,7 @@ index 0000000..a613862
 +					err = -EINVAL;
 +			} else {
 +				struct inode *inode;
-+				inode = file->f_path.dentry->d_inode;
++				inode = dentry->d_inode;
 +				rdstate = find_rdstate(inode, offset);
 +				if (rdstate) {
 +					UNIONFS_F(file)->rdstate = rdstate;
@@ -3871,7 +4006,8 @@ index 0000000..a613862
 +	}
 +
 +out:
-+	unionfs_read_unlock(file->f_path.dentry->d_sb);
++	unionfs_unlock_dentry(dentry);
++	unionfs_read_unlock(dentry->d_sb);
 +	return err;
 +}
 +
@@ -4487,10 +4623,10 @@ index 0000000..29d42fb
 +#endif	/* not _FANOUT_H */
 diff --git a/fs/unionfs/file.c b/fs/unionfs/file.c
 new file mode 100644
-index 0000000..0c424f6
+index 0000000..0a39387
 --- /dev/null
 +++ b/fs/unionfs/file.c
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,343 @@
 +/*
 + * Copyright (c) 2003-2007 Erez Zadok
 + * Copyright (c) 2003-2006 Charles P. Wright
@@ -4511,10 +4647,75 @@ index 0000000..0c424f6
 +
 +#include "union.h"
 +
++static ssize_t unionfs_read(struct file *file, char __user *buf,
++			    size_t count, loff_t *ppos)
++{
++	int err;
++	struct file *lower_file;
++	struct dentry *dentry = file->f_path.dentry;
++
++	unionfs_read_lock(dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
++	err = unionfs_file_revalidate(file, false);
++	if (unlikely(err))
++		goto out;
++
++	lower_file = unionfs_lower_file(file);
++	err = vfs_read(lower_file, buf, count, ppos);
++	/* update our inode atime upon a successful lower read */
++	if (err >= 0) {
++		fsstack_copy_attr_atime(file->f_path.dentry->d_inode,
++					lower_file->f_path.dentry->d_inode);
++		unionfs_check_file(file);
++	}
++
++out:
++	unionfs_unlock_dentry(dentry);
++	unionfs_read_unlock(file->f_path.dentry->d_sb);
++	return err;
++}
++
++static ssize_t unionfs_write(struct file *file, const char __user *buf,
++			     size_t count, loff_t *ppos)
++{
++	int err = 0;
++	struct file *lower_file;
++	struct dentry *dentry = file->f_path.dentry;
++
++	unionfs_read_lock(dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
++	err = unionfs_file_revalidate(file, true);
++	if (unlikely(err))
++		goto out;
++
++	lower_file = unionfs_lower_file(file);
++	err = vfs_write(lower_file, buf, count, ppos);
++	/* update our inode times+sizes upon a successful lower write */
++	if (err >= 0) {
++		fsstack_copy_inode_size(file->f_path.dentry->d_inode,
++					lower_file->f_path.dentry->d_inode);
++		fsstack_copy_attr_times(file->f_path.dentry->d_inode,
++					lower_file->f_path.dentry->d_inode);
++		unionfs_check_file(file);
++	}
++
++out:
++	unionfs_unlock_dentry(dentry);
++	unionfs_read_unlock(file->f_path.dentry->d_sb);
++	return err;
++}
++
++
 +static int unionfs_file_readdir(struct file *file, void *dirent,
 +				filldir_t filldir)
 +{
 +	return -ENOTDIR;
++}
++
++int unionfs_readpage_dummy(struct file *file, struct page *page)
++{
++	BUG();
++	return -EINVAL;
 +}
 +
 +static int unionfs_mmap(struct file *file, struct vm_area_struct *vma)
@@ -4522,8 +4723,11 @@ index 0000000..0c424f6
 +	int err = 0;
 +	bool willwrite;
 +	struct file *lower_file;
++	struct dentry *dentry = file->f_path.dentry;
++	struct vm_operations_struct *saved_vm_ops = NULL;
 +
-+	unionfs_read_lock(file->f_path.dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_read_lock(dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
 +
 +	/* This might be deferred to mmap's writepage */
 +	willwrite = ((vma->vm_flags | VM_SHARED | VM_WRITE) == vma->vm_flags);
@@ -4547,20 +4751,48 @@ index 0000000..0c424f6
 +		err = -EINVAL;
 +		printk(KERN_ERR "unionfs: branch %d file system does not "
 +		       "support writeable mmap\n", fbstart(file));
-+	} else {
-+		err = generic_file_mmap(file, vma);
-+		if (err)
-+			printk(KERN_ERR
-+			       "unionfs: generic_file_mmap failed %d\n", err);
++		goto out;
 +	}
++
++	/*
++	 * find and save lower vm_ops.
++	 *
++	 * XXX: the VFS should have a cleaner way of finding the lower vm_ops
++	 */
++	if (!UNIONFS_F(file)->lower_vm_ops) {
++		err = lower_file->f_op->mmap(lower_file, vma);
++		if (err) {
++			printk(KERN_ERR "unionfs: lower mmap failed %d\n", err);
++			goto out;
++		}
++		saved_vm_ops = vma->vm_ops;
++		err = do_munmap(current->mm, vma->vm_start,
++				vma->vm_end - vma->vm_start);
++		if (err) {
++			printk(KERN_ERR "unionfs: do_munmap failed %d\n", err);
++			goto out;
++		}
++	}
++
++	file->f_mapping->a_ops = &unionfs_dummy_aops;
++	err = generic_file_mmap(file, vma);
++	file->f_mapping->a_ops = &unionfs_aops;
++	if (err) {
++		printk(KERN_ERR "unionfs: generic_file_mmap failed %d\n", err);
++		goto out;
++	}
++	vma->vm_ops = &unionfs_vm_ops;
++	if (!UNIONFS_F(file)->lower_vm_ops)
++		UNIONFS_F(file)->lower_vm_ops = saved_vm_ops;
 +
 +out:
 +	if (!err) {
 +		/* copyup could cause parent dir times to change */
-+		unionfs_copy_attr_times(file->f_path.dentry->d_parent->d_inode);
++		unionfs_copy_attr_times(dentry->d_parent->d_inode);
 +		unionfs_check_file(file);
 +	}
-+	unionfs_read_unlock(file->f_path.dentry->d_sb);
++	unionfs_unlock_dentry(dentry);
++	unionfs_read_unlock(dentry->d_sb);
 +	return err;
 +}
 +
@@ -4572,7 +4804,8 @@ index 0000000..0c424f6
 +	struct inode *lower_inode, *inode;
 +	int err = -EINVAL;
 +
-+	unionfs_read_lock(file->f_path.dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_read_lock(dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
 +	err = unionfs_file_revalidate(file, true);
 +	if (unlikely(err))
 +		goto out;
@@ -4607,8 +4840,10 @@ index 0000000..0c424f6
 +	unionfs_copy_attr_times(inode);
 +
 +out:
-+	unionfs_check_file(file);
-+	unionfs_read_unlock(file->f_path.dentry->d_sb);
++	if (!err)
++		unionfs_check_file(file);
++	unionfs_unlock_dentry(dentry);
++	unionfs_read_unlock(dentry->d_sb);
 +	return err;
 +}
 +
@@ -4616,11 +4851,12 @@ index 0000000..0c424f6
 +{
 +	int bindex, bstart, bend;
 +	struct file *lower_file;
-+	struct dentry *dentry;
++	struct dentry *dentry = file->f_path.dentry;
 +	struct inode *lower_inode, *inode;
 +	int err = 0;
 +
-+	unionfs_read_lock(file->f_path.dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_read_lock(dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
 +	err = unionfs_file_revalidate(file, true);
 +	if (unlikely(err))
 +		goto out;
@@ -4631,7 +4867,6 @@ index 0000000..0c424f6
 +	if (bstart < 0 || bend < 0)
 +		goto out;
 +
-+	dentry = file->f_path.dentry;
 +	inode = dentry->d_inode;
 +	if (unlikely(!inode)) {
 +		printk(KERN_ERR
@@ -4653,17 +4888,77 @@ index 0000000..0c424f6
 +	unionfs_copy_attr_times(inode);
 +
 +out:
-+	unionfs_check_file(file);
-+	unionfs_read_unlock(file->f_path.dentry->d_sb);
++	if (!err)
++		unionfs_check_file(file);
++	unionfs_unlock_dentry(dentry);
++	unionfs_read_unlock(dentry->d_sb);
++	return err;
++}
++
++static ssize_t unionfs_splice_read(struct file *file, loff_t *ppos,
++				   struct pipe_inode_info *pipe, size_t len,
++				   unsigned int flags)
++{
++	ssize_t err;
++	struct file *lower_file;
++	struct dentry *dentry = file->f_path.dentry;
++
++	unionfs_read_lock(dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
++	err = unionfs_file_revalidate(file, false);
++	if (unlikely(err))
++		goto out;
++
++	lower_file = unionfs_lower_file(file);
++	err = vfs_splice_to(lower_file, ppos, pipe, len, flags);
++	/* update our inode atime upon a successful lower splice-read */
++	if (err >= 0) {
++		fsstack_copy_attr_atime(dentry->d_inode,
++					lower_file->f_path.dentry->d_inode);
++		unionfs_check_file(file);
++	}
++
++out:
++	unionfs_unlock_dentry(dentry);
++	unionfs_read_unlock(dentry->d_sb);
++	return err;
++}
++
++static ssize_t unionfs_splice_write(struct pipe_inode_info *pipe,
++				    struct file *file, loff_t *ppos,
++				    size_t len, unsigned int flags)
++{
++	ssize_t err = 0;
++	struct file *lower_file;
++	struct dentry *dentry = file->f_path.dentry;
++
++	unionfs_read_lock(dentry->d_sb, UNIONFS_SMUTEX_PARENT);
++	unionfs_lock_dentry(dentry, UNIONFS_DMUTEX_CHILD);
++	err = unionfs_file_revalidate(file, true);
++	if (unlikely(err))
++		goto out;
++
++	lower_file = unionfs_lower_file(file);
++	err = vfs_splice_from(pipe, lower_file, ppos, len, flags);
++	/* update our inode times+sizes upon a successful lower write */
++	if (err >= 0) {
++		fsstack_copy_inode_size(dentry->d_inode,
++					lower_file->f_path.dentry->d_inode);
++		fsstack_copy_attr_times(dentry->d_inode,
++					lower_file->f_path.dentry->d_inode);
++		unionfs_check_file(file);
++	}
++
++out:
++	unionfs_unlock_dentry(dentry);
++	unionfs_read_unlock(dentry->d_sb);
 +	return err;
 +}
 +
 +struct file_operations unionfs_main_fops = {
 +	.llseek		= generic_file_llseek,
-+	.read		= do_sync_read,
-+	.aio_read	= generic_file_aio_read,
-+	.write		= do_sync_write,
-+	.aio_write	= generic_file_aio_write,
++	.read		= unionfs_read,
++	.write		= unionfs_write,
 +	.readdir	= unionfs_file_readdir,
 +	.unlocked_ioctl	= unionfs_ioctl,
 +	.mmap		= unionfs_mmap,
@@ -4672,15 +4967,15 @@ index 0000000..0c424f6
 +	.release	= unionfs_file_release,
 +	.fsync		= unionfs_fsync,
 +	.fasync		= unionfs_fasync,
-+	.splice_read	= generic_file_splice_read,
-+	.splice_write	= generic_file_splice_write,
++	.splice_read	= unionfs_splice_read,
++	.splice_write	= unionfs_splice_write,
 +};
 diff --git a/fs/unionfs/inode.c b/fs/unionfs/inode.c
 new file mode 100644
-index 0000000..2e791fd
+index 0000000..c0d319e
 --- /dev/null
 +++ b/fs/unionfs/inode.c
-@@ -0,0 +1,1115 @@
+@@ -0,0 +1,1114 @@
 +/*
 + * Copyright (c) 2003-2007 Erez Zadok
 + * Copyright (c) 2003-2006 Charles P. Wright
@@ -5747,8 +6042,7 @@ index 0000000..2e791fd
 +	if (ia->ia_valid & ATTR_ATIME_SET)
 +		inode->i_atime = lower_inode->i_atime;
 +	fsstack_copy_inode_size(inode, lower_inode);
-+	/* if setattr succeeded, then parent dir may have changed */
-+	unionfs_copy_attr_times(dentry->d_parent->d_inode);
++
 +out:
 +	if (!err)
 +		unionfs_check_dentry(dentry);
@@ -5798,10 +6092,10 @@ index 0000000..2e791fd
 +};
 diff --git a/fs/unionfs/lookup.c b/fs/unionfs/lookup.c
 new file mode 100644
-index 0000000..755158e
+index 0000000..7f512c2
 --- /dev/null
 +++ b/fs/unionfs/lookup.c
-@@ -0,0 +1,665 @@
+@@ -0,0 +1,663 @@
 +/*
 + * Copyright (c) 2003-2007 Erez Zadok
 + * Copyright (c) 2003-2006 Charles P. Wright
@@ -5836,7 +6130,7 @@ index 0000000..755158e
 +}
 +
 +/* The rest of these are utility functions for lookup. */
-+static noinline int is_opaque_dir(struct dentry *dentry, int bindex)
++static noinline_for_stack int is_opaque_dir(struct dentry *dentry, int bindex)
 +{
 +	int err = 0;
 +	struct dentry *lower_dentry;
@@ -6068,7 +6362,9 @@ index 0000000..755158e
 +		 * branches, but we have to skip non-dirs (to avoid, say,
 +		 * calling readdir on a regular file).
 +		 */
-+		if (!S_ISDIR(lower_dentry->d_inode->i_mode) && dentry_count) {
++		if ((lookupmode != INTERPOSE_PARTIAL) &&
++		    !S_ISDIR(lower_dentry->d_inode->i_mode) &&
++		    dentry_count) {
 +			dput(lower_dentry);
 +			continue;
 +		}
@@ -6099,10 +6395,6 @@ index 0000000..755158e
 +				continue;
 +			if (dentry_count == 1)
 +				goto out_positive;
-+			/* This can only happen with mixed D-*-F-* */
-+			BUG_ON(!S_ISDIR(unionfs_lower_dentry(dentry)->
-+					d_inode->i_mode));
-+			continue;
 +		}
 +
 +		opaque = is_opaque_dir(dentry, bindex);
@@ -6469,10 +6761,10 @@ index 0000000..755158e
 +}
 diff --git a/fs/unionfs/main.c b/fs/unionfs/main.c
 new file mode 100644
-index 0000000..ba3471d
+index 0000000..42dc8a8
 --- /dev/null
 +++ b/fs/unionfs/main.c
-@@ -0,0 +1,797 @@
+@@ -0,0 +1,802 @@
 +/*
 + * Copyright (c) 2003-2007 Erez Zadok
 + * Copyright (c) 2003-2006 Charles P. Wright
@@ -7212,7 +7504,12 @@ index 0000000..ba3471d
 +			  int flags, const char *dev_name,
 +			  void *raw_data, struct vfsmount *mnt)
 +{
-+	return get_sb_nodev(fs_type, flags, raw_data, unionfs_read_super, mnt);
++	int err;
++	err = get_sb_nodev(fs_type, flags, raw_data, unionfs_read_super, mnt);
++	if (!err)
++		UNIONFS_SB(mnt->mnt_sb)->dev_name =
++			kstrdup(dev_name, GFP_KERNEL);
++	return err;
 +}
 +
 +static struct file_system_type unionfs_fs_type = {
@@ -7272,10 +7569,10 @@ index 0000000..ba3471d
 +module_exit(exit_unionfs_fs);
 diff --git a/fs/unionfs/mmap.c b/fs/unionfs/mmap.c
 new file mode 100644
-index 0000000..d6ac61e
+index 0000000..07db5b0
 --- /dev/null
 +++ b/fs/unionfs/mmap.c
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,84 @@
 +/*
 + * Copyright (c) 2003-2007 Erez Zadok
 + * Copyright (c) 2003-2006 Charles P. Wright
@@ -7297,318 +7594,68 @@ index 0000000..d6ac61e
 +
 +#include "union.h"
 +
-+static int unionfs_writepage(struct page *page, struct writeback_control *wbc)
-+{
-+	int err = -EIO;
-+	struct inode *inode;
-+	struct inode *lower_inode;
-+	struct page *lower_page;
-+	struct address_space *lower_mapping; /* lower inode mapping */
-+	gfp_t mask;
 +
-+	BUG_ON(!PageUptodate(page));
-+	inode = page->mapping->host;
-+	/* if no lower inode, nothing to do */
-+	if (!inode || !UNIONFS_I(inode) || UNIONFS_I(inode)->lower_inodes) {
-+		err = 0;
-+		goto out;
-+	}
-+	lower_inode = unionfs_lower_inode(inode);
-+	lower_mapping = lower_inode->i_mapping;
-+
-+	/*
-+	 * find lower page (returns a locked page)
-+	 *
-+	 * We turn off __GFP_FS while we look for or create a new lower
-+	 * page.  This prevents a recursion into the file system code, which
-+	 * under memory pressure conditions could lead to a deadlock.  This
-+	 * is similar to how the loop driver behaves (see loop_set_fd in
-+	 * drivers/block/loop.c).  If we can't find the lower page, we
-+	 * redirty our page and return "success" so that the VM will call us
-+	 * again in the (hopefully near) future.
-+	 */
-+	mask = mapping_gfp_mask(lower_mapping) & ~(__GFP_FS);
-+	lower_page = find_or_create_page(lower_mapping, page->index, mask);
-+	if (!lower_page) {
-+		err = 0;
-+		set_page_dirty(page);
-+		goto out;
-+	}
-+
-+	/* copy page data from our upper page to the lower page */
-+	copy_highpage(lower_page, page);
-+	flush_dcache_page(lower_page);
-+	SetPageUptodate(lower_page);
-+	set_page_dirty(lower_page);
-+
-+	/*
-+	 * Call lower writepage (expects locked page).  However, if we are
-+	 * called with wbc->for_reclaim, then the VFS/VM just wants to
-+	 * reclaim our page.  Therefore, we don't need to call the lower
-+	 * ->writepage: just copy our data to the lower page (already done
-+	 * above), then mark the lower page dirty and unlock it, and return
-+	 * success.
-+	 */
-+	if (wbc->for_reclaim) {
-+		unlock_page(lower_page);
-+		goto out_release;
-+	}
-+
-+	BUG_ON(!lower_mapping->a_ops->writepage);
-+	wait_on_page_writeback(lower_page); /* prevent multiple writers */
-+	clear_page_dirty_for_io(lower_page); /* emulate VFS behavior */
-+	err = lower_mapping->a_ops->writepage(lower_page, wbc);
-+	if (err < 0)
-+		goto out_release;
-+
-+	/*
-+	 * Lower file systems such as ramfs and tmpfs, may return
-+	 * AOP_WRITEPAGE_ACTIVATE so that the VM won't try to (pointlessly)
-+	 * write the page again for a while.  But those lower file systems
-+	 * also set the page dirty bit back again.  Since we successfully
-+	 * copied our page data to the lower page, then the VM will come
-+	 * back to the lower page (directly) and try to flush it.  So we can
-+	 * save the VM the hassle of coming back to our page and trying to
-+	 * flush too.  Therefore, we don't re-dirty our own page, and we
-+	 * never return AOP_WRITEPAGE_ACTIVATE back to the VM (we consider
-+	 * this a success).
-+	 *
-+	 * We also unlock the lower page if the lower ->writepage returned
-+	 * AOP_WRITEPAGE_ACTIVATE.  (This "anomalous" behaviour may be
-+	 * addressed in future shmem/VM code.)
-+	 */
-+	if (err == AOP_WRITEPAGE_ACTIVATE) {
-+		err = 0;
-+		unlock_page(lower_page);
-+	}
-+
-+	/* all is well */
-+
-+	/* lower mtimes have changed: update ours */
-+	unionfs_copy_attr_times(inode);
-+
-+out_release:
-+	/* b/c find_or_create_page increased refcnt */
-+	page_cache_release(lower_page);
-+out:
-+	/*
-+	 * We unlock our page unconditionally, because we never return
-+	 * AOP_WRITEPAGE_ACTIVATE.
-+	 */
-+	unlock_page(page);
-+	return err;
-+}
-+
-+static int unionfs_writepages(struct address_space *mapping,
-+			      struct writeback_control *wbc)
-+{
-+	int err = 0;
-+	struct inode *lower_inode;
-+	struct inode *inode;
-+
-+	inode = mapping->host;
-+	if (ibstart(inode) < 0 && ibend(inode) < 0)
-+		goto out;
-+	lower_inode = unionfs_lower_inode(inode);
-+	if (!lower_inode)
-+		goto out;
-+
-+	err = generic_writepages(mapping, wbc);
-+	if (!err)
-+		unionfs_copy_attr_times(inode);
-+out:
-+	return err;
-+}
-+
-+/* Readpage expects a locked page, and must unlock it */
++/*
++ * XXX: we need a dummy readpage handler because generic_file_mmap (which we
++ * use in unionfs_mmap) checks for the existence of
++ * mapping->a_ops->readpage, else it returns -ENOEXEC.  The VFS will need to
++ * be fixed to allow a file system to define vm_ops->fault without any
++ * address_space_ops whatsoever.
++ *
++ * Otherwise, we don't want to use our readpage method at all.
++ */
 +static int unionfs_readpage(struct file *file, struct page *page)
 +{
++	BUG();
++	return -EINVAL;
++}
++
++static int unionfs_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++{
 +	int err;
-+	struct file *lower_file;
-+	struct inode *inode;
-+	mm_segment_t old_fs;
-+	char *page_data = NULL;
-+	mode_t orig_mode;
++	struct file *file, *lower_file;
++	struct vm_operations_struct *lower_vm_ops;
 +
-+	unionfs_read_lock(file->f_path.dentry->d_sb, UNIONFS_SMUTEX_PARENT);
-+	err = unionfs_file_revalidate(file, false);
-+	if (unlikely(err))
-+		goto out;
-+	unionfs_check_file(file);
-+
-+	if (!UNIONFS_F(file)) {
-+		err = -ENOENT;
-+		goto out;
-+	}
++	BUG_ON(!vma);
++	file = vma->vm_file;
++	lower_vm_ops = UNIONFS_F(file)->lower_vm_ops;
++	BUG_ON(!lower_vm_ops);
 +
 +	lower_file = unionfs_lower_file(file);
-+	/* FIXME: is this assertion right here? */
-+	BUG_ON(lower_file == NULL);
-+
-+	inode = file->f_path.dentry->d_inode;
-+
-+	page_data = (char *) kmap(page);
++	BUG_ON(!lower_file);
 +	/*
-+	 * Use vfs_read because some lower file systems don't have a
-+	 * readpage method, and some file systems (esp. distributed ones)
-+	 * don't like their pages to be accessed directly.  Using vfs_read
-+	 * may be a little slower, but a lot safer, as the VFS does a lot of
-+	 * the necessary magic for us.
++	 * XXX: we set the vm_file to the lower_file, before calling the
++	 * lower ->fault op, then we restore the vm_file back to the upper
++	 * file.  Need to change the ->fault prototype to take an explicit
++	 * struct file, and fix all users accordingly.
 +	 */
-+	lower_file->f_pos = page_offset(page);
-+	old_fs = get_fs();
-+	set_fs(KERNEL_DS);
-+	/*
-+	 * generic_file_splice_write may call us on a file not opened for
-+	 * reading, so temporarily allow reading.
-+	 */
-+	orig_mode = lower_file->f_mode;
-+	lower_file->f_mode |= FMODE_READ;
-+	err = vfs_read(lower_file, page_data, PAGE_CACHE_SIZE,
-+		       &lower_file->f_pos);
-+	lower_file->f_mode = orig_mode;
-+	set_fs(old_fs);
-+	if (err >= 0 && err < PAGE_CACHE_SIZE)
-+		memset(page_data + err, 0, PAGE_CACHE_SIZE - err);
-+	kunmap(page);
-+
-+	if (err < 0)
-+		goto out;
-+	err = 0;
-+
-+	/* if vfs_read succeeded above, sync up our times */
-+	unionfs_copy_attr_times(inode);
-+
-+	flush_dcache_page(page);
-+
-+	/*
-+	 * we have to unlock our page, b/c we _might_ have gotten a locked
-+	 * page.  but we no longer have to wakeup on our page here, b/c
-+	 * UnlockPage does it
-+	 */
-+out:
-+	if (err == 0)
-+		SetPageUptodate(page);
-+	else
-+		ClearPageUptodate(page);
-+
-+	unlock_page(page);
-+	unionfs_check_file(file);
-+	unionfs_read_unlock(file->f_path.dentry->d_sb);
-+
++	vma->vm_file = lower_file;
++	err = lower_vm_ops->fault(vma, vmf);
++	vma->vm_file = file;
 +	return err;
-+}
-+
-+static int unionfs_prepare_write(struct file *file, struct page *page,
-+				 unsigned from, unsigned to)
-+{
-+	int err;
-+
-+	unionfs_read_lock(file->f_path.dentry->d_sb, UNIONFS_SMUTEX_PARENT);
-+	err = unionfs_file_revalidate(file, true);
-+	if (!err) {
-+		unionfs_copy_attr_times(file->f_path.dentry->d_inode);
-+		unionfs_check_file(file);
-+	}
-+	unionfs_read_unlock(file->f_path.dentry->d_sb);
-+
-+	return err;
-+}
-+
-+static int unionfs_commit_write(struct file *file, struct page *page,
-+				unsigned from, unsigned to)
-+{
-+	int err = -ENOMEM;
-+	struct inode *inode, *lower_inode;
-+	struct file *lower_file = NULL;
-+	unsigned bytes = to - from;
-+	char *page_data = NULL;
-+	mm_segment_t old_fs;
-+
-+	BUG_ON(file == NULL);
-+
-+	unionfs_read_lock(file->f_path.dentry->d_sb, UNIONFS_SMUTEX_PARENT);
-+	err = unionfs_file_revalidate(file, true);
-+	if (unlikely(err))
-+		goto out;
-+	unionfs_check_file(file);
-+
-+	inode = page->mapping->host;
-+
-+	if (UNIONFS_F(file) != NULL)
-+		lower_file = unionfs_lower_file(file);
-+
-+	/* FIXME: is this assertion right here? */
-+	BUG_ON(lower_file == NULL);
-+
-+	page_data = (char *)kmap(page);
-+	lower_file->f_pos = page_offset(page) + from;
-+
-+	/*
-+	 * We use vfs_write instead of copying page data and the
-+	 * prepare_write/commit_write combo because file system's like
-+	 * GFS/OCFS2 don't like things touching those directly,
-+	 * calling the underlying write op, while a little bit slower, will
-+	 * call all the FS specific code as well
-+	 */
-+	old_fs = get_fs();
-+	set_fs(KERNEL_DS);
-+	err = vfs_write(lower_file, page_data + from, bytes,
-+			&lower_file->f_pos);
-+	set_fs(old_fs);
-+
-+	kunmap(page);
-+
-+	if (err < 0)
-+		goto out;
-+
-+	/* if vfs_write succeeded above, sync up our times/sizes */
-+	lower_inode = lower_file->f_path.dentry->d_inode;
-+	if (!lower_inode)
-+		lower_inode = unionfs_lower_inode(inode);
-+	BUG_ON(!lower_inode);
-+	fsstack_copy_inode_size(inode, lower_inode);
-+	unionfs_copy_attr_times(inode);
-+	mark_inode_dirty_sync(inode);
-+
-+out:
-+	if (err < 0)
-+		ClearPageUptodate(page);
-+
-+	unionfs_check_file(file);
-+	unionfs_read_unlock(file->f_path.dentry->d_sb);
-+	return err;		/* assume all is ok */
 +}
 +
 +/*
-+ * Although unionfs isn't a block-based file system, it may stack on one.
-+ * ->bmap is needed, for example, to swapon(2) files.
++ * XXX: the default address_space_ops for unionfs is empty.  We cannot set
++ * our inode->i_mapping->a_ops to NULL because too many code paths expect
++ * the a_ops vector to be non-NULL.
 + */
-+sector_t unionfs_bmap(struct address_space *mapping, sector_t block)
-+{
-+	int err = -EINVAL;
-+	struct inode *inode, *lower_inode;
-+	sector_t (*bmap)(struct address_space *, sector_t);
-+
-+	inode = (struct inode *)mapping->host;
-+	lower_inode = unionfs_lower_inode(inode);
-+	if (!lower_inode)
-+		goto out;
-+	bmap = lower_inode->i_mapping->a_ops->bmap;
-+	if (bmap)
-+		err = bmap(lower_inode->i_mapping, block);
-+out:
-+	return err;
-+}
-+
-+
 +struct address_space_operations unionfs_aops = {
-+	.writepage	= unionfs_writepage,
-+	.writepages	= unionfs_writepages,
++	/* empty on purpose */
++};
++
++/*
++ * XXX: we need a second, dummy address_space_ops vector, to be used
++ * temporarily during unionfs_mmap, because the latter calls
++ * generic_file_mmap, which checks if ->readpage exists, else returns
++ * -ENOEXEC.
++ */
++struct address_space_operations unionfs_dummy_aops = {
 +	.readpage	= unionfs_readpage,
-+	.prepare_write	= unionfs_prepare_write,
-+	.commit_write	= unionfs_commit_write,
-+	.bmap		= unionfs_bmap,
++};
++
++struct vm_operations_struct unionfs_vm_ops = {
++	.fault		= unionfs_fault,
 +};
 diff --git a/fs/unionfs/rdstate.c b/fs/unionfs/rdstate.c
 new file mode 100644
@@ -8984,10 +9031,10 @@ index 0000000..1a40f63
 +}
 diff --git a/fs/unionfs/super.c b/fs/unionfs/super.c
 new file mode 100644
-index 0000000..175840f
+index 0000000..6ac4abb
 --- /dev/null
 +++ b/fs/unionfs/super.c
-@@ -0,0 +1,1039 @@
+@@ -0,0 +1,1045 @@
 +/*
 + * Copyright (c) 2003-2007 Erez Zadok
 + * Copyright (c) 2003-2006 Charles P. Wright
@@ -9114,6 +9161,7 @@ index 0000000..175840f
 +		atomic_dec(&s->s_active);
 +	}
 +
++	kfree(spd->dev_name);
 +	kfree(spd->data);
 +	kfree(spd);
 +	sb->s_fs_info = NULL;
@@ -9169,9 +9217,11 @@ index 0000000..175840f
 +}
 +
 +/* handle mode changing during remount */
-+static noinline int do_remount_mode_option(char *optarg, int cur_branches,
-+					   struct unionfs_data *new_data,
-+					   struct path *new_lower_paths)
++static noinline_for_stack int do_remount_mode_option(
++					char *optarg,
++					int cur_branches,
++					struct unionfs_data *new_data,
++					struct path *new_lower_paths)
 +{
 +	int err = -EINVAL;
 +	int perms, idx;
@@ -9230,9 +9280,10 @@ index 0000000..175840f
 +}
 +
 +/* handle branch deletion during remount */
-+static noinline int do_remount_del_option(char *optarg, int cur_branches,
-+					  struct unionfs_data *new_data,
-+					  struct path *new_lower_paths)
++static noinline_for_stack int do_remount_del_option(
++					char *optarg, int cur_branches,
++					struct unionfs_data *new_data,
++					struct path *new_lower_paths)
 +{
 +	int err = -EINVAL;
 +	int idx;
@@ -9293,10 +9344,11 @@ index 0000000..175840f
 +}
 +
 +/* handle branch insertion during remount */
-+static noinline int do_remount_add_option(char *optarg, int cur_branches,
-+					  struct unionfs_data *new_data,
-+					  struct path *new_lower_paths,
-+					  int *high_branch_id)
++static noinline_for_stack int do_remount_add_option(
++					char *optarg, int cur_branches,
++					struct unionfs_data *new_data,
++					struct path *new_lower_paths,
++					int *high_branch_id)
 +{
 +	int err = -EINVAL;
 +	int perms;
@@ -9781,7 +9833,8 @@ index 0000000..175840f
 +	atomic_set(&UNIONFS_D(sb->s_root)->generation, i);
 +	atomic_set(&UNIONFS_I(sb->s_root->d_inode)->generation, i);
 +	if (!(*flags & MS_SILENT))
-+		pr_info("unionfs: new generation number %d\n", i);
++		pr_info("unionfs: %s: new generation number %d\n",
++			UNIONFS_SB(sb)->dev_name, i);
 +	/* finally, update the root dentry's times */
 +	unionfs_copy_attr_times(sb->s_root->d_inode);
 +	err = 0;		/* reset to success */
@@ -10029,10 +10082,10 @@ index 0000000..175840f
 +};
 diff --git a/fs/unionfs/union.h b/fs/unionfs/union.h
 new file mode 100644
-index 0000000..eca67bc
+index 0000000..9cccb33
 --- /dev/null
 +++ b/fs/unionfs/union.h
-@@ -0,0 +1,615 @@
+@@ -0,0 +1,622 @@
 +/*
 + * Copyright (c) 2003-2007 Erez Zadok
 + * Copyright (c) 2003-2006 Charles P. Wright
@@ -10081,6 +10134,7 @@ index 0000000..eca67bc
 +#include <linux/poison.h>
 +#include <linux/mman.h>
 +#include <linux/backing-dev.h>
++#include <linux/splice.h>
 +
 +#include <asm/system.h>
 +
@@ -10109,7 +10163,8 @@ index 0000000..eca67bc
 +extern struct inode_operations unionfs_symlink_iops;
 +extern struct super_operations unionfs_sops;
 +extern struct dentry_operations unionfs_dops;
-+extern struct address_space_operations unionfs_aops;
++extern struct address_space_operations unionfs_aops, unionfs_dummy_aops;
++extern struct vm_operations_struct unionfs_vm_ops;
 +
 +/* How long should an entry be allowed to persist */
 +#define RDCACHE_JIFFIES	(5*HZ)
@@ -10121,6 +10176,10 @@ index 0000000..eca67bc
 +# define unionfs_rw_semaphore	rw_semaphore
 +#endif /* not CONFIG_PREEMPT_RT */
 +
++#ifndef noinline_for_stack
++# define noinline_for_stack noinline
++#endif /* not noinline_for_stack */
++
 +/* file private data. */
 +struct unionfs_file_info {
 +	int bstart;
@@ -10130,6 +10189,7 @@ index 0000000..eca67bc
 +	struct unionfs_dir_state *rdstate;
 +	struct file **lower_files;
 +	int *saved_branch_ids; /* IDs of branches when file was opened */
++	struct vm_operations_struct *lower_vm_ops;
 +};
 +
 +/* unionfs inode data in memory */
@@ -10198,6 +10258,7 @@ index 0000000..eca67bc
 +	struct unionfs_rw_semaphore rwsem;
 +	pid_t write_lock_owner;	/* PID of rw_sem owner (write lock) */
 +	int high_branch_id;	/* last unique branch ID given */
++	char *dev_name;		/* to identify different unions in pr_debug */
 +	struct unionfs_data *data;
 +};
 +
@@ -10394,7 +10455,6 @@ index 0000000..eca67bc
 +extern int unionfs_getlk(struct file *file, struct file_lock *fl);
 +
 +/* Common file operations. */
-+extern int unionfs_file_revalidate_locked(struct file *file, bool willwrite);
 +extern int unionfs_file_revalidate(struct file *file, bool willwrite);
 +extern int unionfs_open(struct inode *inode, struct file *file);
 +extern int unionfs_file_release(struct inode *inode, struct file *file);
@@ -10596,24 +10656,24 @@ index 0000000..eca67bc
 +#ifdef CONFIG_UNION_FS_DEBUG
 +
 +/* useful for tracking code reachability */
-+#define UDBG pr_debug("DBG:%s:%s:%d\n", __FILE__, __FUNCTION__, __LINE__)
++#define UDBG pr_debug("DBG:%s:%s:%d\n", __FILE__, __func__, __LINE__)
 +
 +#define unionfs_check_inode(i)	__unionfs_check_inode((i),	\
-+	__FILE__, __FUNCTION__, __LINE__)
++	__FILE__, __func__, __LINE__)
 +#define unionfs_check_dentry(d)	__unionfs_check_dentry((d),	\
-+	__FILE__, __FUNCTION__, __LINE__)
++	__FILE__, __func__, __LINE__)
 +#define unionfs_check_file(f)	__unionfs_check_file((f),	\
-+	__FILE__, __FUNCTION__, __LINE__)
++	__FILE__, __func__, __LINE__)
 +#define unionfs_check_nd(n)	__unionfs_check_nd((n),		\
-+	__FILE__, __FUNCTION__, __LINE__)
++	__FILE__, __func__, __LINE__)
 +#define show_branch_counts(sb)	__show_branch_counts((sb),	\
-+	__FILE__, __FUNCTION__, __LINE__)
++	__FILE__, __func__, __LINE__)
 +#define show_inode_times(i)	__show_inode_times((i),		\
-+	__FILE__, __FUNCTION__, __LINE__)
++	__FILE__, __func__, __LINE__)
 +#define show_dinode_times(d)	__show_dinode_times((d),	\
-+	__FILE__, __FUNCTION__, __LINE__)
++	__FILE__, __func__, __LINE__)
 +#define show_inode_counts(i)	__show_inode_counts((i),	\
-+	__FILE__, __FUNCTION__, __LINE__)
++	__FILE__, __func__, __LINE__)
 +
 +extern void __unionfs_check_inode(const struct inode *inode, const char *fname,
 +				  const char *fxn, int line);
@@ -10650,10 +10710,10 @@ index 0000000..eca67bc
 +#endif	/* not _UNION_H_ */
 diff --git a/fs/unionfs/unlink.c b/fs/unionfs/unlink.c
 new file mode 100644
-index 0000000..6e93da3
+index 0000000..c66bb3e
 --- /dev/null
 +++ b/fs/unionfs/unlink.c
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,291 @@
 +/*
 + * Copyright (c) 2003-2007 Erez Zadok
 + * Copyright (c) 2003-2006 Charles P. Wright
@@ -10674,7 +10734,32 @@ index 0000000..6e93da3
 +
 +#include "union.h"
 +
-+/* unlink a file by creating a whiteout */
++/*
++ * Helper function for Unionfs's unlink operation.
++ *
++ * The main goal of this function is to optimize the unlinking of non-dir
++ * objects in unionfs by deleting all possible lower inode objects from the
++ * underlying branches having same dentry name as the non-dir dentry on
++ * which this unlink operation is called.  This way we delete as many lower
++ * inodes as possible, and save space.  Whiteouts need to be created in
++ * branch0 only if unlinking fails on any of the lower branch other than
++ * branch0, or if a lower branch is marked read-only.
++ *
++ * Also, while unlinking a file, if we encounter any dir type entry in any
++ * intermediate branch, then we remove the directory by calling vfs_rmdir.
++ * The following special cases are also handled:
++
++ * (1) If an error occurs in branch0 during vfs_unlink, then we return
++ *     appropriate error.
++ *
++ * (2) If we get an error during unlink in any of other lower branch other
++ *     than branch0, then we create a whiteout in branch0.
++ *
++ * (3) If a whiteout already exists in any intermediate branch, we delete
++ *     all possible inodes only up to that branch (this is an "opaqueness"
++ *     as as per Documentation/filesystems/unionfs/concepts.txt).
++ *
++ */
 +static int unionfs_unlink_whiteout(struct inode *dir, struct dentry *dentry)
 +{
 +	struct dentry *lower_dentry;
@@ -10686,51 +10771,57 @@ index 0000000..6e93da3
 +	if (err)
 +		goto out;
 +
-+	bindex = dbstart(dentry);
++	/* trying to unlink all possible valid instances */
++	for (bindex = dbstart(dentry); bindex <= dbend(dentry); bindex++) {
++		lower_dentry = unionfs_lower_dentry_idx(dentry, bindex);
++		if (!lower_dentry || !lower_dentry->d_inode)
++			continue;
 +
-+	lower_dentry = unionfs_lower_dentry_idx(dentry, bindex);
-+	if (!lower_dentry)
-+		goto out;
++		lower_dir_dentry = lock_parent(lower_dentry);
 +
-+	lower_dir_dentry = lock_parent(lower_dentry);
++		/* avoid destroying the lower inode if the object is in use */
++		dget(lower_dentry);
++		err = is_robranch_super(dentry->d_sb, bindex);
++		if (!err) {
++			/* see Documentation/filesystems/unionfs/issues.txt */
++			lockdep_off();
++			if (!S_ISDIR(lower_dentry->d_inode->i_mode))
++				err = vfs_unlink(lower_dir_dentry->d_inode,
++								lower_dentry);
++			else
++				err = vfs_rmdir(lower_dir_dentry->d_inode,
++								lower_dentry);
++			lockdep_on();
++		}
 +
-+	/* avoid destroying the lower inode if the file is in use */
-+	dget(lower_dentry);
-+	err = is_robranch_super(dentry->d_sb, bindex);
-+	if (!err) {
-+		/* see Documentation/filesystems/unionfs/issues.txt */
-+		lockdep_off();
-+		err = vfs_unlink(lower_dir_dentry->d_inode, lower_dentry);
-+		lockdep_on();
++		/* if lower object deletion succeeds, update inode's times */
++		if (!err)
++			unionfs_copy_attr_times(dentry->d_inode);
++		dput(lower_dentry);
++		fsstack_copy_attr_times(dir, lower_dir_dentry->d_inode);
++		unlock_dir(lower_dir_dentry);
++
++		if (err)
++			break;
 +	}
-+	/* if vfs_unlink succeeded, update our inode's times */
-+	if (!err)
-+		unionfs_copy_attr_times(dentry->d_inode);
-+	dput(lower_dentry);
-+	fsstack_copy_attr_times(dir, lower_dir_dentry->d_inode);
-+	unlock_dir(lower_dir_dentry);
-+
-+	if (err && !IS_COPYUP_ERR(err))
-+		goto out;
 +
 +	/*
-+	 * We create whiteouts if (1) there was an error unlinking the main
-+	 * file; (2) there is a lower priority file with the same name
-+	 * (dbopaque); (3) the branch in which the file is not the last
-+	 * (rightmost0 branch.  The last rule is an optimization to avoid
-+	 * creating all those whiteouts if there's no chance they'd be
-+	 * masking any lower-priority branch, as well as unionfs is used
-+	 * with only one branch (using only one branch, while odd, is still
-+	 * possible).
++	 * Create the whiteout in branch 0 (highest priority) only if (a)
++	 * there was an error in any intermediate branch other than branch 0
++	 * due to failure of vfs_unlink/vfs_rmdir or (b) a branch marked or
++	 * mounted read-only.
 +	 */
 +	if (err) {
-+		if (dbstart(dentry) == 0)
++		if ((bindex == 0) ||
++		    ((bindex == dbstart(dentry)) &&
++		     (!IS_COPYUP_ERR(err))))
 +			goto out;
-+		err = create_whiteout(dentry, dbstart(dentry) - 1);
-+	} else if (dbopaque(dentry) != -1) {
-+		err = create_whiteout(dentry, dbopaque(dentry));
-+	} else if (dbstart(dentry) < sbend(dentry->d_sb)) {
-+		err = create_whiteout(dentry, dbstart(dentry));
++		else {
++			if (!IS_COPYUP_ERR(err))
++				pr_debug("unionfs: lower object deletion "
++					     "failed in branch:%d\n", bindex);
++			err = create_whiteout(dentry, sbstart(dentry->d_sb));
++		}
 +	}
 +
 +out:
@@ -11153,6 +11244,21 @@ index 4cb4f8d..63f16d9 100644
 +}
 +
  #endif /* _LINUX_NAMEI_H */
+diff --git a/include/linux/splice.h b/include/linux/splice.h
+index 33e447f..616d473 100644
+--- a/include/linux/splice.h
++++ b/include/linux/splice.h
+@@ -69,5 +69,10 @@ extern ssize_t splice_to_pipe(struct pipe_inode_info *,
+ 			      struct splice_pipe_desc *);
+ extern ssize_t splice_direct_to_actor(struct file *, struct splice_desc *,
+ 				      splice_direct_actor *);
++extern long vfs_splice_from(struct pipe_inode_info *pipe, struct file *out,
++			    loff_t *ppos, size_t len, unsigned int flags);
++extern long vfs_splice_to(struct file *in, loff_t *ppos,
++			  struct pipe_inode_info *pipe, size_t len,
++			  unsigned int flags);
+ 
+ #endif
 diff --git a/include/linux/union_fs.h b/include/linux/union_fs.h
 new file mode 100644
 index 0000000..a467de0
