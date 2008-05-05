@@ -18,6 +18,10 @@ class Gencontrol(Base):
         super(Gencontrol, self).do_main_setup(vars, makeflags, extra)
         vars.update(self.config['image',])
         makeflags.update({
+            'MAJOR': self.version.linux_major,
+            'VERSION': self.version.linux_version,
+            'UPSTREAMVERSION': self.version.linux_upstream,
+            'ABINAME': self.abiname,
             'SOURCEVERSION': self.version.complete,
         })
 
@@ -78,17 +82,29 @@ class Gencontrol(Base):
         makefile.add('source_%s_%s_real' % (arch, featureset), cmds = cmds_source)
 
     def do_flavour_setup(self, vars, makeflags, arch, featureset, flavour, extra):
-        vars.update(self.config.merge('image', arch, featureset, flavour))
+        config_image = self.config.merge('image', arch, featureset, flavour)
+
+        vars.update(config_image)
+
+        vars['localversion-image'] = vars['localversion']
+        override_localversion = config_image.get('override-localversion', None)
+        if override_localversion is not None:
+            vars['localversion-image'] = vars['localversion_headers'] + '-' + override_localversion
+
+        for i in (
+            ('compiler', 'COMPILER'),
+            ('kernel-arch', 'KERNEL_ARCH'),
+            ('localversion', 'LOCALVERSION'),
+            ('type', 'TYPE'),
+        ):
+            makeflags[i[1]] = vars[i[0]]
         for i in (
             ('cflags', 'CFLAGS'),
-            ('compiler', 'COMPILER'),
-            ('initramfs', 'INITRAMFS',),
-            ('kernel-arch', 'KERNEL_ARCH'),
+            ('initramfs', 'INITRAMFS'),
             ('kpkg-arch', 'KPKG_ARCH'),
             ('kpkg-subarch', 'KPKG_SUBARCH'),
-            ('localversion', 'LOCALVERSION'),
+            ('localversion-image', 'LOCALVERSION_IMAGE'),
             ('override-host-type', 'OVERRIDE_HOST_TYPE'),
-            ('type', 'TYPE'),
         ):
             if vars.has_key(i[0]):
                 makeflags[i[1]] = vars[i[0]]
@@ -231,20 +247,17 @@ class Gencontrol(Base):
 
     def do_extra(self, packages, makefile):
         apply = self.templates['patch.apply']
-        unpatch = self.templates['patch.unpatch']
 
         vars = {
-            'home': '/usr/src/kernel-patches/all/%s/debian' % self.version.linux_upstream,
-            'revisions': ' '.join([i.debian for i in self.versions[::-1]]),
-            'source': "%(linux_upstream)s-%(debian)s" % self.version.__dict__,
-            'upstream': self.version.linux_upstream,
+            'revisions': 'orig ' + ' '.join([i.revision for i in self.versions[::-1]]),
+            'upstream': self.version.upstream,
+            'linux_upstream': self.version.linux_upstream,
+            'abiname': self.abiname,
         }
 
         apply = self.substitute(apply, vars)
-        unpatch = self.substitute(unpatch, vars)
 
         file('debian/bin/patch.apply', 'w').write(apply)
-        file('debian/bin/patch.unpatch', 'w').write(unpatch)
 
     def process_changelog(self):
         act_upstream = self.changelog[0].version.linux_upstream
@@ -259,7 +272,13 @@ class Gencontrol(Base):
             self.abiname = ''
         else:
             self.abiname = '-%s' % self.config['abi',]['abiname']
-        self.vars = self.process_version_linux(self.version, self.abiname)
+        self.vars = {
+            'upstreamversion': self.version.linux_upstream,
+            'version': self.version.linux_version,
+            'source_upstream': self.version.upstream,
+            'major': self.version.linux_major,
+            'abiname': self.abiname,
+        }
         self.config['version',] = {'source': self.version.complete, 'abiname': self.abiname}
 
     def process_real_image(self, in_entry, relations, config, vars):
