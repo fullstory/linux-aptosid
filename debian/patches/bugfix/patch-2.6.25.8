@@ -15,7 +15,7 @@ index e65736c..63e59b8 100644
  Detecting drive failures:
  -------------------------
 diff --git a/Makefile b/Makefile
-index 39516bf..ab94c3f 100644
+index 39516bf..e18e2b8 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -1,7 +1,7 @@
@@ -23,7 +23,7 @@ index 39516bf..ab94c3f 100644
  PATCHLEVEL = 6
  SUBLEVEL = 25
 -EXTRAVERSION =
-+EXTRAVERSION = .7
++EXTRAVERSION = .8
  NAME = Funky Weasel is Jiggy wit it
  
  # *DOCUMENTATION*
@@ -1385,10 +1385,44 @@ index cef054b..89bb5ee 100644
  	} else
  #endif
 diff --git a/arch/x86/kernel/process_32.c b/arch/x86/kernel/process_32.c
-index 43930e7..c8890b8 100644
+index 43930e7..39b1b7e 100644
 --- a/arch/x86/kernel/process_32.c
 +++ b/arch/x86/kernel/process_32.c
-@@ -710,8 +710,11 @@ struct task_struct * __switch_to(struct task_struct *prev_p, struct task_struct
+@@ -259,12 +259,31 @@ static void mwait_idle(void)
+ 	mwait_idle_with_hints(0, 0);
+ }
+ 
++/*
++ * mwait selection logic:
++ *
++ * It depends on the CPU. For AMD CPUs that support MWAIT this is
++ * wrong. Family 0x10 and 0x11 CPUs will enter C1 on HLT. Powersavings
++ * then depend on a clock divisor and current Pstate of the core. If
++ * all cores of a processor are in halt state (C1) the processor can
++ * enter the C1E (C1 enhanced) state. If mwait is used this will never
++ * happen.
++ *
++ * idle=mwait overrides this decision and forces the usage of mwait.
++ */
+ static int __cpuinit mwait_usable(const struct cpuinfo_x86 *c)
+ {
+ 	if (force_mwait)
+ 		return 1;
+-	/* Any C1 states supported? */
+-	return c->cpuid_level >= 5 && ((cpuid_edx(5) >> 4) & 0xf) > 0;
++
++	if (c->x86_vendor == X86_VENDOR_AMD) {
++		switch(c->x86) {
++		case 0x10:
++		case 0x11:
++			return 0;
++		}
++	}
++	return 1;
+ }
+ 
+ void __cpuinit select_idle_routine(const struct cpuinfo_x86 *c)
+@@ -710,8 +729,11 @@ struct task_struct * __switch_to(struct task_struct *prev_p, struct task_struct
  	/* If the task has used fpu the last 5 timeslices, just do a full
  	 * restore of the math state immediately to avoid the trap; the
  	 * chances of needing FPU soon are obviously high now
@@ -1402,10 +1436,45 @@ index 43930e7..c8890b8 100644
  
  	/*
 diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
-index 46c4c54..1316f1c 100644
+index 46c4c54..53b9c4c 100644
 --- a/arch/x86/kernel/process_64.c
 +++ b/arch/x86/kernel/process_64.c
-@@ -696,8 +696,11 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+@@ -254,13 +254,31 @@ static void mwait_idle(void)
+ 	}
+ }
+ 
+-
++/*
++ * mwait selection logic:
++ *
++ * It depends on the CPU. For AMD CPUs that support MWAIT this is
++ * wrong. Family 0x10 and 0x11 CPUs will enter C1 on HLT. Powersavings
++ * then depend on a clock divisor and current Pstate of the core. If
++ * all cores of a processor are in halt state (C1) the processor can
++ * enter the C1E (C1 enhanced) state. If mwait is used this will never
++ * happen.
++ *
++ * idle=mwait overrides this decision and forces the usage of mwait.
++ */
+ static int __cpuinit mwait_usable(const struct cpuinfo_x86 *c)
+ {
+ 	if (force_mwait)
+ 		return 1;
+-	/* Any C1 states supported? */
+-	return c->cpuid_level >= 5 && ((cpuid_edx(5) >> 4) & 0xf) > 0;
++
++	if (c->x86_vendor == X86_VENDOR_AMD) {
++		switch(c->x86) {
++		case 0x10:
++		case 0x11:
++			return 0;
++		}
++	}
++	return 1;
+ }
+ 
+ void __cpuinit select_idle_routine(const struct cpuinfo_x86 *c)
+@@ -696,8 +714,11 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
  	/* If the task has used fpu the last 5 timeslices, just do a full
  	 * restore of the math state immediately to avoid the trap; the
  	 * chances of needing FPU soon are obviously high now
@@ -1571,6 +1640,100 @@ index d3bebaa..5153afc 100644
  	for_each_possible_cpu(cpu)
  		set_cyc2ns_scale(tsc_khz, cpu);
  }
+diff --git a/arch/x86/lib/copy_user_64.S b/arch/x86/lib/copy_user_64.S
+index 70bebd3..ee1c3f6 100644
+--- a/arch/x86/lib/copy_user_64.S
++++ b/arch/x86/lib/copy_user_64.S
+@@ -217,19 +217,19 @@ ENTRY(copy_user_generic_unrolled)
+ 	/* table sorted by exception address */
+ 	.section __ex_table,"a"
+ 	.align 8
+-	.quad .Ls1,.Ls1e
+-	.quad .Ls2,.Ls2e
+-	.quad .Ls3,.Ls3e
+-	.quad .Ls4,.Ls4e
+-	.quad .Ld1,.Ls1e
++	.quad .Ls1,.Ls1e	/* Ls1-Ls4 have copied zero bytes */
++	.quad .Ls2,.Ls1e
++	.quad .Ls3,.Ls1e
++	.quad .Ls4,.Ls1e
++	.quad .Ld1,.Ls1e	/* Ld1-Ld4 have copied 0-24 bytes */
+ 	.quad .Ld2,.Ls2e
+ 	.quad .Ld3,.Ls3e
+ 	.quad .Ld4,.Ls4e
+-	.quad .Ls5,.Ls5e
+-	.quad .Ls6,.Ls6e
+-	.quad .Ls7,.Ls7e
+-	.quad .Ls8,.Ls8e
+-	.quad .Ld5,.Ls5e
++	.quad .Ls5,.Ls5e	/* Ls5-Ls8 have copied 32 bytes */
++	.quad .Ls6,.Ls5e
++	.quad .Ls7,.Ls5e
++	.quad .Ls8,.Ls5e
++	.quad .Ld5,.Ls5e	/* Ld5-Ld8 have copied 32-56 bytes */
+ 	.quad .Ld6,.Ls6e
+ 	.quad .Ld7,.Ls7e
+ 	.quad .Ld8,.Ls8e
+@@ -244,11 +244,8 @@ ENTRY(copy_user_generic_unrolled)
+ 	.quad .Le5,.Le_zero
+ 	.previous
+ 
+-	/* compute 64-offset for main loop. 8 bytes accuracy with error on the
+-	   pessimistic side. this is gross. it would be better to fix the
+-	   interface. */
+ 	/* eax: zero, ebx: 64 */
+-.Ls1e: 	addl $8,%eax
++.Ls1e: 	addl $8,%eax		/* eax is bytes left uncopied within the loop (Ls1e: 64 .. Ls8e: 8) */
+ .Ls2e: 	addl $8,%eax
+ .Ls3e: 	addl $8,%eax
+ .Ls4e: 	addl $8,%eax
+diff --git a/arch/x86/lib/copy_user_nocache_64.S b/arch/x86/lib/copy_user_nocache_64.S
+index 5196762..9d3d1ab 100644
+--- a/arch/x86/lib/copy_user_nocache_64.S
++++ b/arch/x86/lib/copy_user_nocache_64.S
+@@ -145,19 +145,19 @@ ENTRY(__copy_user_nocache)
+ 	/* table sorted by exception address */
+ 	.section __ex_table,"a"
+ 	.align 8
+-	.quad .Ls1,.Ls1e
+-	.quad .Ls2,.Ls2e
+-	.quad .Ls3,.Ls3e
+-	.quad .Ls4,.Ls4e
+-	.quad .Ld1,.Ls1e
++	.quad .Ls1,.Ls1e	/* .Ls[1-4] - 0 bytes copied */
++	.quad .Ls2,.Ls1e
++	.quad .Ls3,.Ls1e
++	.quad .Ls4,.Ls1e
++	.quad .Ld1,.Ls1e	/* .Ld[1-4] - 0..24 bytes coped */
+ 	.quad .Ld2,.Ls2e
+ 	.quad .Ld3,.Ls3e
+ 	.quad .Ld4,.Ls4e
+-	.quad .Ls5,.Ls5e
+-	.quad .Ls6,.Ls6e
+-	.quad .Ls7,.Ls7e
+-	.quad .Ls8,.Ls8e
+-	.quad .Ld5,.Ls5e
++	.quad .Ls5,.Ls5e	/* .Ls[5-8] - 32 bytes copied */
++	.quad .Ls6,.Ls5e
++	.quad .Ls7,.Ls5e
++	.quad .Ls8,.Ls5e
++	.quad .Ld5,.Ls5e	/* .Ld[5-8] - 32..56 bytes copied */
+ 	.quad .Ld6,.Ls6e
+ 	.quad .Ld7,.Ls7e
+ 	.quad .Ld8,.Ls8e
+@@ -172,11 +172,8 @@ ENTRY(__copy_user_nocache)
+ 	.quad .Le5,.Le_zero
+ 	.previous
+ 
+-	/* compute 64-offset for main loop. 8 bytes accuracy with error on the
+-	   pessimistic side. this is gross. it would be better to fix the
+-	   interface. */
+ 	/* eax: zero, ebx: 64 */
+-.Ls1e: 	addl $8,%eax
++.Ls1e: 	addl $8,%eax	/* eax: bytes left uncopied: Ls1e: 64 .. Ls8e: 8 */
+ .Ls2e: 	addl $8,%eax
+ .Ls3e: 	addl $8,%eax
+ .Ls4e: 	addl $8,%eax
 diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
 index a02a14f..b2c5231 100644
 --- a/arch/x86/mm/init_64.c
@@ -1793,6 +1956,35 @@ index 788da97..836362b 100644
  
  		obj = &(element->package.elements[2]);
  		if (obj->type != ACPI_TYPE_INTEGER)
+diff --git a/drivers/acpi/tables/tbinstal.c b/drivers/acpi/tables/tbinstal.c
+index 3bc0c67..225e88c 100644
+--- a/drivers/acpi/tables/tbinstal.c
++++ b/drivers/acpi/tables/tbinstal.c
+@@ -123,17 +123,13 @@ acpi_tb_add_table(struct acpi_table_desc *table_desc,
+ 		}
+ 	}
+ 
+-	/* The table must be either an SSDT or a PSDT or an OEMx */
+-
+-	if ((!ACPI_COMPARE_NAME(table_desc->pointer->signature, ACPI_SIG_PSDT))
+-	    &&
+-	    (!ACPI_COMPARE_NAME(table_desc->pointer->signature, ACPI_SIG_SSDT))
+-	    && (strncmp(table_desc->pointer->signature, "OEM", 3))) {
+-		ACPI_ERROR((AE_INFO,
+-			    "Table has invalid signature [%4.4s], must be SSDT, PSDT or OEMx",
+-			    table_desc->pointer->signature));
+-		return_ACPI_STATUS(AE_BAD_SIGNATURE);
+-	}
++	/*
++	 * Originally, we checked the table signature for "SSDT" or "PSDT" here.
++	 * Next, we added support for OEMx tables, signature "OEM".
++	 * Valid tables were encountered with a null signature, so we've just
++	 * given up on validating the signature, since it seems to be a waste
++	 * of code. The original code was removed (05/2008).
++	 */
+ 
+ 	(void)acpi_ut_acquire_mutex(ACPI_MTX_TABLES);
+ 
 diff --git a/drivers/ata/ata_piix.c b/drivers/ata/ata_piix.c
 index fae8404..815b8c3 100644
 --- a/drivers/ata/ata_piix.c
@@ -2260,6 +2452,62 @@ index fb7ea56..cf507b3 100644
 -
  	if ((err = i2c_attach_client(real_client)) != 0)
  		goto exit_kfree2;
+ 
+diff --git a/drivers/ide/pci/opti621.c b/drivers/ide/pci/opti621.c
+index 46e8748..3eecbd4 100644
+--- a/drivers/ide/pci/opti621.c
++++ b/drivers/ide/pci/opti621.c
+@@ -103,18 +103,6 @@
+  *  address: 50 ns, data: 50 ns, recovery: 100 ns.
+  */
+ 
+-/* #define READ_PREFETCH 0 */
+-/* Uncomment for disable read prefetch.
+- * There is some readprefetch capatibility in hdparm,
+- * but when I type hdparm -P 1 /dev/hda, I got errors
+- * and till reset drive is inaccessible.
+- * This (hw) read prefetch is safe on my drive.
+- */
+-
+-#ifndef READ_PREFETCH
+-#define READ_PREFETCH 0x40 /* read prefetch is enabled */
+-#endif /* else read prefetch is disabled */
+-
+ #define READ_REG 0	/* index of Read cycle timing register */
+ #define WRITE_REG 1	/* index of Write cycle timing register */
+ #define CNTRL_REG 3	/* index of Control register */
+@@ -260,7 +248,8 @@ static void opti621_set_pio_mode(ide_drive_t *drive, const u8 pio)
+ 
+ 	cycle1 = ((first.data_time-1)<<4)  | (first.recovery_time-2);
+ 	cycle2 = ((second.data_time-1)<<4) | (second.recovery_time-2);
+-	misc = READ_PREFETCH | ((ax-1)<<4) | ((drdy-2)<<1);
++
++	misc = ((ax - 1) << 4) | ((drdy - 2) << 1);
+ 
+ #ifdef OPTI621_DEBUG
+ 	printk("%s: master: address: %d, data: %d, "
+@@ -335,20 +324,16 @@ static const struct ide_port_info opti621_chipsets[] __devinitdata = {
+ 		.name		= "OPTI621",
+ 		.init_hwif	= init_hwif_opti621,
+ 		.enablebits	= {{0x45,0x80,0x00}, {0x40,0x08,0x00}},
+-		.host_flags	= IDE_HFLAG_TRUST_BIOS_FOR_DMA |
++		.host_flags	= IDE_HFLAG_NO_DMA |
+ 				  IDE_HFLAG_BOOTABLE,
+ 		.pio_mask	= ATA_PIO3,
+-		.swdma_mask	= ATA_SWDMA2,
+-		.mwdma_mask	= ATA_MWDMA2,
+ 	},{	/* 1 */
+ 		.name		= "OPTI621X",
+ 		.init_hwif	= init_hwif_opti621,
+ 		.enablebits	= {{0x45,0x80,0x00}, {0x40,0x08,0x00}},
+-		.host_flags	= IDE_HFLAG_TRUST_BIOS_FOR_DMA |
++		.host_flags	= IDE_HFLAG_NO_DMA |
+ 				  IDE_HFLAG_BOOTABLE,
+ 		.pio_mask	= ATA_PIO3,
+-		.swdma_mask	= ATA_SWDMA2,
+-		.mwdma_mask	= ATA_MWDMA2,
+ 	}
+ };
  
 diff --git a/drivers/infiniband/core/umem.c b/drivers/infiniband/core/umem.c
 index 4e3128f..9d5b86c 100644
@@ -3710,11 +3958,45 @@ index c1075a7..c688c3a 100644
  
  	struct timer_list		timer;
  	u16				timer_counter;
+diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
+index 555b70c..2d31587 100644
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -83,9 +83,7 @@ static void receive_skb(struct net_device *dev, struct sk_buff *skb,
+ 	BUG_ON(len > MAX_PACKET_LEN);
+ 
+ 	skb_trim(skb, len);
+-	skb->protocol = eth_type_trans(skb, dev);
+-	pr_debug("Receiving skb proto 0x%04x len %i type %i\n",
+-		 ntohs(skb->protocol), skb->len, skb->pkt_type);
++
+ 	dev->stats.rx_bytes += skb->len;
+ 	dev->stats.rx_packets++;
+ 
+@@ -95,6 +93,10 @@ static void receive_skb(struct net_device *dev, struct sk_buff *skb,
+ 			goto frame_err;
+ 	}
+ 
++	skb->protocol = eth_type_trans(skb, dev);
++	pr_debug("Receiving skb proto 0x%04x len %i type %i\n",
++		 ntohs(skb->protocol), skb->len, skb->pkt_type);
++
+ 	if (hdr->gso_type != VIRTIO_NET_HDR_GSO_NONE) {
+ 		pr_debug("GSO!\n");
+ 		switch (hdr->gso_type & ~VIRTIO_NET_HDR_GSO_ECN) {
 diff --git a/drivers/net/wireless/b43/b43.h b/drivers/net/wireless/b43/b43.h
-index f13346b..44ebdea 100644
+index f13346b..b14087b 100644
 --- a/drivers/net/wireless/b43/b43.h
 +++ b/drivers/net/wireless/b43/b43.h
-@@ -628,6 +628,10 @@ struct b43_wl {
+@@ -596,7 +596,6 @@ struct b43_dma {
+ 
+ /* Context information for a noise calculation (Link Quality). */
+ struct b43_noise_calculation {
+-	u8 channel_at_start;
+ 	bool calculation_running;
+ 	u8 nr_samples;
+ 	s8 samples[8][4];
+@@ -628,6 +627,10 @@ struct b43_wl {
  
  	struct mutex mutex;
  	spinlock_t irq_lock;
@@ -3726,7 +4008,7 @@ index f13346b..44ebdea 100644
  	spinlock_t leds_lock;
  	/* Lock for SHM access. */
 diff --git a/drivers/net/wireless/b43/dma.c b/drivers/net/wireless/b43/dma.c
-index 48e9124..4ec1915 100644
+index 48e9124..f74dba2 100644
 --- a/drivers/net/wireless/b43/dma.c
 +++ b/drivers/net/wireless/b43/dma.c
 @@ -822,6 +822,18 @@ static u64 supported_dma_mask(struct b43_wldev *dev)
@@ -3748,6 +4030,22 @@ index 48e9124..4ec1915 100644
  /* Main initialization function. */
  static
  struct b43_dmaring *b43_setup_dmaring(struct b43_wldev *dev,
+@@ -838,6 +850,7 @@ struct b43_dmaring *b43_setup_dmaring(struct b43_wldev *dev,
+ 	if (!ring)
+ 		goto out;
+ 	ring->type = type;
++	ring->dev = dev;
+ 
+ 	nr_slots = B43_RXRING_SLOTS;
+ 	if (for_tx)
+@@ -889,7 +902,6 @@ struct b43_dmaring *b43_setup_dmaring(struct b43_wldev *dev,
+ 				 DMA_TO_DEVICE);
+ 	}
+ 
+-	ring->dev = dev;
+ 	ring->nr_slots = nr_slots;
+ 	ring->mmio_base = b43_dmacontroller_base(type, controller_index);
+ 	ring->index = controller_index;
 @@ -982,6 +994,42 @@ void b43_dma_free(struct b43_wldev *dev)
  	dma->tx_ring0 = NULL;
  }
@@ -3824,7 +4122,7 @@ index 48e9124..4ec1915 100644
  	err = -ENOMEM;
  	/* setup TX DMA channels. */
 diff --git a/drivers/net/wireless/b43/main.c b/drivers/net/wireless/b43/main.c
-index c73a75b..6966eec 100644
+index c73a75b..b4a2042 100644
 --- a/drivers/net/wireless/b43/main.c
 +++ b/drivers/net/wireless/b43/main.c
 @@ -78,6 +78,11 @@ static int modparam_nohwcrypt;
@@ -3867,7 +4165,55 @@ index c73a75b..6966eec 100644
  }
  
  static void key_write(struct b43_wldev *dev,
-@@ -2587,15 +2599,21 @@ static int b43_op_tx(struct ieee80211_hw *hw,
+@@ -1015,7 +1027,6 @@ static void b43_generate_noise_sample(struct b43_wldev *dev)
+ 	b43_jssi_write(dev, 0x7F7F7F7F);
+ 	b43_write32(dev, B43_MMIO_MACCMD,
+ 		    b43_read32(dev, B43_MMIO_MACCMD) | B43_MACCMD_BGNOISE);
+-	B43_WARN_ON(dev->noisecalc.channel_at_start != dev->phy.channel);
+ }
+ 
+ static void b43_calculate_link_quality(struct b43_wldev *dev)
+@@ -1024,7 +1035,6 @@ static void b43_calculate_link_quality(struct b43_wldev *dev)
+ 
+ 	if (dev->noisecalc.calculation_running)
+ 		return;
+-	dev->noisecalc.channel_at_start = dev->phy.channel;
+ 	dev->noisecalc.calculation_running = 1;
+ 	dev->noisecalc.nr_samples = 0;
+ 
+@@ -1041,9 +1051,16 @@ static void handle_irq_noise(struct b43_wldev *dev)
+ 
+ 	/* Bottom half of Link Quality calculation. */
+ 
++	/* Possible race condition: It might be possible that the user
++	 * changed to a different channel in the meantime since we
++	 * started the calculation. We ignore that fact, since it's
++	 * not really that much of a problem. The background noise is
++	 * an estimation only anyway. Slightly wrong results will get damped
++	 * by the averaging of the 8 sample rounds. Additionally the
++	 * value is shortlived. So it will be replaced by the next noise
++	 * calculation round soon. */
++
+ 	B43_WARN_ON(!dev->noisecalc.calculation_running);
+-	if (dev->noisecalc.channel_at_start != phy->channel)
+-		goto drop_calculation;
+ 	*((__le32 *)noise) = cpu_to_le32(b43_jssi_read(dev));
+ 	if (noise[0] == 0x7F || noise[1] == 0x7F ||
+ 	    noise[2] == 0x7F || noise[3] == 0x7F)
+@@ -1084,11 +1101,10 @@ static void handle_irq_noise(struct b43_wldev *dev)
+ 			average -= 48;
+ 
+ 		dev->stats.link_noise = average;
+-	      drop_calculation:
+ 		dev->noisecalc.calculation_running = 0;
+ 		return;
+ 	}
+-      generate_new:
++generate_new:
+ 	b43_generate_noise_sample(dev);
+ }
+ 
+@@ -2587,15 +2603,21 @@ static int b43_op_tx(struct ieee80211_hw *hw,
  {
  	struct b43_wl *wl = hw_to_b43_wl(hw);
  	struct b43_wldev *dev = wl->current_dev;
@@ -3896,7 +4242,7 @@ index c73a75b..6966eec 100644
  	if (unlikely(err))
  		return NETDEV_TX_BUSY;
  	return NETDEV_TX_OK;
-@@ -3104,7 +3122,9 @@ static void b43_wireless_core_stop(struct b43_wldev *dev)
+@@ -3104,7 +3126,9 @@ static void b43_wireless_core_stop(struct b43_wldev *dev)
  	spin_unlock_irqrestore(&wl->irq_lock, flags);
  	b43_synchronize_irq(dev);
  
@@ -3906,7 +4252,7 @@ index c73a75b..6966eec 100644
  
  	mutex_unlock(&wl->mutex);
  	/* Must unlock as it would otherwise deadlock. No races here.
-@@ -3112,8 +3132,6 @@ static void b43_wireless_core_stop(struct b43_wldev *dev)
+@@ -3112,8 +3136,6 @@ static void b43_wireless_core_stop(struct b43_wldev *dev)
  	cancel_delayed_work_sync(&dev->periodic_work);
  	mutex_lock(&wl->mutex);
  
@@ -3915,7 +4261,7 @@ index c73a75b..6966eec 100644
  	b43_mac_suspend(dev);
  	free_irq(dev->dev->irq, dev);
  	b43dbg(wl, "Wireless interface stopped\n");
-@@ -3339,6 +3357,8 @@ static void b43_bluetooth_coext_enable(struct b43_wldev *dev)
+@@ -3339,6 +3361,8 @@ static void b43_bluetooth_coext_enable(struct b43_wldev *dev)
  	struct ssb_sprom *sprom = &dev->dev->bus->sprom;
  	u32 hf;
  
@@ -3924,7 +4270,7 @@ index c73a75b..6966eec 100644
  	if (!(sprom->boardflags_lo & B43_BFL_BTCOEXIST))
  		return;
  	if (dev->phy.type != B43_PHYTYPE_B && !dev->phy.gmode)
-@@ -3350,11 +3370,13 @@ static void b43_bluetooth_coext_enable(struct b43_wldev *dev)
+@@ -3350,11 +3374,13 @@ static void b43_bluetooth_coext_enable(struct b43_wldev *dev)
  	else
  		hf |= B43_HF_BTCOEX;
  	b43_hf_write(dev, hf);
@@ -3940,7 +4286,7 @@ index c73a75b..6966eec 100644
  }
  
  static void b43_imcfglo_timeouts_workaround(struct b43_wldev *dev)
-@@ -3796,7 +3818,9 @@ static void b43_chip_reset(struct work_struct *work)
+@@ -3796,7 +3822,9 @@ static void b43_chip_reset(struct work_struct *work)
  			goto out;
  		}
  	}
@@ -3951,7 +4297,7 @@ index c73a75b..6966eec 100644
  	mutex_unlock(&wl->mutex);
  	if (err)
  		b43err(wl, "Controller restart FAILED\n");
-@@ -3903,6 +3927,14 @@ static int b43_wireless_core_attach(struct b43_wldev *dev)
+@@ -3903,6 +3931,14 @@ static int b43_wireless_core_attach(struct b43_wldev *dev)
  		err = -EOPNOTSUPP;
  		goto err_powerdown;
  	}
@@ -3966,7 +4312,7 @@ index c73a75b..6966eec 100644
  	dev->phy.gmode = have_2ghz_phy;
  	tmp = dev->phy.gmode ? B43_TMSLOW_GMODE : 0;
  	b43_wireless_core_reset(dev, tmp);
-@@ -3937,9 +3969,11 @@ static void b43_one_core_detach(struct ssb_device *dev)
+@@ -3937,9 +3973,11 @@ static void b43_one_core_detach(struct ssb_device *dev)
  	struct b43_wldev *wldev;
  	struct b43_wl *wl;
  
@@ -3979,7 +4325,7 @@ index c73a75b..6966eec 100644
  	b43_debugfs_remove_device(wldev);
  	b43_wireless_core_detach(wldev);
  	list_del(&wldev->list);
-@@ -4000,8 +4034,16 @@ static int b43_one_core_attach(struct ssb_device *dev, struct b43_wl *wl)
+@@ -4000,8 +4038,16 @@ static int b43_one_core_attach(struct ssb_device *dev, struct b43_wl *wl)
  	return err;
  }
  
@@ -3996,7 +4342,7 @@ index c73a75b..6966eec 100644
  	/* boardflags workarounds */
  	if (bus->boardinfo.vendor == SSB_BOARDVENDOR_DELL &&
  	    bus->chip_id == 0x4301 && bus->boardinfo.rev == 0x74)
-@@ -4009,6 +4051,13 @@ static void b43_sprom_fixup(struct ssb_bus *bus)
+@@ -4009,6 +4055,13 @@ static void b43_sprom_fixup(struct ssb_bus *bus)
  	if (bus->boardinfo.vendor == PCI_VENDOR_ID_APPLE &&
  	    bus->boardinfo.type == 0x4E && bus->boardinfo.rev > 0x40)
  		bus->sprom.boardflags_lo |= B43_BFL_PACTRL;
@@ -4010,7 +4356,7 @@ index c73a75b..6966eec 100644
  }
  
  static void b43_wireless_exit(struct ssb_device *dev, struct b43_wl *wl)
-@@ -4052,6 +4101,7 @@ static int b43_wireless_init(struct ssb_device *dev)
+@@ -4052,6 +4105,7 @@ static int b43_wireless_init(struct ssb_device *dev)
  	memset(wl, 0, sizeof(*wl));
  	wl->hw = hw;
  	spin_lock_init(&wl->irq_lock);
@@ -4018,7 +4364,7 @@ index c73a75b..6966eec 100644
  	spin_lock_init(&wl->leds_lock);
  	spin_lock_init(&wl->shm_lock);
  	mutex_init(&wl->mutex);
-@@ -4106,6 +4156,10 @@ static void b43_remove(struct ssb_device *dev)
+@@ -4106,6 +4160,10 @@ static void b43_remove(struct ssb_device *dev)
  	struct b43_wl *wl = ssb_get_devtypedata(dev);
  	struct b43_wldev *wldev = ssb_get_drvdata(dev);
  
@@ -4086,6 +4432,23 @@ index 6ccdc96..d9bc859 100644
  		struct Scsi_Host *shost = container_of((void *)hd, struct Scsi_Host, hostdata);
  
  		aha152x_release(shost);
+diff --git a/drivers/scsi/hosts.c b/drivers/scsi/hosts.c
+index ed7e0a1..079c733 100644
+--- a/drivers/scsi/hosts.c
++++ b/drivers/scsi/hosts.c
+@@ -455,9 +455,10 @@ struct Scsi_Host *scsi_host_lookup(unsigned short hostnum)
+ 	struct Scsi_Host *shost = ERR_PTR(-ENXIO);
+ 
+ 	cdev = class_find_child(&shost_class, &hostnum, __scsi_host_match);
+-	if (cdev)
++	if (cdev) {
+ 		shost = scsi_host_get(class_to_shost(cdev));
+-
++		class_device_put(cdev);
++	}
+ 	return shost;
+ }
+ EXPORT_SYMBOL(scsi_host_lookup);
 diff --git a/drivers/scsi/libiscsi.c b/drivers/scsi/libiscsi.c
 index bdd7de7..9975095 100644
 --- a/drivers/scsi/libiscsi.c
@@ -4184,6 +4547,35 @@ index 3c1b433..0e8e092 100644
  						fcport->loop_id = FC_NO_LOOP_ID;
  				}
  				if (test_bit(LOOP_RESYNC_NEEDED, &ha->dpc_flags))
+diff --git a/drivers/scsi/sr.c b/drivers/scsi/sr.c
+index 7ee86d4..c82df8b 100644
+--- a/drivers/scsi/sr.c
++++ b/drivers/scsi/sr.c
+@@ -178,6 +178,9 @@ int sr_test_unit_ready(struct scsi_device *sdev, struct scsi_sense_hdr *sshdr)
+ 		the_result = scsi_execute_req(sdev, cmd, DMA_NONE, NULL,
+ 					      0, sshdr, SR_TIMEOUT,
+ 					      retries--);
++		if (scsi_sense_valid(sshdr) &&
++		    sshdr->sense_key == UNIT_ATTENTION)
++			sdev->changed = 1;
+ 
+ 	} while (retries > 0 &&
+ 		 (!scsi_status_is_good(the_result) ||
+diff --git a/drivers/serial/8250.c b/drivers/serial/8250.c
+index 77f7a7f..d60705e 100644
+--- a/drivers/serial/8250.c
++++ b/drivers/serial/8250.c
+@@ -2174,7 +2174,9 @@ serial8250_set_termios(struct uart_port *port, struct ktermios *termios,
+ 	}
+ 	serial8250_set_mctrl(&up->port, up->port.mctrl);
+ 	spin_unlock_irqrestore(&up->port.lock, flags);
+-	tty_termios_encode_baud_rate(termios, baud, baud);
++	/* Don't rewrite B0 */
++	if (tty_termios_baud_rate(termios))
++		tty_termios_encode_baud_rate(termios, baud, baud);
+ }
+ 
+ static void
 diff --git a/drivers/serial/dz.c b/drivers/serial/dz.c
 index 116211f..0dddd68 100644
 --- a/drivers/serial/dz.c
@@ -7870,7 +8262,7 @@ index c170685..7d5c263 100644
  }
  
 diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
-index b77eb56..4147de6 100644
+index b77eb56..8785784 100644
 --- a/net/netfilter/nf_conntrack_core.c
 +++ b/net/netfilter/nf_conntrack_core.c
 @@ -104,7 +104,7 @@ nf_ct_get_tuple(const struct sk_buff *skb,
@@ -7891,6 +8283,23 @@ index b77eb56..4147de6 100644
  
  	inverse->src.l3num = orig->src.l3num;
  	if (l3proto->invert_tuple(inverse, orig) == 0)
+@@ -199,8 +199,6 @@ destroy_conntrack(struct nf_conntrack *nfct)
+ 	if (l4proto && l4proto->destroy)
+ 		l4proto->destroy(ct);
+ 
+-	nf_ct_ext_destroy(ct);
+-
+ 	rcu_read_unlock();
+ 
+ 	spin_lock_bh(&nf_conntrack_lock);
+@@ -523,6 +521,7 @@ static void nf_conntrack_free_rcu(struct rcu_head *head)
+ 
+ void nf_conntrack_free(struct nf_conn *ct)
+ {
++	nf_ct_ext_destroy(ct);
+ 	call_rcu(&ct->rcu, nf_conntrack_free_rcu);
+ }
+ EXPORT_SYMBOL_GPL(nf_conntrack_free);
 diff --git a/net/netfilter/nf_conntrack_expect.c b/net/netfilter/nf_conntrack_expect.c
 index 684ec9c..d15d70f 100644
 --- a/net/netfilter/nf_conntrack_expect.c
@@ -7908,6 +8317,68 @@ index 684ec9c..d15d70f 100644
  err1:
  	return err;
  }
+diff --git a/net/netfilter/nf_conntrack_h323_main.c b/net/netfilter/nf_conntrack_h323_main.c
+index 898f192..7407dd3 100644
+--- a/net/netfilter/nf_conntrack_h323_main.c
++++ b/net/netfilter/nf_conntrack_h323_main.c
+@@ -617,6 +617,7 @@ static struct nf_conntrack_helper nf_conntrack_helper_h245 __read_mostly = {
+ 	.me			= THIS_MODULE,
+ 	.max_expected		= H323_RTP_CHANNEL_MAX * 4 + 2 /* T.120 */,
+ 	.timeout		= 240,
++	.tuple.src.l3num	= AF_UNSPEC,
+ 	.tuple.dst.protonum	= IPPROTO_UDP,
+ 	.help			= h245_help
+ };
+@@ -1758,6 +1759,7 @@ static void __exit nf_conntrack_h323_fini(void)
+ 	nf_conntrack_helper_unregister(&nf_conntrack_helper_ras[0]);
+ 	nf_conntrack_helper_unregister(&nf_conntrack_helper_q931[1]);
+ 	nf_conntrack_helper_unregister(&nf_conntrack_helper_q931[0]);
++	nf_conntrack_helper_unregister(&nf_conntrack_helper_h245);
+ 	kfree(h323_buffer);
+ 	pr_debug("nf_ct_h323: fini\n");
+ }
+@@ -1770,28 +1772,34 @@ static int __init nf_conntrack_h323_init(void)
+ 	h323_buffer = kmalloc(65536, GFP_KERNEL);
+ 	if (!h323_buffer)
+ 		return -ENOMEM;
+-	ret = nf_conntrack_helper_register(&nf_conntrack_helper_q931[0]);
++	ret = nf_conntrack_helper_register(&nf_conntrack_helper_h245);
+ 	if (ret < 0)
+ 		goto err1;
+-	ret = nf_conntrack_helper_register(&nf_conntrack_helper_q931[1]);
++	ret = nf_conntrack_helper_register(&nf_conntrack_helper_q931[0]);
+ 	if (ret < 0)
+ 		goto err2;
+-	ret = nf_conntrack_helper_register(&nf_conntrack_helper_ras[0]);
++	ret = nf_conntrack_helper_register(&nf_conntrack_helper_q931[1]);
+ 	if (ret < 0)
+ 		goto err3;
+-	ret = nf_conntrack_helper_register(&nf_conntrack_helper_ras[1]);
++	ret = nf_conntrack_helper_register(&nf_conntrack_helper_ras[0]);
+ 	if (ret < 0)
+ 		goto err4;
++	ret = nf_conntrack_helper_register(&nf_conntrack_helper_ras[1]);
++	if (ret < 0)
++		goto err5;
+ 	pr_debug("nf_ct_h323: init success\n");
+ 	return 0;
+ 
+-err4:
++err5:
+ 	nf_conntrack_helper_unregister(&nf_conntrack_helper_ras[0]);
+-err3:
++err4:
+ 	nf_conntrack_helper_unregister(&nf_conntrack_helper_q931[1]);
+-err2:
++err3:
+ 	nf_conntrack_helper_unregister(&nf_conntrack_helper_q931[0]);
++err2:
++	nf_conntrack_helper_unregister(&nf_conntrack_helper_h245);
+ err1:
++	kfree(h323_buffer);
+ 	return ret;
+ }
+ 
 diff --git a/net/netfilter/nfnetlink_queue.c b/net/netfilter/nfnetlink_queue.c
 index 10522c0..bcaf967 100644
 --- a/net/netfilter/nfnetlink_queue.c
