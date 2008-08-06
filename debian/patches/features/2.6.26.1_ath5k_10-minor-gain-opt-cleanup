@@ -1,0 +1,257 @@
+commit 4fe28e4673d1d00b8bce160c72181f6cc01f1b3d
+Author: root <root@makis.(none)>
+Date:   Sun Jul 20 03:37:46 2008 +0300
+
+     * Reorder functions to separate 5111/5112-specific gain optimization functions from rfregs functions
+     * Add some documentation on gain optimization for 5111/5112
+
+diff --git a/drivers/net/wireless/ath5k/phy.c b/drivers/net/wireless/ath5k/phy.c
+index dc05f98..5a9619b 100644
+--- a/drivers/net/wireless/ath5k/phy.c
++++ b/drivers/net/wireless/ath5k/phy.c
+@@ -1104,7 +1104,7 @@ static const struct ath5k_gain_opt rfgain_opt_5112 = {
+ };
+ 
+ /*
+- * Used to modify RF Banks before writing them to AR5K_RF_BUFFER
++ * Helper function used to read/modify RF Banks
+  */
+ static unsigned int ath5k_hw_rfregs_op(u32 *rf, u32 offset, u32 reg, u32 bits,
+ 		u32 first, u32 col, bool set)
+@@ -1152,6 +1152,47 @@ static unsigned int ath5k_hw_rfregs_op(u32 *rf, u32 offset, u32 reg, u32 bits,
+ 	return data;
+ }
+ 
++/*****************************\
++  Gain optimization functions
++\*****************************/
++
++/*
++ * These functions are only for RF5111/5112 chips -check out bank 7-
++ */
++
++/*
++ * Initialize rfgain optimization values
++ */
++int ath5k_hw_set_rfgain_opt(struct ath5k_hw *ah)
++{
++	/* Initialize the gain optimization values */
++	switch (ah->ah_radio) {
++	case AR5K_RF5111:
++		ah->ah_gain.g_step_idx = rfgain_opt_5111.go_default;
++		ah->ah_gain.g_step =
++		    &rfgain_opt_5111.go_step[ah->ah_gain.g_step_idx];
++		ah->ah_gain.g_low = 20;
++		ah->ah_gain.g_high = 35;
++		ah->ah_gain.g_active = 1;
++		break;
++	case AR5K_RF5112:
++		ah->ah_gain.g_step_idx = rfgain_opt_5112.go_default;
++		ah->ah_gain.g_step =
++		    &rfgain_opt_5112.go_step[ah->ah_gain.g_step_idx];
++		ah->ah_gain.g_low = 20;
++		ah->ah_gain.g_high = 85;
++		ah->ah_gain.g_active = 1;
++		break;
++	default:
++		return 0;
++	}
++
++	return 0;
++}
++
++/*
++ * Get gain correction for RF5112
++ */
+ static u32 ath5k_hw_rfregs_gainf_corr(struct ath5k_hw *ah)
+ {
+ 	u32 mix, step;
+@@ -1187,6 +1228,9 @@ static u32 ath5k_hw_rfregs_gainf_corr(struct ath5k_hw *ah)
+ 	return ah->ah_gain.g_f_corr;
+ }
+ 
++/*
++ * Read gain boundaries from rf banks
++ */
+ static bool ath5k_hw_rfregs_gain_readback(struct ath5k_hw *ah)
+ {
+ 	u32 step, mix, level[4];
+@@ -1197,7 +1241,18 @@ static bool ath5k_hw_rfregs_gain_readback(struct ath5k_hw *ah)
+ 
+ 	rf = ah->ah_rf_banks;
+ 
+-	if (ah->ah_radio == AR5K_RF5111) {
++	if (ah->ah_radio == AR5K_RF5112) {
++		mix = ath5k_hw_rfregs_op(rf, ah->ah_offset[7], 0, 1, 36, 0,
++				false);
++		level[0] = level[2] = 0;
++
++		if (mix == 1) {
++			level[1] = level[3] = 83;
++		} else {
++			level[1] = level[3] = 107;
++			ah->ah_gain.g_high = 55;
++		}
++	} else {
+ 		step = ath5k_hw_rfregs_op(rf, ah->ah_offset[7], 0, 6, 37, 0,
+ 				false);
+ 		level[0] = 0;
+@@ -1209,17 +1264,6 @@ static bool ath5k_hw_rfregs_gain_readback(struct ath5k_hw *ah)
+ 			(step == 0x3f ? AR5K_GAIN_DYN_ADJUST_HI_MARGIN : -5);
+ 		ah->ah_gain.g_low = level[0] +
+ 			(step == 0x3f ? AR5K_GAIN_DYN_ADJUST_LO_MARGIN : 0);
+-	} else {
+-		mix = ath5k_hw_rfregs_op(rf, ah->ah_offset[7], 0, 1, 36, 0,
+-				false);
+-		level[0] = level[2] = 0;
+-
+-		if (mix == 1) {
+-			level[1] = level[3] = 83;
+-		} else {
+-			level[1] = level[3] = 107;
+-			ah->ah_gain.g_high = 55;
+-		}
+ 	}
+ 
+ 	return (ah->ah_gain.g_current >= level[0] &&
+@@ -1228,6 +1272,9 @@ static bool ath5k_hw_rfregs_gain_readback(struct ath5k_hw *ah)
+ 			ah->ah_gain.g_current <= level[3]);
+ }
+ 
++/*
++ * Optimize gain values using gain optimization values
++ */
+ static s32 ath5k_hw_rfregs_gain_adjust(struct ath5k_hw *ah)
+ {
+ 	const struct ath5k_gain_opt *go;
+@@ -1288,6 +1335,55 @@ done:
+ }
+ 
+ /*
++ * This is the main function called during reset to update gain parameters
++ * so that we write them on the next call to rfregs function during reset.
++ */
++enum ath5k_rfgain ath5k_hw_get_rf_gain(struct ath5k_hw *ah)
++{
++	u32 data, type;
++
++	ATH5K_TRACE(ah->ah_sc);
++
++	if (ah->ah_rf_banks == NULL || !ah->ah_gain.g_active ||
++			ah->ah_version <= AR5K_AR5211)
++		return AR5K_RFGAIN_INACTIVE;
++
++	if (ah->ah_rf_gain != AR5K_RFGAIN_READ_REQUESTED)
++		goto done;
++
++	data = ath5k_hw_reg_read(ah, AR5K_PHY_PAPD_PROBE);
++
++	if (!(data & AR5K_PHY_PAPD_PROBE_TX_NEXT)) {
++		ah->ah_gain.g_current = data >> AR5K_PHY_PAPD_PROBE_GAINF_S;
++		type = AR5K_REG_MS(data, AR5K_PHY_PAPD_PROBE_TYPE);
++
++		if (type == AR5K_PHY_PAPD_PROBE_TYPE_CCK)
++			ah->ah_gain.g_current += AR5K_GAIN_CCK_PROBE_CORR;
++
++		if (ah->ah_radio >= AR5K_RF5112) {
++			ath5k_hw_rfregs_gainf_corr(ah);
++			ah->ah_gain.g_current =
++				ah->ah_gain.g_current>=ah->ah_gain.g_f_corr ?
++				(ah->ah_gain.g_current-ah->ah_gain.g_f_corr) :
++				0;
++		}
++
++		if (ath5k_hw_rfregs_gain_readback(ah) &&
++				AR5K_GAIN_CHECK_ADJUST(&ah->ah_gain) &&
++				ath5k_hw_rfregs_gain_adjust(ah))
++			ah->ah_rf_gain = AR5K_RFGAIN_NEED_CHANGE;
++			/* TODO */
++	}
++
++done:
++	return ah->ah_rf_gain;
++}
++
++/***********************\
++  PHY/RF initialization
++\***********************/
++
++/*
+  * Read EEPROM Calibration data, modify RF Banks and Initialize RF5111
+  */
+ static int ath5k_hw_rf5111_rfregs(struct ath5k_hw *ah,
+@@ -1681,73 +1777,6 @@ int ath5k_hw_rfgain(struct ath5k_hw *ah, unsigned int freq)
+ 	return 0;
+ }
+ 
+-enum ath5k_rfgain ath5k_hw_get_rf_gain(struct ath5k_hw *ah)
+-{
+-	u32 data, type;
+-
+-	ATH5K_TRACE(ah->ah_sc);
+-
+-	if (ah->ah_rf_banks == NULL || !ah->ah_gain.g_active ||
+-			ah->ah_version <= AR5K_AR5211)
+-		return AR5K_RFGAIN_INACTIVE;
+-
+-	if (ah->ah_rf_gain != AR5K_RFGAIN_READ_REQUESTED)
+-		goto done;
+-
+-	data = ath5k_hw_reg_read(ah, AR5K_PHY_PAPD_PROBE);
+-
+-	if (!(data & AR5K_PHY_PAPD_PROBE_TX_NEXT)) {
+-		ah->ah_gain.g_current = data >> AR5K_PHY_PAPD_PROBE_GAINF_S;
+-		type = AR5K_REG_MS(data, AR5K_PHY_PAPD_PROBE_TYPE);
+-
+-		if (type == AR5K_PHY_PAPD_PROBE_TYPE_CCK)
+-			ah->ah_gain.g_current += AR5K_GAIN_CCK_PROBE_CORR;
+-
+-		if (ah->ah_radio >= AR5K_RF5112) {
+-			ath5k_hw_rfregs_gainf_corr(ah);
+-			ah->ah_gain.g_current =
+-				ah->ah_gain.g_current>=ah->ah_gain.g_f_corr ?
+-				(ah->ah_gain.g_current-ah->ah_gain.g_f_corr) :
+-				0;
+-		}
+-
+-		if (ath5k_hw_rfregs_gain_readback(ah) &&
+-				AR5K_GAIN_CHECK_ADJUST(&ah->ah_gain) &&
+-				ath5k_hw_rfregs_gain_adjust(ah))
+-			ah->ah_rf_gain = AR5K_RFGAIN_NEED_CHANGE;
+-	}
+-
+-done:
+-	return ah->ah_rf_gain;
+-}
+-
+-int ath5k_hw_set_rfgain_opt(struct ath5k_hw *ah)
+-{
+-	/* Initialize the gain optimization values */
+-	switch (ah->ah_radio) {
+-	case AR5K_RF5111:
+-		ah->ah_gain.g_step_idx = rfgain_opt_5111.go_default;
+-		ah->ah_gain.g_step =
+-		    &rfgain_opt_5111.go_step[ah->ah_gain.g_step_idx];
+-		ah->ah_gain.g_low = 20;
+-		ah->ah_gain.g_high = 35;
+-		ah->ah_gain.g_active = 1;
+-		break;
+-	case AR5K_RF5112:
+-		ah->ah_gain.g_step_idx = rfgain_opt_5112.go_default;
+-		ah->ah_gain.g_step =
+-		    &rfgain_opt_5112.go_step[ah->ah_gain.g_step_idx];
+-		ah->ah_gain.g_low = 20;
+-		ah->ah_gain.g_high = 85;
+-		ah->ah_gain.g_active = 1;
+-		break;
+-	default:
+-		return -EINVAL;
+-	}
+-
+-	return 0;
+-}
+-
+ /**************************\
+   PHY/RF channel functions
+ \**************************/
+
