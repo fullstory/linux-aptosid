@@ -1,62 +1,3 @@
-"Nick Kossifidis" <mickflemm@gmail.com> wrote:
- > 2008/10/26 Elias Oltmanns <eo@nebensachen.de>:
- >>
- >
- >> Let me quote from legacy-hal:
- >>
- >> ar5212/ar5212_reset.c:
- >> 373:            OS_REG_RMW_FIELD(ah, AR_PHY_DAG_CTRLCCK,
- >> 374:                    AR_PHY_DAG_CTRLCCK_RSSI_THR, 2);
- >>
- >> ah_internal.h:
- >> 598:    #define OS_REG_RMW_FIELD(_a, _r, _f, _v) \
- >> 599:        OS_REG_WRITE(_a, _r, \
- >> 600:            (OS_REG_READ(_a, _r) &~ _f) | (((_v) << _f##_S) & _f))
- >>
- >> Please note the last argument to OS_REG_RMW_FIELD() which is 2 in this
- >> case. Unless I've made a mistake, this translates into the
- >>
- >> data |= 0x00000800;
- >>
- >> in my patch.
- >>
- >> There definitely is no way for me to connect to an ap (or even get a
- >> list of aps) with current 2.6.27.4. Perhaps we'll hear something from
- >> Nils on that matter too.
- >>
- >
- > Some lines above...
- >
- > 	/* Overwrite INI values for revised chipsets */
- > 	if (AH_PRIVATE(ah)->ah_phyRev >= AR_PHY_CHIP_ID_REV_2) {
- >
- > so
- >
- > 		/* Add barker RSSI thresh enable as disabled */
- > 		OS_REG_CLR_BIT(ah, AR_PHY_DAG_CTRLCCK,
- > 			AR_PHY_DAG_CTRLCCK_EN_RSSI_THR);
- > 		OS_REG_RMW_FIELD(ah, AR_PHY_DAG_CTRLCCK,
- > 			AR_PHY_DAG_CTRLCCK_RSSI_THR, 2);
- >
- > is for phy (BB) revisions > 2 since you have RF5111 this code should
- > not run but (and here is our bug) instead of checking bb revision we
- > run this code for all AR5212 chips
- >
- > 		/*
- > 		 * Write some more initial register settings
- > 		 */
- > 		if (ah->ah_version == AR5K_AR5212) {
- >
- [...]
- > So can you please change the check on ath5k_hw_reset + add initial
- > rssi threshold setting and retry ?
- 
-Is this what you had in mind? It works for me.
-
-Regards,
-
-Elias
-
 From: Elias Oltmanns <eo@nebensachen.de>
 Subject: ath5k: Fix reset sequence for AR5212 in general and RF5111 in particular
 
@@ -68,36 +9,55 @@ a stable release.
 
 v2: Only overwrite initial register values on later revisions of AR5212
     chips.
+v3: Use standard macros to manipulate the register.
 
-Cc: stable <stable@kernel.org>
 Signed-off-by: Elias Oltmanns <eo@nebensachen.de>
 
- drivers/net/wireless/ath5k/hw.c       |    4 +++-
+ drivers/net/wireless/ath5k/hw.c       |   22 +++++++---------------
  drivers/net/wireless/ath5k/initvals.c |    2 ++
- 2 files changed, 5 insertions(+), 1 deletions(-)
+ 2 files changed, 9 insertions(+), 15 deletions(-)
 
 diff --git a/drivers/net/wireless/ath5k/hw.c b/drivers/net/wireless/ath5k/hw.c
-index ad1a5b4..68cf2ae 100644
+index ad1a5b4..67b71e7 100644
 --- a/drivers/net/wireless/ath5k/hw.c
 +++ b/drivers/net/wireless/ath5k/hw.c
-@@ -828,7 +828,8 @@ int ath5k_hw_reset(struct ath5k_hw *ah, enum ieee80211_if_types op_mode,
+@@ -826,9 +826,10 @@ int ath5k_hw_reset(struct ath5k_hw *ah, enum ieee80211_if_types op_mode,
+ 		mdelay(1);
+ 
  		/*
- 		 * Write some more initial register settings
+-		 * Write some more initial register settings
++		 * Write some more initial register settings for revised chips
  		 */
 -		if (ah->ah_version == AR5K_AR5212) {
 +		if (ah->ah_version == AR5K_AR5212 &&
-+		    ah->ah_radio > AR5K_RF5111) {
++		    ah->ah_phy_revision > 0x41) {
  			ath5k_hw_reg_write(ah, 0x0002a002, 0x982c);
  
  			if (channel->hw_value == CHANNEL_G)
-@@ -858,6 +859,7 @@ int ath5k_hw_reset(struct ath5k_hw *ah, enum ieee80211_if_types op_mode,
+@@ -847,19 +848,10 @@ int ath5k_hw_reset(struct ath5k_hw *ah, enum ieee80211_if_types op_mode,
+ 			else
+ 				ath5k_hw_reg_write(ah, 0x00000000, 0x994c);
  
- 			data = ath5k_hw_reg_read(ah, 0xa228);
- 			data &= 0xfffe03ff;
-+			data |= 0x00000800;
- 			ath5k_hw_reg_write(ah, data, 0xa228);
- 			data = 0;
+-			/* Some bits are disabled here, we know nothing about
+-			 * register 0xa228 yet, most of the times this ends up
+-			 * with a value 0x9b5 -haven't seen any dump with
+-			 * a different value- */
+-			/* Got this from decompiling binary HAL */
+-			data = ath5k_hw_reg_read(ah, 0xa228);
+-			data &= 0xfffffdff;
+-			ath5k_hw_reg_write(ah, data, 0xa228);
+-
+-			data = ath5k_hw_reg_read(ah, 0xa228);
+-			data &= 0xfffe03ff;
+-			ath5k_hw_reg_write(ah, data, 0xa228);
+-			data = 0;
++			/* Got this from legacy-hal */
++			AR5K_REG_DISABLE_BITS(ah, 0xa228, 0x200);
++
++			AR5K_REG_MASKED_BITS(ah, 0xa228, 0x800, 0xfffe03ff);
  
+ 			/* Just write 0x9b5 ? */
+ 			/* ath5k_hw_reg_write(ah, 0x000009b5, 0xa228); */
 diff --git a/drivers/net/wireless/ath5k/initvals.c b/drivers/net/wireless/ath5k/initvals.c
 index 2806b21..cf7ebd1 100644
 --- a/drivers/net/wireless/ath5k/initvals.c
