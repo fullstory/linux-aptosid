@@ -1,0 +1,1032 @@
+diff --git a/Makefile b/Makefile
+index 1ea4453..d3ce1dd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 27
+-EXTRAVERSION = .6
++EXTRAVERSION = .7-rc1
+ NAME = Trembling Tortoise
+ 
+ # *DOCUMENTATION*
+diff --git a/arch/arm/mm/cache-feroceon-l2.c b/arch/arm/mm/cache-feroceon-l2.c
+index 7b5a25d..4f6cf46 100644
+--- a/arch/arm/mm/cache-feroceon-l2.c
++++ b/arch/arm/mm/cache-feroceon-l2.c
+@@ -148,7 +148,7 @@ static void feroceon_l2_inv_range(unsigned long start, unsigned long end)
+ 	/*
+ 	 * Clean and invalidate partial last cache line.
+ 	 */
+-	if (end & (CACHE_LINE_SIZE - 1)) {
++	if (start < end && end & (CACHE_LINE_SIZE - 1)) {
+ 		l2_clean_inv_pa(end & ~(CACHE_LINE_SIZE - 1));
+ 		end &= ~(CACHE_LINE_SIZE - 1);
+ 	}
+@@ -156,7 +156,7 @@ static void feroceon_l2_inv_range(unsigned long start, unsigned long end)
+ 	/*
+ 	 * Invalidate all full cache lines between 'start' and 'end'.
+ 	 */
+-	while (start != end) {
++	while (start < end) {
+ 		unsigned long range_end = calc_range_end(start, end);
+ 		l2_inv_pa_range(start, range_end - CACHE_LINE_SIZE);
+ 		start = range_end;
+diff --git a/arch/powerpc/include/asm/mpic.h b/arch/powerpc/include/asm/mpic.h
+index fe566a3..eb685ed 100644
+--- a/arch/powerpc/include/asm/mpic.h
++++ b/arch/powerpc/include/asm/mpic.h
+@@ -355,6 +355,8 @@ struct mpic
+ #define MPIC_NO_BIAS			0x00000400
+ /* Ignore NIRQS as reported by FRR */
+ #define MPIC_BROKEN_FRR_NIRQS		0x00000800
++/* Destination only supports a single CPU at a time */
++#define MPIC_SINGLE_DEST_CPU		0x00001000
+ 
+ /* MPIC HW modification ID */
+ #define MPIC_REGSET_MASK		0xf0000000
+diff --git a/arch/powerpc/platforms/85xx/mpc85xx_ds.c b/arch/powerpc/platforms/85xx/mpc85xx_ds.c
+index 483b65c..613bf8c 100644
+--- a/arch/powerpc/platforms/85xx/mpc85xx_ds.c
++++ b/arch/powerpc/platforms/85xx/mpc85xx_ds.c
+@@ -78,7 +78,8 @@ void __init mpc85xx_ds_pic_init(void)
+ 
+ 	mpic = mpic_alloc(np, r.start,
+ 			  MPIC_PRIMARY | MPIC_WANTS_RESET |
+-			  MPIC_BIG_ENDIAN | MPIC_BROKEN_FRR_NIRQS,
++			  MPIC_BIG_ENDIAN | MPIC_BROKEN_FRR_NIRQS |
++			  MPIC_SINGLE_DEST_CPU,
+ 			0, 256, " OpenPIC  ");
+ 	BUG_ON(mpic == NULL);
+ 	of_node_put(np);
+diff --git a/arch/powerpc/platforms/86xx/pic.c b/arch/powerpc/platforms/86xx/pic.c
+index 8881c5d..668275d 100644
+--- a/arch/powerpc/platforms/86xx/pic.c
++++ b/arch/powerpc/platforms/86xx/pic.c
+@@ -44,7 +44,8 @@ void __init mpc86xx_init_irq(void)
+ 
+ 	mpic = mpic_alloc(np, res.start,
+ 			MPIC_PRIMARY | MPIC_WANTS_RESET |
+-			MPIC_BIG_ENDIAN | MPIC_BROKEN_FRR_NIRQS,
++			MPIC_BIG_ENDIAN | MPIC_BROKEN_FRR_NIRQS |
++			MPIC_SINGLE_DEST_CPU,
+ 			0, 256, " MPIC     ");
+ 	of_node_put(np);
+ 	BUG_ON(mpic == NULL);
+diff --git a/arch/powerpc/sysdev/mpic.c b/arch/powerpc/sysdev/mpic.c
+index 8e3478c..19fe5db 100644
+--- a/arch/powerpc/sysdev/mpic.c
++++ b/arch/powerpc/sysdev/mpic.c
+@@ -563,6 +563,51 @@ static void __init mpic_scan_ht_pics(struct mpic *mpic)
+ 
+ #endif /* CONFIG_MPIC_U3_HT_IRQS */
+ 
++#ifdef CONFIG_SMP
++static int irq_choose_cpu(unsigned int virt_irq)
++{
++	cpumask_t mask = irq_desc[virt_irq].affinity;
++	int cpuid;
++
++	if (cpus_equal(mask, CPU_MASK_ALL)) {
++		static int irq_rover;
++		static DEFINE_SPINLOCK(irq_rover_lock);
++		unsigned long flags;
++
++		/* Round-robin distribution... */
++	do_round_robin
++		spin_lock_irqsave(&irq_rover_lock, flags);
++
++		while (!cpu_online(irq_rover)) {
++			if (++irq_rover >= NR_CPUS)
++				irq_rover = 0;
++		}
++		cpuid = irq_rover;
++		do {
++			if (++irq_rover >= NR_CPUS)
++				irq_rover = 0;
++		} while (!cpu_online(irq_rover));
++
++		spin_unlock_irqrestore(&irq_rover_lock, flags);
++	} else {
++		cpumask_t tmp;
++
++		cpus_and(tmp, cpu_online_map, mask);
++
++		if (cpus_empty(tmp))
++			goto do_round_robin;
++
++		cpuid = first_cpu(tmp);
++	}
++
++	return cpuid;
++}
++#else
++static int irq_choose_cpu(unsigned int virt_irq)
++{
++	return hard_smp_processor_id();
++}
++#endif
+ 
+ #define mpic_irq_to_hw(virq)	((unsigned int)irq_map[virq].hwirq)
+ 
+@@ -777,12 +822,18 @@ void mpic_set_affinity(unsigned int irq, cpumask_t cpumask)
+ 	struct mpic *mpic = mpic_from_irq(irq);
+ 	unsigned int src = mpic_irq_to_hw(irq);
+ 
+-	cpumask_t tmp;
++	if (mpic->flags & MPIC_SINGLE_DEST_CPU) {
++		int cpuid = irq_choose_cpu(irq);
+ 
+-	cpus_and(tmp, cpumask, cpu_online_map);
++		mpic_irq_write(src, MPIC_INFO(IRQ_DESTINATION), 1 << cpuid);
++	} else {
++		cpumask_t tmp;
+ 
+-	mpic_irq_write(src, MPIC_INFO(IRQ_DESTINATION),
+-		       mpic_physmask(cpus_addr(tmp)[0]));	
++		cpus_and(tmp, cpumask, cpu_online_map);
++
++		mpic_irq_write(src, MPIC_INFO(IRQ_DESTINATION),
++			       mpic_physmask(cpus_addr(tmp)[0]));
++	}
+ }
+ 
+ static unsigned int mpic_type_to_vecpri(struct mpic *mpic, unsigned int type)
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index 5efc9e7..857dce7 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -95,6 +95,9 @@ new_hw_segment:
+ 			nr_hw_segs++;
+ 		}
+ 
++		if (nr_phys_segs == 1 && seg_size > rq->bio->bi_seg_front_size)
++			rq->bio->bi_seg_front_size = seg_size;
++
+ 		nr_phys_segs++;
+ 		bvprv = bv;
+ 		seg_size = bv->bv_len;
+@@ -106,6 +109,10 @@ new_hw_segment:
+ 		rq->bio->bi_hw_front_size = hw_seg_size;
+ 	if (hw_seg_size > rq->biotail->bi_hw_back_size)
+ 		rq->biotail->bi_hw_back_size = hw_seg_size;
++	if (nr_phys_segs == 1 && seg_size > rq->bio->bi_seg_front_size)
++		rq->bio->bi_seg_front_size = seg_size;
++	if (seg_size > rq->biotail->bi_seg_back_size)
++		rq->biotail->bi_seg_back_size = seg_size;
+ 	rq->nr_phys_segments = nr_phys_segs;
+ 	rq->nr_hw_segments = nr_hw_segs;
+ }
+@@ -133,7 +140,8 @@ static int blk_phys_contig_segment(struct request_queue *q, struct bio *bio,
+ 
+ 	if (!BIOVEC_PHYS_MERGEABLE(__BVEC_END(bio), __BVEC_START(nxt)))
+ 		return 0;
+-	if (bio->bi_size + nxt->bi_size > q->max_segment_size)
++	if (bio->bi_seg_back_size + nxt->bi_seg_front_size >
++	    q->max_segment_size)
+ 		return 0;
+ 
+ 	/*
+@@ -377,6 +385,8 @@ static int ll_merge_requests_fn(struct request_queue *q, struct request *req,
+ {
+ 	int total_phys_segments;
+ 	int total_hw_segments;
++	unsigned int seg_size =
++		req->biotail->bi_seg_back_size + next->bio->bi_seg_front_size;
+ 
+ 	/*
+ 	 * First check if the either of the requests are re-queued
+@@ -392,8 +402,13 @@ static int ll_merge_requests_fn(struct request_queue *q, struct request *req,
+ 		return 0;
+ 
+ 	total_phys_segments = req->nr_phys_segments + next->nr_phys_segments;
+-	if (blk_phys_contig_segment(q, req->biotail, next->bio))
++	if (blk_phys_contig_segment(q, req->biotail, next->bio)) {
++		if (req->nr_phys_segments == 1)
++			req->bio->bi_seg_front_size = seg_size;
++		if (next->nr_phys_segments == 1)
++			next->biotail->bi_seg_back_size = seg_size;
+ 		total_phys_segments--;
++	}
+ 
+ 	if (total_phys_segments > q->max_phys_segments)
+ 		return 0;
+diff --git a/drivers/acpi/ec.c b/drivers/acpi/ec.c
+index 444cd9e..5b94204 100644
+--- a/drivers/acpi/ec.c
++++ b/drivers/acpi/ec.c
+@@ -286,7 +286,8 @@ static int acpi_ec_transaction_unlocked(struct acpi_ec *ec,
+ 		acpi_enable_gpe(NULL, ec->gpe, ACPI_NOT_ISR);
+ 	} else if (test_bit(EC_FLAGS_GPE_MODE, &ec->flags) &&
+ 		   t->irq_count > ACPI_EC_STORM_THRESHOLD) {
+-		pr_debug(PREFIX "GPE storm detected\n");
++		pr_info(PREFIX "GPE storm detected, "
++			"transactions will use polling mode\n");
+ 		set_bit(EC_FLAGS_GPE_STORM, &ec->flags);
+ 	}
+ 	return ret;
+@@ -566,9 +567,15 @@ static u32 acpi_ec_gpe_handler(void *data)
+ 	if (!test_bit(EC_FLAGS_GPE_MODE, &ec->flags) &&
+ 	    !test_bit(EC_FLAGS_NO_GPE, &ec->flags)) {
+ 		/* this is non-query, must be confirmation */
+-		if (printk_ratelimit())
+-			pr_info(PREFIX "non-query interrupt received,"
++		if (!test_bit(EC_FLAGS_GPE_STORM, &ec->flags)) {
++			if (printk_ratelimit())
++				pr_info(PREFIX "non-query interrupt received,"
++					" switching to interrupt mode\n");
++		} else {
++			/* hush, STORM switches the mode every transaction */
++			pr_debug(PREFIX "non-query interrupt received,"
+ 				" switching to interrupt mode\n");
++		}
+ 		set_bit(EC_FLAGS_GPE_MODE, &ec->flags);
+ 	}
+ 	return ACPI_INTERRUPT_HANDLED;
+diff --git a/drivers/acpi/system.c b/drivers/acpi/system.c
+index 91dec44..4745792 100644
+--- a/drivers/acpi/system.c
++++ b/drivers/acpi/system.c
+@@ -78,9 +78,15 @@ static ssize_t acpi_table_show(struct kobject *kobj,
+ 	    container_of(bin_attr, struct acpi_table_attr, attr);
+ 	struct acpi_table_header *table_header = NULL;
+ 	acpi_status status;
++	char name[ACPI_NAME_SIZE];
++
++	if (strncmp(table_attr->name, "NULL", 4))
++		memcpy(name, table_attr->name, ACPI_NAME_SIZE);
++	else
++		memcpy(name, "\0\0\0\0", 4);
+ 
+ 	status =
+-	    acpi_get_table(table_attr->name, table_attr->instance,
++	    acpi_get_table(name, table_attr->instance,
+ 			   &table_header);
+ 	if (ACPI_FAILURE(status))
+ 		return -ENODEV;
+@@ -95,21 +101,24 @@ static void acpi_table_attr_init(struct acpi_table_attr *table_attr,
+ 	struct acpi_table_header *header = NULL;
+ 	struct acpi_table_attr *attr = NULL;
+ 
+-	memcpy(table_attr->name, table_header->signature, ACPI_NAME_SIZE);
++	if (table_header->signature[0] != '\0')
++		memcpy(table_attr->name, table_header->signature,
++			ACPI_NAME_SIZE);
++	else
++		memcpy(table_attr->name, "NULL", 4);
+ 
+ 	list_for_each_entry(attr, &acpi_table_attr_list, node) {
+-		if (!memcmp(table_header->signature, attr->name,
+-			    ACPI_NAME_SIZE))
++		if (!memcmp(table_attr->name, attr->name, ACPI_NAME_SIZE))
+ 			if (table_attr->instance < attr->instance)
+ 				table_attr->instance = attr->instance;
+ 	}
+ 	table_attr->instance++;
+ 
+ 	if (table_attr->instance > 1 || (table_attr->instance == 1 &&
+-					 !acpi_get_table(table_header->
+-							 signature, 2,
+-							 &header)))
+-		sprintf(table_attr->name + 4, "%d", table_attr->instance);
++					!acpi_get_table
++					(table_header->signature, 2, &header)))
++		sprintf(table_attr->name + ACPI_NAME_SIZE, "%d",
++			table_attr->instance);
+ 
+ 	table_attr->attr.size = 0;
+ 	table_attr->attr.read = acpi_table_show;
+diff --git a/drivers/char/ipmi/ipmi_msghandler.c b/drivers/char/ipmi/ipmi_msghandler.c
+index 8a59aaa..7a88dfd 100644
+--- a/drivers/char/ipmi/ipmi_msghandler.c
++++ b/drivers/char/ipmi/ipmi_msghandler.c
+@@ -422,9 +422,11 @@ struct ipmi_smi {
+ /**
+  * The driver model view of the IPMI messaging driver.
+  */
+-static struct device_driver ipmidriver = {
+-	.name = "ipmi",
+-	.bus = &platform_bus_type
++static struct platform_driver ipmidriver = {
++	.driver = {
++		.name = "ipmi",
++		.bus = &platform_bus_type
++	}
+ };
+ static DEFINE_MUTEX(ipmidriver_mutex);
+ 
+@@ -2384,9 +2386,9 @@ static int ipmi_bmc_register(ipmi_smi_t intf, int ifnum,
+ 	 * representing the interfaced BMC already
+ 	 */
+ 	if (bmc->guid_set)
+-		old_bmc = ipmi_find_bmc_guid(&ipmidriver, bmc->guid);
++		old_bmc = ipmi_find_bmc_guid(&ipmidriver.driver, bmc->guid);
+ 	else
+-		old_bmc = ipmi_find_bmc_prod_dev_id(&ipmidriver,
++		old_bmc = ipmi_find_bmc_prod_dev_id(&ipmidriver.driver,
+ 						    bmc->id.product_id,
+ 						    bmc->id.device_id);
+ 
+@@ -2416,7 +2418,7 @@ static int ipmi_bmc_register(ipmi_smi_t intf, int ifnum,
+ 		snprintf(name, sizeof(name),
+ 			 "ipmi_bmc.%4.4x", bmc->id.product_id);
+ 
+-		while (ipmi_find_bmc_prod_dev_id(&ipmidriver,
++		while (ipmi_find_bmc_prod_dev_id(&ipmidriver.driver,
+ 						 bmc->id.product_id,
+ 						 bmc->id.device_id)) {
+ 			if (!warn_printed) {
+@@ -2446,7 +2448,7 @@ static int ipmi_bmc_register(ipmi_smi_t intf, int ifnum,
+ 			       " Unable to allocate platform device\n");
+ 			return -ENOMEM;
+ 		}
+-		bmc->dev->dev.driver = &ipmidriver;
++		bmc->dev->dev.driver = &ipmidriver.driver;
+ 		dev_set_drvdata(&bmc->dev->dev, bmc);
+ 		kref_init(&bmc->refcount);
+ 
+@@ -4247,7 +4249,7 @@ static int ipmi_init_msghandler(void)
+ 	if (initialized)
+ 		return 0;
+ 
+-	rv = driver_register(&ipmidriver);
++	rv = driver_register(&ipmidriver.driver);
+ 	if (rv) {
+ 		printk(KERN_ERR PFX "Could not register IPMI driver\n");
+ 		return rv;
+@@ -4308,7 +4310,7 @@ static __exit void cleanup_ipmi(void)
+ 	remove_proc_entry(proc_ipmi_root->name, NULL);
+ #endif /* CONFIG_PROC_FS */
+ 
+-	driver_unregister(&ipmidriver);
++	driver_unregister(&ipmidriver.driver);
+ 
+ 	initialized = 0;
+ 
+diff --git a/drivers/char/ipmi/ipmi_si_intf.c b/drivers/char/ipmi/ipmi_si_intf.c
+index 8e8afb6..7e860da 100644
+--- a/drivers/char/ipmi/ipmi_si_intf.c
++++ b/drivers/char/ipmi/ipmi_si_intf.c
+@@ -114,9 +114,11 @@ static char *si_to_str[] = { "kcs", "smic", "bt" };
+ 
+ #define DEVICE_NAME "ipmi_si"
+ 
+-static struct device_driver ipmi_driver = {
+-	.name = DEVICE_NAME,
+-	.bus = &platform_bus_type
++static struct platform_driver ipmi_driver = {
++	.driver = {
++		.name = DEVICE_NAME,
++		.bus = &platform_bus_type
++	}
+ };
+ 
+ 
+@@ -2868,7 +2870,7 @@ static int try_smi_init(struct smi_info *new_smi)
+ 			goto out_err;
+ 		}
+ 		new_smi->dev = &new_smi->pdev->dev;
+-		new_smi->dev->driver = &ipmi_driver;
++		new_smi->dev->driver = &ipmi_driver.driver;
+ 
+ 		rv = platform_device_add(new_smi->pdev);
+ 		if (rv) {
+@@ -2983,7 +2985,7 @@ static __devinit int init_ipmi_si(void)
+ 	initialized = 1;
+ 
+ 	/* Register the device drivers. */
+-	rv = driver_register(&ipmi_driver);
++	rv = driver_register(&ipmi_driver.driver);
+ 	if (rv) {
+ 		printk(KERN_ERR
+ 		       "init_ipmi_si: Unable to register driver: %d\n",
+@@ -3052,7 +3054,7 @@ static __devinit int init_ipmi_si(void)
+ #ifdef CONFIG_PPC_OF
+ 		of_unregister_platform_driver(&ipmi_of_platform_driver);
+ #endif
+-		driver_unregister(&ipmi_driver);
++		driver_unregister(&ipmi_driver.driver);
+ 		printk(KERN_WARNING
+ 		       "ipmi_si: Unable to find any System Interface(s)\n");
+ 		return -ENODEV;
+@@ -3151,7 +3153,7 @@ static __exit void cleanup_ipmi_si(void)
+ 		cleanup_one_si(e);
+ 	mutex_unlock(&smi_infos_lock);
+ 
+-	driver_unregister(&ipmi_driver);
++	driver_unregister(&ipmi_driver.driver);
+ }
+ module_exit(cleanup_ipmi_si);
+ 
+diff --git a/drivers/hwmon/ibmaem.c b/drivers/hwmon/ibmaem.c
+index 0f70dc2..7e909e8 100644
+--- a/drivers/hwmon/ibmaem.c
++++ b/drivers/hwmon/ibmaem.c
+@@ -88,9 +88,11 @@
+ static DEFINE_IDR(aem_idr);
+ static DEFINE_SPINLOCK(aem_idr_lock);
+ 
+-static struct device_driver aem_driver = {
+-	.name = DRVNAME,
+-	.bus = &platform_bus_type,
++static struct platform_driver aem_driver = {
++	.driver = {
++		.name = DRVNAME,
++		.bus = &platform_bus_type,
++	}
+ };
+ 
+ struct aem_ipmi_data {
+@@ -583,7 +585,7 @@ static int aem_init_aem1_inst(struct aem_ipmi_data *probe, u8 module_handle)
+ 	data->pdev = platform_device_alloc(DRVNAME, data->id);
+ 	if (!data->pdev)
+ 		goto dev_err;
+-	data->pdev->dev.driver = &aem_driver;
++	data->pdev->dev.driver = &aem_driver.driver;
+ 
+ 	res = platform_device_add(data->pdev);
+ 	if (res)
+@@ -716,7 +718,7 @@ static int aem_init_aem2_inst(struct aem_ipmi_data *probe,
+ 	data->pdev = platform_device_alloc(DRVNAME, data->id);
+ 	if (!data->pdev)
+ 		goto dev_err;
+-	data->pdev->dev.driver = &aem_driver;
++	data->pdev->dev.driver = &aem_driver.driver;
+ 
+ 	res = platform_device_add(data->pdev);
+ 	if (res)
+@@ -1085,7 +1087,7 @@ static int __init aem_init(void)
+ {
+ 	int res;
+ 
+-	res = driver_register(&aem_driver);
++	res = driver_register(&aem_driver.driver);
+ 	if (res) {
+ 		printk(KERN_ERR "Can't register aem driver\n");
+ 		return res;
+@@ -1097,7 +1099,7 @@ static int __init aem_init(void)
+ 	return 0;
+ 
+ ipmi_reg_err:
+-	driver_unregister(&aem_driver);
++	driver_unregister(&aem_driver.driver);
+ 	return res;
+ 
+ }
+@@ -1107,7 +1109,7 @@ static void __exit aem_exit(void)
+ 	struct aem_data *p1, *next1;
+ 
+ 	ipmi_smi_watcher_unregister(&driver_data.bmc_events);
+-	driver_unregister(&aem_driver);
++	driver_unregister(&aem_driver.driver);
+ 	list_for_each_entry_safe(p1, next1, &driver_data.aem_devices, list)
+ 		aem_delete(p1);
+ }
+diff --git a/drivers/input/mouse/alps.c b/drivers/input/mouse/alps.c
+index 385e32b..cbedf95 100644
+--- a/drivers/input/mouse/alps.c
++++ b/drivers/input/mouse/alps.c
+@@ -54,6 +54,7 @@ static const struct alps_model_info alps_model_data[] = {
+ 	{ { 0x20, 0x02, 0x0e },	0xf8, 0xf8, ALPS_PASS | ALPS_DUALPOINT }, /* XXX */
+ 	{ { 0x22, 0x02, 0x0a },	0xf8, 0xf8, ALPS_PASS | ALPS_DUALPOINT },
+ 	{ { 0x22, 0x02, 0x14 }, 0xff, 0xff, ALPS_PASS | ALPS_DUALPOINT }, /* Dell Latitude D600 */
++	{ { 0x62, 0x02, 0x14 }, 0xcf, 0xcf, ALPS_PASS | ALPS_DUALPOINT }, /* Dell Latitude E6500 */
+ 	{ { 0x73, 0x02, 0x50 }, 0xcf, 0xcf, ALPS_FW_BK_1 } /* Dell Vostro 1400 */
+ };
+ 
+diff --git a/drivers/misc/sony-laptop.c b/drivers/misc/sony-laptop.c
+index 60775be..b35eb92 100644
+--- a/drivers/misc/sony-laptop.c
++++ b/drivers/misc/sony-laptop.c
+@@ -2315,8 +2315,10 @@ end:
+  */
+ static int sony_pic_disable(struct acpi_device *device)
+ {
+-	if (ACPI_FAILURE(acpi_evaluate_object(device->handle,
+-			"_DIS", NULL, NULL)))
++	acpi_status ret = acpi_evaluate_object(device->handle, "_DIS", NULL,
++					       NULL);
++
++	if (ACPI_FAILURE(ret) && ret != AE_NOT_FOUND)
+ 		return -ENXIO;
+ 
+ 	dprintk("Device disabled\n");
+diff --git a/drivers/net/Kconfig b/drivers/net/Kconfig
+index 4a11296..60a0453 100644
+--- a/drivers/net/Kconfig
++++ b/drivers/net/Kconfig
+@@ -2046,6 +2046,7 @@ config R8169
+ 	tristate "Realtek 8169 gigabit ethernet support"
+ 	depends on PCI
+ 	select CRC32
++	select MII
+ 	---help---
+ 	  Say Y here if you have a Realtek 8169 PCI Gigabit Ethernet adapter.
+ 
+diff --git a/drivers/net/bnx2x_init.h b/drivers/net/bnx2x_init.h
+index 130927c..a6c0b3a 100644
+--- a/drivers/net/bnx2x_init.h
++++ b/drivers/net/bnx2x_init.h
+@@ -564,14 +564,15 @@ static const struct arb_line write_arb_addr[NUM_WR_Q-1] = {
+ 
+ static void bnx2x_init_pxp(struct bnx2x *bp)
+ {
++	u16 devctl;
+ 	int r_order, w_order;
+ 	u32 val, i;
+ 
+ 	pci_read_config_word(bp->pdev,
+-			     bp->pcie_cap + PCI_EXP_DEVCTL, (u16 *)&val);
+-	DP(NETIF_MSG_HW, "read 0x%x from devctl\n", (u16)val);
+-	w_order = ((val & PCI_EXP_DEVCTL_PAYLOAD) >> 5);
+-	r_order = ((val & PCI_EXP_DEVCTL_READRQ) >> 12);
++			     bp->pcie_cap + PCI_EXP_DEVCTL, &devctl);
++	DP(NETIF_MSG_HW, "read 0x%x from devctl\n", devctl);
++	w_order = ((devctl & PCI_EXP_DEVCTL_PAYLOAD) >> 5);
++	r_order = ((devctl & PCI_EXP_DEVCTL_READRQ) >> 12);
+ 
+ 	if (r_order > MAX_RD_ORD) {
+ 		DP(NETIF_MSG_HW, "read order of %d  order adjusted to %d\n",
+diff --git a/drivers/net/bnx2x_main.c b/drivers/net/bnx2x_main.c
+index a8eb3c4..53459db 100644
+--- a/drivers/net/bnx2x_main.c
++++ b/drivers/net/bnx2x_main.c
+@@ -6480,6 +6480,7 @@ load_int_disable:
+ 	bnx2x_free_irq(bp);
+ load_error:
+ 	bnx2x_free_mem(bp);
++	bp->port.pmf = 0;
+ 
+ 	/* TBD we really need to reset the chip
+ 	   if we want to recover from this */
+@@ -6790,6 +6791,7 @@ unload_error:
+ 	/* Report UNLOAD_DONE to MCP */
+ 	if (!BP_NOMCP(bp))
+ 		bnx2x_fw_command(bp, DRV_MSG_CODE_UNLOAD_DONE);
++	bp->port.pmf = 0;
+ 
+ 	/* Free SKBs, SGEs, TPA pool and driver internals */
+ 	bnx2x_free_skbs(bp);
+@@ -10203,8 +10205,6 @@ static int __devinit bnx2x_init_one(struct pci_dev *pdev,
+ 		return -ENOMEM;
+ 	}
+ 
+-	netif_carrier_off(dev);
+-
+ 	bp = netdev_priv(dev);
+ 	bp->msglevel = debug;
+ 
+@@ -10228,6 +10228,8 @@ static int __devinit bnx2x_init_one(struct pci_dev *pdev,
+ 		goto init_one_exit;
+ 	}
+ 
++	netif_carrier_off(dev);
++
+ 	bp->common.name = board_info[ent->driver_data].name;
+ 	printk(KERN_INFO "%s: %s (%c%d) PCI-E x%d %s found at mem %lx,"
+ 	       " IRQ %d, ", dev->name, bp->common.name,
+diff --git a/drivers/net/wireless/ath5k/base.c b/drivers/net/wireless/ath5k/base.c
+index 0676c6d..a225827 100644
+--- a/drivers/net/wireless/ath5k/base.c
++++ b/drivers/net/wireless/ath5k/base.c
+@@ -294,9 +294,9 @@ static inline u64 ath5k_extend_tsf(struct ath5k_hw *ah, u32 rstamp)
+ }
+ 
+ /* Interrupt handling */
+-static int 	ath5k_init(struct ath5k_softc *sc);
++static int 	ath5k_init(struct ath5k_softc *sc, bool is_resume);
+ static int 	ath5k_stop_locked(struct ath5k_softc *sc);
+-static int 	ath5k_stop_hw(struct ath5k_softc *sc);
++static int 	ath5k_stop_hw(struct ath5k_softc *sc, bool is_suspend);
+ static irqreturn_t ath5k_intr(int irq, void *dev_id);
+ static void 	ath5k_tasklet_reset(unsigned long data);
+ 
+@@ -584,7 +584,7 @@ ath5k_pci_suspend(struct pci_dev *pdev, pm_message_t state)
+ 
+ 	ath5k_led_off(sc);
+ 
+-	ath5k_stop_hw(sc);
++	ath5k_stop_hw(sc, true);
+ 
+ 	free_irq(pdev->irq, sc);
+ 	pci_save_state(pdev);
+@@ -599,8 +599,7 @@ ath5k_pci_resume(struct pci_dev *pdev)
+ {
+ 	struct ieee80211_hw *hw = pci_get_drvdata(pdev);
+ 	struct ath5k_softc *sc = hw->priv;
+-	struct ath5k_hw *ah = sc->ah;
+-	int i, err;
++	int err;
+ 
+ 	pci_restore_state(pdev);
+ 
+@@ -621,21 +620,11 @@ ath5k_pci_resume(struct pci_dev *pdev)
+ 		goto err_no_irq;
+ 	}
+ 
+-	err = ath5k_init(sc);
++	err = ath5k_init(sc, true);
+ 	if (err)
+ 		goto err_irq;
+ 	ath5k_led_enable(sc);
+ 
+-	/*
+-	 * Reset the key cache since some parts do not
+-	 * reset the contents on initial power up or resume.
+-	 *
+-	 * FIXME: This may need to be revisited when mac80211 becomes
+-	 *        aware of suspend/resume.
+-	 */
+-	for (i = 0; i < AR5K_KEYTABLE_SIZE; i++)
+-		ath5k_hw_reset_key(ah, i);
+-
+ 	return 0;
+ err_irq:
+ 	free_irq(pdev->irq, sc);
+@@ -657,7 +646,6 @@ ath5k_attach(struct pci_dev *pdev, struct ieee80211_hw *hw)
+ 	struct ath5k_softc *sc = hw->priv;
+ 	struct ath5k_hw *ah = sc->ah;
+ 	u8 mac[ETH_ALEN];
+-	unsigned int i;
+ 	int ret;
+ 
+ 	ATH5K_DBG(sc, ATH5K_DEBUG_ANY, "devid 0x%x\n", pdev->device);
+@@ -676,13 +664,6 @@ ath5k_attach(struct pci_dev *pdev, struct ieee80211_hw *hw)
+ 		__set_bit(ATH_STAT_MRRETRY, sc->status);
+ 
+ 	/*
+-	 * Reset the key cache since some parts do not
+-	 * reset the contents on initial power up.
+-	 */
+-	for (i = 0; i < AR5K_KEYTABLE_SIZE; i++)
+-		ath5k_hw_reset_key(ah, i);
+-
+-	/*
+ 	 * Collect the channel list.  The 802.11 layer
+ 	 * is resposible for filtering this list based
+ 	 * on settings like the phy mode and regulatory
+@@ -2197,12 +2178,18 @@ ath5k_beacon_config(struct ath5k_softc *sc)
+ \********************/
+ 
+ static int
+-ath5k_init(struct ath5k_softc *sc)
++ath5k_init(struct ath5k_softc *sc, bool is_resume)
+ {
+-	int ret;
++	struct ath5k_hw *ah = sc->ah;
++	int ret, i;
+ 
+ 	mutex_lock(&sc->lock);
+ 
++	if (is_resume && !test_bit(ATH_STAT_STARTED, sc->status))
++		goto out_ok;
++
++	__clear_bit(ATH_STAT_STARTED, sc->status);
++
+ 	ATH5K_DBG(sc, ATH5K_DEBUG_RESET, "mode %d\n", sc->opmode);
+ 
+ 	/*
+@@ -2220,7 +2207,7 @@ ath5k_init(struct ath5k_softc *sc)
+ 	 */
+ 	sc->curchan = sc->hw->conf.channel;
+ 	sc->curband = &sc->sbands[sc->curchan->band];
+-	ret = ath5k_hw_reset(sc->ah, sc->opmode, sc->curchan, false);
++	ret = ath5k_hw_reset(ah, sc->opmode, sc->curchan, false);
+ 	if (ret) {
+ 		ATH5K_ERR(sc, "unable to reset hardware: %d\n", ret);
+ 		goto done;
+@@ -2229,7 +2216,14 @@ ath5k_init(struct ath5k_softc *sc)
+ 	 * This is needed only to setup initial state
+ 	 * but it's best done after a reset.
+ 	 */
+-	ath5k_hw_set_txpower_limit(sc->ah, 0);
++	ath5k_hw_set_txpower_limit(ah, 0);
++
++	/*
++	 * Reset the key cache since some parts do not reset the
++	 * contents on initial power up or resume from suspend.
++	 */
++	for (i = 0; i < AR5K_KEYTABLE_SIZE; i++)
++		ath5k_hw_reset_key(ah, i);
+ 
+ 	/*
+ 	 * Setup the hardware after reset: the key cache
+@@ -2249,13 +2243,17 @@ ath5k_init(struct ath5k_softc *sc)
+ 		AR5K_INT_RXORN | AR5K_INT_FATAL | AR5K_INT_GLOBAL |
+ 		AR5K_INT_MIB;
+ 
+-	ath5k_hw_set_intr(sc->ah, sc->imask);
++	ath5k_hw_set_intr(ah, sc->imask);
++
++	__set_bit(ATH_STAT_STARTED, sc->status);
++
+ 	/* Set ack to be sent at low bit-rates */
+-	ath5k_hw_set_ack_bitrate_high(sc->ah, false);
++	ath5k_hw_set_ack_bitrate_high(ah, false);
+ 
+ 	mod_timer(&sc->calib_tim, round_jiffies(jiffies +
+ 			msecs_to_jiffies(ath5k_calinterval * 1000)));
+ 
++out_ok:
+ 	ret = 0;
+ done:
+ 	mmiowb();
+@@ -2310,7 +2308,7 @@ ath5k_stop_locked(struct ath5k_softc *sc)
+  * stop is preempted).
+  */
+ static int
+-ath5k_stop_hw(struct ath5k_softc *sc)
++ath5k_stop_hw(struct ath5k_softc *sc, bool is_suspend)
+ {
+ 	int ret;
+ 
+@@ -2341,6 +2339,9 @@ ath5k_stop_hw(struct ath5k_softc *sc)
+ 		}
+ 	}
+ 	ath5k_txbuf_free(sc, sc->bbuf);
++	if (!is_suspend)
++		__clear_bit(ATH_STAT_STARTED, sc->status);
++
+ 	mmiowb();
+ 	mutex_unlock(&sc->lock);
+ 
+@@ -2719,12 +2720,12 @@ err:
+ 
+ static int ath5k_start(struct ieee80211_hw *hw)
+ {
+-	return ath5k_init(hw->priv);
++	return ath5k_init(hw->priv, false);
+ }
+ 
+ static void ath5k_stop(struct ieee80211_hw *hw)
+ {
+-	ath5k_stop_hw(hw->priv);
++	ath5k_stop_hw(hw->priv, false);
+ }
+ 
+ static int ath5k_add_interface(struct ieee80211_hw *hw,
+diff --git a/drivers/net/wireless/ath5k/base.h b/drivers/net/wireless/ath5k/base.h
+index 7ec2f37..214a565 100644
+--- a/drivers/net/wireless/ath5k/base.h
++++ b/drivers/net/wireless/ath5k/base.h
+@@ -132,11 +132,12 @@ struct ath5k_softc {
+ 	size_t			desc_len;	/* size of TX/RX descriptors */
+ 	u16			cachelsz;	/* cache line size */
+ 
+-	DECLARE_BITMAP(status, 4);
++	DECLARE_BITMAP(status, 5);
+ #define ATH_STAT_INVALID	0		/* disable hardware accesses */
+ #define ATH_STAT_MRRETRY	1		/* multi-rate retry support */
+ #define ATH_STAT_PROMISC	2
+ #define ATH_STAT_LEDSOFT	3		/* enable LED gpio status */
++#define ATH_STAT_STARTED	4		/* opened & irqs enabled */
+ 
+ 	unsigned int		filter_flags;	/* HW flags, AR5K_RX_FILTER_* */
+ 	unsigned int		curmode;	/* current phy mode */
+diff --git a/drivers/net/wireless/ath5k/hw.c b/drivers/net/wireless/ath5k/hw.c
+index ad1a5b4..9b40cbe 100644
+--- a/drivers/net/wireless/ath5k/hw.c
++++ b/drivers/net/wireless/ath5k/hw.c
+@@ -826,9 +826,10 @@ int ath5k_hw_reset(struct ath5k_hw *ah, enum ieee80211_if_types op_mode,
+ 		mdelay(1);
+ 
+ 		/*
+-		 * Write some more initial register settings
++		 * Write some more initial register settings for revised chips
+ 		 */
+-		if (ah->ah_version == AR5K_AR5212) {
++		if (ah->ah_version == AR5K_AR5212 &&
++		    ah->ah_phy_revision > 0x41) {
+ 			ath5k_hw_reg_write(ah, 0x0002a002, 0x982c);
+ 
+ 			if (channel->hw_value == CHANNEL_G)
+@@ -847,19 +848,10 @@ int ath5k_hw_reset(struct ath5k_hw *ah, enum ieee80211_if_types op_mode,
+ 			else
+ 				ath5k_hw_reg_write(ah, 0x00000000, 0x994c);
+ 
+-			/* Some bits are disabled here, we know nothing about
+-			 * register 0xa228 yet, most of the times this ends up
+-			 * with a value 0x9b5 -haven't seen any dump with
+-			 * a different value- */
+-			/* Got this from decompiling binary HAL */
+-			data = ath5k_hw_reg_read(ah, 0xa228);
+-			data &= 0xfffffdff;
+-			ath5k_hw_reg_write(ah, data, 0xa228);
+-
+-			data = ath5k_hw_reg_read(ah, 0xa228);
+-			data &= 0xfffe03ff;
+-			ath5k_hw_reg_write(ah, data, 0xa228);
+-			data = 0;
++			/* Got this from legacy-hal */
++			AR5K_REG_DISABLE_BITS(ah, 0xa228, 0x200);
++
++			AR5K_REG_MASKED_BITS(ah, 0xa228, 2 << 10, ~0x1fc00);
+ 
+ 			/* Just write 0x9b5 ? */
+ 			/* ath5k_hw_reg_write(ah, 0x000009b5, 0xa228); */
+diff --git a/drivers/net/wireless/ath5k/initvals.c b/drivers/net/wireless/ath5k/initvals.c
+index 2806b21..cf7ebd1 100644
+--- a/drivers/net/wireless/ath5k/initvals.c
++++ b/drivers/net/wireless/ath5k/initvals.c
+@@ -810,6 +810,8 @@ static const struct ath5k_ini_mode ar5212_rf5111_ini_mode_end[] = {
+ 		{ 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 } },
+ 	{ AR5K_PHY(642),
+ 		{ 0xd03e6788, 0xd03e6788, 0xd03e6788, 0xd03e6788, 0xd03e6788 } },
++	{ 0xa228,
++		{ 0x000001b5, 0x000001b5, 0x000001b5, 0x000001b5, 0x000001b5 } },
+ 	{ 0xa23c,
+ 		{ 0x13c889af, 0x13c889af, 0x13c889af, 0x13c889af, 0x13c889af } },
+ };
+diff --git a/drivers/net/wireless/hostap/hostap_wlan.h b/drivers/net/wireless/hostap/hostap_wlan.h
+index ffdf487..a68f97c 100644
+--- a/drivers/net/wireless/hostap/hostap_wlan.h
++++ b/drivers/net/wireless/hostap/hostap_wlan.h
+@@ -918,9 +918,12 @@ struct hostap_interface {
+ 
+ /*
+  * TX meta data - stored in skb->cb buffer, so this must not be increased over
+- * the 40-byte limit
++ * the 48-byte limit.
++ * THE PADDING THIS STARTS WITH IS A HORRIBLE HACK THAT SHOULD NOT LIVE
++ * TO SEE THE DAY.
+  */
+ struct hostap_skb_tx_data {
++	unsigned int __padding_for_default_qdiscs;
+ 	u32 magic; /* HOSTAP_SKB_TX_DATA_MAGIC */
+ 	u8 rate; /* transmit rate */
+ #define HOSTAP_TX_FLAGS_WDS BIT(0)
+diff --git a/drivers/net/wireless/iwlwifi/iwl-agn.c b/drivers/net/wireless/iwlwifi/iwl-agn.c
+index 72a6743..cf7056e 100644
+--- a/drivers/net/wireless/iwlwifi/iwl-agn.c
++++ b/drivers/net/wireless/iwlwifi/iwl-agn.c
+@@ -3275,7 +3275,11 @@ static void iwl4965_mac_update_tkip_key(struct ieee80211_hw *hw,
+ 		return;
+ 	}
+ 
+-	iwl_scan_cancel_timeout(priv, 100);
++	if (iwl_scan_cancel(priv)) {
++		/* cancel scan failed, just live w/ bad key and rely
++		   briefly on SW decryption */
++		return;
++	}
+ 
+ 	key_flags |= (STA_KEY_FLG_TKIP | STA_KEY_FLG_MAP_KEY_MSK);
+ 	key_flags |= cpu_to_le16(keyconf->keyidx << STA_KEY_FLG_KEYID_POS);
+diff --git a/drivers/net/wireless/rtl8187_dev.c b/drivers/net/wireless/rtl8187_dev.c
+index ca5deb6..0cebbc4 100644
+--- a/drivers/net/wireless/rtl8187_dev.c
++++ b/drivers/net/wireless/rtl8187_dev.c
+@@ -45,6 +45,9 @@ static struct usb_device_id rtl8187_table[] __devinitdata = {
+ 	{USB_DEVICE(0x03f0, 0xca02), .driver_info = DEVICE_RTL8187},
+ 	/* Sitecom */
+ 	{USB_DEVICE(0x0df6, 0x000d), .driver_info = DEVICE_RTL8187},
++	{USB_DEVICE(0x0df6, 0x0028), .driver_info = DEVICE_RTL8187B},
++	/* Abocom */
++	{USB_DEVICE(0x13d1, 0xabe6), .driver_info = DEVICE_RTL8187},
+ 	{}
+ };
+ 
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 6e283c9..1bd5ba2 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1553,8 +1553,13 @@ static noinline int do_remount(struct nameidata *nd, int flags, int mnt_flags,
+ 	if (!err)
+ 		nd->path.mnt->mnt_flags = mnt_flags;
+ 	up_write(&sb->s_umount);
+-	if (!err)
++	if (!err) {
+ 		security_sb_post_remount(nd->path.mnt, flags, data);
++
++		spin_lock(&vfsmount_lock);
++		touch_mnt_namespace(nd->path.mnt->mnt_ns);
++		spin_unlock(&vfsmount_lock);
++	}
+ 	return err;
+ }
+ 
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index 0933a14..3d83947 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -98,6 +98,13 @@ struct bio {
+ 	unsigned int		bi_size;	/* residual I/O count */
+ 
+ 	/*
++	 * To keep track of the max segment size, we account for the
++	 * sizes of the first and last mergeable segments in this bio.
++	 */
++	unsigned int            bi_seg_front_size;
++	unsigned int            bi_seg_back_size;
++
++	/*
+ 	 * To keep track of the max hw size, we account for the
+ 	 * sizes of the first and last virtually mergeable segments
+ 	 * in this bio
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 77427c8..81e9a82 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1797,6 +1797,7 @@ int unmap_ref_private(struct mm_struct *mm,
+ 					struct page *page,
+ 					unsigned long address)
+ {
++	struct hstate *h = hstate_vma(vma);
+ 	struct vm_area_struct *iter_vma;
+ 	struct address_space *mapping;
+ 	struct prio_tree_iter iter;
+@@ -1806,7 +1807,7 @@ int unmap_ref_private(struct mm_struct *mm,
+ 	 * vm_pgoff is in PAGE_SIZE units, hence the different calculation
+ 	 * from page cache lookup which is in HPAGE_SIZE units.
+ 	 */
+-	address = address & huge_page_mask(hstate_vma(vma));
++	address = address & huge_page_mask(h);
+ 	pgoff = ((address - vma->vm_start) >> PAGE_SHIFT)
+ 		+ (vma->vm_pgoff >> PAGE_SHIFT);
+ 	mapping = (struct address_space *)page_private(page);
+@@ -1825,7 +1826,7 @@ int unmap_ref_private(struct mm_struct *mm,
+ 		 */
+ 		if (!is_vma_resv_set(iter_vma, HPAGE_RESV_OWNER))
+ 			unmap_hugepage_range(iter_vma,
+-				address, address + HPAGE_SIZE,
++				address, address + huge_page_size(h),
+ 				page);
+ 	}
+ 
+diff --git a/mm/page_isolation.c b/mm/page_isolation.c
+index b70a7fe..5e0ffd9 100644
+--- a/mm/page_isolation.c
++++ b/mm/page_isolation.c
+@@ -130,10 +130,11 @@ int test_pages_isolated(unsigned long start_pfn, unsigned long end_pfn)
+ 		if (page && get_pageblock_migratetype(page) != MIGRATE_ISOLATE)
+ 			break;
+ 	}
+-	if (pfn < end_pfn)
++	page = __first_valid_page(start_pfn, end_pfn - start_pfn);
++	if ((pfn < end_pfn) || !page)
+ 		return -EBUSY;
+ 	/* Check all pages are free or Marked as ISOLATED */
+-	zone = page_zone(pfn_to_page(pfn));
++	zone = page_zone(page);
+ 	spin_lock_irqsave(&zone->lock, flags);
+ 	ret = __test_page_isolated_in_pageblock(start_pfn, end_pfn);
+ 	spin_unlock_irqrestore(&zone->lock, flags);
+diff --git a/scripts/package/builddeb b/scripts/package/builddeb
+index ba6bf5d..1264b8e 100644
+--- a/scripts/package/builddeb
++++ b/scripts/package/builddeb
+@@ -15,15 +15,18 @@ set -e
+ version=$KERNELRELEASE
+ revision=`cat .version`
+ tmpdir="$objtree/debian/tmp"
++fwdir="$objtree/debian/fwtmp"
+ packagename=linux-$version
++fwpackagename=linux-firmware-image
+ 
+ if [ "$ARCH" == "um" ] ; then
+ 	packagename=user-mode-linux-$version
+ fi
+ 
+ # Setup the directory structure
+-rm -rf "$tmpdir"
++rm -rf "$tmpdir" "$fwdir"
+ mkdir -p "$tmpdir/DEBIAN" "$tmpdir/lib" "$tmpdir/boot"
++mkdir -p "$fwdir/DEBIAN" "$fwdir/lib"
+ if [ "$ARCH" == "um" ] ; then
+ 	mkdir -p "$tmpdir/usr/lib/uml/modules/$version" "$tmpdir/usr/share/doc/$packagename" "$tmpdir/usr/bin"
+ fi
+@@ -107,6 +110,7 @@ Standards-Version: 3.6.1
+ 
+ Package: $packagename
+ Provides: kernel-image-$version, linux-image-$version
++Suggests: $fwpackagename
+ Architecture: any
+ Description: Linux kernel, version $version
+  This package contains the Linux kernel, modules and corresponding other
+@@ -118,8 +122,24 @@ fi
+ chown -R root:root "$tmpdir"
+ chmod -R go-w "$tmpdir"
+ 
++# Do we have firmware? Move it out of the way and build it into a package.
++if [ -e "$tmpdir/lib/firmware" ]; then
++	mv "$tmpdir/lib/firmware" "$fwdir/lib/"
++
++	cat <<EOF >> debian/control
++
++Package: $fwpackagename
++Architecture: all
++Description: Linux kernel firmware, version $version
++ This package contains firmware from the Linux kernel, version $version
++EOF
++
++	dpkg-gencontrol -isp -p$fwpackagename -P"$fwdir"
++	dpkg --build "$fwdir" ..
++fi
++
+ # Perform the final magic
+-dpkg-gencontrol -isp
++dpkg-gencontrol -isp -p$packagename
+ dpkg --build "$tmpdir" ..
+ 
+ exit 0
