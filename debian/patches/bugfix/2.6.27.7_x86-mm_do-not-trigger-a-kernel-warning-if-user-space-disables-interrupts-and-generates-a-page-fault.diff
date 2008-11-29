@@ -1,0 +1,102 @@
+commit 891cffbd6bcba26409869c19c07ecd4bfc0c2460
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Sun Oct 12 13:16:12 2008 -0700
+
+    x86/mm: do not trigger a kernel warning if user-space disables interrupts and generates a page fault
+    
+    Arjan reported a spike in the following bug pattern in v2.6.27:
+    
+       http://www.kerneloops.org/searchweek.php?search=lock_page
+    
+    which happens because hwclock started triggering warnings due to
+    a (correct) might_sleep() check in the MM code.
+    
+    The warning occurs because hwclock uses this dubious sequence of
+    code to run "atomic" code:
+    
+      static unsigned long
+      atomic(const char *name, unsigned long (*op)(unsigned long),
+             unsigned long arg)
+      {
+        unsigned long v;
+        __asm__ volatile ("cli");
+        v = (*op)(arg);
+        __asm__ volatile ("sti");
+        return v;
+      }
+    
+    Then it pagefaults in that "atomic" section, triggering the warning.
+    
+    There is no way the kernel could provide "atomicity" in this path,
+    a page fault is a cannot-continue machine event so the kernel has to
+    wait for the page to be filled in.
+    
+    Even if it was just a minor fault we'd have to take locks and might have
+    to spend quite a bit of time with interrupts disabled - not nice to irq
+    latencies in general.
+    
+    So instead just enable interrupts in the pagefault path unconditionally
+    if we come from user-space, and handle the fault.
+    
+    Also, while touching this code, unify some trivial parts of the x86
+    VM paths at the same time.
+    
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Reported-by: Arjan van de Ven <arjan@infradead.org>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index a742d75..ac2ad78 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -645,24 +645,23 @@ void __kprobes do_page_fault(struct pt_regs *regs, unsigned long error_code)
+ 	}
+ 
+ 
+-#ifdef CONFIG_X86_32
+-	/* It's safe to allow irq's after cr2 has been saved and the vmalloc
+-	   fault has been handled. */
+-	if (regs->flags & (X86_EFLAGS_IF | X86_VM_MASK))
+-		local_irq_enable();
+-
+ 	/*
+-	 * If we're in an interrupt, have no user context or are running in an
+-	 * atomic region then we must not take the fault.
++	 * It's safe to allow irq's after cr2 has been saved and the
++	 * vmalloc fault has been handled.
++	 *
++	 * User-mode registers count as a user access even for any
++	 * potential system fault or CPU buglet.
+ 	 */
+-	if (in_atomic() || !mm)
+-		goto bad_area_nosemaphore;
+-#else /* CONFIG_X86_64 */
+-	if (likely(regs->flags & X86_EFLAGS_IF))
++	if (user_mode_vm(regs)) {
++		local_irq_enable();
++		error_code |= PF_USER;
++	} else if (regs->flags & X86_EFLAGS_IF)
+ 		local_irq_enable();
+ 
++#ifdef CONFIG_X86_64
+ 	if (unlikely(error_code & PF_RSVD))
+ 		pgtable_bad(address, regs, error_code);
++#endif
+ 
+ 	/*
+ 	 * If we're in an interrupt, have no user context or are running in an
+@@ -671,14 +670,7 @@ void __kprobes do_page_fault(struct pt_regs *regs, unsigned long error_code)
+ 	if (unlikely(in_atomic() || !mm))
+ 		goto bad_area_nosemaphore;
+ 
+-	/*
+-	 * User-mode registers count as a user access even for any
+-	 * potential system fault or CPU buglet.
+-	 */
+-	if (user_mode_vm(regs))
+-		error_code |= PF_USER;
+ again:
+-#endif
+ 	/* When running in the kernel we expect faults to occur only to
+ 	 * addresses in user space.  All other faults represent errors in the
+ 	 * kernel and should generate an OOPS.  Unfortunately, in the case of an
