@@ -1,0 +1,79 @@
+We would get an oops on RX on -ENOMEM by passing
+NULL to the hardware on ath_rx_buf_link(). The oops
+would look something like this:
+
+ath_rx_tasklet
+...
+RIP: ath_rx_buf_link
+
+We correct this by handling the allocation for the next
+skb we will put in our RX tail directly on the ath_rx_tasklet()
+*prior* to sending up the last hardware processed
+skb. If we run out of memory this gauranteees we have
+skbs to work with while it simply drops new received
+frames.
+
+Signed-off-by: Luis R. Rodriguez <lrodriguez@atheros.com>
+
+ drivers/net/wireless/ath9k/recv.c |   18 ++++++++++++++----
+ 1 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/ath9k/recv.c b/drivers/net/wireless/ath9k/recv.c
+index 0941589..a4f92b2 100644
+--- a/drivers/net/wireless/ath9k/recv.c
++++ b/drivers/net/wireless/ath9k/recv.c
+@@ -441,18 +441,16 @@ static void ath_rx_requeue(struct ath_softc *sc, struct sk_buff *skb)
+  */
+ static int ath_rx_indicate(struct ath_softc *sc,
+ 			   struct sk_buff *skb,
++			   struct sk_buff *nskb,
+ 			   struct ath_recv_status *status,
+ 			   u16 keyix)
+ {
+ 	struct ath_buf *bf = ATH_RX_CONTEXT(skb)->ctx_rxbuf;
+-	struct sk_buff *nskb;
+ 	int type;
+ 
+ 	/* indicate frame to the stack, which will free the old skb. */
+ 	type = ath__rx_indicate(sc, skb, status, keyix);
+ 
+-	/* allocate a new skb and queue it to for H/W processing */
+-	nskb = ath_rxbuf_alloc(sc, sc->sc_rxbufsize);
+ 	if (nskb != NULL) {
+ 		bf->bf_mpdu = nskb;
+ 		bf->bf_buf_addr = ath_skb_map_single(sc,
+@@ -741,6 +739,7 @@ int ath_rx_tasklet(struct ath_softc *sc, int flush)
+ 	struct ath_desc *ds;
+ 	struct ieee80211_hdr *hdr;
+ 	struct sk_buff *skb = NULL;
++	struct sk_buff *nskb = NULL;
+ 	struct ath_recv_status rx_status;
+ 	struct ath_hal *ah = sc->sc_ah;
+ 	int type, rx_processed = 0;
+@@ -963,6 +962,17 @@ int ath_rx_tasklet(struct ath_softc *sc, int flush)
+ 		 */
+ 		if (sc->sc_rxbufsize < ds->ds_rxstat.rs_datalen)
+ 			goto rx_next;
++
++		/* allocate a new skb and queue it to for H/W processing */
++		nskb = ath_rxbuf_alloc(sc, sc->sc_rxbufsize);
++
++		/* Diregard current RX'd frame and reuse the old skb */
++		if (!nskb) {
++			list_move_tail(&bf->list, &sc->sc_rxbuf);
++			ath_rx_buf_link(sc, bf);
++			goto rx_next;
++		}
++
+ 		/*
+ 		 * Sync and unmap the frame.  At this point we're
+ 		 * committed to passing the sk_buff somewhere so
+@@ -1052,7 +1062,7 @@ int ath_rx_tasklet(struct ath_softc *sc, int flush)
+ 
+ 		/* Pass frames up to the stack. */
+ 
+-		type = ath_rx_indicate(sc, skb,
++		type = ath_rx_indicate(sc, skb, nskb,
+ 			&rx_status, ds->ds_rxstat.rs_keyix);
+ 
+ 		/*
