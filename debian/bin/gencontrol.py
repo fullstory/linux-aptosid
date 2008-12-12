@@ -25,6 +25,8 @@ class Gencontrol(Base):
         })
 
     def do_main_packages(self, packages, vars, makeflags, extra):
+        packages.extend(self.process_packages(self.templates["control.main"], self.vars))
+        packages.append(self.process_real_tree(self.templates["control.tree"][0], self.vars))
         packages.extend(self.process_packages(self.templates["control.support"], self.vars))
 
     def do_arch_setup(self, vars, makeflags, arch, extra):
@@ -51,7 +53,9 @@ class Gencontrol(Base):
                 packages.append(package)
 
         cmds_binary_arch = ["$(MAKE) -f debian/rules.real binary-arch-arch %s" % makeflags]
+        cmds_source = ["$(MAKE) -f debian/rules.real source-arch %s" % makeflags]
         makefile.add('binary-arch_%s_real' % arch, cmds = cmds_binary_arch)
+        makefile.add('source_%s_real' % arch, cmds = cmds_source)
 
     def do_featureset_setup(self, vars, makeflags, arch, featureset, extra):
         config_base = self.config.merge('base', arch, featureset)
@@ -71,7 +75,9 @@ class Gencontrol(Base):
             packages.append(package_headers)
 
         cmds_binary_arch = ["$(MAKE) -f debian/rules.real binary-arch-featureset %s" % makeflags]
+        cmds_source = ["$(MAKE) -f debian/rules.real source-featureset %s" % makeflags]
         makefile.add('binary-arch_%s_%s_real' % (arch, featureset), cmds = cmds_binary_arch)
+        makefile.add('source_%s_%s_real' % (arch, featureset), cmds = cmds_source)
 
     def do_flavour_setup(self, vars, makeflags, arch, featureset, flavour, extra):
         config_base = self.config.merge('base', arch, featureset, flavour)
@@ -117,6 +123,7 @@ class Gencontrol(Base):
         for group in relations_compiler_build_dep:
             for item in group:
                 item.arches = [arch]
+        packages['source']['Build-Depends'].extend(relations_compiler_build_dep)
 
         image_fields = {'Description': PackageDescription()}
         for field in 'Depends', 'Provides', 'Suggests', 'Recommends', 'Conflicts':
@@ -288,6 +295,19 @@ class Gencontrol(Base):
                 real.extend(value)
             elif value:
                 entry[key] = value
+        return entry
+
+    def process_real_tree(self, entry, vars):
+        entry = self.process_package(entry, vars)
+        version = self.changelog[0].version
+
+        value = entry.setdefault('Depends', PackageRelation())
+        value.append("linux-patch-sidux-%s (= %s)" % (version.linux_version, version.complete))
+        value.append(PackageRelationGroup(["linux-source-sidux-%s (= %s)" % (v.linux_version, v.complete) for v in self.versions]))
+
+        value = entry.setdefault('Provides', PackageRelation())
+        value.extend(["linux-tree-%s" % v.complete.replace('~', '-') for v in self.versions])
+
         return entry
 
     def write(self, packages, makefile):
