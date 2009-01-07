@@ -1,0 +1,146 @@
+Gitweb:     http://git.kernel.org/git/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commit;h=f1bc4ac61f2c08515afd80c6dc3962aa6d0b138b
+Commit:     f1bc4ac61f2c08515afd80c6dc3962aa6d0b138b
+Parent:     4087f6f68cdbd2845c7e54236bae1b058a7b827b
+Author:     Zhu Yi <yi.zhu@intel.com>
+AuthorDate: Wed Dec 17 16:52:33 2008 +0800
+Committer:  John W. Linville <linville@tuxdriver.com>
+CommitDate: Fri Dec 19 15:23:41 2008 -0500
+
+    iwlwifi: use GFP_KERNEL to allocate Rx SKB memory
+    
+    Previously we allocate Rx SKB with GFP_ATOMIC flag. This is because we need
+    to hold a spinlock to protect the two rx_used and rx_free lists operation
+    in the rxq.
+    
+    	spin_lock();
+    	...
+    	element = rxq->rx_used.next;
+    	element->skb = alloc_skb(..., GFP_ATOMIC);
+    	list_del(element);
+    	list_add_tail(&element->list, &rxq->rx_free);
+    	...
+    	spin_unlock();
+    
+    After spliting the rx_used delete and rx_free insert into two operations,
+    we don't require the skb allocation in an atomic context any more (the
+    function itself is scheduled in a workqueue).
+    
+    	spin_lock();
+    	...
+    	element = rxq->rx_used.next;
+    	list_del(element);
+    	...
+    	spin_unlock();
+    	...
+    	element->skb = alloc_skb(..., GFP_KERNEL);
+    	...
+    	spin_lock()
+    	...
+    	list_add_tail(&element->list, &rxq->rx_free);
+    	...
+    	spin_unlock();
+    
+    This patch should fix the "iwlagn: Can not allocate SKB buffers" warning
+    we see recently.
+    
+    Signed-off-by: Zhu Yi <yi.zhu@intel.com>
+    Acked-by: Tomas Winkler <tomas.winkler@intel.com>
+    Cc: stable@kernel.org
+    Signed-off-by: John W. Linville <linville@tuxdriver.com>
+
+ drivers/net/wireless/iwlwifi/iwl-agn.c |   12 +-----------
+ drivers/net/wireless/iwlwifi/iwl-rx.c  |   29 +++++++++++++++++++----------
+ 2 files changed, 20 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/wireless/iwlwifi/iwl-agn.c b/drivers/net/wireless/iwlwifi/iwl-agn.c
+index a005192..ff8635f 100644
+--- a/drivers/net/wireless/iwlwifi/iwl-agn.c
++++ b/drivers/net/wireless/iwlwifi/iwl-agn.c
+@@ -1110,16 +1110,6 @@ static void iwl_setup_rx_handlers(struct iwl_priv *priv)
+ 	priv->cfg->ops->lib->rx_handler_setup(priv);
+ }
+ 
+-/*
+- * this should be called while priv->lock is locked
+-*/
+-static void __iwl_rx_replenish(struct iwl_priv *priv)
+-{
+-	iwl_rx_allocate(priv);
+-	iwl_rx_queue_restock(priv);
+-}
+-
+-
+ /**
+  * iwl_rx_handle - Main entry function for receiving responses from uCode
+  *
+@@ -1228,7 +1218,7 @@ void iwl_rx_handle(struct iwl_priv *priv)
+ 			count++;
+ 			if (count >= 8) {
+ 				priv->rxq.read = i;
+-				__iwl_rx_replenish(priv);
++				iwl_rx_queue_restock(priv);
+ 				count = 0;
+ 			}
+ 		}
+diff --git a/drivers/net/wireless/iwlwifi/iwl-rx.c b/drivers/net/wireless/iwlwifi/iwl-rx.c
+index 919a775..c5f1aa0 100644
+--- a/drivers/net/wireless/iwlwifi/iwl-rx.c
++++ b/drivers/net/wireless/iwlwifi/iwl-rx.c
+@@ -244,25 +244,31 @@ void iwl_rx_allocate(struct iwl_priv *priv)
+ 	struct list_head *element;
+ 	struct iwl_rx_mem_buffer *rxb;
+ 	unsigned long flags;
+-	spin_lock_irqsave(&rxq->lock, flags);
+-	while (!list_empty(&rxq->rx_used)) {
++
++	while (1) {
++		spin_lock_irqsave(&rxq->lock, flags);
++
++		if (list_empty(&rxq->rx_used)) {
++			spin_unlock_irqrestore(&rxq->lock, flags);
++			return;
++		}
+ 		element = rxq->rx_used.next;
+ 		rxb = list_entry(element, struct iwl_rx_mem_buffer, list);
++		list_del(element);
++
++		spin_unlock_irqrestore(&rxq->lock, flags);
+ 
+ 		/* Alloc a new receive buffer */
+ 		rxb->skb = alloc_skb(priv->hw_params.rx_buf_size + 256,
+-				__GFP_NOWARN | GFP_ATOMIC);
++				     GFP_KERNEL);
+ 		if (!rxb->skb) {
+-			if (net_ratelimit())
+-				printk(KERN_CRIT DRV_NAME
+-				       ": Can not allocate SKB buffers\n");
++			printk(KERN_CRIT DRV_NAME
++				   "Can not allocate SKB buffers\n");
+ 			/* We don't reschedule replenish work here -- we will
+ 			 * call the restock method and if it still needs
+ 			 * more buffers it will schedule replenish */
+ 			break;
+ 		}
+-		priv->alloc_rxb_skb++;
+-		list_del(element);
+ 
+ 		/* Get physical address of RB/SKB */
+ 		rxb->real_dma_addr = pci_map_single(
+@@ -276,12 +282,15 @@ void iwl_rx_allocate(struct iwl_priv *priv)
+ 		rxb->aligned_dma_addr = ALIGN(rxb->real_dma_addr, 256);
+ 		skb_reserve(rxb->skb, rxb->aligned_dma_addr - rxb->real_dma_addr);
+ 
++		spin_lock_irqsave(&rxq->lock, flags);
++
+ 		list_add_tail(&rxb->list, &rxq->rx_free);
+ 		rxq->free_count++;
++		priv->alloc_rxb_skb++;
++
++		spin_unlock_irqrestore(&rxq->lock, flags);
+ 	}
+-	spin_unlock_irqrestore(&rxq->lock, flags);
+ }
+-EXPORT_SYMBOL(iwl_rx_allocate);
+ 
+ void iwl_rx_replenish(struct iwl_priv *priv)
+ {
