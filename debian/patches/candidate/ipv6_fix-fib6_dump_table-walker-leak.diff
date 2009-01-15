@@ -1,0 +1,80 @@
+On Wed, Jan 14, 2009 at 02:30:11AM +0000, Chris Caputo wrote:
+ > On a 2.6.28 x86 system with a full IPv6 route table - 1,524 routes - I can 
+ > reproducibly panic the system with the following:
+ > 
+ >   ip -6 route | head
+ > 
+ > The above finishes and a command prompt is shown.  Then about half of the 
+ > time I get a panic:
+ > 
+ >  BUG: unable to handle kernel paging request at 01000014
+ >   [<c0432168>] ? inet6_rtm_delroute+0x0/0x22
+ >   [<c0432184>] ? inet6_rtm_delroute+0x1c/0x22
+ >   [<c03a0e4b>] ? rtnetlink_rcv_msg+0x188/0x1a2
+ >   [<c03a0cc3>] ? rtnetlink_rcv_msg+0x0/0x1a2
+ >   [<c03bdf1f>] ? netlink_rcv_skb+0x30/0x75
+ >   [<c03a0cbb>] ? rtnetlink_rcv+0x17/0x1f
+ >   [<c03bdd50>] ? netlink_unicast+0x1a8/0x209
+ >   [<c03be40d>] ? netlink_sendmsg+0x21a/0x227
+ >   [<c038f25f>] ? sock_sendmsg+0xca/0xe1
+ >   [<c0231271>] ? autoremove_wake_function+0x0/0x33
+ >   [<c02077f8>] ? nommu_map_single+0x0/0x41
+ >   [<c0398149>] ? dev_kfree_skb_any+0x23/0x2e
+ >   [<f807a73b>] ? e1000_unmap_and_free_tx_resource+0x5b/0x70 [e1000]
+ >   [<c02fbb92>] ? copy_from_user+0x2c/0x4f
+ >   [<c03953e1>] ? verify_iovec+0x40/0x73
+ >   [<c038f3c5>] ? sys_sendmsg+0x14f/0x1aa
+ >   [<c03900bb>] ? sys_socketcall+0x140/0x16d
+ >   [<c0202bf1>] ? sysenter_do_call+0x12/0x25
+ >  Code: 00 ff 48 0c 8b 81 dc 01 00 00 ff 40 14 39 53 18 75 07 c7 43 18 00 00 00 00 b8 d0 2d 5a c0 e8 a6 3f 04 00 8b 15 e4 2d 5a c0 eb 1f <80> 7a 14 02 75 16 39 72 10 75 11 8b 86 88 00 00 00 85 c0 89 42
+ >  EIP: [<c04345e1>] fib6_del+0xd9/0x395 SS:ESP 0068:f6457c10
+ >  Kernel panic - not syncing: Fatal exception in interrupt
+ >  Rebooting in 10 seconds..
+
+I'm surprised that it's taken nearly 3 years for this bug to
+show itself.  It even survived a move from route.c :)
+
+ipv6: Fix fib6_dump_table walker leak
+
+When a fib6 table dump is prematurely ended, we won't unlink
+its walker from the list.  This causes all sorts of grief for
+other users of the list later.
+
+Reported-by: Chris Caputo <ccaputo@alt.net>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+
+diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
+index 29c7c99..52ee1dc 100644
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@ -298,6 +298,10 @@ static void fib6_dump_end(struct netlink_callback *cb)
+ 	struct fib6_walker_t *w = (void*)cb->args[2];
+ 
+ 	if (w) {
++		if (cb->args[4]) {
++			cb->args[4] = 0;
++			fib6_walker_unlink(w);
++		}
+ 		cb->args[2] = 0;
+ 		kfree(w);
+ 	}
+@@ -330,15 +334,12 @@ static int fib6_dump_table(struct fib6_table *table, struct sk_buff *skb,
+ 		read_lock_bh(&table->tb6_lock);
+ 		res = fib6_walk_continue(w);
+ 		read_unlock_bh(&table->tb6_lock);
+-		if (res != 0) {
+-			if (res < 0)
+-				fib6_walker_unlink(w);
+-			goto end;
++		if (res <= 0) {
++			fib6_walker_unlink(w);
++			cb->args[4] = 0;
+ 		}
+-		fib6_walker_unlink(w);
+-		cb->args[4] = 0;
+ 	}
+-end:
++
+ 	return res;
+ }
+
