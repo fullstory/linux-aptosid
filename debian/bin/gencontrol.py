@@ -254,20 +254,6 @@ class Gencontrol(Base):
         makefile.add('build_%s_%s_%s_real' % (arch, featureset, flavour), cmds = cmds_build)
         makefile.add('setup_%s_%s_%s_real' % (arch, featureset, flavour), cmds = cmds_setup)
 
-    def do_extra(self, packages, makefile):
-        apply = self.templates['patch.apply']
-
-        vars = {
-            'revisions': 'orig ' + ' '.join([i.revision for i in self.versions[::-1]]),
-            'upstream': self.version.upstream,
-            'linux_upstream': self.version.linux_upstream,
-            'abiname': self.abiname,
-        }
-
-        apply = self.substitute(apply, vars)
-
-        file('debian/bin/patch.apply', 'w').write(apply)
-
     def process_changelog(self):
         act_upstream = self.changelog[0].version.linux_upstream
         versions = []
