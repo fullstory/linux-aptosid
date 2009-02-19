@@ -181,7 +181,6 @@ class Gencontrol(object):
 
         self.do_featureset_setup(vars, makeflags, arch, featureset, extra)
         self.do_featureset_makefile(makefile, arch, featureset, makeflags, extra)
-        self.do_featureset_packages(packages, makefile, arch, featureset, vars, makeflags, extra)
         self.do_featureset_recurse(packages, makefile, arch, featureset, vars, makeflags, extra)
 
     def do_featureset_setup(self, vars, makeflags, arch, featureset, extra):
@@ -196,9 +195,6 @@ class Gencontrol(object):
             target3 = '_'.join((target2, 'real'))
             makefile.add(target1, [target2])
             makefile.add(target2, [target3])
-
-    def do_featureset_packages(self, packages, makefile, arch, featureset, vars, makeflags, extra):
-        pass
 
     def do_featureset_recurse(self, packages, makefile, arch, featureset, vars, makeflags, extra):
         for flavour in self.config['base', arch, featureset]['flavours']:

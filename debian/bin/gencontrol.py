@@ -31,15 +31,10 @@ class Gencontrol(Base):
 
     def do_arch_setup(self, vars, makeflags, arch, extra):
         config_base = self.config.merge('base', arch)
-        #config_libc_dev = self.config.merge('libc-dev', arch)
-        #makeflags['LIBC_DEV_ARCH'] = config_libc_dev.get('arch', config_base.get('kernel-arch'))
 
     def do_arch_packages(self, packages, makefile, arch, vars, makeflags, extra):
         headers_arch = self.templates["control.headers.arch"]
         packages_headers_arch = self.process_packages(headers_arch, vars)
-
-        #libc_dev = self.templates["control.libc-dev"]
-        #packages_headers_arch[0:0] = self.process_packages(libc_dev, {})
         
         extra['headers_arch_depends'] = packages_headers_arch[-1]['Depends'] = PackageRelation()
 
@@ -61,23 +56,6 @@ class Gencontrol(Base):
         config_base = self.config.merge('base', arch, featureset)
         makeflags['KERNEL_HEADER_DIRS'] = config_base.get('kernel-header-dirs', config_base.get('kernel-arch'))
         makeflags['LOCALVERSION_HEADERS'] = vars['localversion_headers'] = vars['localversion']
-
-    def do_featureset_packages(self, packages, makefile, arch, featureset, vars, makeflags, extra):
-        headers_featureset = self.templates["control.headers.featureset"]
-        package_headers = self.process_package(headers_featureset[0], vars)
-
-        name = package_headers['Package']
-        if packages.has_key(name):
-            package_headers = packages.get(name)
-            package_headers['Architecture'].append(arch)
-        else:
-            package_headers['Architecture'] = [arch]
-            packages.append(package_headers)
-
-        cmds_binary_arch = ["$(MAKE) -f debian/rules.real binary-arch-featureset %s" % makeflags]
-        cmds_source = ["$(MAKE) -f debian/rules.real source-featureset %s" % makeflags]
-        makefile.add('binary-arch_%s_%s_real' % (arch, featureset), cmds = cmds_binary_arch)
-        makefile.add('source_%s_%s_real' % (arch, featureset), cmds = cmds_source)
 
     def do_flavour_setup(self, vars, makeflags, arch, featureset, flavour, extra):
         config_base = self.config.merge('base', arch, featureset, flavour)
@@ -175,7 +153,6 @@ class Gencontrol(Base):
         else:
             build_modules = True
             image = self.templates["control.image.type-%s" % config_entry_image['type']]
-            #image = self.templates["control.image.type-modulesinline"]
 
         vars.setdefault('desc', None)
 
@@ -185,7 +162,6 @@ class Gencontrol(Base):
         if build_modules:
             makeflags['MODULES'] = True
             package_headers = self.process_package(headers[0], vars)
-            package_headers['Depends'].extend(relations_compiler)
             packages_own.append(package_headers)
             extra['headers_arch_depends'].append('%s (= ${binary:Version})' % packages_own[-1]['Package'])
 
