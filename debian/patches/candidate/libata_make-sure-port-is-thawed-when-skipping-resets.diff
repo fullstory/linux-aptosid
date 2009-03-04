@@ -1,0 +1,63 @@
+When SCR access is available and the link is offline, softreset is
+skipped as it only wastes time and some controllers don't respond very
+well.  However, the skip path forgot to thaw the port, which not only
+blocks further event notification from the port but also causes
+repeated EH invocations on the same event on drivers which rely on
+->thaw() to clear events if the IRQ is shared with another device or
+port.
+
+This problem has always been there but is uncovered by recent sata_nv
+nf2/3 change which dropped hardreset support while maintaining SCR
+access.  nf2/3 doesn't clear hotplug event mask from the interrupt
+handler but relies on ->thaw() to clear them.  When the hardreset was
+there, the reset action was never skipped and the port was always
+thawed but, with the hardreset gone, ->prereset() determines that
+there's no need for softreset and both ->softreset() and ->thaw() are
+skipped.  This leads to stuck hotplug event in the IRQ status register
+triggering hotplug event whenever IRQ is delieverd on the same IRQ.
+As the controller shares the same IRQ for both ports, this happens on
+every IO if one port is occpupied and the other isn't.
+
+This patch fixes the problem by making sure that the port is thawed on
+reset-skip path.
+
+bko#11615 reports this problem.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Robert Hancock <hancockrwd@gmail.com>
+Reported-by: Dan Andresan <danyer@gmail.com>
+Reported-by: Arne Woerner <arne_woerner@yahoo.com>
+Reported-by: Stefan Lippers-Hollmann <s.L-H@gmx.de>
+---
+Heh.... this is one convoluted failure case.  The only two drivers
+which have SCR access but doesn't use hardrest are sata_uli and
+sata_nv at this point.  sata_uli doesn't have PHY event or any other
+sticky events, so sata_nv became the one to get hit by this.
+Hopefully, this will put an end to sata_nv reset fiasco.
+
+Thanks.
+
+ drivers/ata/libata-eh.c |    5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/ata/libata-eh.c b/drivers/ata/libata-eh.c
+index ce2ef04..02d47b2 100644
+--- a/drivers/ata/libata-eh.c
++++ b/drivers/ata/libata-eh.c
+@@ -2423,11 +2423,14 @@ int ata_eh_reset(struct ata_link *link, int classify,
+ 		}
+ 
+ 		/* prereset() might have cleared ATA_EH_RESET.  If so,
+-		 * bang classes and return.
++		 * bang classes, thaw and return.
+ 		 */
+ 		if (reset && !(ehc->i.action & ATA_EH_RESET)) {
+ 			ata_for_each_dev(dev, link, ALL)
+ 				classes[dev->devno] = ATA_DEV_NONE;
++			if ((ap->pflags & ATA_PFLAG_FROZEN) &&
++			    ata_is_host_link(link))
++				ata_eh_thaw_port(ap);
+ 			rc = 0;
+ 			goto out;
+ 		}
+
