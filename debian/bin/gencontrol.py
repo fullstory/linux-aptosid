@@ -40,6 +40,14 @@ class Gencontrol(Base):
         ):
             makeflags[i[1]] = data[i[0]]
 
+        data = vars.copy()
+        data.update(config_base)
+
+        for i in (
+            ('kernel-arch', 'KERNEL_ARCH'),
+        ):
+            makeflags[i[1]] = data[i[0]]
+
     def do_arch_packages(self, packages, makefile, arch, vars, makeflags, extra):
         headers_arch = self.templates["control.headers.arch"]
         packages_headers_arch = self.process_packages(headers_arch, vars)
