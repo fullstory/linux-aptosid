@@ -16,7 +16,7 @@ index 61aeb5a..4a1cfca 100644
  W:	http://www.parisc-linux.org/
  T:	git kernel.org:/pub/scm/linux/kernel/git/kyle/parisc-2.6.git
 diff --git a/Makefile b/Makefile
-index 2e2f4a4..87faba3 100644
+index 2e2f4a4..3c53a7b 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -1,7 +1,7 @@
@@ -24,10 +24,761 @@ index 2e2f4a4..87faba3 100644
  PATCHLEVEL = 6
  SUBLEVEL = 29
 -EXTRAVERSION = -rc8
-+EXTRAVERSION = -rc8-git1
++EXTRAVERSION = -rc8-git2
  NAME = Erotic Pickled Herring
  
  # *DOCUMENTATION*
+diff --git a/arch/arm/kernel/entry-common.S b/arch/arm/kernel/entry-common.S
+index 49a6ba9..159d041 100644
+--- a/arch/arm/kernel/entry-common.S
++++ b/arch/arm/kernel/entry-common.S
+@@ -111,6 +111,7 @@ ENTRY(mcount)
+ 	.globl mcount_call
+ mcount_call:
+ 	bl ftrace_stub
++	ldr lr, [fp, #-4]			@ restore lr
+ 	ldmia sp!, {r0-r3, pc}
+ 
+ ENTRY(ftrace_caller)
+@@ -122,6 +123,7 @@ ENTRY(ftrace_caller)
+ 	.globl ftrace_call
+ ftrace_call:
+ 	bl ftrace_stub
++	ldr lr, [fp, #-4]			@ restore lr
+ 	ldmia sp!, {r0-r3, pc}
+ 
+ #else
+@@ -133,6 +135,7 @@ ENTRY(mcount)
+ 	adr r0, ftrace_stub
+ 	cmp r0, r2
+ 	bne trace
++	ldr lr, [fp, #-4]			@ restore lr
+ 	ldmia sp!, {r0-r3, pc}
+ 
+ trace:
+@@ -141,6 +144,7 @@ trace:
+ 	sub r0, r0, #MCOUNT_INSN_SIZE
+ 	mov lr, pc
+ 	mov pc, r2
++	mov lr, r1				@ restore lr
+ 	ldmia sp!, {r0-r3, pc}
+ 
+ #endif /* CONFIG_DYNAMIC_FTRACE */
+diff --git a/arch/arm/kernel/fiq.c b/arch/arm/kernel/fiq.c
+index 36f81d9..6ff7919 100644
+--- a/arch/arm/kernel/fiq.c
++++ b/arch/arm/kernel/fiq.c
+@@ -88,7 +88,7 @@ void set_fiq_handler(void *start, unsigned int length)
+  * disable irqs for the duration.  Note - these functions are almost
+  * entirely coded in assembly.
+  */
+-void __attribute__((naked)) set_fiq_regs(struct pt_regs *regs)
++void __naked set_fiq_regs(struct pt_regs *regs)
+ {
+ 	register unsigned long tmp;
+ 	asm volatile (
+@@ -106,7 +106,7 @@ void __attribute__((naked)) set_fiq_regs(struct pt_regs *regs)
+ 	: "r" (&regs->ARM_r8), "I" (PSR_I_BIT | PSR_F_BIT | FIQ_MODE));
+ }
+ 
+-void __attribute__((naked)) get_fiq_regs(struct pt_regs *regs)
++void __naked get_fiq_regs(struct pt_regs *regs)
+ {
+ 	register unsigned long tmp;
+ 	asm volatile (
+diff --git a/arch/arm/mach-ep93xx/include/mach/platform.h b/arch/arm/mach-ep93xx/include/mach/platform.h
+index 88f7e88..05f0f4f 100644
+--- a/arch/arm/mach-ep93xx/include/mach/platform.h
++++ b/arch/arm/mach-ep93xx/include/mach/platform.h
+@@ -4,6 +4,8 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++struct i2c_board_info;
++
+ struct ep93xx_eth_data
+ {
+ 	unsigned char	dev_addr[6];
+diff --git a/arch/arm/mach-mx1/devices.c b/arch/arm/mach-mx1/devices.c
+index 686d8d2..a956441 100644
+--- a/arch/arm/mach-mx1/devices.c
++++ b/arch/arm/mach-mx1/devices.c
+@@ -23,6 +23,8 @@
+ #include <linux/init.h>
+ #include <linux/platform_device.h>
+ #include <linux/gpio.h>
++
++#include <mach/irqs.h>
+ #include <mach/hardware.h>
+ 
+ static struct resource imx_csi_resources[] = {
+diff --git a/arch/arm/mach-mx1/mx1ads.c b/arch/arm/mach-mx1/mx1ads.c
+index 2e4b185..3200cf6 100644
+--- a/arch/arm/mach-mx1/mx1ads.c
++++ b/arch/arm/mach-mx1/mx1ads.c
+@@ -21,6 +21,7 @@
+ #include <asm/mach/arch.h>
+ #include <asm/mach/time.h>
+ 
++#include <mach/irqs.h>
+ #include <mach/hardware.h>
+ #include <mach/common.h>
+ #include <mach/imx-uart.h>
+diff --git a/arch/arm/mach-omap2/board-omap3beagle.c b/arch/arm/mach-omap2/board-omap3beagle.c
+index 38c88fb..e39cd2c 100644
+--- a/arch/arm/mach-omap2/board-omap3beagle.c
++++ b/arch/arm/mach-omap2/board-omap3beagle.c
+@@ -178,7 +178,9 @@ static int __init omap3_beagle_i2c_init(void)
+ #ifdef CONFIG_I2C2_OMAP_BEAGLE
+ 	omap_register_i2c_bus(2, 400, NULL, 0);
+ #endif
+-	omap_register_i2c_bus(3, 400, NULL, 0);
++	/* Bus 3 is attached to the DVI port where devices like the pico DLP
++	 * projector don't work reliably with 400kHz */
++	omap_register_i2c_bus(3, 100, NULL, 0);
+ 	return 0;
+ }
+ 
+diff --git a/arch/arm/mach-orion5x/common.c b/arch/arm/mach-orion5x/common.c
+index 0a62337..8a0e49d 100644
+--- a/arch/arm/mach-orion5x/common.c
++++ b/arch/arm/mach-orion5x/common.c
+@@ -431,6 +431,10 @@ void __init orion5x_uart1_init(void)
+ /*****************************************************************************
+  * XOR engine
+  ****************************************************************************/
++struct mv_xor_platform_shared_data orion5x_xor_shared_data = {
++	.dram		= &orion5x_mbus_dram_info,
++};
++
+ static struct resource orion5x_xor_shared_resources[] = {
+ 	{
+ 		.name	= "xor low",
+@@ -448,6 +452,9 @@ static struct resource orion5x_xor_shared_resources[] = {
+ static struct platform_device orion5x_xor_shared = {
+ 	.name		= MV_XOR_SHARED_NAME,
+ 	.id		= 0,
++	.dev		= {
++		.platform_data	= &orion5x_xor_shared_data,
++	},
+ 	.num_resources	= ARRAY_SIZE(orion5x_xor_shared_resources),
+ 	.resource	= orion5x_xor_shared_resources,
+ };
+diff --git a/arch/arm/mach-s3c6410/mach-smdk6410.c b/arch/arm/mach-s3c6410/mach-smdk6410.c
+index 3c4d471..25f7935 100644
+--- a/arch/arm/mach-s3c6410/mach-smdk6410.c
++++ b/arch/arm/mach-s3c6410/mach-smdk6410.c
+@@ -129,7 +129,7 @@ static struct s3c_fb_platdata smdk6410_lcd_pdata __initdata = {
+ 	.vidcon1	= VIDCON1_INV_HSYNC | VIDCON1_INV_VSYNC,
+ };
+ 
+-struct map_desc smdk6410_iodesc[] = {};
++static struct map_desc smdk6410_iodesc[] = {};
+ 
+ static struct platform_device *smdk6410_devices[] __initdata = {
+ #ifdef CONFIG_SMDK6410_SD_CH0
+@@ -146,7 +146,7 @@ static struct platform_device *smdk6410_devices[] __initdata = {
+ 
+ static struct i2c_board_info i2c_devs0[] __initdata = {
+ 	{ I2C_BOARD_INFO("24c08", 0x50), },
+-	{ I2C_BOARD_INFO("WM8580", 0X1b), },
++	{ I2C_BOARD_INFO("wm8580", 0x1b), },
+ };
+ 
+ static struct i2c_board_info i2c_devs1[] __initdata = {
+diff --git a/arch/arm/mm/copypage-feroceon.c b/arch/arm/mm/copypage-feroceon.c
+index c3ba6a9..70997d5 100644
+--- a/arch/arm/mm/copypage-feroceon.c
++++ b/arch/arm/mm/copypage-feroceon.c
+@@ -13,7 +13,7 @@
+ #include <linux/init.h>
+ #include <linux/highmem.h>
+ 
+-static void __attribute__((naked))
++static void __naked
+ feroceon_copy_user_page(void *kto, const void *kfrom)
+ {
+ 	asm("\
+diff --git a/arch/arm/mm/copypage-v3.c b/arch/arm/mm/copypage-v3.c
+index 70ed96c..de9c068 100644
+--- a/arch/arm/mm/copypage-v3.c
++++ b/arch/arm/mm/copypage-v3.c
+@@ -15,7 +15,7 @@
+  *
+  * FIXME: do we need to handle cache stuff...
+  */
+-static void __attribute__((naked))
++static void __naked
+ v3_copy_user_page(void *kto, const void *kfrom)
+ {
+ 	asm("\n\
+diff --git a/arch/arm/mm/copypage-v4mc.c b/arch/arm/mm/copypage-v4mc.c
+index 1601698..7370a71 100644
+--- a/arch/arm/mm/copypage-v4mc.c
++++ b/arch/arm/mm/copypage-v4mc.c
+@@ -44,7 +44,7 @@ static DEFINE_SPINLOCK(minicache_lock);
+  * instruction.  If your processor does not supply this, you have to write your
+  * own copy_user_highpage that does the right thing.
+  */
+-static void __attribute__((naked))
++static void __naked
+ mc_copy_user_page(void *from, void *to)
+ {
+ 	asm volatile(
+diff --git a/arch/arm/mm/copypage-v4wb.c b/arch/arm/mm/copypage-v4wb.c
+index 3ec93da..9ab0984 100644
+--- a/arch/arm/mm/copypage-v4wb.c
++++ b/arch/arm/mm/copypage-v4wb.c
+@@ -22,7 +22,7 @@
+  * instruction.  If your processor does not supply this, you have to write your
+  * own copy_user_highpage that does the right thing.
+  */
+-static void __attribute__((naked))
++static void __naked
+ v4wb_copy_user_page(void *kto, const void *kfrom)
+ {
+ 	asm("\
+diff --git a/arch/arm/mm/copypage-v4wt.c b/arch/arm/mm/copypage-v4wt.c
+index 0f1188e..300efaf 100644
+--- a/arch/arm/mm/copypage-v4wt.c
++++ b/arch/arm/mm/copypage-v4wt.c
+@@ -20,7 +20,7 @@
+  * dirty data in the cache.  However, we do have to ensure that
+  * subsequent reads are up to date.
+  */
+-static void __attribute__((naked))
++static void __naked
+ v4wt_copy_user_page(void *kto, const void *kfrom)
+ {
+ 	asm("\
+diff --git a/arch/arm/mm/copypage-xsc3.c b/arch/arm/mm/copypage-xsc3.c
+index 39a9945..bc4525f 100644
+--- a/arch/arm/mm/copypage-xsc3.c
++++ b/arch/arm/mm/copypage-xsc3.c
+@@ -29,7 +29,7 @@
+  * if we eventually end up using our copied page.
+  *
+  */
+-static void __attribute__((naked))
++static void __naked
+ xsc3_mc_copy_user_page(void *kto, const void *kfrom)
+ {
+ 	asm("\
+diff --git a/arch/arm/mm/copypage-xscale.c b/arch/arm/mm/copypage-xscale.c
+index d18f239..76824d3 100644
+--- a/arch/arm/mm/copypage-xscale.c
++++ b/arch/arm/mm/copypage-xscale.c
+@@ -42,7 +42,7 @@ static DEFINE_SPINLOCK(minicache_lock);
+  * Dcache aliasing issue.  The writes will be forwarded to the write buffer,
+  * and merged as appropriate.
+  */
+-static void __attribute__((naked))
++static void __naked
+ mc_copy_user_page(void *from, void *to)
+ {
+ 	/*
+diff --git a/arch/arm/mm/dma-mapping.c b/arch/arm/mm/dma-mapping.c
+index 310e479..f1ef561 100644
+--- a/arch/arm/mm/dma-mapping.c
++++ b/arch/arm/mm/dma-mapping.c
+@@ -490,26 +490,30 @@ core_initcall(consistent_init);
+  */
+ void dma_cache_maint(const void *start, size_t size, int direction)
+ {
+-	const void *end = start + size;
++	void (*inner_op)(const void *, const void *);
++	void (*outer_op)(unsigned long, unsigned long);
+ 
+-	BUG_ON(!virt_addr_valid(start) || !virt_addr_valid(end - 1));
++	BUG_ON(!virt_addr_valid(start) || !virt_addr_valid(start + size - 1));
+ 
+ 	switch (direction) {
+ 	case DMA_FROM_DEVICE:		/* invalidate only */
+-		dmac_inv_range(start, end);
+-		outer_inv_range(__pa(start), __pa(end));
++		inner_op = dmac_inv_range;
++		outer_op = outer_inv_range;
+ 		break;
+ 	case DMA_TO_DEVICE:		/* writeback only */
+-		dmac_clean_range(start, end);
+-		outer_clean_range(__pa(start), __pa(end));
++		inner_op = dmac_clean_range;
++		outer_op = outer_clean_range;
+ 		break;
+ 	case DMA_BIDIRECTIONAL:		/* writeback and invalidate */
+-		dmac_flush_range(start, end);
+-		outer_flush_range(__pa(start), __pa(end));
++		inner_op = dmac_flush_range;
++		outer_op = outer_flush_range;
+ 		break;
+ 	default:
+ 		BUG();
+ 	}
++
++	inner_op(start, start + size);
++	outer_op(__pa(start), __pa(start) + size);
+ }
+ EXPORT_SYMBOL(dma_cache_maint);
+ 
+diff --git a/arch/arm/mm/init.c b/arch/arm/mm/init.c
+index 34df4d9..80fd3b6 100644
+--- a/arch/arm/mm/init.c
++++ b/arch/arm/mm/init.c
+@@ -382,7 +382,7 @@ void __init bootmem_init(void)
+ 	for_each_node(node)
+ 		bootmem_free_node(node, mi);
+ 
+-	high_memory = __va(memend_pfn << PAGE_SHIFT);
++	high_memory = __va((memend_pfn << PAGE_SHIFT) - 1) + 1;
+ 
+ 	/*
+ 	 * This doesn't seem to be used by the Linux memory manager any
+diff --git a/arch/arm/mm/mmap.c b/arch/arm/mm/mmap.c
+index 5358fcc..f7457fe 100644
+--- a/arch/arm/mm/mmap.c
++++ b/arch/arm/mm/mmap.c
+@@ -124,7 +124,7 @@ int valid_phys_addr_range(unsigned long addr, size_t size)
+ {
+ 	if (addr < PHYS_OFFSET)
+ 		return 0;
+-	if (addr + size > __pa(high_memory))
++	if (addr + size >= __pa(high_memory - 1))
+ 		return 0;
+ 
+ 	return 1;
+diff --git a/arch/arm/plat-omap/Makefile b/arch/arm/plat-omap/Makefile
+index deaff58..04a100c 100644
+--- a/arch/arm/plat-omap/Makefile
++++ b/arch/arm/plat-omap/Makefile
+@@ -18,7 +18,8 @@ obj-$(CONFIG_CPU_FREQ) += cpu-omap.o
+ obj-$(CONFIG_OMAP_DM_TIMER) += dmtimer.o
+ obj-$(CONFIG_OMAP_DEBUG_DEVICES) += debug-devices.o
+ obj-$(CONFIG_OMAP_DEBUG_LEDS) += debug-leds.o
+-obj-$(CONFIG_I2C_OMAP) += i2c.o
++i2c-omap-$(CONFIG_I2C_OMAP) := i2c.o
++obj-y += $(i2c-omap-m) $(i2c-omap-y)
+ 
+ # OMAP mailbox framework
+ obj-$(CONFIG_OMAP_MBOX_FWK) += mailbox.o
+diff --git a/arch/arm/plat-omap/common.c b/arch/arm/plat-omap/common.c
+index 0843b88..6825fbb 100644
+--- a/arch/arm/plat-omap/common.c
++++ b/arch/arm/plat-omap/common.c
+@@ -200,20 +200,16 @@ static struct clocksource clocksource_32k = {
+ };
+ 
+ /*
+- * Rounds down to nearest nsec.
+- */
+-unsigned long long omap_32k_ticks_to_nsecs(unsigned long ticks_32k)
+-{
+-	return cyc2ns(&clocksource_32k, ticks_32k);
+-}
+-
+-/*
+  * Returns current time from boot in nsecs. It's OK for this to wrap
+  * around for now, as it's just a relative time stamp.
+  */
+ unsigned long long sched_clock(void)
+ {
+-	return omap_32k_ticks_to_nsecs(omap_32k_read());
++	unsigned long long ret;
++
++	ret = (unsigned long long)omap_32k_read();
++	ret = (ret * clocksource_32k.mult_orig) >> clocksource_32k.shift;
++	return ret;
+ }
+ 
+ static int __init omap_init_clocksource_32k(void)
+diff --git a/arch/arm/plat-omap/include/mach/common.h b/arch/arm/plat-omap/include/mach/common.h
+index ef70e2b..e746ec7 100644
+--- a/arch/arm/plat-omap/include/mach/common.h
++++ b/arch/arm/plat-omap/include/mach/common.h
+@@ -35,7 +35,7 @@ extern void omap_map_common_io(void);
+ extern struct sys_timer omap_timer;
+ extern void omap_serial_init(void);
+ extern void omap_serial_enable_clocks(int enable);
+-#ifdef CONFIG_I2C_OMAP
++#if defined(CONFIG_I2C_OMAP) || defined(CONFIG_I2C_OMAP_MODULE)
+ extern int omap_register_i2c_bus(int bus_id, u32 clkrate,
+ 				 struct i2c_board_info const *info,
+ 				 unsigned len);
+diff --git a/arch/arm/plat-omap/include/mach/pm.h b/arch/arm/plat-omap/include/mach/pm.h
+index 2a9c27a..37e2f0f 100644
+--- a/arch/arm/plat-omap/include/mach/pm.h
++++ b/arch/arm/plat-omap/include/mach/pm.h
+@@ -108,7 +108,7 @@
+ 	!defined(CONFIG_ARCH_OMAP15XX) && \
+ 	!defined(CONFIG_ARCH_OMAP16XX) && \
+ 	!defined(CONFIG_ARCH_OMAP24XX)
+-#error "Power management for this processor not implemented yet"
++#warning "Power management for this processor not implemented yet"
+ #endif
+ 
+ #ifndef __ASSEMBLER__
+diff --git a/arch/arm/plat-s3c64xx/clock.c b/arch/arm/plat-s3c64xx/clock.c
+index 136c982..ad1b968 100644
+--- a/arch/arm/plat-s3c64xx/clock.c
++++ b/arch/arm/plat-s3c64xx/clock.c
+@@ -248,7 +248,7 @@ static struct clk *clks[] __initdata = {
+ 	&clk_48m,
+ };
+ 
+-void s3c64xx_register_clocks(void)
++void __init s3c64xx_register_clocks(void)
+ {
+ 	struct clk *clkp;
+ 	int ret;
+diff --git a/arch/arm/plat-s3c64xx/gpiolib.c b/arch/arm/plat-s3c64xx/gpiolib.c
+index cc62941..ee9188a 100644
+--- a/arch/arm/plat-s3c64xx/gpiolib.c
++++ b/arch/arm/plat-s3c64xx/gpiolib.c
+@@ -417,4 +417,4 @@ static __init int s3c64xx_gpiolib_init(void)
+ 	return 0;
+ }
+ 
+-arch_initcall(s3c64xx_gpiolib_init);
++core_initcall(s3c64xx_gpiolib_init);
+diff --git a/arch/arm/plat-s3c64xx/include/plat/irqs.h b/arch/arm/plat-s3c64xx/include/plat/irqs.h
+index 2846f55..f865bf4 100644
+--- a/arch/arm/plat-s3c64xx/include/plat/irqs.h
++++ b/arch/arm/plat-s3c64xx/include/plat/irqs.h
+@@ -117,7 +117,7 @@
+ #define IRQ_ONENAND1		S3C64XX_IRQ_VIC1(12)
+ #define IRQ_NFC			S3C64XX_IRQ_VIC1(13)
+ #define IRQ_CFCON		S3C64XX_IRQ_VIC1(14)
+-#define IRQ_UHOST		S3C64XX_IRQ_VIC1(15)
++#define IRQ_USBH		S3C64XX_IRQ_VIC1(15)
+ #define IRQ_SPI0		S3C64XX_IRQ_VIC1(16)
+ #define IRQ_SPI1		S3C64XX_IRQ_VIC1(17)
+ #define IRQ_IIC			S3C64XX_IRQ_VIC1(18)
+diff --git a/arch/arm/plat-s3c64xx/irq-eint.c b/arch/arm/plat-s3c64xx/irq-eint.c
+index ebb305c..cf52482 100644
+--- a/arch/arm/plat-s3c64xx/irq-eint.c
++++ b/arch/arm/plat-s3c64xx/irq-eint.c
+@@ -14,12 +14,15 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/interrupt.h>
++#include <linux/gpio.h>
+ #include <linux/irq.h>
+ #include <linux/io.h>
+ 
+ #include <asm/hardware/vic.h>
+ 
+ #include <plat/regs-irqtype.h>
++#include <plat/regs-gpio.h>
++#include <plat/gpio-cfg.h>
+ 
+ #include <mach/map.h>
+ #include <plat/cpu.h>
+@@ -74,6 +77,7 @@ static void s3c_irq_eint_maskack(unsigned int irq)
+ static int s3c_irq_eint_set_type(unsigned int irq, unsigned int type)
+ {
+ 	int offs = eint_offset(irq);
++	int pin;
+ 	int shift;
+ 	u32 ctrl, mask;
+ 	u32 newvalue = 0;
+@@ -125,6 +129,15 @@ static int s3c_irq_eint_set_type(unsigned int irq, unsigned int type)
+ 	ctrl |= newvalue << shift;
+ 	__raw_writel(ctrl, reg);
+ 
++	/* set the GPIO pin appropriately */
++
++	if (offs < 23)
++		pin = S3C64XX_GPN(offs);
++	else
++		pin = S3C64XX_GPM(offs - 23);
++
++	s3c_gpio_cfgpin(pin, S3C_GPIO_SFN(2));
++
+ 	return 0;
+ }
+ 
+@@ -181,7 +194,7 @@ static void s3c_irq_demux_eint20_27(unsigned int irq, struct irq_desc *desc)
+ 	s3c_irq_demux_eint(20, 27);
+ }
+ 
+-int __init s3c64xx_init_irq_eint(void)
++static int __init s3c64xx_init_irq_eint(void)
+ {
+ 	int irq;
+ 
+diff --git a/arch/arm/plat-s3c64xx/irq.c b/arch/arm/plat-s3c64xx/irq.c
+index a94f1d5..f22edf7 100644
+--- a/arch/arm/plat-s3c64xx/irq.c
++++ b/arch/arm/plat-s3c64xx/irq.c
+@@ -207,7 +207,7 @@ static struct irq_chip s3c_irq_uart = {
+ 
+ static void __init s3c64xx_uart_irq(struct uart_irq *uirq)
+ {
+-	void *reg_base = uirq->regs;
++	void __iomem *reg_base = uirq->regs;
+ 	unsigned int irq;
+ 	int offs;
+ 
+diff --git a/arch/arm/plat-s3c64xx/s3c6400-clock.c b/arch/arm/plat-s3c64xx/s3c6400-clock.c
+index 8d9a0ca..05b1752 100644
+--- a/arch/arm/plat-s3c64xx/s3c6400-clock.c
++++ b/arch/arm/plat-s3c64xx/s3c6400-clock.c
+@@ -36,7 +36,7 @@
+  * ext_xtal_mux for want of an actual name from the manual.
+ */
+ 
+-struct clk clk_ext_xtal_mux = {
++static struct clk clk_ext_xtal_mux = {
+ 	.name		= "ext_xtal",
+ 	.id		= -1,
+ };
+@@ -63,7 +63,7 @@ struct clksrc_clk {
+ 	void __iomem		*reg_divider;
+ };
+ 
+-struct clk clk_fout_apll = {
++static struct clk clk_fout_apll = {
+ 	.name		= "fout_apll",
+ 	.id		= -1,
+ };
+@@ -78,7 +78,7 @@ static struct clk_sources clk_src_apll = {
+ 	.nr_sources	= ARRAY_SIZE(clk_src_apll_list),
+ };
+ 
+-struct clksrc_clk clk_mout_apll = {
++static struct clksrc_clk clk_mout_apll = {
+ 	.clk	= {
+ 		.name		= "mout_apll",
+ 		.id		= -1,
+@@ -88,7 +88,7 @@ struct clksrc_clk clk_mout_apll = {
+ 	.sources	= &clk_src_apll,
+ };
+ 
+-struct clk clk_fout_epll = {
++static struct clk clk_fout_epll = {
+ 	.name		= "fout_epll",
+ 	.id		= -1,
+ };
+@@ -103,7 +103,7 @@ static struct clk_sources clk_src_epll = {
+ 	.nr_sources	= ARRAY_SIZE(clk_src_epll_list),
+ };
+ 
+-struct clksrc_clk clk_mout_epll = {
++static struct clksrc_clk clk_mout_epll = {
+ 	.clk	= {
+ 		.name		= "mout_epll",
+ 		.id		= -1,
+@@ -123,7 +123,7 @@ static struct clk_sources clk_src_mpll = {
+ 	.nr_sources	= ARRAY_SIZE(clk_src_mpll_list),
+ };
+ 
+-struct clksrc_clk clk_mout_mpll = {
++static struct clksrc_clk clk_mout_mpll = {
+ 	.clk = {
+ 		.name		= "mout_mpll",
+ 		.id		= -1,
+@@ -145,7 +145,7 @@ static unsigned long s3c64xx_clk_doutmpll_get_rate(struct clk *clk)
+ 	return rate;
+ }
+ 
+-struct clk clk_dout_mpll = {
++static struct clk clk_dout_mpll = {
+ 	.name		= "dout_mpll",
+ 	.id		= -1,
+ 	.parent		= &clk_mout_mpll.clk,
+@@ -189,10 +189,10 @@ static struct clk_sources clkset_uart = {
+ };
+ 
+ static struct clk *clkset_uhost_list[] = {
++	&clk_48m,
+ 	&clk_mout_epll.clk,
+ 	&clk_dout_mpll,
+ 	&clk_fin_epll,
+-	&clk_48m,
+ };
+ 
+ static struct clk_sources clkset_uhost = {
+@@ -239,10 +239,12 @@ static int s3c64xx_setrate_clksrc(struct clk *clk, unsigned long rate)
+ 
+ 	rate = clk_round_rate(clk, rate);
+ 	div = clk_get_rate(clk->parent) / rate;
++	if (div > 16)
++		return -EINVAL;
+ 
+ 	val = __raw_readl(reg);
+-	val &= ~sclk->mask;
+-	val |= (rate - 1) << sclk->shift;
++	val &= ~(0xf << sclk->shift);
++	val |= (div - 1) << sclk->shift;
+ 	__raw_writel(val, reg);
+ 
+ 	return 0;
+@@ -351,7 +353,7 @@ static struct clksrc_clk clk_mmc2 = {
+ 
+ static struct clksrc_clk clk_usbhost = {
+ 	.clk	= {
+-		.name		= "usb-host-bus",
++		.name		= "usb-bus-host",
+ 		.id		= -1,
+ 		.ctrlbit        = S3C_CLKCON_SCLK_UHOST,
+ 		.enable		= s3c64xx_sclk_ctrl,
+diff --git a/arch/arm/tools/mach-types b/arch/arm/tools/mach-types
+index fd23c0e..b4211d8 100644
+--- a/arch/arm/tools/mach-types
++++ b/arch/arm/tools/mach-types
+@@ -12,7 +12,7 @@
+ #
+ #   http://www.arm.linux.org.uk/developer/machines/?action=new
+ #
+-# Last update: Sun Nov 30 16:39:36 2008
++# Last update: Thu Mar 12 18:01:45 2009
+ #
+ # machine_is_xxx	CONFIG_xxxx		MACH_TYPE_xxx		number
+ #
+@@ -1811,7 +1811,7 @@ pilz_pmi5		MACH_PILZ_PMI5		PILZ_PMI5		1820
+ jade			MACH_JADE		JADE			1821
+ ks8695_softplc		MACH_KS8695_SOFTPLC	KS8695_SOFTPLC		1822
+ gprisc3			MACH_GPRISC3		GPRISC3			1823
+-stamp9260		MACH_STAMP9260		STAMP9260		1824
++stamp9g20		MACH_STAMP9G20		STAMP9G20		1824
+ smdk6430		MACH_SMDK6430		SMDK6430		1825
+ smdkc100		MACH_SMDKC100		SMDKC100		1826
+ tavorevb		MACH_TAVOREVB		TAVOREVB		1827
+@@ -1993,4 +1993,134 @@ spark			MACH_SPARK		SPARK			2002
+ benzina			MACH_BENZINA		BENZINA			2003
+ blaze			MACH_BLAZE		BLAZE			2004
+ linkstation_ls_hgl	MACH_LINKSTATION_LS_HGL	LINKSTATION_LS_HGL	2005
+-htcvenus		MACH_HTCVENUS		HTCVENUS		2006
++htckovsky		MACH_HTCVENUS		HTCVENUS		2006
++sony_prs505		MACH_SONY_PRS505	SONY_PRS505		2007
++hanlin_v3		MACH_HANLIN_V3		HANLIN_V3		2008
++sapphira		MACH_SAPPHIRA		SAPPHIRA		2009
++dack_sda_01		MACH_DACK_SDA_01	DACK_SDA_01		2010
++armbox			MACH_ARMBOX		ARMBOX			2011
++harris_rvp		MACH_HARRIS_RVP		HARRIS_RVP		2012
++ribaldo			MACH_RIBALDO		RIBALDO			2013
++agora			MACH_AGORA		AGORA			2014
++omap3_mini		MACH_OMAP3_MINI		OMAP3_MINI		2015
++a9sam6432_b		MACH_A9SAM6432_B	A9SAM6432_B		2016
++usg2410			MACH_USG2410		USG2410			2017
++pc72052_i10_revb	MACH_PC72052_I10_REVB	PC72052_I10_REVB	2018
++mx35_exm32		MACH_MX35_EXM32		MX35_EXM32		2019
++topas910		MACH_TOPAS910		TOPAS910		2020
++hyena			MACH_HYENA		HYENA			2021
++pospax			MACH_POSPAX		POSPAX			2022
++hdl_gx			MACH_HDL_GX		HDL_GX			2023
++ctera_4bay		MACH_CTERA_4BAY		CTERA_4BAY		2024
++ctera_plug_c		MACH_CTERA_PLUG_C	CTERA_PLUG_C		2025
++crwea_plug_i		MACH_CRWEA_PLUG_I	CRWEA_PLUG_I		2026
++egauge2			MACH_EGAUGE2		EGAUGE2			2027
++didj			MACH_DIDJ		DIDJ			2028
++m_s3c2443		MACH_MEISTER		MEISTER			2029
++htcblackstone		MACH_HTCBLACKSTONE	HTCBLACKSTONE		2030
++cpuat9g20		MACH_CPUAT9G20		CPUAT9G20		2031
++smdk6440		MACH_SMDK6440		SMDK6440		2032
++omap_35xx_mvp		MACH_OMAP_35XX_MVP	OMAP_35XX_MVP		2033
++ctera_plug_i		MACH_CTERA_PLUG_I	CTERA_PLUG_I		2034
++pvg610_100		MACH_PVG610		PVG610			2035
++hprw6815		MACH_HPRW6815		HPRW6815		2036
++omap3_oswald		MACH_OMAP3_OSWALD	OMAP3_OSWALD		2037
++nas4220b		MACH_NAS4220B		NAS4220B		2038
++htcraphael_cdma		MACH_HTCRAPHAEL_CDMA	HTCRAPHAEL_CDMA		2039
++htcdiamond_cdma		MACH_HTCDIAMOND_CDMA	HTCDIAMOND_CDMA		2040
++scaler			MACH_SCALER		SCALER			2041
++zylonite2		MACH_ZYLONITE2		ZYLONITE2		2042
++aspenite		MACH_ASPENITE		ASPENITE		2043
++teton			MACH_TETON		TETON			2044
++ttc_dkb			MACH_TTC_DKB		TTC_DKB			2045
++bishop2			MACH_BISHOP2		BISHOP2			2046
++ippv5			MACH_IPPV5		IPPV5			2047
++farm926			MACH_FARM926		FARM926			2048
++mmccpu			MACH_MMCCPU		MMCCPU			2049
++sgmsfl			MACH_SGMSFL		SGMSFL			2050
++tt8000			MACH_TT8000		TT8000			2051
++zrn4300lp		MACH_ZRN4300LP		ZRN4300LP		2052
++mptc			MACH_MPTC		MPTC			2053
++h6051			MACH_H6051		H6051			2054
++pvg610_101		MACH_PVG610_101		PVG610_101		2055
++stamp9261_pc_evb	MACH_STAMP9261_PC_EVB	STAMP9261_PC_EVB	2056
++pelco_odysseus		MACH_PELCO_ODYSSEUS	PELCO_ODYSSEUS		2057
++tny_a9260		MACH_TNY_A9260		TNY_A9260		2058
++tny_a9g20		MACH_TNY_A9G20		TNY_A9G20		2059
++aesop_mp2530f		MACH_AESOP_MP2530F	AESOP_MP2530F		2060
++dx900			MACH_DX900		DX900			2061
++cpodc2			MACH_CPODC2		CPODC2			2062
++tilt_8925		MACH_TILT_8925		TILT_8925		2063
++davinci_dm357_evm	MACH_DAVINCI_DM357_EVM	DAVINCI_DM357_EVM	2064
++swordfish		MACH_SWORDFISH		SWORDFISH		2065
++corvus			MACH_CORVUS		CORVUS			2066
++taurus			MACH_TAURUS		TAURUS			2067
++axm			MACH_AXM		AXM			2068
++axc			MACH_AXC		AXC			2069
++baby			MACH_BABY		BABY			2070
++mp200			MACH_MP200		MP200			2071
++pcm043			MACH_PCM043		PCM043			2072
++hanlin_v3c		MACH_HANLIN_V3C		HANLIN_V3C		2073
++kbk9g20			MACH_KBK9G20		KBK9G20			2074
++adsturbog5		MACH_ADSTURBOG5		ADSTURBOG5		2075
++avenger_lite1		MACH_AVENGER_LITE1	AVENGER_LITE1		2076
++suc82x			MACH_SUC		SUC			2077
++at91sam7s256		MACH_AT91SAM7S256	AT91SAM7S256		2078
++mendoza			MACH_MENDOZA		MENDOZA			2079
++kira			MACH_KIRA		KIRA			2080
++mx1hbm			MACH_MX1HBM		MX1HBM			2081
++quatro43xx		MACH_QUATRO43XX		QUATRO43XX		2082
++quatro4230		MACH_QUATRO4230		QUATRO4230		2083
++nsb400			MACH_NSB400		NSB400			2084
++drp255			MACH_DRP255		DRP255			2085
++thoth			MACH_THOTH		THOTH			2086
++firestone		MACH_FIRESTONE		FIRESTONE		2087
++asusp750		MACH_ASUSP750		ASUSP750		2088
++ctera_dl		MACH_CTERA_DL		CTERA_DL		2089
++socr			MACH_SOCR		SOCR			2090
++htcoxygen		MACH_HTCOXYGEN		HTCOXYGEN		2091
++heroc			MACH_HEROC		HEROC			2092
++zeno6800		MACH_ZENO6800		ZENO6800		2093
++sc2mcs			MACH_SC2MCS		SC2MCS			2094
++gene100			MACH_GENE100		GENE100			2095
++as353x			MACH_AS353X		AS353X			2096
++sheevaplug		MACH_SHEEVAPLUG		SHEEVAPLUG		2097
++at91sam9g20		MACH_AT91SAM9G20	AT91SAM9G20		2098
++mv88f6192gtw_fe		MACH_MV88F6192GTW_FE	MV88F6192GTW_FE		2099
++cc9200			MACH_CC9200		CC9200			2100
++sm9200			MACH_SM9200		SM9200			2101
++tp9200			MACH_TP9200		TP9200			2102
++snapperdv		MACH_SNAPPERDV		SNAPPERDV		2103
++avengers_lite		MACH_AVENGERS_LITE	AVENGERS_LITE		2104
++avengers_lite1		MACH_AVENGERS_LITE1	AVENGERS_LITE1		2105
++omap3axon		MACH_OMAP3AXON		OMAP3AXON		2106
++ma8xx			MACH_MA8XX		MA8XX			2107
++mp201ek			MACH_MP201EK		MP201EK			2108
++davinci_tux		MACH_DAVINCI_TUX	DAVINCI_TUX		2109
++mpa1600			MACH_MPA1600		MPA1600			2110
++pelco_troy		MACH_PELCO_TROY		PELCO_TROY		2111
++nsb667			MACH_NSB667		NSB667			2112
++rovers5_4mpix		MACH_ROVERS5_4MPIX	ROVERS5_4MPIX		2113
++twocom			MACH_TWOCOM		TWOCOM			2114
++ubisys_p9_rcu3r2	MACH_UBISYS_P9_RCU3R2	UBISYS_P9_RCU3R2	2115
++hero_espresso		MACH_HERO_ESPRESSO	HERO_ESPRESSO		2116
++afeusb			MACH_AFEUSB		AFEUSB			2117
++t830			MACH_T830		T830			2118
++spd8020_cc		MACH_SPD8020_CC		SPD8020_CC		2119
++om_3d7k			MACH_OM_3D7K		OM_3D7K			2120
++picocom2		MACH_PICOCOM2		PICOCOM2		2121
++uwg4mx27		MACH_UWG4MX27		UWG4MX27		2122
++uwg4mx31		MACH_UWG4MX31		UWG4MX31		2123
++cherry			MACH_CHERRY		CHERRY			2124
++mx51_babbage		MACH_MX51_BABBAGE	MX51_BABBAGE		2125
++s3c2440turkiye		MACH_S3C2440TURKIYE	S3C2440TURKIYE		2126
++tx37			MACH_TX37		TX37			2127
++sbc2800_9g20		MACH_SBC2800_9G20	SBC2800_9G20		2128
++benzglb			MACH_BENZGLB		BENZGLB			2129
++benztd			MACH_BENZTD		BENZTD			2130
++cartesio_plus		MACH_CARTESIO_PLUS	CARTESIO_PLUS		2131
++solrad_g20		MACH_SOLRAD_G20		SOLRAD_G20		2132
++mx27wallace		MACH_MX27WALLACE	MX27WALLACE		2133
++fmzwebmodul		MACH_FMZWEBMODUL	FMZWEBMODUL		2134
++rd78x00_masa		MACH_RD78X00_MASA	RD78X00_MASA		2135
++smallogger		MACH_SMALLOGGER		SMALLOGGER		2136
 diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
 index e61465a..206cb79 100644
 --- a/arch/mips/Kconfig
@@ -9286,6 +10037,39 @@ index 7007edd..74b1080 100644
  	return IRQ_RETVAL(handled);
  }
  
+diff --git a/drivers/block/xsysace.c b/drivers/block/xsysace.c
+index 381d686..119be34 100644
+--- a/drivers/block/xsysace.c
++++ b/drivers/block/xsysace.c
+@@ -489,6 +489,28 @@ static void ace_fsm_dostate(struct ace_device *ace)
+ 		ace->fsm_state, ace->id_req_count);
+ #endif
+ 
++	/* Verify that there is actually a CF in the slot. If not, then
++	 * bail out back to the idle state and wake up all the waiters */
++	status = ace_in32(ace, ACE_STATUS);
++	if ((status & ACE_STATUS_CFDETECT) == 0) {
++		ace->fsm_state = ACE_FSM_STATE_IDLE;
++		ace->media_change = 1;
++		set_capacity(ace->gd, 0);
++		dev_info(ace->dev, "No CF in slot\n");
++
++		/* Drop all pending requests */
++		while ((req = elv_next_request(ace->queue)) != NULL)
++			end_request(req, 0);
++
++		/* Drop back to IDLE state and notify waiters */
++		ace->fsm_state = ACE_FSM_STATE_IDLE;
++		ace->id_result = -EIO;
++		while (ace->id_req_count) {
++			complete(&ace->id_completion);
++			ace->id_req_count--;
++		}
++	}
++
+ 	switch (ace->fsm_state) {
+ 	case ACE_FSM_STATE_IDLE:
+ 		/* See if there is anything to do */
 diff --git a/drivers/char/agp/parisc-agp.c b/drivers/char/agp/parisc-agp.c
 index db60539..699e342 100644
 --- a/drivers/char/agp/parisc-agp.c
@@ -9844,10 +10628,10 @@ index d8233de..59fbbf1 100644
  			/* enable on PPB */
  			(void) pci_read_config_byte(bus->self, PCI_BRIDGE_CONTROL, &control);
 diff --git a/drivers/parisc/sba_iommu.c b/drivers/parisc/sba_iommu.c
-index a70cf16..6aad854 100644
+index a70cf16..e5999c4 100644
 --- a/drivers/parisc/sba_iommu.c
 +++ b/drivers/parisc/sba_iommu.c
-@@ -1206,31 +1206,49 @@ sba_alloc_pdir(unsigned int pdir_size)
+@@ -1206,30 +1206,48 @@ sba_alloc_pdir(unsigned int pdir_size)
  	return (void *) pdir_base;
  }
  
@@ -9895,8 +10679,8 @@ index a70cf16..6aad854 100644
 +
 +	device_for_each_child(&sba->dev, &ibase_data,
 +			      setup_ibase_imask_callback);
- }
- 
++}
++
 +#ifdef SBA_AGP_SUPPORT
 +static int
 +sba_ioc_find_quicksilver(struct device *dev, void *data)
@@ -9907,12 +10691,11 @@ index a70cf16..6aad854 100644
 +	if (IS_QUICKSILVER(lba))
 +		*agp_found = 1;
 +	return 0;
-+}
+ }
 +#endif
-+
+ 
  static void
  sba_ioc_init_pluto(struct parisc_device *sba, struct ioc *ioc, int ioc_num)
- {
 @@ -1332,9 +1350,6 @@ sba_ioc_init_pluto(struct parisc_device *sba, struct ioc *ioc, int ioc_num)
  	WRITE_REG(ioc->ibase | 31, ioc->ioc_hpa + IOC_PCOM);
  
@@ -9938,6 +10721,16 @@ index a70cf16..6aad854 100644
  
  	if (agp_found && sba_reserve_agpgart) {
  		printk(KERN_INFO "%s: reserving %dMb of IOVA space for agpgart\n",
+@@ -1358,9 +1367,7 @@ sba_ioc_init_pluto(struct parisc_device *sba, struct ioc *ioc, int ioc_num)
+ 		ioc->pdir_size /= 2;
+ 		ioc->pdir_base[PDIR_INDEX(iova_space_size/2)] = SBA_AGPGART_COOKIE;
+ 	}
+-}
+ #endif /*SBA_AGP_SUPPORT*/
+-
+ }
+ 
+ static void
 diff --git a/drivers/scsi/fcoe/fc_transport_fcoe.c b/drivers/scsi/fcoe/fc_transport_fcoe.c
 index bf7fe6f..8862758 100644
 --- a/drivers/scsi/fcoe/fc_transport_fcoe.c
@@ -13058,6 +13851,52 @@ index a8d61a6..97f3158 100644
  		     dev->irq);
  		goto fail;
  	}
+diff --git a/fs/bio-integrity.c b/fs/bio-integrity.c
+index 549b014..fe2b1aa 100644
+--- a/fs/bio-integrity.c
++++ b/fs/bio-integrity.c
+@@ -685,19 +685,20 @@ EXPORT_SYMBOL(bio_integrity_split);
+  * bio_integrity_clone - Callback for cloning bios with integrity metadata
+  * @bio:	New bio
+  * @bio_src:	Original bio
++ * @gfp_mask:	Memory allocation mask
+  * @bs:		bio_set to allocate bip from
+  *
+  * Description:	Called to allocate a bip when cloning a bio
+  */
+ int bio_integrity_clone(struct bio *bio, struct bio *bio_src,
+-			struct bio_set *bs)
++			gfp_t gfp_mask, struct bio_set *bs)
+ {
+ 	struct bio_integrity_payload *bip_src = bio_src->bi_integrity;
+ 	struct bio_integrity_payload *bip;
+ 
+ 	BUG_ON(bip_src == NULL);
+ 
+-	bip = bio_integrity_alloc_bioset(bio, GFP_NOIO, bip_src->bip_vcnt, bs);
++	bip = bio_integrity_alloc_bioset(bio, gfp_mask, bip_src->bip_vcnt, bs);
+ 
+ 	if (bip == NULL)
+ 		return -EIO;
+diff --git a/fs/bio.c b/fs/bio.c
+index 124b95c..d4f0632 100644
+--- a/fs/bio.c
++++ b/fs/bio.c
+@@ -463,10 +463,12 @@ struct bio *bio_clone(struct bio *bio, gfp_t gfp_mask)
+ 	if (bio_integrity(bio)) {
+ 		int ret;
+ 
+-		ret = bio_integrity_clone(b, bio, fs_bio_set);
++		ret = bio_integrity_clone(b, bio, gfp_mask, fs_bio_set);
+ 
+-		if (ret < 0)
++		if (ret < 0) {
++			bio_put(b);
+ 			return NULL;
++		}
+ 	}
+ 
+ 	return b;
 diff --git a/fs/ecryptfs/crypto.c b/fs/ecryptfs/crypto.c
 index f6caeb1..bdca1f4 100644
 --- a/fs/ecryptfs/crypto.c
@@ -13663,6 +14502,49 @@ index b9b567a..5d7c7ec 100644
  	page_cache_release(pages + loop);
  	for (loop++; loop < npages; loop++)
  		__free_page(pages + loop);
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index 1b16108..d8bd43b 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -531,7 +531,7 @@ extern void bio_integrity_endio(struct bio *, int);
+ extern void bio_integrity_advance(struct bio *, unsigned int);
+ extern void bio_integrity_trim(struct bio *, unsigned int, unsigned int);
+ extern void bio_integrity_split(struct bio *, struct bio_pair *, int);
+-extern int bio_integrity_clone(struct bio *, struct bio *, struct bio_set *);
++extern int bio_integrity_clone(struct bio *, struct bio *, gfp_t, struct bio_set *);
+ extern int bioset_integrity_create(struct bio_set *, int);
+ extern void bioset_integrity_free(struct bio_set *);
+ extern void bio_integrity_init_slab(void);
+@@ -542,7 +542,7 @@ extern void bio_integrity_init_slab(void);
+ #define bioset_integrity_create(a, b)	(0)
+ #define bio_integrity_prep(a)		(0)
+ #define bio_integrity_enabled(a)	(0)
+-#define bio_integrity_clone(a, b, c)	(0)
++#define bio_integrity_clone(a, b, c,d )	(0)
+ #define bioset_integrity_free(a)	do { } while (0)
+ #define bio_integrity_free(a, b)	do { } while (0)
+ #define bio_integrity_endio(a, b)	do { } while (0)
+diff --git a/include/linux/compiler-gcc.h b/include/linux/compiler-gcc.h
+index 1514d53..a3ed7cb 100644
+--- a/include/linux/compiler-gcc.h
++++ b/include/linux/compiler-gcc.h
+@@ -52,7 +52,15 @@
+ #define __deprecated			__attribute__((deprecated))
+ #define __packed			__attribute__((packed))
+ #define __weak				__attribute__((weak))
+-#define __naked				__attribute__((naked))
++
++/*
++ * it doesn't make sense on ARM (currently the only user of __naked) to trace
++ * naked functions because then mcount is called without stack and frame pointer
++ * being set up and there is no chance to restore the lr register to the value
++ * before mcount was called.
++ */
++#define __naked				__attribute__((naked)) notrace
++
+ #define __noreturn			__attribute__((noreturn))
+ 
+ /*
 diff --git a/include/linux/ide.h b/include/linux/ide.h
 index e0cedfe..25087ae 100644
 --- a/include/linux/ide.h

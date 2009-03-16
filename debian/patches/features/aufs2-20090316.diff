@@ -1,9 +1,9 @@
 diff --git a/Documentation/filesystems/aufs/README b/Documentation/filesystems/aufs/README
 new file mode 100644
-index 0000000..f381b27
+index 0000000..727af03
 --- /dev/null
 +++ b/Documentation/filesystems/aufs/README
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,251 @@
 +
 +Aufs2 -- advanced multi layered unification filesystem version 2
 +http://aufs.sf.net
@@ -90,6 +90,19 @@ index 0000000..f381b27
 +- statistics of aufs thread (/sys/fs/aufs/stat)
 +- delegation mode (dlgt)
 +- intent.open/create (file open in a single lookup)
++
++Features or just an idea in the future (see also design/*.txt),
++- reorder the branch index without del/re-add.
++- permanent xino files
++- an option for refreshing the opened files after add/del branches
++- 'move' policy for copy-up between two writable branches, after
++  checking free space.
++- remount option copy/move between two branches. (almost done)
++- O_DIRECT
++- light version, without branch manipulation. (unnecessary?)
++- copyup in userspace
++- inotify in userspace
++- xattr, acl
 +
 +
 +2. Download
@@ -2376,10 +2389,10 @@ index 0000000..b172cd1
 +  is called.
 diff --git a/Documentation/filesystems/aufs/design/07mmap.txt b/Documentation/filesystems/aufs/design/07mmap.txt
 new file mode 100644
-index 0000000..17987a3
+index 0000000..d751c42
 --- /dev/null
 +++ b/Documentation/filesystems/aufs/design/07mmap.txt
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,44 @@
 +
 +# Copyright (C) 2005-2009 Junjiro R. Okajima
 +# 
@@ -2416,8 +2429,9 @@ index 0000000..17987a3
 +refresh the opened files or not. See plan.txt too.)
 +In this case, an already mapped file will not be updated since the
 +contents are a part of a process already and it should not be changed by
-+aufs branch manipulation. Of course, in case of the deleting branch has a
-+busy file, it cannot be deleted from the union.
++aufs branch manipulation. (Even if MAP_SHARED is specified, currently).
++Of course, in case of the deleting branch has a busy file, it cannot be
++deleted from the union.
 +
 +In Unionfs, it took an approach which the memory pages mapped to
 +filedata are copied from the lower (real) file into the Unionfs's
@@ -2611,10 +2625,10 @@ index 93945dd..75156dd 100644
  endif # MISC_FILESYSTEMS
  
 diff --git a/fs/Makefile b/fs/Makefile
-index 38bc735..d6e2810 100644
+index dc20db3..a4e9a65 100644
 --- a/fs/Makefile
 +++ b/fs/Makefile
-@@ -122,3 +122,4 @@ obj-$(CONFIG_DEBUG_FS)		+= debugfs/
+@@ -124,3 +124,4 @@ obj-$(CONFIG_DEBUG_FS)		+= debugfs/
  obj-$(CONFIG_OCFS2_FS)		+= ocfs2/
  obj-$(CONFIG_BTRFS_FS)		+= btrfs/
  obj-$(CONFIG_GFS2_FS)           += gfs2/
@@ -9293,7 +9307,7 @@ index 0000000..3004054
 +#endif /* __AUFS_FILE_H__ */
 diff --git a/fs/aufs/finfo.c b/fs/aufs/finfo.c
 new file mode 100644
-index 0000000..49141cb
+index 0000000..49c4934
 --- /dev/null
 +++ b/fs/aufs/finfo.c
 @@ -0,0 +1,126 @@
@@ -9373,7 +9387,7 @@ index 0000000..49141cb
 +	struct au_finfo *finfo;
 +	struct dentry *dentry;
 +	union {
-+		void *p;
++		unsigned int u;
 +		fmode_t m;
 +	} u;
 +
@@ -9395,7 +9409,7 @@ index 0000000..49141cb
 +	/* smp_mb(); */ /* atomic_set */
 +
 +	/* cf. au_store_oflag() */
-+	u.p = file->private_data;
++	u.u = (unsigned int)file->private_data;
 +	file->f_mode |= (u.m & FMODE_EXEC);
 +	file->private_data = finfo;
 +	return 0; /* success */
@@ -17362,7 +17376,7 @@ index 0000000..89ea7a2
 +#endif /* __AUFS_SPL_H__ */
 diff --git a/fs/aufs/super.c b/fs/aufs/super.c
 new file mode 100644
-index 0000000..646bf82
+index 0000000..700f8c8
 --- /dev/null
 +++ b/fs/aufs/super.c
 @@ -0,0 +1,846 @@
@@ -17525,7 +17539,7 @@ index 0000000..646bf82
 +	if (d->d_parent == h_root
 +	    && name->len == len
 +	    && !memcmp(name->name, AUFS_XINO_FNAME, len))
-+		   goto out;
++		goto out;
 +
 +	seq_puts(seq, ",xino=");
 +	err = au_xino_path(seq, f);
@@ -19886,10 +19900,10 @@ index 0000000..b0580c2
 +}
 diff --git a/fs/aufs/vfsub.c b/fs/aufs/vfsub.c
 new file mode 100644
-index 0000000..a5d175c
+index 0000000..34359cd
 --- /dev/null
 +++ b/fs/aufs/vfsub.c
-@@ -0,0 +1,709 @@
+@@ -0,0 +1,716 @@
 +/*
 + * Copyright (C) 2005-2009 Junjiro R. Okajima
 + *
@@ -20040,7 +20054,9 @@ index 0000000..a5d175c
 +
 +		memset(&h_nd, 0, sizeof(h_nd));
 +		h_nd.flags = LOOKUP_CREATE;
-+		h_nd.intent.open.flags = O_CREAT | FMODE_READ;
++		/* cf. fs/namei.c:open_to_namei_flags() */
++		h_nd.intent.open.flags = O_CREAT | O_RDONLY;
++		h_nd.intent.open.flags++;
 +		h_nd.intent.open.create_mode = mode;
 +		h_nd.path.dentry = path->dentry->d_parent;
 +		h_nd.path.mnt = path->mnt;
@@ -20362,6 +20378,10 @@ index 0000000..a5d175c
 +{
 +	int err;
 +	struct inode *h_inode;
++	union {
++		unsigned int u;
++		fmode_t m;
++	} u;
 +
 +	h_inode = h_path->dentry->d_inode;
 +	if (!h_file) {
@@ -20374,7 +20394,8 @@ index 0000000..a5d175c
 +		err = get_write_access(h_inode);
 +		if (err)
 +			goto out_mnt;
-+		err = break_lease(h_inode, FMODE_WRITE);
++		u.m = FMODE_WRITE;
++		err = break_lease(h_inode, u.u);
 +		if (err)
 +			goto out_inode;
 +	}
