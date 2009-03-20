@@ -1,15 +1,15 @@
 From:	Christian Lamparter <chunkeey@web.de>
 Subject: [RFC][PATCH 4/5] ar9170: USB frontend driver
-Date:	Tue, 17 Mar 2009 04:10:20 +0100
+Date:	Fri, 20 Mar 2009 20:36:42 +0100
 
 USB frontend driver code for Atheros AR9170.
 
 diff --git a/drivers/net/wireless/ar9170/usb.c b/drivers/net/wireless/ar9170/usb.c
 new file mode 100644
-index 0000000..308bda0
+index 0000000..28ad3a1
 --- /dev/null
 +++ b/drivers/net/wireless/ar9170/usb.c
-@@ -0,0 +1,754 @@
+@@ -0,0 +1,748 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -59,7 +59,7 @@ index 0000000..308bda0
 +#include "hw.h"
 +#include "usb.h"
 +
-+MODULE_AUTHOR("Johannes Berg <johannes@sipsolutions.net>");
++MODULE_AUTHOR("Christian Lamparter <chunkeey@web.de>");
 +MODULE_LICENSE("GPL");
 +MODULE_DESCRIPTION("USB Driver for Atheros AR9170 based devices");
 +MODULE_FIRMWARE("ar9170-1.fw");
@@ -93,12 +93,6 @@ index 0000000..308bda0
 +	{}
 +};
 +MODULE_DEVICE_TABLE(usb, ar9170_usb_ids);
-+
-+struct ar9170_usb_sync_comp {
-+	struct completion complete;
-+	size_t length;
-+	int status;
-+};
 +
 +static void ar9170_usb_tx_urb_complete_free(struct urb *urb)
 +{
@@ -139,8 +133,8 @@ index 0000000..308bda0
 +		goto resubmit;
 +	}
 +
-+	print_hex_dump(KERN_DEBUG, "ar9170 irq: ", DUMP_PREFIX_OFFSET,
-+		       16, 1, urb->transfer_buffer, urb->actual_length, true);
++	print_hex_dump_bytes("ar9170 irq: ", DUMP_PREFIX_OFFSET,
++			     urb->transfer_buffer, urb->actual_length);
 +
 +resubmit:
 +	usb_anchor_urb(urb, &aru->rx_submitted);
@@ -297,7 +291,11 @@ index 0000000..308bda0
 +{
 +	int ret;
 +
++	aru->common.state = AR9170_UNKNOWN_STATE;
++
 +	usb_unlink_anchored_urbs(&aru->tx_submitted);
++
++	/* give the LED OFF command and the deauth frame a chance to air. */
 +	ret = usb_wait_anchor_empty_timeout(&aru->tx_submitted,
 +					    msecs_to_jiffies(100));
 +	if (ret == 0)
@@ -312,36 +310,23 @@ index 0000000..308bda0
 +	usb_poison_anchored_urbs(&aru->rx_submitted);
 +}
 +
-+static void ar9170_usb_sync_complete(struct urb *urb)
-+{
-+	struct ar9170_usb_sync_comp *ctx = urb->context;
-+
-+	ctx->status = urb->status;
-+	ctx->length = urb->actual_length;
-+	complete(&ctx->complete);
-+}
-+
 +static int ar9170_usb_exec_cmd(struct ar9170 *ar, enum ar9170_cmd cmd,
 +			       unsigned int plen, void *payload,
 +			       unsigned int outlen, void *out)
 +{
 +	struct ar9170_usb *aru = (void *) ar;
 +	struct urb *urb = NULL;
-+	struct ar9170_usb_sync_comp *ctx = NULL;
 +	unsigned long flags;
 +	int err = -ENOMEM;
++
++	if (unlikely(!IS_ACCEPTING_CMD(ar)))
++		return -EPERM;
 +
 +	if (WARN_ON(plen > AR9170_MAX_CMD_LEN - 4))
 +		return -EINVAL;
 +
-+	ctx = kzalloc(sizeof(*ctx), GFP_ATOMIC);
-+	if (!ctx)
-+		return -ENOMEM;
-+
-+	init_completion(&ctx->complete);
-+
 +	urb = usb_alloc_urb(0, GFP_ATOMIC);
-+	if (!urb)
++	if (unlikely(!urb))
 +		goto err_free;
 +
 +	ar->cmdbuf[0] = cpu_to_le32(plen);
@@ -358,7 +343,7 @@ index 0000000..308bda0
 +	usb_fill_int_urb(urb, aru->udev,
 +			 usb_sndbulkpipe(aru->udev, AR9170_EP_CMD),
 +			 aru->common.cmdbuf, plen + 4,
-+			 ar9170_usb_sync_complete, ctx, 1);
++			 ar9170_usb_tx_urb_complete, NULL, 1);
 +
 +	usb_anchor_urb(urb, &aru->tx_submitted);
 +	err = usb_submit_urb(urb, GFP_ATOMIC);
@@ -369,31 +354,9 @@ index 0000000..308bda0
 +	}
 +	usb_free_urb(urb);
 +
-+	err = wait_for_completion_timeout(&ctx->complete, msecs_to_jiffies(32));
-+	if (err == 0) {
-+		err = -ETIMEDOUT;
-+		goto err_unbuf;
-+	}
-+
 +	err = wait_for_completion_timeout(&aru->cmd_wait, HZ);
 +	if (err == 0) {
-+		/*
-+		 * It is highly probable that ctx->status contains
-+		 * the answer to why this command has failed.
-+		 */
-+
-+		if (ctx->status)
-+			err = ctx->status;
-+		else
-+			err = -ETIMEDOUT;
-+
-+		dev_err(&aru->udev->dev, "no command feedback received (%d).\n",
-+			err);
-+
-+		/* provide some maybe useful debug information */
-+		print_hex_dump_bytes("cmd: ", DUMP_PREFIX_NONE,
-+				     aru->common.cmdbuf, plen + 4);
-+		dump_stack();
++		err = -ETIMEDOUT;
 +		goto err_unbuf;
 +	}
 +
@@ -402,27 +365,42 @@ index 0000000..308bda0
 +		goto err_unbuf;
 +	}
 +
-+	kfree(ctx);
 +	return 0;
 +
 +err_unbuf:
++	/* Maybe the device was removed in the second we were waiting? */
++	if (IS_STARTED(ar)) {
++		dev_err(&aru->udev->dev, "no command feedback "
++					 "received (%d).\n", err);
++
++		/* provide some maybe useful debug information */
++		print_hex_dump_bytes("ar9170 cmd: ", DUMP_PREFIX_NONE,
++				     aru->common.cmdbuf, plen + 4);
++		dump_stack();
++	}
++
 +	/* invalidate to avoid completing the next prematurely */
 +	spin_lock_irqsave(&aru->common.cmdlock, flags);
 +	aru->readbuf = NULL;
-+	aru->readlen = -1;
++	aru->readlen = 0;
 +	spin_unlock_irqrestore(&aru->common.cmdlock, flags);
 +
 +err_free:
-+	kfree(ctx);
++
 +	return err;
 +}
 +
 +static int ar9170_usb_tx(struct ar9170 *ar, struct sk_buff *skb,
-+			 bool txstatus_needed)
++			 bool txstatus_needed, unsigned int extra_len)
 +{
 +	struct ar9170_usb *aru = (struct ar9170_usb *) ar;
 +	struct urb *urb;
 +	int err;
++
++	if (unlikely(!IS_STARTED(ar))) {
++		/* Seriously, what were you drink... err... thinking!? */
++		return -EPERM;
++	}
 +
 +	urb = usb_alloc_urb(0, GFP_ATOMIC);
 +	if (unlikely(!urb))
@@ -430,7 +408,7 @@ index 0000000..308bda0
 +
 +	usb_fill_bulk_urb(urb, aru->udev,
 +			  usb_sndbulkpipe(aru->udev, AR9170_EP_TX),
-+			  skb->data, skb->len, (txstatus_needed ?
++			  skb->data, skb->len + extra_len, (txstatus_needed ?
 +			  ar9170_usb_tx_urb_complete :
 +			  ar9170_usb_tx_urb_complete_free), skb);
 +	urb->transfer_flags |= URB_ZERO_PACKET;
@@ -467,10 +445,18 @@ index 0000000..308bda0
 +		out |= in & 0xFF;
 +	}
 +
-+	if (unlikely(out != in)) {
-+		print_hex_dump(KERN_DEBUG, "ar9170 invalid resp: ",
-+			       DUMP_PREFIX_OFFSET,
-+			       16, 1, buffer, len, true);
++	/*
++	 * Some commands (e.g: AR9170_CMD_FREQUENCY) have a variable response
++	 * length and we cannot predict the correct length in advance.
++	 * So we only check if we provided enough space for the data.
++	 */
++	if (unlikely(out < in)) {
++		dev_warn(&aru->udev->dev, "received invalid command response "
++					  "got %d bytes, instead of %d bytes "
++					  "and the resp length is %d bytes\n",
++			 in, out, len);
++		print_hex_dump_bytes("ar9170 invalid resp: ",
++				     DUMP_PREFIX_OFFSET, buffer, len);
 +		/*
 +		 * Do not complete, then the command times out,
 +		 * and we get a stack trace from there.
@@ -480,7 +466,7 @@ index 0000000..308bda0
 +
 +	spin_lock_irqsave(&aru->common.cmdlock, flags);
 +	if (aru->readbuf && len > 0) {
-+		memcpy(aru->readbuf, buffer + 4, aru->readlen);
++		memcpy(aru->readbuf, buffer + 4, len - 4);
 +		aru->readbuf = NULL;
 +	}
 +	complete(&aru->cmd_wait);
@@ -617,21 +603,38 @@ index 0000000..308bda0
 +	struct ar9170_usb *aru = (void *) ar;
 +	int ret;
 +
-+	/* lets wait a while until the queues are dried out */
++	/* lets wait a while until the tx - queues are dried out */
 +	ret = usb_wait_anchor_empty_timeout(&aru->tx_submitted,
 +					    msecs_to_jiffies(1000));
 +	if (ret == 0)
 +		dev_err(&aru->udev->dev, "kill pending tx urbs.\n");
 +
 +	usb_poison_anchored_urbs(&aru->tx_submitted);
++
++	/*
++	 * Note:
++	 * So far we freed all tx urbs, but we won't dare to touch any rx urbs.
++	 * Else we would end up with a unresponsive device...
++	 */
++
++	if (IS_ACCEPTING_CMD(ar))
++		aru->common.state = AR9170_STOPPED;
 +}
 +
 +static int ar9170_usb_open(struct ar9170 *ar)
 +{
 +	struct ar9170_usb *aru = (void *) ar;
++	int err;
 +
 +	usb_unpoison_anchored_urbs(&aru->tx_submitted);
-+	return ar9170_usb_init_transport(aru);
++	err = ar9170_usb_init_transport(aru);
++	if (err) {
++		usb_poison_anchored_urbs(&aru->tx_submitted);
++		return err;
++	}
++
++	aru->common.state = AR9170_IDLE;
++	return 0;
 +}
 +
 +static int ar9170_usb_probe(struct usb_interface *intf,
@@ -729,10 +732,8 @@ index 0000000..308bda0
 +	if (!aru)
 +		return;
 +
-+	aru->common.started = false;
-+
++	aru->common.state = AR9170_IDLE;
 +	ar9170_unregister(&aru->common);
-+
 +	ar9170_usb_cancel_urbs(aru);
 +
 +	release_firmware(aru->init_values);
@@ -740,7 +741,6 @@ index 0000000..308bda0
 +
 +	usb_put_dev(aru->udev);
 +	usb_set_intfdata(intf, NULL);
-+
 +	ieee80211_free_hw(aru->common.hw);
 +}
 +
@@ -842,11 +842,5 @@ index 0000000..56a1957
 +	const struct firmware *init_values;
 +	const struct firmware *firmware;
 +};
-+
-+#if 0
-+#include <linux/mutex.h>
-+#define mutex_lock(m) do { mutex_lock(m); __acquire(m); } while (0)
-+#define mutex_unlock(m) do { mutex_unlock(m); __release(m); } while (0)
-+#endif
 +
 +#endif /* __USB_H */

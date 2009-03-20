@@ -1,15 +1,15 @@
 From:	Christian Lamparter <chunkeey@web.de>
-Subject: [RFC][PATCH 3/5] ar9170: mac/bbp and phy code
-Date:	Tue, 17 Mar 2009 04:09:46 +0100
+Subject: [RFC][PATCH 3/5 v5] ar9170: mac/bbp and phy code
+Date:	Fri, 20 Mar 2009 20:36:49 +0100
 
 MAC/BBP and PHY programming code
 
 diff --git a/drivers/net/wireless/ar9170/mac.c b/drivers/net/wireless/ar9170/mac.c
 new file mode 100644
-index 0000000..4e88cd9
+index 0000000..2e69878
 --- /dev/null
 +++ b/drivers/net/wireless/ar9170/mac.c
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,452 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -93,8 +93,8 @@ index 0000000..4e88cd9
 +	ar9170_regwrite(AR9170_MAC_REG_RETRY_MAX, 0);
 +
 +	/* enable MMIC */
-+	ar9170_regwrite(AR9170_MAC_REG_SNIFFER, 0x2000000);
-+	/* TODO: ar9170_regwrite(AR9170_MAC_REG_SNIFFER, 1); */
++	ar9170_regwrite(AR9170_MAC_REG_SNIFFER,
++			AR9170_MAC_REG_SNIFFER_DEFAULTS);
 +
 +	ar9170_regwrite(AR9170_MAC_REG_RX_THRESHOLD, 0xc1f80);
 +
@@ -158,22 +158,172 @@ index 0000000..4e88cd9
 +	ar9170_regwrite(AR9170_MAC_REG_TXOP_NOT_ENOUGH_IND,
 +			0x141E0F48);
 +
-+#ifndef HWCRYPT
-+	/*
-+	 * disable HW crypto entirely, otherwise we will
-+	 * not see encrypted frames if the key isn't in
-+	 * the key cache it seems
-+	 */
-+	ar9170_regwrite(AR9170_MAC_REG_ENCRYPTION, 0x70 | 1<<3);
-+#else
-+	ar9170_regwrite(AR9170_MAC_REG_ENCRYPTION, 0x70);
-+#endif
++	ar9170_regwrite_finish();
++
++	return ar9170_regwrite_result();
++}
++
++static int ar9170_set_mac_reg(struct ar9170 *ar, const u32 reg, const u8 *mac)
++{
++	static const u8 zero[ETH_ALEN] = { 0 };
++
++	if (!mac)
++		mac = zero;
++
++	ar9170_regwrite_begin(ar);
++
++	ar9170_regwrite(reg,
++			(mac[3] << 24) | (mac[2] << 16) |
++			(mac[1] << 8) | mac[0]);
++
++	ar9170_regwrite(reg + 4, (mac[5] << 8) | mac[4]);
++
++	ar9170_regwrite_finish();
++
++	return ar9170_regwrite_result();
++}
++
++int ar9170_update_multicast(struct ar9170 *ar)
++{
++	int err;
++
++	ar9170_regwrite_begin(ar);
++	ar9170_regwrite(AR9170_MAC_REG_GROUP_HASH_TBL_H,
++		ar->want_mc_hash >> 32);
++	ar9170_regwrite(AR9170_MAC_REG_GROUP_HASH_TBL_L,
++		ar->want_mc_hash);
++
++	ar9170_regwrite_finish();
++	err = ar9170_regwrite_result();
++
++	if (err)
++		return err;
++
++	ar->cur_mc_hash = ar->want_mc_hash;
++
++	return 0;
++}
++
++int ar9170_update_frame_filter(struct ar9170 *ar)
++{
++	int err;
++
++	err = ar9170_write_reg(ar, AR9170_MAC_REG_FRAMETYPE_FILTER,
++			       ar->want_filter);
++
++	if (err)
++		return err;
++
++	ar->cur_filter = ar->want_filter;
++
++	return 0;
++}
++
++static int ar9170_set_promiscouous(struct ar9170 *ar)
++{
++	u32 encr_mode, sniffer;
++	int err;
++
++	err = ar9170_read_reg(ar, AR9170_MAC_REG_SNIFFER, &sniffer);
++	if (err)
++		return err;
++
++	err = ar9170_read_reg(ar, AR9170_MAC_REG_ENCRYPTION, &encr_mode);
++	if (err)
++		return err;
++
++	if (ar->sniffer_enabled) {
++		sniffer |= AR9170_MAC_REG_SNIFFER_ENABLE_PROMISC;
++
++		/*
++		 * Rx decryption works in place.
++		 *
++		 * If we don't disable it, the hardware will render all
++		 * encrypted frames which are encrypted with an unknown
++		 * key useless.
++		 */
++
++		encr_mode |= AR9170_MAC_REG_ENCRYPTION_RX_SOFTWARE;
++		ar->sniffer_enabled = true;
++	} else {
++		sniffer &= ~AR9170_MAC_REG_SNIFFER_ENABLE_PROMISC;
++
++		if (ar->rx_software_decryption)
++			encr_mode |= AR9170_MAC_REG_ENCRYPTION_RX_SOFTWARE;
++		else
++			encr_mode &= ~AR9170_MAC_REG_ENCRYPTION_RX_SOFTWARE;
++	}
++
++	ar9170_regwrite_begin(ar);
++	ar9170_regwrite(AR9170_MAC_REG_ENCRYPTION, encr_mode);
++	ar9170_regwrite(AR9170_MAC_REG_SNIFFER, sniffer);
 +	ar9170_regwrite_finish();
 +
 +	return ar9170_regwrite_result();
 +}
 +
 +int ar9170_set_operating_mode(struct ar9170 *ar)
++{
++	u32 pm_mode = AR9170_MAC_REG_POWERMGT_DEFAULTS;
++	u8 *mac_addr, *bssid;
++	int err;
++
++	if (ar->vif) {
++		mac_addr = ar->mac_addr;
++		bssid = ar->bssid;
++
++		switch (ar->vif->type) {
++		case NL80211_IFTYPE_MESH_POINT:
++		case NL80211_IFTYPE_ADHOC:
++			pm_mode |= AR9170_MAC_REG_POWERMGT_IBSS;
++			break;
++		case NL80211_IFTYPE_AP:
++			pm_mode |= AR9170_MAC_REG_POWERMGT_AP;
++			break;
++		case NL80211_IFTYPE_WDS:
++			pm_mode |= AR9170_MAC_REG_POWERMGT_AP_WDS;
++			break;
++		case NL80211_IFTYPE_MONITOR:
++			ar->sniffer_enabled = true;
++			ar->rx_software_decryption = true;
++			break;
++		default:
++			pm_mode |= AR9170_MAC_REG_POWERMGT_STA;
++			break;
++		}
++	} else {
++		mac_addr = NULL;
++		bssid = NULL;
++	}
++
++	err = ar9170_set_mac_reg(ar, AR9170_MAC_REG_MAC_ADDR_L, mac_addr);
++	if (err)
++		return err;
++
++	err = ar9170_set_mac_reg(ar, AR9170_MAC_REG_BSSID_L, bssid);
++	if (err)
++		return err;
++
++	err = ar9170_set_promiscouous(ar);
++	if (err)
++		return err;
++
++	ar9170_regwrite_begin(ar);
++
++	ar9170_regwrite(AR9170_MAC_REG_POWERMANAGEMENT, pm_mode);
++	ar9170_regwrite_finish();
++
++	return ar9170_regwrite_result();
++}
++
++int ar9170_set_hwretry_limit(struct ar9170 *ar, unsigned int max_retry)
++{
++	u32 tmp = min_t(u32, 0x33333, max_retry * 0x11111);
++
++	return ar9170_write_reg(ar, AR9170_MAC_REG_RETRY_MAX, tmp);
++}
++
++int ar9170_set_beacon_timers(struct ar9170 *ar)
 +{
 +	u32 v = 0;
 +	u32 pretbtt = 0;
@@ -261,7 +411,7 @@ index 0000000..4e88cd9
 +					 beacon_work);
 +	struct sk_buff *skb;
 +
-+	if (unlikely(!ar->started))
++	if (unlikely(!IS_STARTED(ar)))
 +		return ;
 +
 +	mutex_lock(&ar->mutex);
@@ -314,10 +464,10 @@ index 0000000..4e88cd9
 +}
 diff --git a/drivers/net/wireless/ar9170/phy.c b/drivers/net/wireless/ar9170/phy.c
 new file mode 100644
-index 0000000..70ef568
+index 0000000..90e0ec8
 --- /dev/null
 +++ b/drivers/net/wireless/ar9170/phy.c
-@@ -0,0 +1,1223 @@
+@@ -0,0 +1,1240 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -1430,13 +1580,21 @@ index 0000000..70ef568
 +	return ar9170_regwrite_result();
 +}
 +
++static int ar9170_calc_noise_dbm(u32 raw_noise)
++{
++	if (raw_noise & 0x100)
++		return ~((raw_noise & 0x0ff) >> 1);
++	else
++		return (raw_noise & 0xff) >> 1;
++}
++
 +int ar9170_set_channel(struct ar9170 *ar, struct ieee80211_channel *channel,
 +		       enum ar9170_rf_init_mode rfi, enum ar9170_bw bw)
 +{
 +	const struct ar9170_phy_freq_params *freqpar;
 +	u32 cmd, tmp, offs;
 +	__le32 vals[8];
-+	int err;
++	int i, err;
 +	bool bandswitch;
 +
 +	/* clear BB heavy click enable */
@@ -1534,9 +1692,18 @@ index 0000000..70ef568
 +	vals[6] = cpu_to_le32(freqpar->coeff_man_shgi);
 +	vals[7] = cpu_to_le32(1000);
 +
-+	err = ar->exec_cmd(ar, cmd, sizeof(vals), (u8 *)vals, -1, NULL);
++	err = ar->exec_cmd(ar, cmd, sizeof(vals), (u8 *)vals,
++			   sizeof(vals), (u8 *)vals);
 +	if (err)
 +		return err;
++
++	for (i = 0; i < 2; i++) {
++		ar->noise[i] = ar9170_calc_noise_dbm(
++				(le32_to_cpu(vals[2 + i]) >> 19) & 0x1ff);
++
++		ar->noise[i + 2] = ar9170_calc_noise_dbm(
++				    (le32_to_cpu(vals[5 + i]) >> 23) & 0x1ff);
++	}
 +
 +	ar->channel = channel;
 +	return 0;

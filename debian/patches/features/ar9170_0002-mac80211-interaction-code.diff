@@ -1,15 +1,15 @@
 From:	Christian Lamparter <chunkeey@web.de>
-Subject: [RFC][PATCH 2/5] ar9170: mac80211 interaction code
-Date:	Tue, 17 Mar 2009 04:09:28 +0100
+Subject: [RFC][PATCH 2/5 v5] ar9170: mac80211 interaction code
+Date:	Fri, 20 Mar 2009 20:36:30 +0100
 
-Most code that deals with mac80211's interface
+Most code that deals with mac80211's interface.
 
 diff --git a/drivers/net/wireless/ar9170/ar9170.h b/drivers/net/wireless/ar9170/ar9170.h
 new file mode 100644
-index 0000000..7d0164b
+index 0000000..f51cb07
 --- /dev/null
 +++ b/drivers/net/wireless/ar9170/ar9170.h
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,209 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -54,16 +54,11 @@ index 0000000..7d0164b
 +#include <linux/spinlock.h>
 +#include <net/wireless.h>
 +#include <net/mac80211.h>
-+#ifdef CONFIG_MAC80211_LEDS
++#ifdef CONFIG_AR9170_LEDS
 +#include <linux/leds.h>
-+#endif /* CONFIG_MAC80211_LEDS */
++#endif /* CONFIG_AR9170_LEDS */
 +#include "eeprom.h"
 +#include "hw.h"
-+
-+/*
-+ * TODO:
-+ * enable #define HWCRYPT
-+ */
 +
 +#define PAYLOAD_MAX	(AR9170_MAX_CMD_LEN/4 - 1)
 +
@@ -83,42 +78,62 @@ index 0000000..7d0164b
 +
 +#define AR9170_MAX_RX_BUFFER_SIZE		8192
 +
-+#ifdef CONFIG_MAC80211_LEDS
++#ifdef CONFIG_AR9170_LEDS
 +struct ar9170;
 +
 +struct ar9170_led {
 +	struct ar9170 *ar;
 +	struct led_classdev l;
 +	char name[32];
++	unsigned int toggled;
 +	bool registered;
 +};
 +
-+#endif /* CONFIG_MAC80211_LEDS */
++#endif /* CONFIG_AR9170_LEDS */
++
++enum ar9170_device_state {
++	AR9170_UNKNOWN_STATE,
++	AR9170_STOPPED,
++	AR9170_IDLE,
++	AR9170_STARTED,
++	AR9170_ASSOCIATED,
++};
 +
 +struct ar9170 {
 +	struct ieee80211_hw *hw;
 +	struct mutex mutex;
-+	bool started;
++	enum ar9170_device_state state;
 +
 +	int (*open)(struct ar9170 *);
 +	void (*stop)(struct ar9170 *);
-+	int (*tx)(struct ar9170 *, struct sk_buff *, bool);
++	int (*tx)(struct ar9170 *, struct sk_buff *, bool, unsigned int);
 +	int (*exec_cmd)(struct ar9170 *, enum ar9170_cmd, u32 ,
 +			void *, u32 , void *);
 +	void (*callback_cmd)(struct ar9170 *, u32 , void *);
 +
++	/* interface mode settings */
 +	struct ieee80211_vif *vif;
++	u8 mac_addr[ETH_ALEN];
++	u8 bssid[ETH_ALEN];
 +
 +	/* beaconing */
 +	struct sk_buff *beacon;
 +	struct work_struct beacon_work;
 +
++	/* cryptographic engine */
 +	u64 usedkeys;
++	bool rx_software_decryption;
 +
++	/* filter settings */
 +	struct work_struct filter_config_work;
 +	u64 cur_mc_hash, want_mc_hash;
 +	u32 cur_filter, want_filter;
++	unsigned int filter_changed;
++	bool sniffer_enabled;
++
++	/* PHY */
 +	struct ieee80211_channel *channel;
++	int noise[4];
 +
 +	/* power calibration data */
 +	u8 power_5G_leg[4];
@@ -129,26 +144,36 @@ index 0000000..7d0164b
 +	u8 power_2G_ht20[8];
 +	u8 power_2G_ht40[8];
 +
-+#ifdef CONFIG_MAC80211_LEDS
-+	struct work_struct led_work;
++#ifdef CONFIG_AR9170_LEDS
++	struct delayed_work led_work;
 +	struct ar9170_led leds[AR9170_NUM_LEDS];
-+#endif /* CONFIG_MAC80211_LEDS */
++#endif /* CONFIG_AR9170_LEDS */
 +
++	/* qos queue settings */
 +	spinlock_t tx_stats_lock;
 +	struct ieee80211_tx_queue_stats tx_stats[5];
 +	struct ieee80211_tx_queue_params edcf[5];
 +
-+	struct ieee80211_low_level_stats stats;
-+
 +	spinlock_t cmdlock;
 +	__le32 cmdbuf[PAYLOAD_MAX + 1];
 +
++	/* MAC statistics */
++	struct ieee80211_low_level_stats stats;
++
++	/* EEPROM */
 +	struct ar9170_eeprom eeprom;
 +};
 +
 +struct ar9170_sta_info {
 +	struct sk_buff_head tx_status;
 +};
++
++#define IS_STARTED(a)		(a->state >= AR9170_STARTED)
++#define IS_ACCEPTING_CMD(a)	(a->state >= AR9170_IDLE)
++
++#define AR9170_FILTER_CHANGED_PROMISC		BIT(0)
++#define AR9170_FILTER_CHANGED_MULTICAST		BIT(1)
++#define AR9170_FILTER_CHANGED_FRAMEFILTER	BIT(2)
 +
 +/* exported interface */
 +void *ar9170_alloc(size_t priv_size);
@@ -162,7 +187,11 @@ index 0000000..7d0164b
 +int ar9170_op_tx(struct ieee80211_hw *hw, struct sk_buff *skb);
 +int ar9170_init_mac(struct ar9170 *ar);
 +int ar9170_set_qos(struct ar9170 *ar);
++int ar9170_update_multicast(struct ar9170 *ar);
++int ar9170_update_frame_filter(struct ar9170 *ar);
 +int ar9170_set_operating_mode(struct ar9170 *ar);
++int ar9170_set_beacon_timers(struct ar9170 *ar);
++int ar9170_set_hwretry_limit(struct ar9170 *ar, u32 max_retry);
 +int ar9170_update_beacon(struct ar9170 *ar);
 +void ar9170_new_beacon(struct work_struct *work);
 +int ar9170_upload_key(struct ar9170 *ar, u8 id, const u8 *mac, u8 ktype,
@@ -170,9 +199,12 @@ index 0000000..7d0164b
 +int ar9170_disable_key(struct ar9170 *ar, u8 id);
 +
 +/* LEDs */
++#ifdef CONFIG_AR9170_LEDS
++int ar9170_register_leds(struct ar9170 *ar);
++void ar9170_unregister_leds(struct ar9170 *ar);
++#endif /* CONFIG_AR9170_LEDS */
 +int ar9170_init_leds(struct ar9170 *ar);
-+void ar9170_exit_leds(struct ar9170 *ar);
-+int ar9170_disable_leds(struct ar9170 *ar);
++int ar9170_set_leds_state(struct ar9170 *ar, u32 led_state);
 +
 +/* PHY / RF */
 +int ar9170_init_phy(struct ar9170 *ar, enum ieee80211_band band);
@@ -189,10 +221,10 @@ index 0000000..7d0164b
 +#endif /* __AR9170_H */
 diff --git a/drivers/net/wireless/ar9170/cmd.c b/drivers/net/wireless/ar9170/cmd.c
 new file mode 100644
-index 0000000..8eb49f8
+index 0000000..fd5625c
 --- /dev/null
 +++ b/drivers/net/wireless/ar9170/cmd.c
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,130 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -238,6 +270,9 @@ index 0000000..8eb49f8
 +{
 +	int err;
 +
++	if (unlikely(!IS_ACCEPTING_CMD(ar)))
++		return 0;
++
 +	err = ar->exec_cmd(ar, AR9170_CMD_WMEM, len, (u8 *) data, 0, NULL);
 +	if (err)
 +		printk(KERN_DEBUG "%s: writing memory failed\n",
@@ -253,6 +288,9 @@ index 0000000..8eb49f8
 +	};
 +	int err;
 +
++	if (unlikely(!IS_ACCEPTING_CMD(ar)))
++		return 0;
++
 +	err = ar->exec_cmd(ar, AR9170_CMD_WREG, sizeof(buf),
 +			   (u8 *) buf, 0, NULL);
 +	if (err)
@@ -266,6 +304,9 @@ index 0000000..8eb49f8
 +{
 +	int i, err;
 +	__le32 *offs, *res;
++
++	if (unlikely(!IS_ACCEPTING_CMD(ar)))
++		return 0;
 +
 +	/* abuse "out" for the register offsets, must be same length */
 +	offs = (__le32 *)out;
@@ -299,6 +340,9 @@ index 0000000..8eb49f8
 +	__le32 echores;
 +	int err;
 +
++	if (unlikely(!IS_ACCEPTING_CMD(ar)))
++		return -ENODEV;
++
 +	err = ar->exec_cmd(ar, AR9170_CMD_ECHO,
 +			   4, (u8 *)&echobuf,
 +			   4, (u8 *)&echores);
@@ -313,10 +357,10 @@ index 0000000..8eb49f8
 +EXPORT_SYMBOL_GPL(ar9170_echo_test);
 diff --git a/drivers/net/wireless/ar9170/cmd.h b/drivers/net/wireless/ar9170/cmd.h
 new file mode 100644
-index 0000000..677d66c
+index 0000000..a4f0e50
 --- /dev/null
 +++ b/drivers/net/wireless/ar9170/cmd.h
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,91 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -372,7 +416,7 @@ index 0000000..677d66c
 + * but you won't know which write in the group failed.
 + */
 +#define ar9170_regwrite_begin(ar)					\
-+{									\
++do {									\
 +	int __nreg = 0, __err = 0;					\
 +	struct ar9170 *__ar = ar;
 +
@@ -380,11 +424,12 @@ index 0000000..677d66c
 +	__ar->cmdbuf[2 * __nreg + 1] = cpu_to_le32(r);			\
 +	__ar->cmdbuf[2 * __nreg + 2] = cpu_to_le32(v);			\
 +	__nreg++;							\
-+	if (__nreg >= PAYLOAD_MAX/2) {					\
-+		__err = ar->exec_cmd(__ar, AR9170_CMD_WREG,		\
-+				     8 * __nreg, 			\
-+				     (u8 *) &__ar->cmdbuf[1],		\
-+				     0, NULL);				\
++	if ((__nreg >= PAYLOAD_MAX/2)) {				\
++		if (IS_ACCEPTING_CMD(__ar))				\
++			__err = ar->exec_cmd(__ar, AR9170_CMD_WREG,	\
++					     8 * __nreg,		\
++					     (u8 *) &__ar->cmdbuf[1],	\
++					     0, NULL);			\
 +		__nreg = 0;						\
 +		if (__err)						\
 +			goto __regwrite_out;				\
@@ -394,22 +439,25 @@ index 0000000..677d66c
 +#define ar9170_regwrite_finish()					\
 +__regwrite_out :							\
 +	if (__nreg) {							\
-+		__err = ar->exec_cmd(__ar, AR9170_CMD_WREG,		\
-+				     8 * __nreg, 			\
-+				     (u8 *) &__ar->cmdbuf[1],		\
-+				     0, NULL);				\
++		if (IS_ACCEPTING_CMD(__ar))				\
++			__err = ar->exec_cmd(__ar, AR9170_CMD_WREG,	\
++					     8 * __nreg, 		\
++					     (u8 *) &__ar->cmdbuf[1],	\
++					     0, NULL);			\
 +		__nreg = 0;						\
 +	}
 +
-+#define ar9170_regwrite_result() __err;	}
++#define ar9170_regwrite_result()					\
++	__err;								\
++} while (0);
 +
 +#endif /* __CMD_H */
 diff --git a/drivers/net/wireless/ar9170/led.c b/drivers/net/wireless/ar9170/led.c
 new file mode 100644
-index 0000000..030d7d6
+index 0000000..5384ae8
 --- /dev/null
 +++ b/drivers/net/wireless/ar9170/led.c
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,168 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -448,25 +496,60 @@ index 0000000..030d7d6
 + *    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 + */
 +
-+#ifdef CONFIG_MAC80211_LEDS
 +#include "ar9170.h"
 +#include "cmd.h"
 +
++int ar9170_set_leds_state(struct ar9170 *ar, u32 led_state)
++{
++	return ar9170_write_reg(ar, AR9170_GPIO_REG_DATA, led_state);
++}
++
++int ar9170_init_leds(struct ar9170 *ar)
++{
++	int err;
++
++	/* disable LEDs */
++	/* GPIO [0/1 mode: output, 2/3: input] */
++	err = ar9170_write_reg(ar, AR9170_GPIO_REG_PORT_TYPE, 3);
++	if (err)
++		goto out;
++
++	/* GPIO 0/1 value: off */
++	err = ar9170_set_leds_state(ar, 0);
++
++out:
++	return err;
++}
++
++#ifdef CONFIG_AR9170_LEDS
 +static void ar9170_update_leds(struct work_struct *work)
 +{
-+	struct ar9170 *ar = container_of(work, struct ar9170, led_work);
-+	u32 ledval = 0;
-+	int i;
++	struct ar9170 *ar = container_of(work, struct ar9170, led_work.work);
++	int i, tmp, blink_delay = 1000;
++	u32 led_val = 0;
++	bool rerun = false;
 +
 +	mutex_lock(&ar->mutex);
-+
 +	for (i = 0; i < AR9170_NUM_LEDS; i++)
-+		if (ar->leds[i].l.brightness)
-+			ledval |= 1 << i;
++		if (ar->leds[i].toggled) {
++			led_val |= 1 << i;
 +
-+	ar9170_write_reg(ar, AR9170_GPIO_REG_DATA, ledval);
++			tmp = 70 + 200 / (ar->leds[i].toggled);
++			if (tmp < blink_delay)
++				blink_delay = tmp;
 +
++			if (ar->leds[i].toggled > 1)
++				ar->leds[i].toggled = 0;
++
++			rerun = true;
++		}
++
++	ar9170_set_leds_state(ar, led_val);
 +	mutex_unlock(&ar->mutex);
++
++	if (likely(IS_ACCEPTING_CMD(ar) && rerun))
++		queue_delayed_work(ar->hw->workqueue, &ar->led_work,
++				   msecs_to_jiffies(blink_delay));
 +}
 +
 +static void ar9170_led_brightness_set(struct led_classdev *led,
@@ -475,16 +558,10 @@ index 0000000..030d7d6
 +	struct ar9170_led *arl = container_of(led, struct ar9170_led, l);
 +	struct ar9170 *ar = arl->ar;
 +
-+	if (unlikely(!ar->started))
-+		return ;
++	arl->toggled++;
 +
-+	/*
-+	 * TODO:
-+	 * check out why the LEDs become stuck in the wrong state for a
-+	 * long time.
-+	 */
-+
-+	queue_work(ar->hw->workqueue, &ar->led_work);
++	if (likely(IS_ACCEPTING_CMD(ar) && brightness))
++		queue_delayed_work(ar->hw->workqueue, &ar->led_work, HZ/10);
 +}
 +
 +static int ar9170_register_led(struct ar9170 *ar, int i, char *name,
@@ -512,11 +589,11 @@ index 0000000..030d7d6
 +	return err;
 +}
 +
-+void ar9170_exit_leds(struct ar9170 *ar)
++void ar9170_unregister_leds(struct ar9170 *ar)
 +{
 +	int i;
 +
-+	cancel_work_sync(&ar->led_work);
++	cancel_delayed_work_sync(&ar->led_work);
 +
 +	for (i = 0; i < AR9170_NUM_LEDS; i++)
 +		if (ar->leds[i].registered) {
@@ -525,11 +602,11 @@ index 0000000..030d7d6
 +		}
 +}
 +
-+int ar9170_init_leds(struct ar9170 *ar)
++int ar9170_register_leds(struct ar9170 *ar)
 +{
 +	int err;
 +
-+	INIT_WORK(&ar->led_work, ar9170_update_leds);
++	INIT_DELAYED_WORK(&ar->led_work, ar9170_update_leds);
 +
 +	err = ar9170_register_led(ar, 0, "tx",
 +				  ieee80211_get_tx_led_name(ar->hw));
@@ -541,48 +618,20 @@ index 0000000..030d7d6
 +	if (err)
 +		goto fail;
 +
-+	return ar9170_disable_leds(ar);
++	return 0;
 +
 +fail:
-+	ar9170_exit_leds(ar);
++	ar9170_unregister_leds(ar);
 +	return err;
 +}
-+#else /* CONFIG_MAC80211_LEDS */
 +
-+int ar9170_init_leds(struct ar9170 *ar)
-+{
-+	return 0;
-+}
-+
-+void ar9170_exit_leds(struct ar9170 *ar)
-+{
-+}
-+
-+#endif /* CONFIG_MAC80211_LEDS */
-+
-+int ar9170_disable_leds(struct ar9170 *ar)
-+{
-+	int err;
-+
-+	/* disable LEDs */
-+	/* GPIO 0/1 mode: output, 2/3: input */
-+	err = ar9170_write_reg(ar, AR9170_GPIO_REG_PORT_TYPE, 3);
-+	if (err)
-+		goto out;
-+
-+	/* GPIO 0/1 value: off */
-+	err = ar9170_write_reg(ar, AR9170_GPIO_REG_DATA, 0);
-+	mdelay(10);
-+
-+out:
-+	return err;
-+}
++#endif /* CONFIG_AR9170_LEDS */
 diff --git a/drivers/net/wireless/ar9170/main.c b/drivers/net/wireless/ar9170/main.c
 new file mode 100644
-index 0000000..b8cf1cf
+index 0000000..2ce3f41
 --- /dev/null
 +++ b/drivers/net/wireless/ar9170/main.c
-@@ -0,0 +1,1486 @@
+@@ -0,0 +1,1592 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -638,6 +687,9 @@ index 0000000..b8cf1cf
 +#include "hw.h"
 +#include "cmd.h"
 +
++static int modparam_nohwcrypt;
++module_param_named(nohwcrypt, modparam_nohwcrypt, bool, S_IRUGO);
++MODULE_PARM_DESC(nohwcrypt, "Disable hardware encryption.");
 +MODULE_AUTHOR("Johannes Berg <johannes@sipsolutions.net>");
 +MODULE_LICENSE("GPL");
 +MODULE_DESCRIPTION("Atheros shared code for AR9170 wireless devices");
@@ -676,7 +728,7 @@ index 0000000..b8cf1cf
 +#define CHAN(_freq, _idx) {		\
 +	.center_freq	= (_freq),	\
 +	.hw_value	= (_idx),	\
-+	.max_power	= 30, /* XXX */	\
++	.max_power	= 36, /* XXX */	\
 +}
 +
 +static struct ieee80211_channel ar9170_2ghz_chantable[] = {
@@ -750,7 +802,7 @@ index 0000000..b8cf1cf
 +};
 +
 +void ar9170_handle_tx_status(struct ar9170 *ar, struct sk_buff *skb,
-+			     bool update_statistics, u16 tx_status)
++			     bool valid_status, u16 tx_status)
 +{
 +	struct ieee80211_tx_info *txinfo;
 +	unsigned int retries = 0, queue = skb_get_queue_mapping(skb);
@@ -767,22 +819,12 @@ index 0000000..b8cf1cf
 +
 +	switch (tx_status) {
 +	case AR9170_TX_STATUS_RETRY:
-+		/*
-+		 * could be more, but maybe be less...
-+		 * No one knows and no one cares.
-+		 */
 +		retries = 2;
-+
 +	case AR9170_TX_STATUS_COMPLETE:
 +		txinfo->flags |= IEEE80211_TX_STAT_ACK;
 +		break;
 +
 +	case AR9170_TX_STATUS_FAILED:
-+		/*
-+		 * TODO: set the maximum retry count.
-+		 * is it long_frame_max_tx_count or short_frame_max_tx_count?
-+		 */
-+
 +		retries = ar->hw->conf.long_frame_max_tx_count;
 +		break;
 +
@@ -792,10 +834,8 @@ index 0000000..b8cf1cf
 +		break;
 +	}
 +
-+	if (update_statistics) {
-+		ar->stats.dot11ACKFailureCount += retries;
++	if (valid_status)
 +		txinfo->status.rates[0].count = retries + 1;
-+	}
 +
 +	skb_pull(skb, sizeof(struct ar9170_tx_control));
 +	ieee80211_tx_status_irqsafe(ar->hw, skb);
@@ -817,7 +857,7 @@ index 0000000..b8cf1cf
 +		struct ar9170_tx_control *txc = (void *) skb->data;
 +
 +		printk(KERN_DEBUG " index:%d => [skb:%p, queue:%d "
-+				  " mac :%04x phy:%08x\n",
++				  "mac:%04x phy:%08x\n",
 +		       i++, skb, skb_get_queue_mapping(skb),
 +		       le16_to_cpu(txc->mac_control),
 +		       le32_to_cpu(txc->phy_control));
@@ -835,7 +875,7 @@ index 0000000..b8cf1cf
 +
 +	/*
 +	 * Unfortunately, the firmware does not tell to which (queued) frame
-+	 * this transmission status report really belongs to.
++	 * this transmission status report belongs to.
 +	 *
 +	 * So we have to make risky guesses - with the scarce information
 +	 * the firmware provided (-> destination MAC, and phy_control) -
@@ -844,7 +884,11 @@ index 0000000..b8cf1cf
 +	sta = ieee80211_find_sta(ar->hw, mac);
 +
 +	if (!sta) {
-+		/* STA is gone. skb has been freed by ar9170_sta_notify */
++		/*
++		 * STA is not in data base.
++		 * skb has been freed by ar9170_sta_notify.
++		 */
++
 +		return NULL;
 +	}
 +
@@ -852,8 +896,9 @@ index 0000000..b8cf1cf
 +	spin_lock_irqsave(&sta_priv->tx_status.lock, flags);
 +	skb_queue_walk(&sta_priv->tx_status, skb) {
 +		struct ar9170_tx_control *txc = (void *) skb->data;
-+		u32 txc_queue = le32_to_cpu(txc->phy_control) &
-+					AR9170_TX_PHY_QOS_MASK;
++		u32 txc_queue = (le32_to_cpu(txc->phy_control) &
++				AR9170_TX_PHY_QOS_MASK) >>
++				AR9170_TX_PHY_QOS_SHIFT;
 +
 +		if (txc_queue != queue)
 +			continue;
@@ -863,11 +908,9 @@ index 0000000..b8cf1cf
 +		return skb;
 +	}
 +
-+	printk(KERN_ERR "%s: BSS (%pM) does not have any "
-+			"outstanding frames of this queue (%d).\n",
-+			wiphy_name(ar->hw->wiphy), sta->addr,
-+			skb_get_queue_mapping(skb));
-+
++	printk(KERN_ERR "%s: ESS (%pM) does not have any "
++			"outstanding frames in this queue (%d).\n",
++			wiphy_name(ar->hw->wiphy), sta->addr, queue);
 +	ar9170_dump_station_tx_status_queue(ar, sta_priv);
 +	spin_unlock_irqrestore(&sta_priv->tx_status.lock, flags);
 +	return NULL;
@@ -898,17 +941,18 @@ index 0000000..b8cf1cf
 +		 */
 +
 +		struct sk_buff *skb;
-+		u32 queue = le32_to_cpu(cmd->tx_status.rate) &
-+					AR9170_TX_PHY_QOS_MASK;
++		u32 queue = (le32_to_cpu(cmd->tx_status.rate) &
++			    AR9170_TX_PHY_QOS_MASK) >> AR9170_TX_PHY_QOS_SHIFT;
 +
 +		skb = ar9170_find_queued_skb(ar, cmd->tx_status.dst, queue);
-+		if (!skb)
++		if (unlikely(!skb))
 +			return ;
 +
 +		ar9170_handle_tx_status(ar, skb, true,
 +					le16_to_cpu(cmd->tx_status.status));
 +		break;
 +		}
++
 +	case 0xc0:
 +		/*
 +		 * pre-TBTT event
@@ -916,9 +960,35 @@ index 0000000..b8cf1cf
 +		if (ar->vif && ar->vif->type == NL80211_IFTYPE_AP)
 +			queue_work(ar->hw->workqueue, &ar->beacon_work);
 +		break;
++
++	case 0xc2:
++		/*
++		 * (IBSS) beacon send notification
++		 * bytes: 04 c2 XX YY B4 B3 B2 B1
++		 *
++		 * XX always 80
++		 * YY always 00
++		 * B1-B4 "should" be the number of send out beacons.
++		 */
++		break;
++
++	case 0xc3:
++		/* End of Atim Window */
++		break;
++
++	case 0xc4:
++	case 0xc5:
++		/* BlockACK events */
++		break;
++
++	case 0xc6:
++		/* Watchdog Interrupt */
++		break;
++
 +	case 0xc9:
 +		/* retransmission issue / SIFS/EIFS collision ?! */
 +		break;
++
 +	default:
 +		printk(KERN_INFO "received unhandled event %x\n", cmd->type);
 +		print_hex_dump_bytes("dump:", DUMP_PREFIX_NONE, buf, len);
@@ -946,7 +1016,7 @@ index 0000000..b8cf1cf
 +	__le16 fc;
 +	int reserved;
 +
-+	if (unlikely(!ar->started))
++	if (unlikely(!IS_STARTED(ar)))
 +		return ;
 +
 +	/* Received MPDU */
@@ -974,7 +1044,8 @@ index 0000000..b8cf1cf
 +
 +	status.band = ar->channel->band;
 +	status.freq = ar->channel->center_freq;
-+	status.signal = (int)~tail->rssi_combined;
++	status.signal = ar->noise[0] + tail->rssi_combined;
++	status.noise = ar->noise[0];
 +	status.antenna = antennas;
 +
 +	switch (tail->status & AR9170_RX_STATUS_MODULATION_MASK) {
@@ -995,8 +1066,10 @@ index 0000000..b8cf1cf
 +			status.rate_idx = 3;
 +			break;
 +		default:
-+			printk(KERN_ERR "%s: invalid plcp cck rate (%x).\n",
-+			       wiphy_name(ar->hw->wiphy), head->plcp[0]);
++			if ((!ar->sniffer_enabled) && (net_ratelimit()))
++				printk(KERN_ERR "%s: invalid plcp cck rate "
++				       "(%x).\n", wiphy_name(ar->hw->wiphy),
++				       head->plcp[0]);
 +			return;
 +		}
 +		break;
@@ -1027,8 +1100,10 @@ index 0000000..b8cf1cf
 +			status.rate_idx = 7;
 +			break;
 +		default:
-+			printk(KERN_ERR "%s: invalid plcp ofdm rate (%x).\n",
-+			       wiphy_name(ar->hw->wiphy), head->plcp[0]);
++			if ((!ar->sniffer_enabled) && (net_ratelimit()))
++				printk(KERN_ERR "%s: invalid plcp ofdm rate "
++				       "(%x).\n", wiphy_name(ar->hw->wiphy),
++				       head->plcp[0]);
 +			return;
 +		}
 +		if (status.band == IEEE80211_BAND_2GHZ)
@@ -1037,8 +1112,10 @@ index 0000000..b8cf1cf
 +	case AR9170_RX_STATUS_MODULATION_HT:
 +	case AR9170_RX_STATUS_MODULATION_DUPOFDM:
 +		/* XXX */
-+		printk(KERN_ERR "%s: invalid modulation\n",
-+		       wiphy_name(ar->hw->wiphy));
++
++		if (net_ratelimit())
++			printk(KERN_ERR "%s: invalid modulation\n",
++			       wiphy_name(ar->hw->wiphy));
 +		return;
 +	}
 +
@@ -1061,22 +1138,24 @@ index 0000000..b8cf1cf
 +
 +	decrypt = ar9170_get_decrypt_type(tail);
 +	if (!(decrypt & AR9170_RX_ENC_SOFTWARE) &&
-+	    decrypt != AR9170_ENC_ALG_NONE) {
-+		printk(KERN_DEBUG "hw decrypt!\n");
++	    decrypt != AR9170_ENC_ALG_NONE)
 +		status.flag |= RX_FLAG_DECRYPTED;
-+	}
 +
 +	/* ignore wrong RA errors */
 +	error &= ~AR9170_RX_ERROR_WRONG_RA;
 +
 +	if (error & AR9170_RX_ERROR_DECRYPT) {
 +		error &= ~AR9170_RX_ERROR_DECRYPT;
-+		printk(KERN_DEBUG "%s: decrypt error\n",
-+		       wiphy_name(ar->hw->wiphy));
++
++		/*
++		 * Rx decryption is done in place,
++		 * the original data is lost anyway.
++		 */
++		return ;
 +	}
 +
 +	/* drop any other error frames */
-+	if (error) {
++	if ((error) && (net_ratelimit())) {
 +		printk(KERN_DEBUG "%s: errors: %#x\n",
 +		       wiphy_name(ar->hw->wiphy), error);
 +		return;
@@ -1100,7 +1179,7 @@ index 0000000..b8cf1cf
 +}
 +
 +/*
-+ * FIXME:
++ * TODO:
 + * It looks like AR9170 supports more than just the USB transport interface.
 + * Unfortunately, there is no available information what parts of the
 + * precendent and following code fragments is device specific and what not.
@@ -1217,7 +1296,7 @@ index 0000000..b8cf1cf
 +	if (err)
 +		goto out;
 +
-+	ar->started = true;
++	ar->state = AR9170_STARTED;
 +
 +out:
 +	mutex_unlock(&ar->mutex);
@@ -1228,15 +1307,19 @@ index 0000000..b8cf1cf
 +{
 +	struct ar9170 *ar = hw->priv;
 +
-+	ar->started = false;
++	ar->state = AR9170_IDLE;
++
 +	mutex_lock(&ar->mutex);
 +
 +	cancel_work_sync(&ar->filter_config_work);
 +	cancel_work_sync(&ar->beacon_work);
-+	ar9170_disable_leds(ar);
 +
-+	/* stop DMA */
-+	ar9170_write_reg(ar, 0x1c3d30, 0);
++	if (IS_ACCEPTING_CMD(ar)) {
++		ar9170_set_leds_state(ar, 0);
++
++		/* stop DMA */
++		ar9170_write_reg(ar, 0x1c3d30, 0);
++	}
 +	ar->stop(ar);
 +
 +	mutex_unlock(&ar->mutex);
@@ -1255,11 +1338,11 @@ index 0000000..b8cf1cf
 +	struct ar9170_sta_info *sta_info = NULL;
 +	u32 power, chains;
 +	u16 keytype = 0;
-+	u16 len;
++	u16 len, icv = 0;
 +	int err;
 +	bool tx_status;
 +
-+	if (unlikely(!ar->started))
++	if (unlikely(!IS_STARTED(ar)))
 +		goto err_free;
 +
 +	hdr = (void *)skb->data;
@@ -1281,18 +1364,19 @@ index 0000000..b8cf1cf
 +
 +	txc = (void *)skb_push(skb, sizeof(*txc));
 +
-+	tx_status = ((info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) != 0) &&
-+		     ((info->control.sta) != NULL);
-+
-+	/* Length */
-+	txc->length = cpu_to_le16(len + 4);
++	tx_status = (((info->flags & IEEE80211_TX_CTL_RATE_CTRL_PROBE) != 0) ||
++		    ((info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) != 0)) &&
++		    ((info->control.sta) != NULL);
 +
 +	if (info->control.hw_key) {
++		icv = info->control.hw_key->icv_len;
++
 +		switch (info->control.hw_key->alg) {
 +		case ALG_WEP:
-+			keytype = AR9170_TX_MAC_ENCR_WEP;
++			keytype = AR9170_TX_MAC_ENCR_RC4;
++			break;
 +		case ALG_TKIP:
-+			keytype = AR9170_TX_MAC_ENCR_TKIP;
++			keytype = AR9170_TX_MAC_ENCR_RC4;
 +			break;
 +		case ALG_CCMP:
 +			keytype = AR9170_TX_MAC_ENCR_AES;
@@ -1301,9 +1385,10 @@ index 0000000..b8cf1cf
 +			WARN_ON(1);
 +			goto err_dequeue;
 +		}
-+		printk(KERN_DEBUG "%s: tx hw crypto %#.4x\n",
-+		       wiphy_name(ar->hw->wiphy), keytype);
 +	}
++
++	/* Length */
++	txc->length = cpu_to_le16(len + icv + 4);
 +
 +	txc->mac_control = cpu_to_le16(AR9170_TX_MAC_HW_DURATION |
 +				       AR9170_TX_MAC_BACKOFF);
@@ -1412,34 +1497,30 @@ index 0000000..b8cf1cf
 +	if (tx_status) {
 +		sta_info = (void *) info->control.sta->drv_priv;
 +
-+		txc->mac_control |= cpu_to_le16(AR9170_TX_MAC_REPORT_TX_STATUS);
++		txc->mac_control |= cpu_to_le16(AR9170_TX_MAC_RATE_PROBE);
 +
 +		/*
 +		 * WARNING:
-+		 * Putting the QoS queue bits into a area which is actually
-+		 * used to set the TX output power is probably the wrong place.
++		 * Putting the QoS queue bits into an unexplored territory is
++		 * certainly not elegant.
 +		 *
 +		 * In my defense: This idea provides a reasonable way to
 +		 * smuggle valuable information to the tx_status callback.
 +		 * Also, the idea behind this bit-abuse came straight from
-+		 * the OTUS driver code.
++		 * the original driver code.
 +		 */
-+		txc->phy_control |= cpu_to_le32(ar9170_qos_hwmap[queue] <<
-+						AR9170_TX_PHY_QOS_SHIFT);
 +
-+		spin_lock_irqsave(&sta_info->tx_status.lock, flags);
++		txc->phy_control |=
++			cpu_to_le32(queue << AR9170_TX_PHY_QOS_SHIFT);
 +
-+		__skb_queue_tail(&sta_info->tx_status, skb);
-+		err = ar->tx(ar, skb, tx_status);
-+		if (err)
-+			__skb_unlink(skb, &sta_info->tx_status);
++		skb_queue_tail(&sta_info->tx_status, skb);
++	}
 +
-+		spin_unlock_irqrestore(&sta_info->tx_status.lock, flags);
-+	} else
-+		err = ar->tx(ar, skb, tx_status);
++	err = ar->tx(ar, skb, tx_status, 0);
++	if (unlikely(tx_status && err))
++		skb_unlink(skb, &sta_info->tx_status);
 +
-+	if (likely(!err))
-+		return NETDEV_TX_OK;
++	return NETDEV_TX_OK;
 +
 +err_dequeue:
 +	spin_lock_irqsave(&ar->tx_stats_lock, flags);
@@ -1450,26 +1531,6 @@ index 0000000..b8cf1cf
 +err_free:
 +	dev_kfree_skb(skb);
 +	return NETDEV_TX_OK;
-+}
-+
-+static int ar9170_set_mac_reg(struct ar9170 *ar, const u32 reg, const u8 *mac)
-+{
-+	static const u8 zero[ETH_ALEN] = { 0 };
-+
-+	if (!mac)
-+		mac = zero;
-+
-+	ar9170_regwrite_begin(ar);
-+
-+	ar9170_regwrite(reg,
-+			(mac[3] << 24) | (mac[2] << 16) |
-+			(mac[1] << 8) | mac[0]);
-+
-+	ar9170_regwrite(reg + 4, (mac[5] << 8) | mac[4]);
-+
-+	ar9170_regwrite_finish();
-+
-+	return ar9170_regwrite_result();
 +}
 +
 +static int ar9170_op_add_interface(struct ieee80211_hw *hw,
@@ -1486,9 +1547,18 @@ index 0000000..b8cf1cf
 +	}
 +
 +	ar->vif = conf->vif;
++	memcpy(ar->mac_addr, conf->mac_addr, ETH_ALEN);
 +
-+	err = ar9170_set_mac_reg(ar, AR9170_MAC_REG_MAC_ADDR_L,
-+				 conf->mac_addr);
++	if (modparam_nohwcrypt)
++		ar->rx_software_decryption = true;
++
++	ar->cur_filter = 0;
++	ar->want_filter = AR9170_MAC_REG_FTF_DEFAULTS;
++	err = ar9170_update_frame_filter(ar);
++	if (err)
++		goto unlock;
++
++	err = ar9170_set_operating_mode(ar);
 +
 +unlock:
 +	mutex_unlock(&ar->mutex);
@@ -1502,10 +1572,14 @@ index 0000000..b8cf1cf
 +
 +	mutex_lock(&ar->mutex);
 +	ar->vif = NULL;
++	ar->want_filter = 0;
++	ar9170_update_frame_filter(ar);
++	ar9170_set_beacon_timers(ar);
 +	dev_kfree_skb(ar->beacon);
 +	ar->beacon = NULL;
++	ar->sniffer_enabled = false;
++	ar->rx_software_decryption = false;
 +	ar9170_set_operating_mode(ar);
-+	ar9170_set_mac_reg(ar, AR9170_MAC_REG_MAC_ADDR_L, NULL);
 +	mutex_unlock(&ar->mutex);
 +}
 +
@@ -1518,26 +1592,37 @@ index 0000000..b8cf1cf
 +
 +	if (changed & IEEE80211_CONF_CHANGE_RADIO_ENABLED) {
 +		/* TODO */
++		err = 0;
 +	}
 +
 +	if (changed & IEEE80211_CONF_CHANGE_LISTEN_INTERVAL) {
 +		/* TODO */
++		err = 0;
 +	}
 +
 +	if (changed & IEEE80211_CONF_CHANGE_PS) {
 +		/* TODO */
++		err = 0;
 +	}
 +
 +	if (changed & IEEE80211_CONF_CHANGE_POWER) {
 +		/* TODO */
++		err = 0;
 +	}
 +
 +	if (changed & IEEE80211_CONF_CHANGE_RETRY_LIMITS) {
-+		/* TODO */
++		/*
++		 * is it long_frame_max_tx_count or short_frame_max_tx_count?
++		 */
++
++		err = ar9170_set_hwretry_limit(ar,
++			ar->hw->conf.long_frame_max_tx_count);
++		if (err)
++			goto out;
 +	}
 +
 +	if (changed & IEEE80211_CONF_CHANGE_BEACON_INTERVAL) {
-+		err = ar9170_set_operating_mode(ar);
++		err = ar9170_set_beacon_timers(ar);
 +		if (err)
 +			goto out;
 +	}
@@ -1567,9 +1652,10 @@ index 0000000..b8cf1cf
 +
 +	mutex_lock(&ar->mutex);
 +
-+	if (conf->changed & IEEE80211_IFCC_BSSID)
-+		err = ar9170_set_mac_reg(ar, AR9170_MAC_REG_BSSID_L,
-+					 conf->bssid);
++	if (conf->changed & IEEE80211_IFCC_BSSID) {
++		memcpy(ar->bssid, conf->bssid, ETH_ALEN);
++		err = ar9170_set_operating_mode(ar);
++	}
 +
 +	if (conf->changed & IEEE80211_IFCC_BEACON) {
 +		err = ar9170_update_beacon(ar);
@@ -1590,32 +1676,26 @@ index 0000000..b8cf1cf
 +					 filter_config_work);
 +	int err;
 +
-+	if (unlikely(!ar->started))
-+		return ;
-+
 +	mutex_lock(&ar->mutex);
++	if (unlikely(!IS_STARTED(ar)))
++		goto unlock;
 +
-+	ar9170_regwrite_begin(ar);
-+
-+	if (ar->cur_mc_hash != ar->want_mc_hash) {
-+		ar9170_regwrite(AR9170_MAC_REG_GROUP_HASH_TBL_H,
-+				ar->want_mc_hash >> 32);
-+		ar9170_regwrite(AR9170_MAC_REG_GROUP_HASH_TBL_L,
-+				ar->want_mc_hash);
++	if (ar->filter_changed & AR9170_FILTER_CHANGED_PROMISC) {
++		err = ar9170_set_operating_mode(ar);
++		if (err)
++			goto unlock;
 +	}
 +
-+	if (ar->cur_filter != ar->want_filter)
-+		ar9170_regwrite(AR9170_MAC_REG_FRAMETYPE_FILTER,
-+				ar->want_filter);
++	if (ar->filter_changed & AR9170_FILTER_CHANGED_MULTICAST) {
++		err = ar9170_update_multicast(ar);
++		if (err)
++			goto unlock;
++	}
 +
-+	ar9170_regwrite_finish();
-+	err = ar9170_regwrite_result();
-+	if (err)
-+		goto out;
++	if (ar->filter_changed & AR9170_FILTER_CHANGED_FRAMEFILTER)
++		err = ar9170_update_frame_filter(ar);
 +
-+	ar->cur_mc_hash = ar->want_mc_hash;
-+	ar->cur_filter = ar->want_filter;
-+ out:
++unlock:
 +	mutex_unlock(&ar->mutex);
 +}
 +
@@ -1625,44 +1705,59 @@ index 0000000..b8cf1cf
 +				       int mc_count, struct dev_mc_list *mclist)
 +{
 +	struct ar9170 *ar = hw->priv;
-+	u64 mchash;
-+	u32 filter;
-+	int i;
 +
 +	/* mask supported flags */
-+	*new_flags &= FIF_ALLMULTI | FIF_CONTROL | FIF_BCN_PRBRESP_PROMISC;
++	*new_flags &= FIF_ALLMULTI | FIF_CONTROL | FIF_BCN_PRBRESP_PROMISC |
++		      FIF_PROMISC_IN_BSS;
 +
 +	/*
 +	 * We can support more by setting the sniffer bit and
 +	 * then checking the error flags, later.
 +	 */
 +
-+	if (*new_flags & FIF_ALLMULTI) {
-+		mchash = ~0ULL;
-+	} else {
-+		/* always get broadcast frames */
-+		mchash = 1ULL << (0xff>>2);
++	if (changed_flags & FIF_ALLMULTI) {
++		if (*new_flags & FIF_ALLMULTI) {
++			ar->want_mc_hash = ~0ULL;
++		} else {
++			u64 mchash;
++			int i;
 +
-+		for (i = 0; i < mc_count; i++) {
-+			if (WARN_ON(!mclist))
-+				break;
-+			mchash |= 1ULL << (mclist->dmi_addr[5] >> 2);
-+			mclist = mclist->next;
++			/* always get broadcast frames */
++			mchash = 1ULL << (0xff>>2);
++
++			for (i = 0; i < mc_count; i++) {
++				if (WARN_ON(!mclist))
++					break;
++				mchash |= 1ULL << (mclist->dmi_addr[5] >> 2);
++				mclist = mclist->next;
++			}
++		ar->want_mc_hash = mchash;
 +		}
++		ar->filter_changed |= AR9170_FILTER_CHANGED_MULTICAST;
 +	}
 +
-+	filter = AR9170_MAC_REG_FTF_DEFAULTS;
-+	if (*new_flags & FIF_CONTROL)
-+		filter |= AR9170_MAC_REG_FTF_PSPOLL |
-+			  AR9170_MAC_REG_FTF_RTS |
-+			  AR9170_MAC_REG_FTF_CTS |
-+			  AR9170_MAC_REG_FTF_ACK |
-+			  AR9170_MAC_REG_FTF_CFE |
-+			  AR9170_MAC_REG_FTF_CFE_ACK;
-+	ar->want_filter = filter;
-+	ar->want_mc_hash = mchash;
++	if (changed_flags & FIF_CONTROL) {
++		u32 filter = AR9170_MAC_REG_FTF_PSPOLL |
++			     AR9170_MAC_REG_FTF_RTS |
++			     AR9170_MAC_REG_FTF_CTS |
++			     AR9170_MAC_REG_FTF_ACK |
++			     AR9170_MAC_REG_FTF_CFE |
++			     AR9170_MAC_REG_FTF_CFE_ACK;
 +
-+	if (likely(ar->started))
++		if (*new_flags & FIF_CONTROL)
++			ar->want_filter = ar->cur_filter | filter;
++		else
++			ar->want_filter = ar->cur_filter & ~filter;
++
++		ar->filter_changed |= AR9170_FILTER_CHANGED_FRAMEFILTER;
++	}
++
++	if (changed_flags & FIF_PROMISC_IN_BSS) {
++		ar->sniffer_enabled = ((*new_flags) & FIF_PROMISC_IN_BSS) != 0;
++		ar->filter_changed |= AR9170_FILTER_CHANGED_PROMISC;
++	}
++
++	if (likely(IS_STARTED(ar)))
 +		queue_work(ar->hw->workqueue, &ar->filter_config_work);
 +}
 +
@@ -1679,11 +1774,17 @@ index 0000000..b8cf1cf
 +	ar9170_regwrite_begin(ar);
 +
 +	if (changed & BSS_CHANGED_ASSOC) {
-+		/* TODO */
++		ar->state = bss_conf->assoc ? AR9170_ASSOCIATED : ar->state;
++
++#ifndef CONFIG_AR9170_LEDS
++		/* enable assoc LED. */
++		err = ar9170_set_leds_state(ar, 2);
++#endif /* CONFIG_AR9170_LEDS */
 +	}
 +
 +	if (changed & BSS_CHANGED_HT) {
 +		/* TODO */
++		err = 0;
 +	}
 +
 +	if (changed & BSS_CHANGED_ERP_SLOT) {
@@ -1745,9 +1846,8 @@ index 0000000..b8cf1cf
 +	int err = 0, i;
 +	u8 ktype;
 +
-+#ifndef HWCRYPT
-+	return -EOPNOTSUPP;
-+#endif
++	if ((modparam_nohwcrypt) || (!ar->vif))
++		return -EOPNOTSUPP;
 +
 +	switch (key->alg) {
 +	case ALG_WEP:
@@ -1763,12 +1863,16 @@ index 0000000..b8cf1cf
 +		ktype = AR9170_ENC_ALG_AESCCMP;
 +		break;
 +	default:
-+		return -EINVAL;
++		return -EOPNOTSUPP;
 +	}
 +
 +	mutex_lock(&ar->mutex);
-+
 +	if (cmd == SET_KEY) {
++		if (unlikely(!IS_STARTED(ar))) {
++			err = -EOPNOTSUPP;
++			goto out;
++		}
++
 +		/* group keys need all-zeroes address */
 +		if (!(key->flags & IEEE80211_KEY_FLAG_PAIRWISE))
 +			sta = NULL;
@@ -1778,6 +1882,8 @@ index 0000000..b8cf1cf
 +				if (!(ar->usedkeys & BIT(i)))
 +					break;
 +			if (i == 64) {
++				ar->rx_software_decryption = true;
++				ar9170_set_operating_mode(ar);
 +				err = -ENOSPC;
 +				goto out;
 +			}
@@ -1797,17 +1903,25 @@ index 0000000..b8cf1cf
 +						ktype, 1, key->key + 16, 16);
 +			if (err)
 +				goto out;
++
++			/*
++			 * hardware is not capable generating the MMIC
++			 * for fragmented frames!
++			 */
++			key->flags |= IEEE80211_KEY_FLAG_GENERATE_MMIC;
 +		}
 +
 +		if (i < 64)
 +			ar->usedkeys |= BIT(i);
 +
 +		key->flags |= IEEE80211_KEY_FLAG_GENERATE_IV;
-+		key->flags |= IEEE80211_KEY_FLAG_GENERATE_MMIC;
-+
-+		printk(KERN_DEBUG "%s: installed key to %d\n",
-+		       wiphy_name(ar->hw->wiphy), i);
 +	} else {
++		if (unlikely(!IS_STARTED(ar))) {
++			/* The device is gone... together with the key ;-) */
++			err = 0;
++			goto out;
++		}
++
 +		err = ar9170_disable_key(ar, key->hw_key_idx);
 +		if (err)
 +			goto out;
@@ -1831,9 +1945,6 @@ index 0000000..b8cf1cf
 +			}
 +
 +		}
-+
-+		printk(KERN_DEBUG "%s: removed key %d\n",
-+		       wiphy_name(ar->hw->wiphy), key->hw_key_idx);
 +	}
 +
 +	ar9170_regwrite_begin(ar);
@@ -1844,7 +1955,7 @@ index 0000000..b8cf1cf
 +	ar9170_regwrite_finish();
 +	err = ar9170_regwrite_result();
 +
-+ out:
++out:
 +	mutex_unlock(&ar->mutex);
 +
 +	return err;
@@ -1880,8 +1991,16 @@ index 0000000..b8cf1cf
 +			    struct ieee80211_low_level_stats *stats)
 +{
 +	struct ar9170 *ar = hw->priv;
++	u32 val;
++	int err;
++
++	mutex_lock(&ar->mutex);
++	err = ar9170_read_reg(ar, AR9170_MAC_REG_TX_RETRY, &val);
++	ar->stats.dot11ACKFailureCount += val;
 +
 +	memcpy(stats, &ar->stats, sizeof(*stats));
++	mutex_unlock(&ar->mutex);
++
 +	return 0;
 +}
 +
@@ -1938,6 +2057,7 @@ index 0000000..b8cf1cf
 +{
 +	struct ieee80211_hw *hw;
 +	struct ar9170 *ar;
++	int i;
 +
 +	hw = ieee80211_alloc_hw(priv_size, &ar9170_ops);
 +	if (!hw)
@@ -1961,13 +2081,19 @@ index 0000000..b8cf1cf
 +					 BIT(NL80211_IFTYPE_ADHOC);
 +	ar->hw->flags |= IEEE80211_HW_RX_INCLUDES_FCS |
 +			 IEEE80211_HW_HOST_BROADCAST_PS_BUFFERING |
-+			 IEEE80211_HW_SIGNAL_DBM;
++			 IEEE80211_HW_SIGNAL_DBM |
++			 IEEE80211_HW_NOISE_DBM;
++
 +	ar->hw->queues = 4;
 +	ar->hw->extra_tx_headroom = 8;
 +	ar->hw->sta_data_size = sizeof(struct ar9170_sta_info);
 +
 +	ar->hw->max_rates = 1;
-+	ar->hw->max_rate_tries = 5;
++	ar->hw->max_rate_tries = 3;
++
++	for (i = 0; i < ARRAY_SIZE(ar->noise); i++)
++		ar->noise[i] = -95; /* ATH_DEFAULT_NOISE_FLOOR */
++
 +	return ar;
 +}
 +EXPORT_SYMBOL_GPL(ar9170_alloc);
@@ -2051,7 +2177,19 @@ index 0000000..b8cf1cf
 +	if (err)
 +		goto err_unreg;
 +
-+	dev_info(pdev, "is registered as '%s'\n", wiphy_name(ar->hw->wiphy));
++#ifdef CONFIG_AR9170_LEDS
++	err = ar9170_register_leds(ar);
++	if (err)
++		goto err_unreg;
++#endif /* CONFIG_AR9170_LEDS */
++
++	dev_info(pdev, "Atheros AR9170 is registered as '%s'\n",
++		 wiphy_name(ar->hw->wiphy));
++
++	if (!modparam_nohwcrypt)
++		printk(KERN_INFO "%s: cryptographic acceleration enabled.\n",
++		       wiphy_name(ar->hw->wiphy));
++
 +	return err;
 +
 +err_unreg:
@@ -2064,8 +2202,25 @@ index 0000000..b8cf1cf
 +
 +void ar9170_unregister(struct ar9170 *ar)
 +{
-+	ar9170_exit_leds(ar);
++	ar9170_set_leds_state(ar, 0);
++#ifdef CONFIG_AR9170_LEDS
++	ar9170_unregister_leds(ar);
++#endif /* CONFIG_AR9170_LEDS */
 +	ieee80211_unregister_hw(ar->hw);
 +	mutex_destroy(&ar->mutex);
 +}
 +EXPORT_SYMBOL_GPL(ar9170_unregister);
++
++static int __init ar9170_init(void)
++{
++	return 0;
++}
++
++static void __exit ar9170_exit(void)
++{
++
++}
++
++module_init(ar9170_init);
++module_exit(ar9170_exit);
++
