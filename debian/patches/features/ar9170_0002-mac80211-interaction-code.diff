@@ -1,8 +1,10 @@
 From:	Christian Lamparter <chunkeey@web.de>
-Subject: [RFC][PATCH 2/5 v5] ar9170: mac80211 interaction code
-Date:	Fri, 20 Mar 2009 20:36:30 +0100
+Subject: [PATCH 2/5] ar9170: ar9170: mac80211 interaction code
+Date:	Sat, 21 Mar 2009 23:05:13 +0100
 
-Most code that deals with mac80211's interface.
+This patch contains almost all mac80211 interaction code of AR9170.
+
+Signed-off-by: Christian Lamparter <chunkeey@web.de>
 
 diff --git a/drivers/net/wireless/ar9170/ar9170.h b/drivers/net/wireless/ar9170/ar9170.h
 new file mode 100644
@@ -123,6 +125,7 @@ index 0000000..f51cb07
 +	/* cryptographic engine */
 +	u64 usedkeys;
 +	bool rx_software_decryption;
++	bool disable_offload;
 +
 +	/* filter settings */
 +	struct work_struct filter_config_work;
@@ -162,6 +165,11 @@ index 0000000..f51cb07
 +
 +	/* EEPROM */
 +	struct ar9170_eeprom eeprom;
++
++	/* global tx status for unregistered Stations. */
++	struct sk_buff_head global_tx_status;
++	struct sk_buff_head global_tx_status_waste;
++	struct delayed_work tx_status_janitor;
 +};
 +
 +struct ar9170_sta_info {
@@ -212,13 +220,104 @@ index 0000000..f51cb07
 +int ar9170_set_channel(struct ar9170 *ar, struct ieee80211_channel *channel,
 +		       enum ar9170_rf_init_mode rfi, enum ar9170_bw bw);
 +
-+#if 0
-+#include <linux/mutex.h>
-+#define mutex_lock(m) do { mutex_lock(m); __acquire(m); } while (0)
-+#define mutex_unlock(m) do { mutex_unlock(m); __release(m); } while (0)
-+#endif
-+
 +#endif /* __AR9170_H */
+diff --git a/drivers/net/wireless/ar9170/cmd.h b/drivers/net/wireless/ar9170/cmd.h
+new file mode 100644
+index 0000000..a4f0e50
+--- /dev/null
++++ b/drivers/net/wireless/ar9170/cmd.h
+@@ -0,0 +1,91 @@
++/*
++ * Atheros AR9170 driver
++ *
++ * Basic HW register/memory/command access functions
++ *
++ * Copyright 2008, Johannes Berg <johannes@sipsolutions.net>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; see the file COPYING.  If not, see
++ * http://www.gnu.org/licenses/.
++ *
++ * This file incorporates work covered by the following copyright and
++ * permission notice:
++ *    Copyright (c) 2007-2008 Atheros Communications, Inc.
++ *
++ *    Permission to use, copy, modify, and/or distribute this software for any
++ *    purpose with or without fee is hereby granted, provided that the above
++ *    copyright notice and this permission notice appear in all copies.
++ *
++ *    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ *    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ *    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ *    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ *    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ *    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ *    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++#ifndef __CMD_H
++#define __CMD_H
++
++#include "ar9170.h"
++
++/* basic HW access */
++int ar9170_write_mem(struct ar9170 *ar, const __le32 *data, size_t len);
++int ar9170_write_reg(struct ar9170 *ar, const u32 reg, const u32 val);
++int ar9170_read_reg(struct ar9170 *ar, u32 reg, u32 *val);
++int ar9170_echo_test(struct ar9170 *ar, u32 v);
++
++/*
++ * Macros to facilitate writing multiple registers in a single
++ * write-combining USB command. Note that when the first group
++ * fails the whole thing will fail without any others attempted,
++ * but you won't know which write in the group failed.
++ */
++#define ar9170_regwrite_begin(ar)					\
++do {									\
++	int __nreg = 0, __err = 0;					\
++	struct ar9170 *__ar = ar;
++
++#define ar9170_regwrite(r, v) do {					\
++	__ar->cmdbuf[2 * __nreg + 1] = cpu_to_le32(r);			\
++	__ar->cmdbuf[2 * __nreg + 2] = cpu_to_le32(v);			\
++	__nreg++;							\
++	if ((__nreg >= PAYLOAD_MAX/2)) {				\
++		if (IS_ACCEPTING_CMD(__ar))				\
++			__err = ar->exec_cmd(__ar, AR9170_CMD_WREG,	\
++					     8 * __nreg,		\
++					     (u8 *) &__ar->cmdbuf[1],	\
++					     0, NULL);			\
++		__nreg = 0;						\
++		if (__err)						\
++			goto __regwrite_out;				\
++	}								\
++} while (0)
++
++#define ar9170_regwrite_finish()					\
++__regwrite_out :							\
++	if (__nreg) {							\
++		if (IS_ACCEPTING_CMD(__ar))				\
++			__err = ar->exec_cmd(__ar, AR9170_CMD_WREG,	\
++					     8 * __nreg, 		\
++					     (u8 *) &__ar->cmdbuf[1],	\
++					     0, NULL);			\
++		__nreg = 0;						\
++	}
++
++#define ar9170_regwrite_result()					\
++	__err;								\
++} while (0);
++
++#endif /* __CMD_H */
 diff --git a/drivers/net/wireless/ar9170/cmd.c b/drivers/net/wireless/ar9170/cmd.c
 new file mode 100644
 index 0000000..fd5625c
@@ -355,109 +454,12 @@ index 0000000..fd5625c
 +	return 0;
 +}
 +EXPORT_SYMBOL_GPL(ar9170_echo_test);
-diff --git a/drivers/net/wireless/ar9170/cmd.h b/drivers/net/wireless/ar9170/cmd.h
-new file mode 100644
-index 0000000..a4f0e50
---- /dev/null
-+++ b/drivers/net/wireless/ar9170/cmd.h
-@@ -0,0 +1,91 @@
-+/*
-+ * Atheros AR9170 driver
-+ *
-+ * Basic HW register/memory/command access functions
-+ *
-+ * Copyright 2008, Johannes Berg <johannes@sipsolutions.net>
-+ *
-+ * This program is free software; you can redistribute it and/or modify
-+ * it under the terms of the GNU General Public License as published by
-+ * the Free Software Foundation; either version 2 of the License, or
-+ * (at your option) any later version.
-+ *
-+ * This program is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ * GNU General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU General Public License
-+ * along with this program; see the file COPYING.  If not, see
-+ * http://www.gnu.org/licenses/.
-+ *
-+ * This file incorporates work covered by the following copyright and
-+ * permission notice:
-+ *    Copyright (c) 2007-2008 Atheros Communications, Inc.
-+ *
-+ *    Permission to use, copy, modify, and/or distribute this software for any
-+ *    purpose with or without fee is hereby granted, provided that the above
-+ *    copyright notice and this permission notice appear in all copies.
-+ *
-+ *    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-+ *    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-+ *    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-+ *    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-+ *    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
-+ *    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-+ *    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-+ */
-+#ifndef __CMD_H
-+#define __CMD_H
-+
-+#include "ar9170.h"
-+
-+/* basic HW access */
-+int ar9170_write_mem(struct ar9170 *ar, const __le32 *data, size_t len);
-+int ar9170_write_reg(struct ar9170 *ar, const u32 reg, const u32 val);
-+int ar9170_read_reg(struct ar9170 *ar, u32 reg, u32 *val);
-+int ar9170_echo_test(struct ar9170 *ar, u32 v);
-+
-+/*
-+ * Macros to facilitate writing multiple registers in a single
-+ * write-combining USB command. Note that when the first group
-+ * fails the whole thing will fail without any others attempted,
-+ * but you won't know which write in the group failed.
-+ */
-+#define ar9170_regwrite_begin(ar)					\
-+do {									\
-+	int __nreg = 0, __err = 0;					\
-+	struct ar9170 *__ar = ar;
-+
-+#define ar9170_regwrite(r, v) do {					\
-+	__ar->cmdbuf[2 * __nreg + 1] = cpu_to_le32(r);			\
-+	__ar->cmdbuf[2 * __nreg + 2] = cpu_to_le32(v);			\
-+	__nreg++;							\
-+	if ((__nreg >= PAYLOAD_MAX/2)) {				\
-+		if (IS_ACCEPTING_CMD(__ar))				\
-+			__err = ar->exec_cmd(__ar, AR9170_CMD_WREG,	\
-+					     8 * __nreg,		\
-+					     (u8 *) &__ar->cmdbuf[1],	\
-+					     0, NULL);			\
-+		__nreg = 0;						\
-+		if (__err)						\
-+			goto __regwrite_out;				\
-+	}								\
-+} while (0)
-+
-+#define ar9170_regwrite_finish()					\
-+__regwrite_out :							\
-+	if (__nreg) {							\
-+		if (IS_ACCEPTING_CMD(__ar))				\
-+			__err = ar->exec_cmd(__ar, AR9170_CMD_WREG,	\
-+					     8 * __nreg, 		\
-+					     (u8 *) &__ar->cmdbuf[1],	\
-+					     0, NULL);			\
-+		__nreg = 0;						\
-+	}
-+
-+#define ar9170_regwrite_result()					\
-+	__err;								\
-+} while (0);
-+
-+#endif /* __CMD_H */
 diff --git a/drivers/net/wireless/ar9170/led.c b/drivers/net/wireless/ar9170/led.c
 new file mode 100644
 index 0000000..5384ae8
 --- /dev/null
 +++ b/drivers/net/wireless/ar9170/led.c
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,171 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -529,6 +531,9 @@ index 0000000..5384ae8
 +	u32 led_val = 0;
 +	bool rerun = false;
 +
++	if (unlikely(!IS_ACCEPTING_CMD(ar)))
++		return ;
++
 +	mutex_lock(&ar->mutex);
 +	for (i = 0; i < AR9170_NUM_LEDS; i++)
 +		if (ar->leds[i].toggled) {
@@ -547,7 +552,7 @@ index 0000000..5384ae8
 +	ar9170_set_leds_state(ar, led_val);
 +	mutex_unlock(&ar->mutex);
 +
-+	if (likely(IS_ACCEPTING_CMD(ar) && rerun))
++	if (rerun)
 +		queue_delayed_work(ar->hw->workqueue, &ar->led_work,
 +				   msecs_to_jiffies(blink_delay));
 +}
@@ -631,7 +636,7 @@ new file mode 100644
 index 0000000..2ce3f41
 --- /dev/null
 +++ b/drivers/net/wireless/ar9170/main.c
-@@ -0,0 +1,1592 @@
+@@ -0,0 +1,1776 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -728,7 +733,7 @@ index 0000000..2ce3f41
 +#define CHAN(_freq, _idx) {		\
 +	.center_freq	= (_freq),	\
 +	.hw_value	= (_idx),	\
-+	.max_power	= 36, /* XXX */	\
++	.max_power	= 18, /* XXX */	\
 +}
 +
 +static struct ieee80211_channel ar9170_2ghz_chantable[] = {
@@ -794,6 +799,47 @@ index 0000000..2ce3f41
 +	.n_bitrates	= ar9170_g_ratetable_size,
 +};
 +
++#ifdef AR9170_QUEUE_DEBUG
++/*
++ * In case some wants works with AR9170's crazy tx_status queueing techniques.
++ * He might need this rather useful probing function.
++ *
++ * NOTE: caller must hold the queue's spinlock!
++ */
++
++static void ar9170_print_txheader(struct ar9170 *ar, struct sk_buff *skb)
++{
++	struct ar9170_tx_control *txc = (void *) skb->data;
++	struct ieee80211_hdr *hdr = (void *)txc->frame_data;
++
++	printk(KERN_DEBUG "%s: => FRAME [skb:%p, queue:%d, DA:[%pM] "
++			  "mac_control:%04x, phy_control:%08x]\n",
++	       wiphy_name(ar->hw->wiphy), skb, skb_get_queue_mapping(skb),
++	       ieee80211_get_DA(hdr), le16_to_cpu(txc->mac_control),
++	       le32_to_cpu(txc->phy_control));
++}
++
++static void ar9170_dump_station_tx_status_queue(struct ar9170 *ar,
++						struct sk_buff_head *queue)
++{
++	struct sk_buff *skb;
++	int i = 0;
++
++	printk(KERN_DEBUG "---[ cut here ]---\n");
++	printk(KERN_DEBUG "%s: %d entries in tx_status queue.\n",
++	       wiphy_name(ar->hw->wiphy), skb_queue_len(queue));
++
++	skb_queue_walk(queue, skb) {
++		struct ar9170_tx_control *txc = (void *) skb->data;
++		struct ieee80211_hdr *hdr = (void *)txc->frame_data;
++
++		printk(KERN_DEBUG "index:%d => \n", i);
++		ar9170_print_txheader(ar, skb);
++	}
++	printk(KERN_DEBUG "---[ end ]---\n");
++}
++#endif /* AR9170_QUEUE_DEBUG */
++
 +static struct ieee80211_supported_band ar9170_band_5GHz = {
 +	.channels	= ar9170_5ghz_chantable,
 +	.n_channels	= ARRAY_SIZE(ar9170_5ghz_chantable),
@@ -842,36 +888,87 @@ index 0000000..2ce3f41
 +}
 +EXPORT_SYMBOL_GPL(ar9170_handle_tx_status);
 +
-+/* caller must hold info->tx_status.lock */
-+static void ar9170_dump_station_tx_status_queue(struct ar9170 *ar,
-+						struct ar9170_sta_info *info)
++static struct sk_buff *ar9170_find_skb_in_queue(struct ar9170 *ar,
++						const u8 *mac,
++						const u32 queue,
++						struct sk_buff_head *q)
 +{
++	unsigned long flags;
 +	struct sk_buff *skb;
-+	int i = 0;
 +
-+	printk(KERN_DEBUG "---[ cut here ]---\n");
-+	printk(KERN_DEBUG "%s: %d entries in tx_status queue.\n",
-+	       wiphy_name(ar->hw->wiphy), skb_queue_len(&info->tx_status));
-+
-+	skb_queue_walk(&info->tx_status, skb) {
++	spin_lock_irqsave(&q->lock, flags);
++	skb_queue_walk(q, skb) {
 +		struct ar9170_tx_control *txc = (void *) skb->data;
++		struct ieee80211_hdr *hdr = (void *) txc->frame_data;
++		u32 txc_queue = (le32_to_cpu(txc->phy_control) &
++				AR9170_TX_PHY_QOS_MASK) >>
++				AR9170_TX_PHY_QOS_SHIFT;
 +
-+		printk(KERN_DEBUG " index:%d => [skb:%p, queue:%d "
-+				  "mac:%04x phy:%08x\n",
-+		       i++, skb, skb_get_queue_mapping(skb),
-+		       le16_to_cpu(txc->mac_control),
-+		       le32_to_cpu(txc->phy_control));
++		if  ((queue != txc_queue) ||
++		     (compare_ether_addr(ieee80211_get_DA(hdr), mac)))
++			continue;
++
++		__skb_unlink(skb, q);
++		spin_unlock_irqrestore(&q->lock, flags);
++		return skb;
 +	}
-+	printk(KERN_DEBUG "---[ end ]---\n");
++	spin_unlock_irqrestore(&q->lock, flags);
++	return NULL;
++}
++
++static struct sk_buff *ar9170_find_skb_in_queue_by_mac(struct ar9170 *ar,
++						       const u8 *mac,
++						       struct sk_buff_head *q)
++{
++	unsigned long flags;
++	struct sk_buff *skb;
++
++	spin_lock_irqsave(&q->lock, flags);
++	skb_queue_walk(q, skb) {
++		struct ar9170_tx_control *txc = (void *) skb->data;
++		struct ieee80211_hdr *hdr = (void *) txc->frame_data;
++
++		if (compare_ether_addr(ieee80211_get_DA(hdr), mac))
++			continue;
++
++		__skb_unlink(skb, q);
++		spin_unlock_irqrestore(&q->lock, flags);
++		return skb;
++	}
++	spin_unlock_irqrestore(&q->lock, flags);
++	return NULL;
++}
++
++static struct sk_buff *ar9170_find_skb_in_queue_by_txcq(struct ar9170 *ar,
++							const u32 queue,
++							struct sk_buff_head *q)
++{
++	unsigned long flags;
++	struct sk_buff *skb;
++
++	spin_lock_irqsave(&q->lock, flags);
++	skb_queue_walk(q, skb) {
++		struct ar9170_tx_control *txc = (void *) skb->data;
++		u32 txc_queue = (le32_to_cpu(txc->phy_control) &
++				AR9170_TX_PHY_QOS_MASK) >>
++				AR9170_TX_PHY_QOS_SHIFT;
++
++		if (queue != txc_queue)
++			continue;
++
++		__skb_unlink(skb, q);
++		spin_unlock_irqrestore(&q->lock, flags);
++		return skb;
++	}
++	spin_unlock_irqrestore(&q->lock, flags);
++	return NULL;
 +}
 +
 +static struct sk_buff *ar9170_find_queued_skb(struct ar9170 *ar, const u8 *mac,
 +					      const u32 queue)
 +{
 +	struct ieee80211_sta *sta;
-+	struct ar9170_sta_info *sta_priv;
 +	struct sk_buff *skb;
-+	unsigned long flags;
 +
 +	/*
 +	 * Unfortunately, the firmware does not tell to which (queued) frame
@@ -881,39 +978,78 @@ index 0000000..2ce3f41
 +	 * the firmware provided (-> destination MAC, and phy_control) -
 +	 * and hope that we picked the right one...
 +	 */
++	rcu_read_lock();
 +	sta = ieee80211_find_sta(ar->hw, mac);
 +
-+	if (!sta) {
-+		/*
-+		 * STA is not in data base.
-+		 * skb has been freed by ar9170_sta_notify.
-+		 */
++	if (likely(sta)) {
++		struct ar9170_sta_info *sta_priv = (void *) sta->drv_priv;
++		skb = ar9170_find_skb_in_queue_by_txcq(ar, queue,
++						       &sta_priv->tx_status);
++	} else {
++		/* STA is not in database (yet/anymore). */
 +
-+		return NULL;
++		/* scan the waste bin for likely candidates */
++		skb = ar9170_find_skb_in_queue(ar, mac, queue,
++					       &ar->global_tx_status_waste);
++		if (!skb) {
++			/* so it still _must_ be in the global list. */
++			skb = ar9170_find_skb_in_queue(ar, mac, queue,
++						       &ar->global_tx_status);
++		}
++	}
++	rcu_read_unlock();
++
++#ifdef AR9170_QUEUE_DEBUG
++	if (unlikely((!skb) && net_ratelimit())) {
++		printk(KERN_ERR "%s: ESS:[%pM] does not have any "
++				"outstanding frames in this queue (%d).\n",
++				wiphy_name(ar->hw->wiphy), mac, queue);
++	}
++#endif /* AR9170_QUEUE_DEBUG */
++
++	return skb;
++}
++
++/*
++ * This worker tries to keep the global tx_status queue empty.
++ * So we can guarantee that incoming tx_status reports for
++ * unregistered stations are always synced with the actual
++ * frame - which we think - belongs to.
++ */
++
++static void ar9170_tx_status_janitor(struct work_struct *work)
++{
++	struct ar9170 *ar = container_of(work, struct ar9170,
++					 filter_config_work);
++	struct sk_buff *skb;
++
++	/* recycle the garbage back to mac80211... one by one. */
++	while ((skb = skb_dequeue(&ar->global_tx_status_waste))) {
++#ifdef AR9170_QUEUE_DEBUG
++		printk(KERN_DEBUG "%s: dispose queued frame =>\n",
++		       wiphy_name(ar->hw->wiphy));
++		ar9170_print_txheader(ar, skb);
++#endif /* AR9170_QUEUE_DEBUG */
++		ar9170_handle_tx_status(ar, skb, false,
++					AR9170_TX_STATUS_FAILED);
 +	}
 +
-+	sta_priv = (void *) sta->drv_priv;
-+	spin_lock_irqsave(&sta_priv->tx_status.lock, flags);
-+	skb_queue_walk(&sta_priv->tx_status, skb) {
-+		struct ar9170_tx_control *txc = (void *) skb->data;
-+		u32 txc_queue = (le32_to_cpu(txc->phy_control) &
-+				AR9170_TX_PHY_QOS_MASK) >>
-+				AR9170_TX_PHY_QOS_SHIFT;
 +
-+		if (txc_queue != queue)
-+			continue;
 +
-+		__skb_unlink(skb, &sta_priv->tx_status);
-+		spin_unlock_irqrestore(&sta_priv->tx_status.lock, flags);
-+		return skb;
++	while ((skb = skb_dequeue(&ar->global_tx_status))) {
++#ifdef AR9170_QUEUE_DEBUG
++		printk(KERN_DEBUG "%s: moving frame into waste queue =>\n",
++		       wiphy_name(ar->hw->wiphy));
++
++		ar9170_print_txheader(ar, skb);
++#endif /* AR9170_QUEUE_DEBUG */
++		skb_queue_tail(&ar->global_tx_status_waste, skb);
 +	}
 +
-+	printk(KERN_ERR "%s: ESS (%pM) does not have any "
-+			"outstanding frames in this queue (%d).\n",
-+			wiphy_name(ar->hw->wiphy), sta->addr, queue);
-+	ar9170_dump_station_tx_status_queue(ar, sta_priv);
-+	spin_unlock_irqrestore(&sta_priv->tx_status.lock, flags);
-+	return NULL;
++	/* recall the janitor in 100ms - if there's garbage in the can. */
++	if (skb_queue_len(&ar->global_tx_status_waste) > 0)
++		queue_delayed_work(ar->hw->workqueue, &ar->tx_status_janitor,
++				   msecs_to_jiffies(100));
 +}
 +
 +static void ar9170_handle_command_response(struct ar9170 *ar,
@@ -1307,20 +1443,24 @@ index 0000000..2ce3f41
 +{
 +	struct ar9170 *ar = hw->priv;
 +
-+	ar->state = AR9170_IDLE;
++	if (IS_STARTED(ar))
++		ar->state = AR9170_IDLE;
 +
 +	mutex_lock(&ar->mutex);
 +
++	cancel_delayed_work_sync(&ar->tx_status_janitor);
 +	cancel_work_sync(&ar->filter_config_work);
 +	cancel_work_sync(&ar->beacon_work);
++	skb_queue_purge(&ar->global_tx_status_waste);
++	skb_queue_purge(&ar->global_tx_status);
 +
 +	if (IS_ACCEPTING_CMD(ar)) {
 +		ar9170_set_leds_state(ar, 0);
 +
 +		/* stop DMA */
 +		ar9170_write_reg(ar, 0x1c3d30, 0);
++		ar->stop(ar);
 +	}
-+	ar->stop(ar);
 +
 +	mutex_unlock(&ar->mutex);
 +}
@@ -1365,8 +1505,7 @@ index 0000000..2ce3f41
 +	txc = (void *)skb_push(skb, sizeof(*txc));
 +
 +	tx_status = (((info->flags & IEEE80211_TX_CTL_RATE_CTRL_PROBE) != 0) ||
-+		    ((info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) != 0)) &&
-+		    ((info->control.sta) != NULL);
++		    ((info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) != 0));
 +
 +	if (info->control.hw_key) {
 +		icv = info->control.hw_key->icv_len;
@@ -1495,10 +1634,7 @@ index 0000000..2ce3f41
 +	txc->phy_control |= cpu_to_le32(chains << AR9170_TX_PHY_TXCHAIN_SHIFT);
 +
 +	if (tx_status) {
-+		sta_info = (void *) info->control.sta->drv_priv;
-+
 +		txc->mac_control |= cpu_to_le16(AR9170_TX_MAC_RATE_PROBE);
-+
 +		/*
 +		 * WARNING:
 +		 * Putting the QoS queue bits into an unexplored territory is
@@ -1513,12 +1649,25 @@ index 0000000..2ce3f41
 +		txc->phy_control |=
 +			cpu_to_le32(queue << AR9170_TX_PHY_QOS_SHIFT);
 +
-+		skb_queue_tail(&sta_info->tx_status, skb);
++		if (info->control.sta) {
++			sta_info = (void *) info->control.sta->drv_priv;
++			skb_queue_tail(&sta_info->tx_status, skb);
++		} else {
++			skb_queue_tail(&ar->global_tx_status, skb);
++
++			queue_delayed_work(ar->hw->workqueue,
++					   &ar->tx_status_janitor,
++					   msecs_to_jiffies(100));
++		}
 +	}
 +
 +	err = ar->tx(ar, skb, tx_status, 0);
-+	if (unlikely(tx_status && err))
-+		skb_unlink(skb, &sta_info->tx_status);
++	if (unlikely(tx_status && err)) {
++		if (info->control.sta)
++			skb_unlink(skb, &sta_info->tx_status);
++		else
++			skb_unlink(skb, &ar->global_tx_status);
++	}
 +
 +	return NETDEV_TX_OK;
 +
@@ -1549,8 +1698,10 @@ index 0000000..2ce3f41
 +	ar->vif = conf->vif;
 +	memcpy(ar->mac_addr, conf->mac_addr, ETH_ALEN);
 +
-+	if (modparam_nohwcrypt)
++	if (modparam_nohwcrypt || (ar->vif->type != NL80211_IFTYPE_STATION)) {
 +		ar->rx_software_decryption = true;
++		ar->disable_offload = true;
++	}
 +
 +	ar->cur_filter = 0;
 +	ar->want_filter = AR9170_MAC_REG_FTF_DEFAULTS;
@@ -1662,7 +1813,7 @@ index 0000000..2ce3f41
 +
 +		if (err)
 +			goto out;
-+		err = ar9170_set_operating_mode(ar);
++		err = ar9170_set_beacon_timers(ar);
 +	}
 +
 +out:
@@ -1778,7 +1929,7 @@ index 0000000..2ce3f41
 +
 +#ifndef CONFIG_AR9170_LEDS
 +		/* enable assoc LED. */
-+		err = ar9170_set_leds_state(ar, 2);
++		err = ar9170_set_leds_state(ar, bss_conf->assoc ? 2 : 0);
 +#endif /* CONFIG_AR9170_LEDS */
 +	}
 +
@@ -1846,7 +1997,7 @@ index 0000000..2ce3f41
 +	int err = 0, i;
 +	u8 ktype;
 +
-+	if ((modparam_nohwcrypt) || (!ar->vif))
++	if ((!ar->vif) || (ar->disable_offload))
 +		return -EOPNOTSUPP;
 +
 +	switch (key->alg) {
@@ -1948,10 +2099,8 @@ index 0000000..2ce3f41
 +	}
 +
 +	ar9170_regwrite_begin(ar);
-+
 +	ar9170_regwrite(AR9170_MAC_REG_ROLL_CALL_TBL_L, ar->usedkeys);
 +	ar9170_regwrite(AR9170_MAC_REG_ROLL_CALL_TBL_H, ar->usedkeys >> 32);
-+
 +	ar9170_regwrite_finish();
 +	err = ar9170_regwrite_result();
 +
@@ -1966,20 +2115,58 @@ index 0000000..2ce3f41
 +			      enum sta_notify_cmd cmd,
 +			      struct ieee80211_sta *sta)
 +{
++	struct ar9170 *ar = hw->priv;
 +	struct ar9170_sta_info *info = (void *) sta->drv_priv;
 +	struct sk_buff *skb;
-+	unsigned long flags;
 +
 +	switch (cmd) {
 +	case STA_NOTIFY_ADD:
 +		skb_queue_head_init(&info->tx_status);
++
++		/*
++		 * do we already have a frame that needs tx_status
++		 * from this station in our queue?
++		 * If so then transfer them to the new station queue.
++		 */
++
++		/* preserve the correct order - check the waste bin first */
++		while ((skb = ar9170_find_skb_in_queue_by_mac(ar, sta->addr,
++				&ar->global_tx_status_waste)))
++			skb_queue_tail(&info->tx_status, skb);
++
++		/* now the still pending frames */
++		while ((skb = ar9170_find_skb_in_queue_by_mac(ar, sta->addr,
++				&ar->global_tx_status)))
++			skb_queue_tail(&info->tx_status, skb);
++
++#ifdef AR9170_QUEUE_DEBUG
++		printk(KERN_DEBUG "%s: STA[%pM] has %d queued frames =>\n",
++		       wiphy_name(ar->hw->wiphy), sta->addr,
++		       skb_queue_len(&info->tx_status));
++
++		ar9170_dump_station_tx_status_queue(ar, &info->tx_status);
++#endif /* AR9170_QUEUE_DEBUG */
++
++
 +		break;
 +
 +	case STA_NOTIFY_REMOVE:
-+		spin_lock_irqsave(&info->tx_status.lock, flags);
-+		while ((skb = __skb_dequeue(&info->tx_status)))
-+			dev_kfree_skb_irq(skb);
-+		spin_unlock_irqrestore(&info->tx_status.lock, flags);
++
++		/*
++		 * transfer all outstanding frames that need a tx_status
++		 * reports to the fallback queue
++		 */
++
++		while ((skb = skb_dequeue(&ar->global_tx_status))) {
++#ifdef AR9170_QUEUE_DEBUG
++			printk(KERN_DEBUG "%s: queueing frame in global "
++					  "tx_status queue =>\n",
++			       wiphy_name(ar->hw->wiphy));
++
++			ar9170_print_txheader(ar, skb);
++#endif /* AR9170_QUEUE_DEBUG */
++			skb_queue_tail(&ar->global_tx_status_waste, skb);
++		}
 +		break;
 +
 +	default:
@@ -2069,8 +2256,11 @@ index 0000000..2ce3f41
 +	mutex_init(&ar->mutex);
 +	spin_lock_init(&ar->cmdlock);
 +	spin_lock_init(&ar->tx_stats_lock);
++	skb_queue_head_init(&ar->global_tx_status);
++	skb_queue_head_init(&ar->global_tx_status_waste);
 +	INIT_WORK(&ar->filter_config_work, ar9170_set_filters);
 +	INIT_WORK(&ar->beacon_work, ar9170_new_beacon);
++	INIT_DELAYED_WORK(&ar->tx_status_janitor, ar9170_tx_status_janitor);
 +
 +	/* all hw supports 2.4 GHz, so set channel to 1 by default */
 +	ar->channel = &ar9170_2ghz_chantable[0];
@@ -2186,10 +2376,6 @@ index 0000000..2ce3f41
 +	dev_info(pdev, "Atheros AR9170 is registered as '%s'\n",
 +		 wiphy_name(ar->hw->wiphy));
 +
-+	if (!modparam_nohwcrypt)
-+		printk(KERN_INFO "%s: cryptographic acceleration enabled.\n",
-+		       wiphy_name(ar->hw->wiphy));
-+
 +	return err;
 +
 +err_unreg:
@@ -2202,10 +2388,10 @@ index 0000000..2ce3f41
 +
 +void ar9170_unregister(struct ar9170 *ar)
 +{
-+	ar9170_set_leds_state(ar, 0);
 +#ifdef CONFIG_AR9170_LEDS
 +	ar9170_unregister_leds(ar);
 +#endif /* CONFIG_AR9170_LEDS */
++
 +	ieee80211_unregister_hw(ar->hw);
 +	mutex_destroy(&ar->mutex);
 +}
@@ -2213,6 +2399,10 @@ index 0000000..2ce3f41
 +
 +static int __init ar9170_init(void)
 +{
++	if (modparam_nohwcrypt)
++		printk(KERN_INFO "ar9170: cryptographic acceleration "
++				 "disabled.\n");
++
 +	return 0;
 +}
 +
@@ -2223,4 +2413,3 @@ index 0000000..2ce3f41
 +
 +module_init(ar9170_init);
 +module_exit(ar9170_exit);
-+
