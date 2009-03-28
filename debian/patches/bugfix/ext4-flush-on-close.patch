@@ -1,0 +1,181 @@
+From: Theodore Ts'o <tytso@mit.edu>
+Date: Thu, 26 Feb 2009 06:04:07 +0000 (-0500)
+Subject: ext4: add EXT4_IOC_ALLOC_DA_BLKS ioctl
+X-Git-Url: http://git.kernel.org/?p=linux%2Fkernel%2Fgit%2Ftytso%2Fext4.git;a=commitdiff_plain;h=3bf3342f394d72ed2ec7e77b5b39e1b50fad8284
+
+ext4: add EXT4_IOC_ALLOC_DA_BLKS ioctl
+
+Add an ioctl which forces all of the delay allocated blocks to be
+allocated.  This also provides a function ext4_alloc_da_blocks() which
+will be used by the following commits to force files to be fully
+allocated to preserve application-expected ext3 behaviour.
+
+XXX ERS: actual ioctl removed, not needed for our purposes at this time
+
+Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+---
+
+
+From: Theodore Ts'o <tytso@mit.edu>
+Date: Tue, 24 Feb 2009 13:21:14 +0000 (-0500)
+Subject: ext4: Automatically allocate delay allocated blocks on close
+X-Git-Url: http://git.kernel.org/?p=linux%2Fkernel%2Fgit%2Ftytso%2Fext4.git;a=commitdiff_plain;h=6645f8c3bc3cdaa7de4aaa3d34d40c2e8e5f09ae
+
+ext4: Automatically allocate delay allocated blocks on close
+
+When closing a file that had been previously truncated, force any
+delay allocated blocks that to be allocated so that if the filesystem
+is mounted with data=ordered, the data blocks will be pushed out to
+disk along with the journal commit.  Many application programs expect
+this, so we do this to avoid zero length files if the system crashes
+unexpectedly.
+
+Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+---
+
+From: Theodore Ts'o <tytso@mit.edu>
+Date: Tue, 24 Feb 2009 04:05:27 +0000 (-0500)
+Subject: ext4: Automatically allocate delay allocated blocks on rename
+X-Git-Url: http://git.kernel.org/?p=linux%2Fkernel%2Fgit%2Ftytso%2Fext4.git;a=commitdiff_plain;h=dbc85aa9f11d8c13c15527d43a3def8d7beffdc8
+
+ext4: Automatically allocate delay allocated blocks on rename
+
+When renaming a file such that a link to another inode is overwritten,
+force any delay allocated blocks that to be allocated so that if the
+filesystem is mounted with data=ordered, the data blocks will be
+pushed out to disk along with the journal commit.  Many application
+programs expect this, so we do this to avoid zero length files if the
+system crashes unexpectedly.
+
+Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+---
+
+
+Index: linux-2.6.28.noarch/fs/ext4/ext4.h
+===================================================================
+--- linux-2.6.28.noarch.orig/fs/ext4/ext4.h
++++ linux-2.6.28.noarch/fs/ext4/ext4.h
+@@ -255,6 +255,7 @@ struct flex_groups {
+ #define EXT4_STATE_NEW			0x00000002 /* inode is newly created */
+ #define EXT4_STATE_XATTR		0x00000004 /* has in-inode xattrs */
+ #define EXT4_STATE_NO_EXPAND		0x00000008 /* No space for expansion */
++#define EXT4_STATE_DA_ALLOC_CLOSE	0x00000010 /* Alloc DA blks on close */
+ 
+ /* Used to pass group descriptor data when online resize is done */
+ struct ext4_new_group_input {
+@@ -1091,6 +1092,7 @@ extern int ext4_can_truncate(struct inod
+ extern void ext4_truncate(struct inode *);
+ extern void ext4_set_inode_flags(struct inode *);
+ extern void ext4_get_inode_flags(struct ext4_inode_info *);
++extern int ext4_alloc_da_blocks(struct inode *inode);
+ extern void ext4_set_aops(struct inode *inode);
+ extern int ext4_writepage_trans_blocks(struct inode *);
+ extern int ext4_meta_trans_blocks(struct inode *, int nrblocks, int idxblocks);
+Index: linux-2.6.28.noarch/fs/ext4/inode.c
+===================================================================
+--- linux-2.6.28.noarch.orig/fs/ext4/inode.c
++++ linux-2.6.28.noarch/fs/ext4/inode.c
+@@ -2816,6 +2816,48 @@ out:
+ 	return;
+ }
+ 
++/*
++ * Force all delayed allocation blocks to be allocated for a given inode.
++ */
++int ext4_alloc_da_blocks(struct inode *inode)
++{
++	if (!EXT4_I(inode)->i_reserved_data_blocks &&
++	    !EXT4_I(inode)->i_reserved_meta_blocks)
++		return 0;
++
++	/*
++	 * We do something simple for now.  The filemap_flush() will
++	 * also start triggering a write of the data blocks, which is
++	 * not strictly speaking necessary (and for users of
++	 * laptop_mode, not even desirable).  However, to do otherwise
++	 * would require replicating code paths in:
++	 * 
++	 * ext4_da_writepages() ->
++	 *    write_cache_pages() ---> (via passed in callback function)
++	 *        __mpage_da_writepage() -->
++	 *           mpage_add_bh_to_extent()
++	 *           mpage_da_map_blocks()
++	 *
++	 * The problem is that write_cache_pages(), located in
++	 * mm/page-writeback.c, marks pages clean in preparation for
++	 * doing I/O, which is not desirable if we're not planning on
++	 * doing I/O at all.
++	 *
++	 * We could call write_cache_pages(), and then redirty all of
++	 * the pages by calling redirty_page_for_writeback() but that
++	 * would be ugly in the extreme.  So instead we would need to
++	 * replicate parts of the code in the above functions,
++	 * simplifying them becuase we wouldn't actually intend to
++	 * write out the pages, but rather only collect contiguous
++	 * logical block extents, call the multi-block allocator, and
++	 * then update the buffer heads with the block allocations.
++	 * 
++	 * For now, though, we'll cheat by calling filemap_flush(),
++	 * which will map the blocks, and start the I/O, but not
++	 * actually wait for the I/O to complete.
++	 */
++	return filemap_flush(inode->i_mapping);
++}
+ 
+ /*
+  * bmap() is special.  It gets used by applications such as lilo and by
+@@ -3838,6 +3880,9 @@ void ext4_truncate(struct inode *inode)
+ 	if (!ext4_can_truncate(inode))
+ 		return;
+ 
++	if (inode->i_size == 0)
++		ei->i_state |= EXT4_STATE_DA_ALLOC_CLOSE;
++
+ 	if (EXT4_I(inode)->i_flags & EXT4_EXTENTS_FL) {
+ 		ext4_ext_truncate(inode);
+ 		return;
+Index: linux-2.6.28.noarch/fs/ext4/file.c
+===================================================================
+--- linux-2.6.28.noarch.orig/fs/ext4/file.c
++++ linux-2.6.28.noarch/fs/ext4/file.c
+@@ -33,6 +33,10 @@
+  */
+ static int ext4_release_file(struct inode *inode, struct file *filp)
+ {
++	if (EXT4_I(inode)->i_state & EXT4_STATE_DA_ALLOC_CLOSE) {
++		ext4_alloc_da_blocks(inode);
++		EXT4_I(inode)->i_state &= ~EXT4_STATE_DA_ALLOC_CLOSE;
++	}
+ 	/* if we are the last writer on the inode, drop the block reservation */
+ 	if ((filp->f_mode & FMODE_WRITE) &&
+ 			(atomic_read(&inode->i_writecount) == 1))
+Index: linux-2.6.28.noarch/fs/ext4/namei.c
+===================================================================
+--- linux-2.6.28.noarch.orig/fs/ext4/namei.c
++++ linux-2.6.28.noarch/fs/ext4/namei.c
+@@ -2311,7 +2311,7 @@ static int ext4_rename(struct inode *old
+ 	struct inode *old_inode, *new_inode;
+ 	struct buffer_head *old_bh, *new_bh, *dir_bh;
+ 	struct ext4_dir_entry_2 *old_de, *new_de;
+-	int retval;
++	int retval, force_da_alloc = 0;
+ 
+ 	old_bh = new_bh = dir_bh = NULL;
+ 
+@@ -2449,6 +2449,7 @@ static int ext4_rename(struct inode *old
+ 		ext4_mark_inode_dirty(handle, new_inode);
+ 		if (!new_inode->i_nlink)
+ 			ext4_orphan_add(handle, new_inode);
++		force_da_alloc = 1;
+ 	}
+ 	retval = 0;
+ 
+@@ -2457,6 +2458,8 @@ end_rename:
+ 	brelse(old_bh);
+ 	brelse(new_bh);
+ 	ext4_journal_stop(handle);
++	if (retval == 0 && force_da_alloc)
++		ext4_alloc_da_blocks(old_inode);
+ 	return retval;
+ }
+ 
