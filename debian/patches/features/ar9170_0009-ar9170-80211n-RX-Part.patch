@@ -1,0 +1,458 @@
+From:	Christian Lamparter <chunkeey@web.de>
+Subject: [RFC] ar9170: 802.11n RX Part
+Date:	Tue, 14 Apr 2009 21:59:59 +0200
+
+With this patch you can finally tune your ar9170 radio to the next network
+and listen to the sound of HT.
+
+Of course, you won't be able to sing along with all other 11n devices.
+We still need a rate algo, BA support (weird stuff!) for HT before
+we can think about coding it.
+
+Regards,
+	Chr
+
+backported to 2.6.29 by Stefan Lippers-Hollmann <s.l-h@gmx.de>
+
+--- a/drivers/net/wireless/ar9170/ar9170.h
++++ b/drivers/net/wireless/ar9170/ar9170.h
+@@ -87,6 +87,13 @@ enum ar9170_device_state {
+ 	AR9170_ASSOCIATED,
+ };
+ 
++struct ar9170_rx_mpdu {
++	struct ar9170_rx_head head;
++	struct ar9170_rx_tail *tail;
++	struct sk_buff_head queue;
++	bool has_head;
++};
++
+ struct ar9170 {
+ 	struct ieee80211_hw *hw;
+ 	struct mutex mutex;
+@@ -156,6 +163,9 @@ struct ar9170 {
+ 	struct sk_buff_head global_tx_status;
+ 	struct sk_buff_head global_tx_status_waste;
+ 	struct delayed_work tx_status_janitor;
++
++	/* rx mpdu merge */
++	struct ar9170_rx_mpdu rx_mpdu;
+ };
+ 
+ struct ar9170_sta_info {
+--- a/drivers/net/wireless/ar9170/main.c
++++ b/drivers/net/wireless/ar9170/main.c
+@@ -436,40 +436,24 @@ static void ar9170_handle_command_respon
+ 	}
+ }
+ 
+-/*
+- * If the frame alignment is right (or the kernel has
+- * CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS), and there
+- * is only a single MPDU in the USB frame, then we can
+- * submit to mac80211 the SKB directly. However, since
+- * there may be multiple packets in one SKB in stream
+- * mode, and we need to observe the proper ordering,
+- * this is non-trivial.
+- */
+-static void ar9170_handle_mpdu(struct ar9170 *ar, u8 *buf, int len)
++static void ar9170_rx_reset_rx_mpdu(struct ar9170 *ar)
+ {
+-	struct sk_buff *skb;
+-	struct ar9170_rx_head *head = (void *)buf;
+-	struct ar9170_rx_tail *tail;
+-	struct ieee80211_rx_status status;
+-	int mpdu_len, i;
+-	u8 error, antennas = 0, decrypt;
+-	__le16 fc;
+-	int reserved;
++	skb_queue_purge(&ar->rx_mpdu.queue);
++	memset(&ar->rx_mpdu.head, 0, sizeof(struct ar9170_rx_head));
++	ar->rx_mpdu.tail = NULL;
++	ar->rx_mpdu.has_head = false;
++}
+ 
+-	if (unlikely(!IS_STARTED(ar)))
+-		return ;
++static int ar9170_rx_generate_status(struct ar9170 *ar,
++				     struct ar9170_rx_head *head,
++				     struct ar9170_rx_tail *tail,
++				     struct ieee80211_rx_status *status)
++{
++	int i;
++	u8 error, antennas = 0, decrypt;
+ 
+-	/* Received MPDU */
+-	mpdu_len = len;
+-	mpdu_len -= sizeof(struct ar9170_rx_head);
+-	mpdu_len -= sizeof(struct ar9170_rx_tail);
+-	BUILD_BUG_ON(sizeof(struct ar9170_rx_head) != 12);
+ 	BUILD_BUG_ON(sizeof(struct ar9170_rx_tail) != 24);
+-
+-	if (mpdu_len <= FCS_LEN)
+-		return;
+-
+-	tail = (void *)(buf + sizeof(struct ar9170_rx_head) + mpdu_len);
++	BUILD_BUG_ON(sizeof(struct ar9170_rx_head) != 12);
+ 
+ 	for (i = 0; i < 3; i++)
+ 		if (tail->rssi[i] != 0x80)
+@@ -480,142 +464,298 @@ static void ar9170_handle_mpdu(struct ar
+ 		if (tail->rssi[i] & 0x80)
+ 			tail->rssi[i] = ((tail->rssi[i] & 0x7f) + 1) & 0x7f;
+ 
+-	memset(&status, 0, sizeof(status));
++	memset(status, 0, sizeof(*status));
+ 
+-	status.band = ar->channel->band;
+-	status.freq = ar->channel->center_freq;
+-	status.signal = ar->noise[0] + tail->rssi_combined;
+-	status.noise = ar->noise[0];
+-	status.antenna = antennas;
++	status->band = ar->channel->band;
++	status->freq = ar->channel->center_freq;
++	status->signal = ar->noise[0] + tail->rssi_combined;
++	status->noise = ar->noise[0];
++	status->antenna = antennas;
+ 
+ 	switch (tail->status & AR9170_RX_STATUS_MODULATION_MASK) {
+ 	case AR9170_RX_STATUS_MODULATION_CCK:
+ 		if (tail->status & AR9170_RX_STATUS_SHORT_PREAMBLE)
+-			status.flag |= RX_FLAG_SHORTPRE;
++			status->flag |= RX_FLAG_SHORTPRE;
+ 		switch (head->plcp[0]) {
+ 		case 0x0a:
+-			status.rate_idx = 0;
++			status->rate_idx = 0;
+ 			break;
+ 		case 0x14:
+-			status.rate_idx = 1;
++			status->rate_idx = 1;
+ 			break;
+ 		case 0x37:
+-			status.rate_idx = 2;
++			status->rate_idx = 2;
+ 			break;
+ 		case 0x6e:
+-			status.rate_idx = 3;
++			status->rate_idx = 3;
+ 			break;
+ 		default:
+ 			if ((!ar->sniffer_enabled) && (net_ratelimit()))
+ 				printk(KERN_ERR "%s: invalid plcp cck rate "
+ 				       "(%x).\n", wiphy_name(ar->hw->wiphy),
+ 				       head->plcp[0]);
+-			return;
++			return -EINVAL;
+ 		}
+ 		break;
++
+ 	case AR9170_RX_STATUS_MODULATION_OFDM:
+ 		switch (head->plcp[0] & 0xF) {
+ 		case 0xB:
+-			status.rate_idx = 0;
++			status->rate_idx = 0;
+ 			break;
+ 		case 0xF:
+-			status.rate_idx = 1;
++			status->rate_idx = 1;
+ 			break;
+ 		case 0xA:
+-			status.rate_idx = 2;
++			status->rate_idx = 2;
+ 			break;
+ 		case 0xE:
+-			status.rate_idx = 3;
++			status->rate_idx = 3;
+ 			break;
+ 		case 0x9:
+-			status.rate_idx = 4;
++			status->rate_idx = 4;
+ 			break;
+ 		case 0xD:
+-			status.rate_idx = 5;
++			status->rate_idx = 5;
+ 			break;
+ 		case 0x8:
+-			status.rate_idx = 6;
++			status->rate_idx = 6;
+ 			break;
+ 		case 0xC:
+-			status.rate_idx = 7;
++			status->rate_idx = 7;
+ 			break;
+ 		default:
+ 			if ((!ar->sniffer_enabled) && (net_ratelimit()))
+ 				printk(KERN_ERR "%s: invalid plcp ofdm rate "
+ 				       "(%x).\n", wiphy_name(ar->hw->wiphy),
+ 				       head->plcp[0]);
+-			return;
++			return -EINVAL;
+ 		}
+-		if (status.band == IEEE80211_BAND_2GHZ)
+-			status.rate_idx += 4;
++		if (status->band == IEEE80211_BAND_2GHZ)
++			status->rate_idx += 4;
+ 		break;
+-	case AR9170_RX_STATUS_MODULATION_HT:
++
+ 	case AR9170_RX_STATUS_MODULATION_DUPOFDM:
+ 		/* XXX */
+-
+ 		if (net_ratelimit())
+ 			printk(KERN_ERR "%s: invalid modulation\n",
+ 			       wiphy_name(ar->hw->wiphy));
+-		return;
++		return -EINVAL;
++
++	case AR9170_RX_STATUS_MODULATION_HT:
++		status->flag |= RX_FLAG_HT;
++		if (head->plcp[3] & 0x80)
++			status->flag |= RX_FLAG_40MHZ;
++		if (head->plcp[6] & 0x80)
++			status->flag |= RX_FLAG_SHORT_GI;
++		status->rate_idx = clamp(0, 75, head->plcp[6] & 0x7f);
++		break;
+ 	}
+ 
+ 	error = tail->error;
+ 
+ 	if (error & AR9170_RX_ERROR_MMIC) {
+-		status.flag |= RX_FLAG_MMIC_ERROR;
++		status->flag |= RX_FLAG_MMIC_ERROR;
+ 		error &= ~AR9170_RX_ERROR_MMIC;
+ 	}
+ 
+ 	if (error & AR9170_RX_ERROR_PLCP) {
+-		status.flag |= RX_FLAG_FAILED_PLCP_CRC;
++		status->flag |= RX_FLAG_FAILED_PLCP_CRC;
+ 		error &= ~AR9170_RX_ERROR_PLCP;
+ 	}
+ 
+ 	if (error & AR9170_RX_ERROR_FCS) {
+-		status.flag |= RX_FLAG_FAILED_FCS_CRC;
++		status->flag |= RX_FLAG_FAILED_FCS_CRC;
+ 		error &= ~AR9170_RX_ERROR_FCS;
+ 	}
+ 
+ 	decrypt = ar9170_get_decrypt_type(tail);
+ 	if (!(decrypt & AR9170_RX_ENC_SOFTWARE) &&
+ 	    decrypt != AR9170_ENC_ALG_NONE)
+-		status.flag |= RX_FLAG_DECRYPTED;
++		status->flag |= RX_FLAG_DECRYPTED;
+ 
+ 	/* ignore wrong RA errors */
+ 	error &= ~AR9170_RX_ERROR_WRONG_RA;
+ 
+ 	if (error & AR9170_RX_ERROR_DECRYPT) {
+ 		error &= ~AR9170_RX_ERROR_DECRYPT;
+-
+ 		/*
+ 		 * Rx decryption is done in place,
+ 		 * the original data is lost anyway.
+ 		 */
+-		return ;
++
++		return -EINVAL;
+ 	}
+ 
+ 	/* drop any other error frames */
+-	if ((error) && (net_ratelimit())) {
+-		printk(KERN_DEBUG "%s: errors: %#x\n",
+-		       wiphy_name(ar->hw->wiphy), error);
+-		return;
++	if (error) {
++		if (net_ratelimit())
++			printk(KERN_DEBUG "%s: errors: %#x\n",
++			       wiphy_name(ar->hw->wiphy), error);
++
++		return -EINVAL;
+ 	}
+ 
+-	buf += sizeof(struct ar9170_rx_head);
+-	fc = *(__le16 *)buf;
++	return 0;
++}
++
++static void ar9170_rx_merge_mpdu(struct ar9170 *ar)
++{
++	struct ar9170_rx_head *head = &ar->rx_mpdu.head;
++	struct ar9170_rx_tail *tail = ar->rx_mpdu.tail;
++	struct ieee80211_rx_status status;
++	struct sk_buff *skb;
++	int err = 0;
++
++	err = ar9170_rx_generate_status(ar, head, tail, &status);
++	if (err)
++		goto out;
++
++	while ((skb = skb_dequeue(&ar->rx_mpdu.queue)))
++		ieee80211_rx_irqsafe(ar->hw, skb, &status);
++
++out:
++	ar9170_rx_reset_rx_mpdu(ar);
++}
++
++static struct sk_buff *ar9170_rx_copy_data(u8 *buf, int len)
++{
++	struct sk_buff *skb;
++	__le16 fc = *(__le16 *)buf;
++	int reserved;
+ 
+ 	if (ieee80211_is_data_qos(fc) ^ ieee80211_has_a4(fc))
+ 		reserved = 32 + 2;
+ 	else
+ 		reserved = 32;
+ 
+-	skb = dev_alloc_skb(mpdu_len + reserved);
++	skb = dev_alloc_skb(len + reserved);
+ 	if (!skb)
+-		return;
++		return NULL;
+ 
+ 	skb_reserve(skb, reserved);
+-	memcpy(skb_put(skb, mpdu_len), buf, mpdu_len);
+-	ieee80211_rx_irqsafe(ar->hw, skb, &status);
++	memcpy(skb_put(skb, len), buf, len);
++	return skb;
++}
++
++/*
++ * If the frame alignment is right (or the kernel has
++ * CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS), and there
++ * is only a single MPDU in the USB frame, then we can
++ * submit to mac80211 the SKB directly. However, since
++ * there may be multiple packets in one SKB in stream
++ * mode, and we need to observe the proper ordering,
++ * this is non-trivial.
++ */
++static void ar9170_handle_mpdu(struct ar9170 *ar, u8 *buf, int len)
++{
++	struct ieee80211_rx_status status;
++	struct sk_buff *skb;
++	int mpdu_len;
++	u8 mpdu_type;
++
++	if (unlikely(!IS_STARTED(ar)))
++		goto err_out;
++
++	/* Received MPDU */
++	mpdu_len = len;
++	mpdu_type = (buf[len - 1] & 0x30) >> 4;
++
++	switch (mpdu_type) {
++	case 0: {
++		/* single mpdu - has head and tail */
++		struct ar9170_rx_head *head = (void *) buf;
++		struct ar9170_rx_tail *tail;
++		int err;
++
++		mpdu_len -= sizeof(struct ar9170_rx_head);
++		mpdu_len -= sizeof(struct ar9170_rx_tail);
++		if (mpdu_len < FCS_LEN)
++				return ;
++
++		buf += sizeof(struct ar9170_rx_head);
++		tail = (void *)(buf + mpdu_len);
++		err = ar9170_rx_generate_status(ar, head, tail, &status);
++
++		if (!err) {
++			skb = ar9170_rx_copy_data(buf, mpdu_len);
++			ieee80211_rx_irqsafe(ar->hw, skb, &status);
++		}
++		return ;
++		}
++
++	case 2: {
++		/* first mpdu packet has the plcp header */
++		if (unlikely(ar->rx_mpdu.has_head)) {
++			printk(KERN_ERR "%s: previous stream was not "
++					"terminated properly.\n",
++					wiphy_name(ar->hw->wiphy));
++
++			ar9170_rx_reset_rx_mpdu(ar);
++		}
++
++		if (likely(mpdu_len >= sizeof(struct ar9170_rx_head))) {
++			memcpy(&ar->rx_mpdu.head, (void *) buf,
++			       sizeof(struct ar9170_rx_head));
++
++			mpdu_len -= sizeof(struct ar9170_rx_head);
++			buf += sizeof(struct ar9170_rx_head);
++			ar->rx_mpdu.has_head = true;
++		} else {
++			printk(KERN_ERR "%s: frame header is clipped.\n",
++					wiphy_name(ar->hw->wiphy));
++			goto err_out;
++		}
++		break;
++		}
++
++	case 3:
++		/* middle mpdus are just data */
++		if (unlikely(!ar->rx_mpdu.has_head)) {
++			printk(KERN_ERR "%s: rx stream did not start "
++					"with a first_mpdu frame.\n",
++			       wiphy_name(ar->hw->wiphy));
++			goto err_out;
++			}
++		break;
++
++	case 1: {
++		/* last mpdu has a extra tail with status information */
++		if (unlikely(!ar->rx_mpdu.has_head)) {
++			printk(KERN_ERR "%s: rx stream has a tail, "
++			       "but no head?!\n", wiphy_name(ar->hw->wiphy));
++			goto err_out;
++		}
++
++		if (likely(mpdu_len >= sizeof(struct ar9170_rx_tail))) {
++			mpdu_len -= sizeof(struct ar9170_rx_tail);
++			ar->rx_mpdu.tail = (void *)(buf + mpdu_len);
++		} else {
++			printk(KERN_ERR "%s: frame tail is clipped.\n",
++			       wiphy_name(ar->hw->wiphy));
++
++			goto err_out;
++		}
++		break;
++		}
++
++	default:
++		BUG_ON(1);
++	}
++
++	if (mpdu_len >= FCS_LEN) {
++		skb = ar9170_rx_copy_data(buf, mpdu_len);
++		skb_queue_tail(&ar->rx_mpdu.queue, skb);
++	}
++
++	if (ar->rx_mpdu.tail && ar->rx_mpdu.has_head)
++		ar9170_rx_merge_mpdu(ar);
++
++	return ;
++
++err_out:
++	ar9170_rx_reset_rx_mpdu(ar);
++	return ;
+ }
+ 
+ void ar9170_rx(struct ar9170 *ar, struct sk_buff *skb)
+@@ -759,6 +899,8 @@ static void ar9170_op_stop(struct ieee80
+ 		ar->stop(ar);
+ 	}
+ 
++	skb_queue_purge(&ar->rx_mpdu.queue);
++
+ 	mutex_unlock(&ar->mutex);
+ }
+ 
+@@ -1535,6 +1677,8 @@ void *ar9170_alloc(size_t priv_size)
+ 	spin_lock_init(&ar->tx_stats_lock);
+ 	skb_queue_head_init(&ar->global_tx_status);
+ 	skb_queue_head_init(&ar->global_tx_status_waste);
++	skb_queue_head_init(&ar->rx_mpdu.queue);
++	ar9170_rx_reset_rx_mpdu(ar);
+ 	INIT_WORK(&ar->filter_config_work, ar9170_set_filters);
+ 	INIT_WORK(&ar->beacon_work, ar9170_new_beacon);
+ 	INIT_DELAYED_WORK(&ar->tx_status_janitor, ar9170_tx_status_janitor);
