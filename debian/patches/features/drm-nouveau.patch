@@ -424,10 +424,10 @@ index 0000000..e3d354f
 +}	
 diff --git a/drivers/gpu/drm/nouveau/nouveau_bios.c b/drivers/gpu/drm/nouveau/nouveau_bios.c
 new file mode 100644
-index 0000000..fd3e08a
+index 0000000..7805dc9
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nouveau_bios.c
-@@ -0,0 +1,4577 @@
+@@ -0,0 +1,4802 @@
 +/*
 + * Copyright 2005-2006 Erik Waling
 + * Copyright 2006 Stephane Marchesin
@@ -461,6 +461,7 @@ index 0000000..fd3e08a
 +#define NV_CIO_CRE_44_HEADB 0x3
 +#define FEATURE_MOBILE 0x10	/* also FEATURE_QUADRO for BMP */
 +#define LEGACY_I2C_CRT 0x80
++#define LEGACY_I2C_PANEL 0x81
 +
 +#define EDID1_LEN 128
 +
@@ -517,12 +518,11 @@ index 0000000..fd3e08a
 +
 +static void load_vbios_prom(struct drm_device *dev, uint8_t *data)
 +{
-+	struct drm_nouveau_private *dev_priv = dev->dev_private;
 +	uint32_t pci_nv_20, save_pci_nv_20;
 +	int pcir_ptr;
 +	int i;
 +
-+	if (dev_priv->card_type >= NV_50)
++	if (nv_arch(dev) >= NV_50)
 +		pci_nv_20 = 0x88050;
 +	else
 +		pci_nv_20 = NV_PBUS_PCI_NV_20;
@@ -561,11 +561,10 @@ index 0000000..fd3e08a
 +
 +static void load_vbios_pramin(struct drm_device *dev, uint8_t *data)
 +{
-+	struct drm_nouveau_private *dev_priv = dev->dev_private;
 +	uint32_t old_bar0_pramin = 0;
 +	int i;
 +
-+	if (dev_priv->card_type >= NV_50) {
++	if (nv_arch(dev) >= NV_50) {
 +		uint32_t vbios_vram = (nv_rd32(0x619f04) & ~0xff) << 8;
 +
 +		if (!vbios_vram)
@@ -584,7 +583,7 @@ index 0000000..fd3e08a
 +		data[i] = nv_rd08(NV_PRAMIN_OFFSET + i);
 +
 +out:
-+	if (dev_priv->card_type >= NV_50)
++	if (nv_arch(dev) >= NV_50)
 +		nv_wr32(0x1700, old_bar0_pramin);
 +}
 +
@@ -676,6 +675,21 @@ index 0000000..fd3e08a
 +//	BIOS_USLEEP(2000);
 +}
 +
++static uint32_t
++munge_reg(struct drm_device *dev, uint32_t reg)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++
++	if (nv_arch(dev) < NV_50)
++		return reg;
++
++	if (reg & 0x40000000)
++		reg += dev_priv->VBIOS.display.head * 0x800;
++
++	reg &= ~(0x40000000);
++	return reg;
++}
++
 +static int valid_reg(struct drm_device *dev, uint32_t reg)
 +{
 +	struct drm_nouveau_private *dev_priv = dev->dev_private;
@@ -700,7 +714,7 @@ index 0000000..fd3e08a
 +	if (WITHIN(reg,NV_PFIFO_OFFSET,NV_PFIFO_SIZE))
 +		return 1;
 +	/* maybe a little large, but it will do for the moment. */
-+	if (dev_priv->VBIOS.pub.chip_version >= 0x80 && WITHIN(reg, 0x1000, 0xEFFF))
++	if (nv_arch(dev) >= NV_50 && WITHIN(reg, 0x1000, 0xEFFF))
 +		return 1;
 +	if (dev_priv->VBIOS.pub.chip_version >= 0x30 && WITHIN(reg,0x4000,0x600))
 +		return 1;
@@ -714,12 +728,13 @@ index 0000000..fd3e08a
 +		if (WITHIN(reg,0x88000,NV_PBUS_SIZE)) /* new PBUS */
 +			return 1;
 +	}
-+	if (dev_priv->VBIOS.pub.chip_version >= 0x80) {
-+		/* No clue what they do, but because they are outside normal ranges we'd
-+		 * better list them seperately. */
-+		if (reg == 0x00020018 || reg == 0x0002004C || reg == 0x00020060 ||
-+			reg == 0x00021218 || reg == 0x0002130C || reg == 0x00089008 ||
-+			reg == 0x00089028)
++	if (nv_arch(dev) >= NV_50) {
++		/* No clue what they do, but because they are outside normal
++		 * ranges we'd better list them seperately. */
++		if (reg == 0x00020018 || reg == 0x0002004C ||
++		    reg == 0x00020060 || reg == 0x00021218 ||
++		    reg == 0x0002130C || reg == 0x00089008 ||
++		    reg == 0x00089028)
 +			return 1;
 +	}
 +	if (WITHIN(reg,NV_PFB_OFFSET,NV_PFB_SIZE))
@@ -728,7 +743,8 @@ index 0000000..fd3e08a
 +		return 1;
 +	if (WITHIN(reg,NV_PCRTC0_OFFSET,NV_PCRTC0_SIZE * 2))
 +		return 1;
-+	if (dev_priv->VBIOS.pub.chip_version >= 0x80 && WITHIN(reg, NV50_DISPLAY_OFFSET, NV50_DISPLAY_SIZE))
++	if (nv_arch(dev) >= NV_50 &&
++	    WITHIN(reg, NV50_DISPLAY_OFFSET, NV50_DISPLAY_SIZE))
 +		return 1;
 +	if (WITHIN(reg,NV_PRAMDAC0_OFFSET,NV_PRAMDAC0_SIZE * 2))
 +		return 1;
@@ -778,6 +794,7 @@ index 0000000..fd3e08a
 +{
 +	uint32_t data;
 +
++	reg = munge_reg(dev, reg);
 +	if (!valid_reg(dev, reg))
 +		return 0;
 +
@@ -806,6 +823,7 @@ index 0000000..fd3e08a
 +{
 +	struct drm_nouveau_private *dev_priv = dev->dev_private;
 +
++	reg = munge_reg(dev, reg);
 +	if (!valid_reg(dev, reg))
 +		return;
 +
@@ -3185,7 +3203,10 @@ index 0000000..fd3e08a
 +	if (bios->major_version < 5 && bios->data[0x48] & 0x4)
 +		return (NVReadVgaCrtc5758(dev, 0, 0xf) & 0xf);
 +
-+	return ((bios_rd32(dev, NV_PEXTDEV_BOOT_0) >> 16) & 0xf);
++	if (nv_arch(dev) >= NV_50)
++		return ((bios_rd32(dev, NV_PEXTDEV_BOOT_0) >> 24) & 0xf);
++	else
++		return ((bios_rd32(dev, NV_PEXTDEV_BOOT_0) >> 16) & 0xf);
 +}
 +
 +static int parse_fp_mode_table(struct drm_device *dev, struct nvbios *bios)
@@ -3199,7 +3220,8 @@ index 0000000..fd3e08a
 +		/* Apple cards don't have the fp table; the laptops use DDC */
 +#ifndef __powerpc__
 +		NV_ERROR(dev, "Pointer to flat panel table invalid\n");
-+		if (bios->pub.chip_version != 0x67)	/* sigh, IGPs */
++		if (bios->pub.chip_version != 0x67 && /* sigh, IGPs */
++		    bios->pub.chip_version != 0x73)
 +			return -EINVAL;
 +#endif
 +		bios->pub.digital_min_front_porch = 0x4b;
@@ -3256,36 +3278,7 @@ index 0000000..fd3e08a
 +
 +	fpstrapping = get_fp_strap(dev, bios);
 +
-+	if (lth.lvds_ver == 0x40) {
-+		/* Query all modes and find one with a matching clock. */
-+		/* Note that this only serves as a backup solution if ddc fails. */
-+
-+		uint32_t clock, needed_clock;
-+		int i, index = 0xf, matches = 0;
-+		needed_clock = bios_rd32(dev, 0x00616404) & 0xFFFFF;
-+		NV_TRACE(dev, "LVDS clock seems to be %d KHz.\n", needed_clock);
-+
-+		for (i = 0; i < fpentries; i++) {
-+			clock = ROM16(fptable[headerlen + recordlen * i]) * 10;
-+			if (clock == needed_clock) {
-+				matches++;
-+				index = i;
-+			}
-+		}
-+
-+		if (matches == 1)
-+			NV_TRACE(dev, "Found a mode with matching clock\n");
-+		else
-+			NV_TRACE(dev, "Found %d modes, this is not useful\n", matches);
-+
-+		if (matches != 1)
-+			index = 0xF;
-+
-+		fpindex = bios->data[bios->fp.fpxlatetableptr + index * bios->fp.xlatwidth];
-+		/* strapping only set as a hack for DDC test below */
-+		fpstrapping = fpindex & 0xf;
-+	} else
-+		fpindex = bios->data[bios->fp.fpxlatetableptr + fpstrapping * bios->fp.xlatwidth];
++	fpindex = bios->data[bios->fp.fpxlatetableptr + fpstrapping * bios->fp.xlatwidth];
 +
 +	if (fpindex > fpentries) {
 +		NV_ERROR(dev, "Bad flat panel table index\n");
@@ -3382,7 +3375,7 @@ index 0000000..fd3e08a
 +	int fpstrapping = get_fp_strap(dev, bios), lvdsmanufacturerindex = 0;
 +	struct lvdstableheader lth;
 +	uint16_t lvdsofs;
-+	int ret;
++	int ret, chip_version = bios->pub.chip_version;
 +
 +	if ((ret = parse_lvds_manufacturer_table_header(dev, bios, &lth)))
 +		return ret;
@@ -3395,14 +3388,23 @@ index 0000000..fd3e08a
 +		if (!pxclk)
 +			break;
 +
-+		/* change in behaviour guessed at nv30; see datapoints below */
-+		if (bios->pub.chip_version < 0x30) {
++		if (chip_version < 0x25) {
 +			/* nv17 behaviour */
 +			/* it seems the old style lvds script pointer is reused
 +			 * to select 18/24 bit colour depth for EDID panels */
 +			lvdsmanufacturerindex = (bios->legacy.lvds_single_a_script_ptr & 1) ? 2 : 0;
 +			if (pxclk >= bios->fp.duallink_transition_clk)
 +				lvdsmanufacturerindex++;
++		} else if (chip_version < 0x30) {
++			/* nv28 behaviour (off-chip encoder) */
++			/* nv28 does a complex dance of first using byte 121 of
++			 * the EDID to choose the lvdsmanufacturerindex, then
++			 * later attempting to match the EDID manufacturer and
++			 * product IDs in a table (signature 'pidt' (panel id
++			 * table?)), setting an lvdsmanufacturerindex of 0 and
++			 * an fp strap of the match index (or 0xf if none)
++			 */
++			lvdsmanufacturerindex = 0;
 +		} else {
 +			/* nv31, nv34 behaviour */
 +			lvdsmanufacturerindex = 0;
@@ -3461,13 +3463,166 @@ index 0000000..fd3e08a
 +	}
 +
 +	/* set dual_link flag for EDID case */
-+	if (pxclk)
++	if (pxclk && (chip_version < 0x25 || chip_version > 0x28))
 +		bios->fp.dual_link = (pxclk >= bios->fp.duallink_transition_clk);
 +
 +	*dl = bios->fp.dual_link;
 +
 +	return 0;
 +}
++
++static int
++find_script_pointers(struct drm_device *dev, uint8_t *table, uint16_t *script0,
++		     uint16_t *script1, uint16_t headerlen, int pxclk,
++		     int cmpval)
++{
++	/* The output script tables describing a particular output type
++	 * look as follows:
++	 *
++	 * offset + 0   (32 bits): output this table matches (hash of DCB)
++	 * offset + 4   ( 8 bits): unknown
++	 * offset + 5   ( 8 bits): number of configurations
++	 * offset + 6   (16 bits): pointer to some script
++	 * offset + 8   (16 bits): pointer to some script
++	 *
++	 * headerlen == 10
++	 * offset + 10           : configuration 0
++	 *
++	 * headerlen == 12
++	 * offset + 10           : pointer to some script
++	 * offset + 12           : configuration 0
++	 *
++	 * Each config entry is as follows:
++	 *
++	 * offset + 0   (16 bits): unknown, assumed to be a match value
++	 * offset + 2   (16 bits): pointer to script table (clock set?)
++	 * offset + 4   (16 bits): pointer to script table (reset?)
++	 *
++	 * There doesn't appear to be a count value to say how many
++	 * entries exist in each script table, instead, a 0 value in
++	 * the first 16-bit word seems to indicate both the end of the
++	 * list and the default entry.  The second 16-bit word in the
++	 * script tables is a pointer to the script to execute.
++	 */
++
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nvbios *bios = &dev_priv->VBIOS;
++	int i;
++
++	*script0 = *script1 = 0;
++	for (i = 0; i < table[5]; i++) {
++		uint16_t offset;
++
++		if (ROM16(table[headerlen + i*6 + 0]) != cmpval)
++			continue;
++
++		offset = ROM16(table[headerlen + i*6 + 2]);
++		if (offset)
++			*script0 = clkcmptable(bios, offset, pxclk);
++
++		if (!*script0)
++			NV_WARN(dev, "script0 missing!\n");
++
++		offset = ROM16(table[headerlen + i*6 + 4]);
++		if (offset)
++			*script1 = clkcmptable(bios, offset, pxclk);
++
++		return 0;
++	}
++
++	NV_ERROR(dev, "couldn't find suitable output scripts\n");
++	return 1;
++}
++
++int
++nouveau_bios_run_display_table(struct drm_device *dev, struct dcb_entry *dcbent,
++			       int pxclk)
++{
++	/* The display script table is located by the BIT 'U' table.
++	 *
++	 * It contains an array of pointers to various tables describing
++	 * a particular output type.  The first 32-bits of the output
++	 * tables contains similar information to a DCB entry, and is
++	 * used to decide whether that particular table is suitable for
++	 * the output you want to access.
++	 *
++	 * The "record header length" field here seems to indicate the
++	 * offset of the first configuration entry in the output tables.
++	 * This is 10 on most cards I've seen, but 12 has been witnessed
++	 * on DP cards, and there's another script pointer within the
++	 * header.
++	 *
++	 * offset + 0   ( 8 bits): version
++	 * offset + 1   ( 8 bits): header length
++	 * offset + 2   ( 8 bits): record length
++	 * offset + 3   ( 8 bits): number of records
++	 * offset + 4   ( 8 bits): record header length
++	 * offset + 5   (16 bits): pointer to first output script table
++	 */
++
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	init_exec_t iexec = {true, false};
++	struct nvbios *bios = &dev_priv->VBIOS;
++	uint8_t *table = &bios->data[bios->display.script_table_ptr];
++	uint8_t *entry, *otable = NULL;
++	uint16_t script0, script1;
++	int i;
++
++	if (!bios->display.script_table_ptr) {
++		NV_ERROR(dev, "No pointer to output script table\n");
++		return 1;
++	}
++
++	if (table[0] != 0x20) {
++		NV_ERROR(dev, "Output script table version 0x%02x unknown\n", table[0]);
++		return 1;
++	}
++
++	NV_DEBUG(dev, "Searching for output entry for %d %d %d\n",
++			dcbent->type, dcbent->location, dcbent->or);
++	entry = table + table[1];
++	for (i = 0; i < table[3]; i++, entry += table[2]) {
++		uint32_t match;
++
++		if (ROM16(entry[0]) == 0)
++			continue;
++		otable = &bios->data[ROM16(entry[0])];
++		match = ROM32(otable[0]);
++
++		NV_DEBUG(dev, " %d: 0x%08x\n", i, match);
++		if ((((match & 0x000f0000) >> 16)  & dcbent->or) &&
++		     ((match & 0x0000000f) >>  0) == dcbent->type &&
++		     ((match & 0x000000f0) >>  4) == dcbent->location)
++			break;
++	}
++
++	if (i == table[3]) {
++		NV_ERROR(dev, "Couldn't find matching output script table\n");
++		return 1;
++	}
++
++	if (find_script_pointers(dev, otable, &script0, &script1, table[4],
++				 pxclk, dcbent->type == OUTPUT_LVDS ?
++				 0x0100 : (pxclk > 165000 ? 0x0105 : 0x0001)))
++		return 1;
++	bios->display.head = ffs(dcbent->or) - 1;
++
++	if (script0) {
++		NV_TRACE(dev, "0x%04X: Parsing output Script0\n", script0);
++		parse_init_table(dev, bios, script0, &iexec);
++	} else {
++		NV_ERROR(dev, "clock script missing!\n");
++		return 1;
++	}
++
++	if (script1) {
++		NV_TRACE(dev, "0x%04X: Parsing output Script1\n", script1);
++		parse_init_table(dev, bios, script1, &iexec);
++	}
++
++	return 0;
++}
++
 +
 +int run_tmds_table(struct drm_device *dev, struct dcb_entry *dcbent, int head, int pxclk)
 +{
@@ -3481,10 +3636,13 @@ index 0000000..fd3e08a
 +
 +	struct drm_nouveau_private *dev_priv = dev->dev_private;
 +	struct nvbios *bios = &dev_priv->VBIOS;
++	int cv = bios->pub.chip_version;
 +	uint16_t clktable = 0, scriptptr;
 +	uint32_t sel_clk_binding, sel_clk;
 +
-+	if (dcbent->location != DCB_LOC_ON_CHIP)
++	/* pre-nv17 off-chip tmds uses scripts, post nv17 doesn't */
++	if (cv >= 0x17 && cv != 0x1a && cv != 0x20 &&
++	    dcbent->location != DCB_LOC_ON_CHIP)
 +		return 0;
 +
 +	switch (ffs(dcbent->or)) {
@@ -3614,6 +3772,8 @@ index 0000000..fd3e08a
 +			pll_lim->vco2.max_n = 0x1f;
 +		pll_lim->vco2.min_m = 0x1;
 +		pll_lim->vco2.max_m = 0x4;
++		pll_lim->max_log2p = 0x7;
++		pll_lim->max_usable_log2p = 0x6;
 +	} else if (pll_lim_ver == 0x20 || pll_lim_ver == 0x21) {
 +		uint16_t plloffs = bios->pll_limit_tbl_ptr + headerlen;
 +		uint32_t reg = 0; /* default match */
@@ -3680,7 +3840,13 @@ index 0000000..fd3e08a
 +		pll_lim->vco2.min_m = pll_rec[26];
 +		pll_lim->vco2.max_m = pll_rec[27];
 +
-+		pll_lim->max_log2p_bias = pll_rec[29];
++		pll_lim->max_usable_log2p = pll_lim->max_log2p = pll_rec[29];
++		if (pll_lim->max_log2p > 0x7)
++			/* pll decoding in nv_hw.c assumes never > 7 */
++			NV_WARN(dev, "Max log2 P value greater than 7 (%d)\n",
++				pll_lim->max_log2p);
++		if (cv < 0x60)
++			pll_lim->max_usable_log2p = 0x6;
 +		pll_lim->log2p_bias = pll_rec[30];
 +
 +		if (recordlen > 0x22)
@@ -3740,7 +3906,7 @@ index 0000000..fd3e08a
 +		pll_lim->vco2.max_n = record[21];
 +		pll_lim->vco2.min_m = record[22];
 +		pll_lim->vco2.max_m = record[23];
-+		pll_lim->max_log2p_bias = record[25];
++		pll_lim->max_usable_log2p = pll_lim->max_log2p = record[25];
 +		pll_lim->log2p_bias = record[27];
 +		pll_lim->refclk = ROM32(record[28]);
 +	}
@@ -3767,6 +3933,11 @@ index 0000000..fd3e08a
 +				pll_lim->vco1.min_m = 0x8;
 +			pll_lim->vco1.max_m = 0xe;
 +		}
++		if (cv < 0x17 || cv == 0x1a || cv == 0x20)
++			pll_lim->max_log2p = 4;
++		else
++			pll_lim->max_log2p = 5;
++		pll_lim->max_usable_log2p = pll_lim->max_log2p;
 +	}
 +
 +	if (!pll_lim->refclk)
@@ -3805,7 +3976,7 @@ index 0000000..fd3e08a
 +	ErrorF("pll.vco2.min_m: %d\n", pll_lim->vco2.min_m);
 +	ErrorF("pll.vco2.max_m: %d\n", pll_lim->vco2.max_m);
 +
-+	ErrorF("pll.max_log2p_bias: %d\n", pll_lim->max_log2p_bias);
++	ErrorF("pll.max_log2p: %d\n", pll_lim->max_log2p);
 +	ErrorF("pll.log2p_bias: %d\n", pll_lim->log2p_bias);
 +
 +	ErrorF("pll.refclk: %d\n", pll_lim->refclk);
@@ -4108,6 +4279,29 @@ index 0000000..fd3e08a
 +	return 0;
 +}
 +
++static int
++parse_bit_U_tbl_entry(struct drm_device *dev, struct nvbios *bios,
++		      bit_entry_t *bitentry)
++{
++	/* Parses the pointer to the G80 output script tables
++	 *
++	 * Starting at bitentry->offset:
++	 *
++	 * offset + 0  (16 bits): output script table pointer
++	 */
++
++	uint16_t outputscripttableptr;
++
++	if (bitentry->length != 3) {
++		NV_ERROR(dev, "Do not understand BIT U table\n");
++		return -EINVAL;
++	}
++
++	outputscripttableptr = ROM16(bios->data[bitentry->offset]);
++	bios->display.script_table_ptr = outputscripttableptr;
++	return 0;
++}
++
 +struct bit_table {
 +	const char id;
 +	int (* const parse_fn)(struct drm_device *, struct nvbios *, bit_entry_t *);
@@ -4160,6 +4354,7 @@ index 0000000..fd3e08a
 +	parse_bit_table(dev, bios, bitoffset, &BIT_TABLE('M', M)); /* memory? */
 +	parse_bit_table(dev, bios, bitoffset, &BIT_TABLE('L', lvds));
 +	parse_bit_table(dev, bios, bitoffset, &BIT_TABLE('T', tmds));
++	parse_bit_table(dev, bios, bitoffset, &BIT_TABLE('U', U));
 +
 +	return 0;
 +}
@@ -4474,6 +4669,32 @@ index 0000000..fd3e08a
 +	/* "or" mostly unused in early gen crt modesetting, 0 is fine */
 +}
 +
++static void fabricate_dvi_i_output(struct parsed_dcb *dcb, bool twoHeads)
++{
++	struct dcb_entry *entry = new_dcb_entry(dcb);
++
++	entry->type = 2;
++	entry->i2c_index = LEGACY_I2C_PANEL;
++	entry->heads = twoHeads ? 3 : 1;
++	entry->location = !DCB_LOC_ON_CHIP;	/* ie OFF CHIP */
++	entry->or = 1;	/* naturally on head A; see setting of CRE_LCD__INDEX */
++	entry->duallink_possible = false; /* SiI164 and co. are single link */
++
++#if 0
++	/* for dvi-a either crtc probably works, but my card appears to only
++	 * support dvi-d.  "nvidia" still attempts to program it for dvi-a,
++	 * doing the full fp output setup (program 0x6808.. fp dimension regs,
++	 * setting 0x680848 to 0x10000111 to enable, maybe setting 0x680880);
++	 * the monitor picks up the mode res ok and lights up, but no pixel
++	 * data appears, so the board manufacturer probably connected up the
++	 * sync lines, but missed the video traces / components
++	 *
++	 * with this introduction, dvi-a left as an exercise for the reader.
++	 */
++	fabricate_vga_output(dcb, LEGACY_I2C_PANEL, entry->heads);
++#endif
++}
++
 +static bool
 +parse_dcb20_entry(struct drm_device *dev, struct bios_parsed_dcb *bdcb,
 +		  uint32_t conn, uint32_t conf, struct dcb_entry *entry)
@@ -4482,7 +4703,7 @@ index 0000000..fd3e08a
 +	entry->i2c_index = (conn >> 4) & 0xf;
 +	entry->heads = (conn >> 8) & 0xf;
 +	entry->bus = (conn >> 16) & 0xf;
-+	entry->location = (conn >> 20) & 0xf;
++	entry->location = (conn >> 20) & 0x3;
 +	entry->or = (conn >> 24) & 0xf;
 +	/* Normal entries consist of a single bit, but dual link has the
 +	 * next most significant bit set too
@@ -4668,7 +4889,7 @@ index 0000000..fd3e08a
 +	dcb->entries = newentries;
 +}
 +
-+static int parse_dcb_table(struct drm_device *dev, struct nvbios *bios)
++static int parse_dcb_table(struct drm_device *dev, struct nvbios *bios, bool twoHeads)
 +{
 +	struct bios_parsed_dcb *bdcb = &bios->bdcb;
 +	struct parsed_dcb *dcb;
@@ -4748,8 +4969,11 @@ index 0000000..fd3e08a
 +		 * v1.1 (NV5+, maybe some NV4) is entirely unhelpful
 +		 */
 +		NV_TRACEWARN(dev, "No useful information in BIOS output table; "
-+				    "assuming a CRT output exists\n");
++				  "adding all possible outputs\n");
 +		fabricate_vga_output(dcb, LEGACY_I2C_CRT, 1);
++		if (bios->tmds.output0_script_ptr ||
++		    bios->tmds.output1_script_ptr)
++			fabricate_dvi_i_output(dcb, twoHeads);
 +		return 0;
 +	}
 +
@@ -4798,9 +5022,12 @@ index 0000000..fd3e08a
 +	struct parsed_dcb *dcb = &bios->bdcb.dcb;
 +	int i;
 +
-+	for (i = 0; i < dcb->entries; i++)
++	for (i = 0; i < dcb->entries; i++) {
 +		if (dcb->entry[i].i2c_index == LEGACY_I2C_CRT)
 +			dcb->entry[i].i2c_index = bios->legacy.i2c_indices.crt;
++		if (dcb->entry[i].i2c_index == LEGACY_I2C_PANEL)
++			dcb->entry[i].i2c_index = bios->legacy.i2c_indices.panel;
++	}
 +}
 +
 +static int load_nv17_hwsq_ucode_entry(struct drm_device *dev, struct nvbios *bios, uint16_t hwsq_offset, int entry)
@@ -4942,10 +5169,8 @@ index 0000000..fd3e08a
 +	struct nvbios *bios = &dev_priv->VBIOS;
 +	int ret = 0;
 +
-+	NV_ERROR(dev, "FIXME twoHeads\n");
-+
 +	NVLockVgaCrtcs(dev, false);
-+	if (1) //dev->twoHeads)
++	if (nv_two_heads(dev))
 +		NVSetOwner(dev, crtchead);
 +
 +	if (bios->major_version < 5)	/* BMP only */
@@ -4977,7 +5202,7 @@ index 0000000..fd3e08a
 +		return -ENODEV;
 +	if ((ret = nouveau_parse_vbios_struct(dev)))
 +		return ret;
-+	if ((ret = parse_dcb_table(dev, bios)))
++	if ((ret = parse_dcb_table(dev, bios, nv_two_heads(dev))))
 +		return ret;
 +	fixup_legacy_i2c(bios);
 +
@@ -5007,10 +5232,10 @@ index 0000000..fd3e08a
 +}
 diff --git a/drivers/gpu/drm/nouveau/nouveau_bios.h b/drivers/gpu/drm/nouveau/nouveau_bios.h
 new file mode 100644
-index 0000000..03445b3
+index 0000000..b7e0f32
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nouveau_bios.h
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,223 @@
 +/*
 + * Copyright 2007-2008 Nouveau Project
 + *
@@ -5137,7 +5362,16 @@ index 0000000..03445b3
 +		uint8_t max_n;
 +	} vco1, vco2;
 +
-+	uint8_t max_log2p_bias;
++	uint8_t max_log2p;
++	/*
++	 * for most pre nv50 cards setting a log2P of 7 (the common max_log2p
++	 * value) is no different to 6 (at least for vplls) so allowing the MNP
++	 * calc to use 7 causes the generated clock to be out by a factor of 2.
++	 * however, max_log2p cannot be fixed-up during parsing as the
++	 * unmodified max_log2p value is still needed for setting mplls, hence
++	 * an additional max_usable_log2p member
++	 */
++	uint8_t max_usable_log2p;
 +	uint8_t log2p_bias;
 +	int refclk;
 +};
@@ -5179,6 +5413,11 @@ index 0000000..03445b3
 +	uint16_t ram_restrict_tbl_ptr;
 +
 +	struct bios_parsed_dcb bdcb;
++
++	struct {
++		int head;
++		uint16_t script_table_ptr;
++	} display;
 +
 +	struct {
 +		uint16_t fptablepointer;	/* also used by tmds */
@@ -5643,10 +5882,10 @@ index 0000000..0f80857
 +};
 diff --git a/drivers/gpu/drm/nouveau/nouveau_calc.c b/drivers/gpu/drm/nouveau/nouveau_calc.c
 new file mode 100644
-index 0000000..1f5fcd5
+index 0000000..a319ad4
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nouveau_calc.c
-@@ -0,0 +1,627 @@
+@@ -0,0 +1,622 @@
 +/*
 + * Copyright 1993-2003 NVIDIA, Corporation
 + * Copyright 2007-2009 Stuart Bennett
@@ -5987,7 +6226,6 @@ index 0000000..1f5fcd5
 +nv4_10UpdateArbitrationSettings(struct drm_device *dev, int VClk, int bpp,
 +				int *burst, int *lwm)
 +{
-+	struct drm_nouveau_private *dev_priv = dev->dev_private;
 +	struct nv_fifo_info fifo_data;
 +	struct nv_sim_state sim_data;
 +	int MClk = nouveau_hw_get_clock(dev, MPLL);
@@ -6011,14 +6249,14 @@ index 0000000..1f5fcd5
 +		sim_data.mem_latency = 3;
 +		sim_data.mem_page_miss = 10;
 +	} else {
-+		sim_data.enable_video = (dev_priv->card_type != NV_04);
++		sim_data.enable_video = (nv_arch(dev) != NV_04);
 +		sim_data.memory_type = nvReadFB(dev, NV_PFB_CFG0) & 0x1;
 +		sim_data.memory_width = (nvReadEXTDEV(dev, NV_PEXTDEV_BOOT_0) & 0x10) ? 128 : 64;
 +		sim_data.mem_latency = cfg1 & 0xf;
 +		sim_data.mem_page_miss = ((cfg1 >> 4) & 0xf) + ((cfg1 >> 31) & 0x1);
 +	}
 +
-+	if (dev_priv->card_type == NV_04)
++	if (nv_arch(dev) == NV_04)
 +		nv4CalcArbitration(&fifo_data, &sim_data);
 +	else
 +		nv10CalcArbitration(&fifo_data, &sim_data);
@@ -6051,9 +6289,7 @@ index 0000000..1f5fcd5
 +void
 +nouveau_calc_arb(struct drm_device *dev, int vclk, int bpp, int *burst, int *lwm)
 +{
-+	struct drm_nouveau_private *dev_priv = dev->dev_private;
-+
-+	if (dev_priv->card_type < NV_30)
++	if (nv_arch(dev) < NV_30)
 +		nv4_10UpdateArbitrationSettings(dev, vclk, bpp, burst, lwm);
 +	else if ((dev->pci_device & 0xfff0) == 0x0240 /*CHIPSET_C51*/ ||
 +		 (dev->pci_device & 0xfff0) == 0x03d0 /*CHIPSET_C512*/) {
@@ -6076,12 +6312,12 @@ index 0000000..1f5fcd5
 +	 * returns calculated clock
 +	 */
 +	struct drm_nouveau_private *dev_priv = dev->dev_private;
-+	int chip_version = dev_priv->vbios->chip_version;
++	int cv = dev_priv->vbios->chip_version;
 +	int minvco = pll_lim->vco1.minfreq, maxvco = pll_lim->vco1.maxfreq;
 +	int minM = pll_lim->vco1.min_m, maxM = pll_lim->vco1.max_m;
 +	int minN = pll_lim->vco1.min_n, maxN = pll_lim->vco1.max_n;
 +	int minU = pll_lim->vco1.min_inputfreq, maxU = pll_lim->vco1.max_inputfreq;
-+	int maxlog2P;
++	int maxlog2P = pll_lim->max_usable_log2p;
 +	int crystal = pll_lim->refclk;
 +	int M, N, log2P, P;
 +	int clkP, calcclk;
@@ -6090,22 +6326,19 @@ index 0000000..1f5fcd5
 +
 +	/* this division verified for nv20, nv18, nv28 (Haiku), and nv34 */
 +	/* possibly correlated with introduction of 27MHz crystal */
-+	if (chip_version <= 0x16 || chip_version == 0x20) {
++	if (cv < 0x17 || cv == 0x1a || cv == 0x20) {
 +		if (clk > 250000)
 +			maxM = 6;
 +		if (clk > 340000)
 +			maxM = 2;
-+		maxlog2P = 4;
-+	} else if (chip_version < 0x40) {
++	} else if (cv < 0x40) {
 +		if (clk > 150000)
 +			maxM = 6;
 +		if (clk > 200000)
 +			maxM = 4;
 +		if (clk > 340000)
 +			maxM = 2;
-+		maxlog2P = 5;
-+	} else /* nv4x may be subject to the nv17+ limits, but assume not for now */
-+		maxlog2P = 6;
++	}
 +
 +	if ((clk << maxlog2P) < minvco) {
 +		minvco = clk << maxlog2P;
@@ -6181,6 +6414,7 @@ index 0000000..1f5fcd5
 +	int minN1 = pll_lim->vco1.min_n, maxN1 = pll_lim->vco1.max_n;
 +	int minM2 = pll_lim->vco2.min_m, maxM2 = pll_lim->vco2.max_m;
 +	int minN2 = pll_lim->vco2.min_n, maxN2 = pll_lim->vco2.max_n;
++	int maxlog2P = pll_lim->max_usable_log2p;
 +	int crystal = pll_lim->refclk;
 +	bool fixedgain2 = (minM2 == maxM2 && minN2 == maxN2);
 +	int M1, N1, M2, N2, log2P;
@@ -6189,7 +6423,7 @@ index 0000000..1f5fcd5
 +	int bestclk = 0;
 +
 +	int vco2 = (maxvco2 - maxvco2/200) / 2;
-+	for (log2P = 0; clk && log2P < 6 && clk <= (vco2 >> log2P); log2P++) /* log2P is maximum of 6 */
++	for (log2P = 0; clk && log2P < maxlog2P && clk <= (vco2 >> log2P); log2P++)
 +		;
 +	clkP = clk << log2P;
 +
@@ -6276,10 +6510,10 @@ index 0000000..1f5fcd5
 +}
 diff --git a/drivers/gpu/drm/nouveau/nouveau_connector.h b/drivers/gpu/drm/nouveau/nouveau_connector.h
 new file mode 100644
-index 0000000..9c78c88
+index 0000000..052d9aa
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nouveau_connector.h
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,51 @@
 +/*
 + * Copyright (C) 2008 Maarten Maathuis.
 + * All Rights Reserved.
@@ -6317,7 +6551,6 @@ index 0000000..9c78c88
 +	struct drm_display_mode *native_mode;
 +	bool digital;
 +
-+	int bus;
 +	struct nouveau_i2c_chan *i2c_chan;
 +
 +	int scaling_mode;
@@ -6328,7 +6561,7 @@ index 0000000..9c78c88
 +};
 +#define to_nouveau_connector(x) container_of((x), struct nouveau_connector, base)
 +
-+int nv50_connector_create(struct drm_device *dev, int bus, int i2c_index, int type);
++int nv50_connector_create(struct drm_device *dev, int i2c_index, int type);
 +void nv50_connector_detect_all(struct drm_device *dev);
 +
 +#endif /* __NOUVEAU_CONNECTOR_H__ */
@@ -6862,10 +7095,10 @@ index 0000000..4383883
 +#endif
 diff --git a/drivers/gpu/drm/nouveau/nouveau_drv.c b/drivers/gpu/drm/nouveau/nouveau_drv.c
 new file mode 100644
-index 0000000..f497aae
+index 0000000..578983e
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nouveau_drv.c
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,194 @@
 +/*
 + * Copyright 2005 Stephane Marchesin.
 + * All Rights Reserved.
@@ -6911,6 +7144,10 @@ index 0000000..f497aae
 +MODULE_PARM_DESC(duallink, "Allow dual-link TMDS (>=GeForce 8)");
 +int nouveau_duallink = 0;
 +module_param_named(duallink, nouveau_duallink, int, 0400);
++
++MODULE_PARM_DESC(uscript, "Execute output scripts (>=GeForce 8)");
++int nouveau_uscript = 0;
++module_param_named(uscript, nouveau_uscript, int, 0400);
 +
 +int nouveau_fbpercrtc = 0;
 +#if 0
@@ -7058,10 +7295,10 @@ index 0000000..f497aae
 +MODULE_LICENSE("GPL and additional rights");
 diff --git a/drivers/gpu/drm/nouveau/nouveau_drv.h b/drivers/gpu/drm/nouveau/nouveau_drv.h
 new file mode 100644
-index 0000000..7d2da72
+index 0000000..13d6f9d
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nouveau_drv.h
-@@ -0,0 +1,776 @@
+@@ -0,0 +1,834 @@
 +/*
 + * Copyright 2005 Stephane Marchesin.
 + * All Rights Reserved.
@@ -7608,6 +7845,9 @@ index 0000000..7d2da72
 +extern int nouveau_parse_bios(struct drm_device *);
 +extern int get_pll_limits(struct drm_device *, uint32_t limit_match,
 +			  struct pll_lims *);
++extern int nouveau_bios_run_display_table(struct drm_device *,
++					  struct dcb_entry *, int pxclk);
++bool nouveau_bios_fp_mode(struct drm_device *, struct drm_display_mode *);
 +
 +/* nv04_fb.c */
 +extern int  nv04_fb_init(struct drm_device *);
@@ -7837,10 +8077,65 @@ index 0000000..7d2da72
 +#define NV_TRACE(d, fmt, arg...) NV_PRINTK(KERN_INFO, d, fmt, ##arg)
 +#define NV_WARN(d, fmt, arg...) NV_PRINTK(KERN_WARNING, d, fmt, ##arg)
 +
++static inline enum nouveau_card_type
++nv_arch(struct drm_device *dev)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++
++	switch (dev_priv->chipset & 0xf0) {
++	case 0x00:
++		return NV_04;
++	case 0x10:
++		return NV_10;
++	case 0x20:
++		return NV_20;
++	case 0x30:
++		return NV_30;
++	case 0x40:
++	case 0x60:
++		return NV_40;
++	case 0x50:
++	case 0x80:
++	case 0x90:
++	case 0xa0:
++		return NV_50;
++	default:
++		return NV_UNKNOWN;
++	}
++}
++
++static inline bool
++nv_two_heads(struct drm_device *dev)
++{
++	const int impl = dev->pci_device & 0x0ff0;
++
++	if (nv_arch(dev) >= NV_10 && impl != 0x0100 &&
++	    impl != 0x0150 && impl != 0x01a0 && impl != 0x0200)
++		return true;
++
++	return false;
++}
++
++static inline bool
++nv_gf4_disp_arch(struct drm_device *dev)
++{
++	return nv_two_heads(dev) && (dev->pci_device & 0x0ff0) != 0x0110;
++}
++
++static inline bool
++nv_two_reg_pll(struct drm_device *dev)
++{
++	const int impl = dev->pci_device & 0x0ff0;
++
++	if (impl == 0x0310 || impl == 0x0340 || nv_arch(dev) >= NV_40)
++		return true;
++	return false;
++}
++
 +#endif /* __NOUVEAU_DRV_H__ */
 diff --git a/drivers/gpu/drm/nouveau/nouveau_encoder.h b/drivers/gpu/drm/nouveau/nouveau_encoder.h
 new file mode 100644
-index 0000000..ea2b9dd
+index 0000000..d9dc976
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nouveau_encoder.h
 @@ -0,0 +1,46 @@
@@ -7876,7 +8171,7 @@ index 0000000..ea2b9dd
 +struct nouveau_encoder {
 +	struct drm_encoder base;
 +
-+	struct dcb_entry *dcb_entry;
++	struct dcb_entry *dcb;
 +	int or;
 +
 +	bool dual_link;
@@ -10513,10 +10808,10 @@ index 0000000..66e35dc
 +
 diff --git a/drivers/gpu/drm/nouveau/nouveau_hw.c b/drivers/gpu/drm/nouveau/nouveau_hw.c
 new file mode 100644
-index 0000000..bd11b69
+index 0000000..ca03e70
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nouveau_hw.c
-@@ -0,0 +1,1041 @@
+@@ -0,0 +1,1019 @@
 +/*
 + * Copyright 2006 Dave Airlie
 + * Copyright 2007 Maarten Maathuis
@@ -10619,8 +10914,7 @@ index 0000000..bd11b69
 +{
 +	unsigned char seq1;
 +
-+	NV_ERROR(dev, "FIXME\n");
-+	if (1) //dev_priv->twoHeads)
++	if (nv_two_heads(dev))
 +		NVSetOwner(dev, head);
 +
 +	seq1 = NVReadVgaSeq(dev, head, NV_VIO_SR_CLOCK_INDEX);
@@ -10642,7 +10936,7 @@ index 0000000..bd11b69
 +{
 +	int shift = -4;
 +
-+	if (chip_version < 0x17 || chip_version == 0x20)
++	if (chip_version < 0x17 || chip_version == 0x1a || chip_version == 0x20)
 +		return shift;
 +
 +	switch (reg) {
@@ -10839,8 +11133,8 @@ index 0000000..bd11b69
 +			return;
 +
 +		Pval2 = pv->log2P + pll_lim.log2p_bias;
-+		if (Pval2 > pll_lim.max_log2p_bias)
-+			Pval2 = pll_lim.max_log2p_bias;
++		if (Pval2 > pll_lim.max_log2p)
++			Pval2 = pll_lim.max_log2p;
 +		Pval |= 1 << 28 | Pval2 << 20;
 +
 +		saved4600 = nvReadMC(dev, 0x4600);
@@ -10907,11 +11201,9 @@ index 0000000..bd11b69
 +{
 +	struct drm_nouveau_private *dev_priv = dev->dev_private;
 +
-+	NV_ERROR(dev, "FIXME two_reg_pll\n");
-+
 +	/* to force parsing as single stage (i.e. nv40 vplls) pass pll2 as 0 */
 +
-+	/* log2P is & 0x7 as never more than 6, and nv30/35 only uses 3 bits */
++	/* log2P is & 0x7 as never more than 7, and nv30/35 only uses 3 bits */
 +	pllvals->log2P = (pll1 >> 16) & 0x7;
 +	pllvals->N2 = pllvals->M2 = 1;
 +
@@ -10922,7 +11214,7 @@ index 0000000..bd11b69
 +			pllvals->NM2 = pll2 >> 16;
 +	} else {
 +		pllvals->NM1 = pll1 & 0xffff;
-+		if (1/*dev_priv->two_reg_pll*/ && pll2 & NV31_RAMDAC_ENABLE_VCO2)
++		if (nv_two_reg_pll(dev) && pll2 & NV31_RAMDAC_ENABLE_VCO2)
 +			pllvals->NM2 = pll2 & 0xffff;
 +		else if (dev_priv->chipset == 0x30 || dev_priv->chipset == 0x35) {
 +			pllvals->M1 &= 0xf; /* only 4 bits */
@@ -10939,7 +11231,6 @@ index 0000000..bd11b69
 +nouveau_hw_get_pllvals(struct drm_device *dev, enum pll_types plltype,
 +		       struct nouveau_pll_vals *pllvals)
 +{
-+	struct drm_nouveau_private *dev_priv = dev->dev_private;
 +	const uint32_t nv04_regs[MAX_PLL_TYPES] = { NV_PRAMDAC_NVPLL_COEFF,
 +						    NV_PRAMDAC_MPLL_COEFF,
 +						    NV_PRAMDAC_VPLL_COEFF,
@@ -10954,7 +11245,7 @@ index 0000000..bd11b69
 +
 +	NV_ERROR(dev, "two_reg_pll\n");
 +
-+	if (dev_priv->card_type < NV_40)
++	if (nv_arch(dev) < NV_40)
 +		reg1 = nv04_regs[plltype];
 +	else
 +		reg1 = nv40_regs[plltype];
@@ -10969,7 +11260,7 @@ index 0000000..bd11b69
 +		pll2 = nvReadMC(dev, reg2);
 +	}
 +
-+	if (dev_priv->card_type == 0x40 && reg1 >= NV_PRAMDAC_VPLL_COEFF) {
++	if (nv_arch(dev) == 0x40 && reg1 >= NV_PRAMDAC_VPLL_COEFF) {
 +		uint32_t ramdac580 = NVReadRAMDAC(dev, 0, NV_PRAMDAC_580);
 +
 +		/* check whether vpll has been forced into single stage mode */
@@ -11046,7 +11337,7 @@ index 0000000..bd11b69
 +
 +	if (pv.M1 >= pll_lim.vco1.min_m && pv.M1 <= pll_lim.vco1.max_m &&
 +	    pv.N1 >= pll_lim.vco1.min_n && pv.N1 <= pll_lim.vco1.max_n &&
-+	    pv.log2P <= 4)	/* log2P limit for NV11 */
++	    pv.log2P <= pll_lim.max_log2p)
 +		return;
 +
 +	NV_WARN(dev, "VPLL %d outwith limits, attempting to fix\n", head + 1);
@@ -11054,7 +11345,7 @@ index 0000000..bd11b69
 +	/* set lowest clock within static limits */
 +	pv.M1 = pll_lim.vco1.max_m;
 +	pv.N1 = pll_lim.vco1.min_n;
-+	pv.log2P = 4;
++	pv.log2P = pll_lim.max_usable_log2p;
 +	nouveau_hw_setpll(dev, pllreg, &pv);
 +}
 +
@@ -11069,8 +11360,8 @@ index 0000000..bd11b69
 +	uint8_t misc, gr4, gr5, gr6, seq2, seq4;
 +	int i;
 +
-+	NV_ERROR(dev, "FIXME twoHeads, saved_vga_font\n");
-+	if (1) //dev_priv->twoHeads)
++	NV_ERROR(dev, "FIXME saved_vga_font\n");
++	if (nv_two_heads(dev))
 +		NVSetOwner(dev, 0);
 +
 +	NVSetEnablePalette(dev, 0, true);
@@ -11081,7 +11372,7 @@ index 0000000..bd11b69
 +		return;
 +
 +	NV_INFO(dev, "%sing VGA fonts\n", save ? "Sav" : "Restor");
-+	if (1) //dev_priv->twoHeads)
++	if (nv_two_heads(dev))
 +		NVBlankScreen(dev, 1, true);
 +	NVBlankScreen(dev, 0, true);
 +
@@ -11144,7 +11435,7 @@ index 0000000..bd11b69
 +	NVWriteVgaSeq(dev, 0, NV_VIO_SR_PLANE_MASK_INDEX, seq2);
 +	NVWriteVgaSeq(dev, 0, NV_VIO_SR_MEM_MODE_INDEX, seq4);
 +
-+	if (1) //dev_priv->twoHeads)
++	if (nv_two_heads(dev))
 +		NVBlankScreen(dev, 1, false);
 +	NVBlankScreen(dev, 0, false);
 +}
@@ -11175,53 +11466,52 @@ index 0000000..bd11b69
 +	struct nv04_crtc_reg * regp = &state->crtc_reg[head];
 +	int i;
 +
-+	NV_ERROR(dev, "FIXME twoHeads\n");
++	if (nv_arch(dev) >= NV_10)
++		regp->nv10_cursync = NVReadRAMDAC(dev, head, NV_RAMDAC_NV10_CURSYNC);
 +
 +	nouveau_hw_get_pllvals(dev, head ? VPLL2 : VPLL1, &regp->pllvals);
-+	if (1) //dev_priv->twoHeads)
-+		state->sel_clk = NVReadRAMDAC(dev, 0, NV_PRAMDAC_SEL_CLK);
 +	state->pllsel = NVReadRAMDAC(dev, 0, NV_PRAMDAC_PLL_COEFF_SELECT);
++	if (nv_two_heads(dev))
++		state->sel_clk = NVReadRAMDAC(dev, 0, NV_PRAMDAC_SEL_CLK);
++	if (dev_priv->chipset == 0x11)
++		regp->dither = NVReadRAMDAC(dev, head, NV_RAMDAC_DITHER_NV11);
 +
 +	regp->ramdac_gen_ctrl = NVReadRAMDAC(dev, head, NV_PRAMDAC_GENERAL_CONTROL);
 +
-+	if (1) { //dev_priv->twoHeads) {
-+		if (dev_priv->chipset >= 0x17)
-+			regp->ramdac_630 = NVReadRAMDAC(dev, head, NV_PRAMDAC_630);
-+		if (dev_priv->chipset >= 0x30)
-+			regp->ramdac_634 = NVReadRAMDAC(dev, head, NV_PRAMDAC_634);
++	if (nv_gf4_disp_arch(dev))
++		regp->ramdac_630 = NVReadRAMDAC(dev, head, NV_PRAMDAC_630);
++	if (dev_priv->chipset >= 0x30)
++		regp->ramdac_634 = NVReadRAMDAC(dev, head, NV_PRAMDAC_634);
 +
-+		regp->fp_control = NVReadRAMDAC(dev, head, NV_PRAMDAC_FP_TG_CONTROL);
-+		regp->fp_debug_0 = NVReadRAMDAC(dev, head, NV_PRAMDAC_FP_DEBUG_0);
-+		regp->fp_debug_1 = NVReadRAMDAC(dev, head, NV_PRAMDAC_FP_DEBUG_1);
-+		regp->fp_debug_2 = NVReadRAMDAC(dev, head, NV_PRAMDAC_FP_DEBUG_2);
-+
-+		regp->ramdac_a20 = NVReadRAMDAC(dev, head, NV_PRAMDAC_A20);
-+		regp->ramdac_a24 = NVReadRAMDAC(dev, head, NV_PRAMDAC_A24);
-+		regp->ramdac_a34 = NVReadRAMDAC(dev, head, NV_PRAMDAC_A34);
++	for (i = 0; i < 7; i++) {
++		uint32_t ramdac_reg = NV_PRAMDAC_FP_VDISPLAY_END + (i * 4);
++		regp->fp_vert_regs[i] = NVReadRAMDAC(dev, head, ramdac_reg);
++		regp->fp_horiz_regs[i] = NVReadRAMDAC(dev, head, ramdac_reg + 0x20);
 +	}
 +
-+	if (dev_priv->chipset == 0x11) {
-+		regp->dither = NVReadRAMDAC(dev, head, NV_RAMDAC_DITHER_NV11);
-+	} else if (1) { //dev_priv->twoHeads) {
++	if (nv_gf4_disp_arch(dev)) {
 +		regp->dither = NVReadRAMDAC(dev, head, NV_RAMDAC_FP_DITHER);
 +		for (i = 0; i < 3; i++) {
 +			regp->dither_regs[i] = NVReadRAMDAC(dev, head, NV_PRAMDAC_850 + i * 4);
 +			regp->dither_regs[i + 3] = NVReadRAMDAC(dev, head, NV_PRAMDAC_85C + i * 4);
 +		}
 +	}
-+	if (dev_priv->card_type >= NV_10)
-+		regp->nv10_cursync = NVReadRAMDAC(dev, head, NV_RAMDAC_NV10_CURSYNC);
 +
-+	/* The regs below are 0 for non-flatpanels, so you can load and save them */
-+
-+	for (i = 0; i < 7; i++) {
-+		uint32_t ramdac_reg = NV_PRAMDAC_FP_HDISPLAY_END + (i * 4);
-+		regp->fp_horiz_regs[i] = NVReadRAMDAC(dev, head, ramdac_reg);
++	regp->fp_control = NVReadRAMDAC(dev, head, NV_PRAMDAC_FP_TG_CONTROL);
++	regp->fp_debug_0 = NVReadRAMDAC(dev, head, NV_PRAMDAC_FP_DEBUG_0);
++	if (!nv_gf4_disp_arch(dev) && head == 0) {
++		/* early chips don't allow access to PRAMDAC_TMDS_* without
++		 * the head A FPCLK on (nv11 even locks up) */
++		NVWriteRAMDAC(dev, 0, NV_PRAMDAC_FP_DEBUG_0, regp->fp_debug_0 &
++			      ~NV_PRAMDAC_FP_DEBUG_0_PWRDOWN_FPCLK);
 +	}
++	regp->fp_debug_1 = NVReadRAMDAC(dev, head, NV_PRAMDAC_FP_DEBUG_1);
++	regp->fp_debug_2 = NVReadRAMDAC(dev, head, NV_PRAMDAC_FP_DEBUG_2);
 +
-+	for (i = 0; i < 7; i++) {
-+		uint32_t ramdac_reg = NV_PRAMDAC_FP_VDISPLAY_END + (i * 4);
-+		regp->fp_vert_regs[i] = NVReadRAMDAC(dev, head, ramdac_reg);
++	if (nv_arch(dev) == NV_40) {
++		regp->ramdac_a20 = NVReadRAMDAC(dev, head, NV_PRAMDAC_A20);
++		regp->ramdac_a24 = NVReadRAMDAC(dev, head, NV_PRAMDAC_A24);
++		regp->ramdac_a34 = NVReadRAMDAC(dev, head, NV_PRAMDAC_A34);
 +	}
 +}
 +
@@ -11234,58 +11524,47 @@ index 0000000..bd11b69
 +	uint32_t pllreg = head ? NV_RAMDAC_VPLL2 : NV_PRAMDAC_VPLL_COEFF;
 +	int i;
 +
-+	NV_ERROR(dev, "FIXME twoHeads\n");
++	if (nv_arch(dev) >= NV_10)
++		NVWriteRAMDAC(dev, head, NV_RAMDAC_NV10_CURSYNC, regp->nv10_cursync);
 +
-+	/* This sequence is important, the NV28 is very sensitive in this area. */
-+	/* Keep pllsel last and sel_clk first. */
-+	if (1) //dev_priv->twoHeads)
-+		NVWriteRAMDAC(dev, 0, NV_PRAMDAC_SEL_CLK, state->sel_clk);
 +	nouveau_hw_setpll(dev, pllreg, &regp->pllvals);
 +	NVWriteRAMDAC(dev, 0, NV_PRAMDAC_PLL_COEFF_SELECT, state->pllsel);
++	if (nv_two_heads(dev))
++		NVWriteRAMDAC(dev, 0, NV_PRAMDAC_SEL_CLK, state->sel_clk);
++	if (dev_priv->chipset == 0x11)
++		NVWriteRAMDAC(dev, head, NV_RAMDAC_DITHER_NV11, regp->dither);
 +
 +	NVWriteRAMDAC(dev, head, NV_PRAMDAC_GENERAL_CONTROL, regp->ramdac_gen_ctrl);
 +
-+	if (1) { //dev_priv->twoHeads) {
-+		if (dev_priv->chipset >= 0x17)
-+			NVWriteRAMDAC(dev, head, NV_PRAMDAC_630, regp->ramdac_630);
-+		if (dev_priv->chipset >= 0x30)
-+			NVWriteRAMDAC(dev, head, NV_PRAMDAC_634, regp->ramdac_634);
-+		NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_TG_CONTROL, regp->fp_control);
-+		NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_DEBUG_0, regp->fp_debug_0);
-+		NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_DEBUG_1, regp->fp_debug_1);
-+		NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_DEBUG_2, regp->fp_debug_2);
-+		if (dev_priv->chipset == 0x30) { /* For unknown purposes. */
-+			uint32_t reg890 = NVReadRAMDAC(dev, head, NV_PRAMDAC_890);
-+			NVWriteRAMDAC(dev, head, NV_PRAMDAC_89C, reg890);
-+		}
++	if (nv_gf4_disp_arch(dev))
++		NVWriteRAMDAC(dev, head, NV_PRAMDAC_630, regp->ramdac_630);
++	if (dev_priv->chipset >= 0x30)
++		NVWriteRAMDAC(dev, head, NV_PRAMDAC_634, regp->ramdac_634);
 +
-+		NVWriteRAMDAC(dev, head, NV_PRAMDAC_A20, regp->ramdac_a20);
-+		NVWriteRAMDAC(dev, head, NV_PRAMDAC_A24, regp->ramdac_a24);
-+		NVWriteRAMDAC(dev, head, NV_PRAMDAC_A34, regp->ramdac_a34);
++	for (i = 0; i < 7; i++) {
++		uint32_t ramdac_reg = NV_PRAMDAC_FP_VDISPLAY_END + (i * 4);
++
++		NVWriteRAMDAC(dev, head, ramdac_reg, regp->fp_vert_regs[i]);
++		NVWriteRAMDAC(dev, head, ramdac_reg + 0x20, regp->fp_horiz_regs[i]);
 +	}
 +
-+	if (dev_priv->chipset == 0x11)
-+		NVWriteRAMDAC(dev, head, NV_RAMDAC_DITHER_NV11, regp->dither);
-+	else if (1) { //dev_priv->twoHeads) {
++	if (nv_gf4_disp_arch(dev)) {
 +		NVWriteRAMDAC(dev, head, NV_RAMDAC_FP_DITHER, regp->dither);
 +		for (i = 0; i < 3; i++) {
 +			NVWriteRAMDAC(dev, head, NV_PRAMDAC_850 + i * 4, regp->dither_regs[i]);
 +			NVWriteRAMDAC(dev, head, NV_PRAMDAC_85C + i * 4, regp->dither_regs[i + 3]);
 +		}
 +	}
-+	if (dev_priv->card_type >= NV_10)
-+		NVWriteRAMDAC(dev, head, NV_RAMDAC_NV10_CURSYNC, regp->nv10_cursync);
 +
-+	/* The regs below are 0 for non-flatpanels, so you can load and save them */
++	NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_TG_CONTROL, regp->fp_control);
++	NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_DEBUG_0, regp->fp_debug_0);
++	NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_DEBUG_1, regp->fp_debug_1);
++	NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_DEBUG_2, regp->fp_debug_2);
 +
-+	for (i = 0; i < 7; i++) {
-+		uint32_t ramdac_reg = NV_PRAMDAC_FP_HDISPLAY_END + (i * 4);
-+		NVWriteRAMDAC(dev, head, ramdac_reg, regp->fp_horiz_regs[i]);
-+	}
-+
-+	for (i = 0; i < 7; i++) {
-+		uint32_t ramdac_reg = NV_PRAMDAC_FP_VDISPLAY_END + (i * 4);
-+		NVWriteRAMDAC(dev, head, ramdac_reg, regp->fp_vert_regs[i]);
++	if (nv_arch(dev) == NV_40) {
++		NVWriteRAMDAC(dev, head, NV_PRAMDAC_A20, regp->ramdac_a20);
++		NVWriteRAMDAC(dev, head, NV_PRAMDAC_A24, regp->ramdac_a24);
++		NVWriteRAMDAC(dev, head, NV_PRAMDAC_A34, regp->ramdac_a34);
 +	}
 +}
 +
@@ -11343,11 +11622,8 @@ index 0000000..bd11b69
 +nv_save_state_ext(struct drm_device *dev, int head,
 +		  struct nv04_mode_state *state)
 +{
-+	struct drm_nouveau_private *dev_priv = dev->dev_private;
 +	struct nv04_crtc_reg * regp = &state->crtc_reg[head];
 +	int i;
-+
-+	NV_ERROR(dev, "FIXME twoHeads\n");
 +
 +	rd_cio_state(dev, head, regp, NV_CIO_CRE_LCD__INDEX);
 +	rd_cio_state(dev, head, regp, NV_CIO_CRE_RPC0_INDEX);
@@ -11360,21 +11636,21 @@ index 0000000..bd11b69
 +	rd_cio_state(dev, head, regp, NV_CIO_CRE_FF_INDEX);
 +	rd_cio_state(dev, head, regp, NV_CIO_CRE_FFLWM__INDEX);
 +	rd_cio_state(dev, head, regp, NV_CIO_CRE_21);
-+	if (dev_priv->card_type >= NV_30)
++	if (nv_arch(dev) >= NV_30)
 +		rd_cio_state(dev, head, regp, NV_CIO_CRE_47);
 +	rd_cio_state(dev, head, regp, NV_CIO_CRE_HCUR_ADDR0_INDEX);
 +	rd_cio_state(dev, head, regp, NV_CIO_CRE_HCUR_ADDR1_INDEX);
 +	rd_cio_state(dev, head, regp, NV_CIO_CRE_HCUR_ADDR2_INDEX);
 +	rd_cio_state(dev, head, regp, NV_CIO_CRE_ILACE__INDEX);
 +
-+	if (dev_priv->card_type >= NV_10) {
++	if (nv_arch(dev) >= NV_10) {
 +		regp->crtc_830 = NVReadCRTC(dev, head, NV_PCRTC_830);
 +		regp->crtc_834 = NVReadCRTC(dev, head, NV_PCRTC_834);
-+		if (dev_priv->card_type == NV_40) {
++		if (nv_arch(dev) == NV_40) {
 +			regp->crtc_850 = NVReadCRTC(dev, head, NV_PCRTC_850);
 +			regp->gpio_ext = NVReadCRTC(dev, head, NV_PCRTC_GPIO_EXT);
 +		}
-+		if (1) //dev_priv->twoHeads)
++		if (nv_two_heads(dev))
 +			regp->crtc_eng_ctrl = NVReadCRTC(dev, head, NV_PCRTC_ENGINE_CTRL);
 +		regp->cursor_cfg = NVReadCRTC(dev, head, NV_PCRTC_CURSOR_CONFIG);
 +	}
@@ -11383,14 +11659,14 @@ index 0000000..bd11b69
 +
 +	rd_cio_state(dev, head, regp, NV_CIO_CRE_SCRATCH3__INDEX);
 +	rd_cio_state(dev, head, regp, NV_CIO_CRE_SCRATCH4__INDEX);
-+	if (dev_priv->card_type >= NV_10) {
++	if (nv_arch(dev) >= NV_10) {
 +		rd_cio_state(dev, head, regp, NV_CIO_CRE_EBR_INDEX);
 +		rd_cio_state(dev, head, regp, NV_CIO_CRE_CSB);
 +		rd_cio_state(dev, head, regp, NV_CIO_CRE_4B);
 +		rd_cio_state(dev, head, regp, NV_CIO_CRE_TVOUT_LATENCY);
 +	}
 +	/* NV11 and NV20 don't have this, they stop at 0x52. */
-+	if (dev_priv->chipset >= 0x17 && 1) { //dev_priv->twoHeads) {
++	if (nv_gf4_disp_arch(dev)) {
 +		rd_cio_state(dev, head, regp, NV_CIO_CRE_53);
 +		rd_cio_state(dev, head, regp, NV_CIO_CRE_54);
 +
@@ -11414,10 +11690,8 @@ index 0000000..bd11b69
 +	struct nv04_crtc_reg * regp = &state->crtc_reg[head];
 +	int i;
 +
-+	NV_ERROR(dev, "FIXME twoHeads\n");
-+
-+	if (dev_priv->card_type >= NV_10) {
-+		if (1) //dev_priv->twoHeads)
++	if (nv_arch(dev) >= NV_10) {
++		if (nv_two_heads(dev))
 +			/* setting ENGINE_CTRL (EC) *must* come before
 +			 * CIO_CRE_LCD, as writing CRE_LCD sets bits 16 & 17 in
 +			 * EC that should not be overwritten by writing stale EC
@@ -11434,16 +11708,15 @@ index 0000000..bd11b69
 +		nvWriteVIDEO(dev, NV_PVIDEO_UVPLANE_LIMIT(1), dev_priv->fb_available_size - 1);
 +		nvWriteMC(dev, NV_PBUS_POWERCTRL_2, 0);
 +
-+		wr_cio_state(dev, head, regp, NV_CIO_CRE_21);
 +		NVWriteCRTC(dev, head, NV_PCRTC_CURSOR_CONFIG, regp->cursor_cfg);
 +		NVWriteCRTC(dev, head, NV_PCRTC_830, regp->crtc_830);
 +		NVWriteCRTC(dev, head, NV_PCRTC_834, regp->crtc_834);
-+		if (dev_priv->card_type == NV_40) {
++		if (nv_arch(dev) == NV_40) {
 +			NVWriteCRTC(dev, head, NV_PCRTC_850, regp->crtc_850);
 +			NVWriteCRTC(dev, head, NV_PCRTC_GPIO_EXT, regp->gpio_ext);
 +		}
 +
-+		if (dev_priv->card_type == NV_40) {
++		if (nv_arch(dev) == NV_40) {
 +			uint32_t reg900 = NVReadRAMDAC(dev, head, NV_PRAMDAC_900);
 +			if (regp->crtc_cfg == NV_PCRTC_CONFIG_START_ADDRESS_HSYNC)
 +				NVWriteRAMDAC(dev, head, NV_PRAMDAC_900, reg900 | 0x10000);
@@ -11463,26 +11736,26 @@ index 0000000..bd11b69
 +	wr_cio_state(dev, head, regp, NV_CIO_CRE_ENH_INDEX);
 +	wr_cio_state(dev, head, regp, NV_CIO_CRE_FF_INDEX);
 +	wr_cio_state(dev, head, regp, NV_CIO_CRE_FFLWM__INDEX);
-+	if (dev_priv->card_type >= NV_30)
++	if (nv_arch(dev) >= NV_30)
 +		wr_cio_state(dev, head, regp, NV_CIO_CRE_47);
 +
 +	wr_cio_state(dev, head, regp, NV_CIO_CRE_HCUR_ADDR0_INDEX);
 +	wr_cio_state(dev, head, regp, NV_CIO_CRE_HCUR_ADDR1_INDEX);
 +	wr_cio_state(dev, head, regp, NV_CIO_CRE_HCUR_ADDR2_INDEX);
-+	if (dev_priv->card_type == NV_40)
++	if (nv_arch(dev) == NV_40)
 +		nv_fix_nv40_hw_cursor(dev, head);
 +	wr_cio_state(dev, head, regp, NV_CIO_CRE_ILACE__INDEX);
 +
 +	wr_cio_state(dev, head, regp, NV_CIO_CRE_SCRATCH3__INDEX);
 +	wr_cio_state(dev, head, regp, NV_CIO_CRE_SCRATCH4__INDEX);
-+	if (dev_priv->card_type >= NV_10) {
++	if (nv_arch(dev) >= NV_10) {
 +		wr_cio_state(dev, head, regp, NV_CIO_CRE_EBR_INDEX);
 +		wr_cio_state(dev, head, regp, NV_CIO_CRE_CSB);
 +		wr_cio_state(dev, head, regp, NV_CIO_CRE_4B);
 +		wr_cio_state(dev, head, regp, NV_CIO_CRE_TVOUT_LATENCY);
 +	}
 +	/* NV11 and NV20 stop at 0x52. */
-+	if (dev_priv->chipset >= 0x17 && 1) { //dev_priv->twoHeads) {
++	if (nv_gf4_disp_arch(dev)) {
 +		wr_cio_state(dev, head, regp, NV_CIO_CRE_53);
 +		wr_cio_state(dev, head, regp, NV_CIO_CRE_54);
 +
@@ -11560,10 +11833,10 @@ index 0000000..bd11b69
 +}
 diff --git a/drivers/gpu/drm/nouveau/nouveau_hw.h b/drivers/gpu/drm/nouveau/nouveau_hw.h
 new file mode 100644
-index 0000000..74f5913
+index 0000000..03aa876
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nouveau_hw.h
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,530 @@
 +/*
 + * Copyright 2008 Stuart Bennett
 + *
@@ -11999,6 +12272,28 @@ index 0000000..74f5913
 +	return waslocked;
 +}
 +
++static inline void
++nv_lock_vga_crtc_shadow(struct drm_device *dev, int head, int lock)
++{
++	/* shadow lock: connects 0x60?3d? regs to "real" 0x3d? regs
++         * bit7: unlocks HDT, HBS, HBE, HRS, HRE, HEB
++         * bit6: seems to have some effect on CR09 (double scan, VBS_9)
++         * bit5: unlocks HDE
++         * bit4: unlocks VDE
++         * bit3: unlocks VDT, OVL, VRS, ?VRE?, VBS, VBE, LSR, EBR
++         * bit2: same as bit 1 of 0x60?804
++         * bit0: same as bit 0 of 0x60?804
++         */
++
++	uint8_t cr21 = lock;
++
++	if (lock < 0)
++		/* 0xfa is generic "unlock all" mask */
++		cr21 = NVReadVgaCrtc(dev, head, NV_CIO_CRE_21) | 0xfa;
++
++	NVWriteVgaCrtc(dev, head, NV_CIO_CRE_21, cr21);
++}
++
 +/* renders the extended crtc regs (cr19+) on all crtcs impervious:
 + * immutable and unreadable
 + */
@@ -12074,10 +12369,10 @@ index 0000000..74f5913
 +#endif	/* __NOUVEAU_HW_H__ */
 diff --git a/drivers/gpu/drm/nouveau/nouveau_i2c.c b/drivers/gpu/drm/nouveau/nouveau_i2c.c
 new file mode 100644
-index 0000000..5cd2fbf
+index 0000000..93cdc61
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nouveau_i2c.c
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,222 @@
 +/*
 + * Copyright 2009 Red Hat Inc.
 + *
@@ -12275,7 +12570,6 @@ index 0000000..5cd2fbf
 +bool
 +nouveau_i2c_detect(struct nouveau_connector *connector)
 +{
-+	struct drm_device *dev = connector->base.dev;
 +	/* kindly borrrowed from the intel driver, hope it works. */
 +	uint8_t out_buf[] = { 0x0, 0x0};
 +	uint8_t buf[2];
@@ -12299,8 +12593,6 @@ index 0000000..5cd2fbf
 +		return false;
 +
 +	ret = (i2c_transfer(&connector->i2c_chan->adapter, msgs, 2) == 2);
-+
-+	NV_DEBUG(dev, "i2c_detect: bus=%d present=%d\n", connector->bus, ret);
 +	return ret;
 +}
 diff --git a/drivers/gpu/drm/nouveau/nouveau_i2c.h b/drivers/gpu/drm/nouveau/nouveau_i2c.h
@@ -23550,10 +23842,10 @@ index 0000000..87c6213
 +}
 diff --git a/drivers/gpu/drm/nouveau/nv50_connector.c b/drivers/gpu/drm/nouveau/nv50_connector.c
 new file mode 100644
-index 0000000..bc43d4d
+index 0000000..a83ee1b
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nv50_connector.c
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,498 @@
 +/*
 + * Copyright (C) 2008 Maarten Maathuis.
 + * All Rights Reserved.
@@ -23591,99 +23883,35 @@ index 0000000..bc43d4d
 +#include "nv50_display.h"
 +#include "nv50_display_commands.h"
 +
-+static struct drm_display_mode *
-+nv50_connector_lvds_native_mode(struct drm_device *dev)
-+{
-+	struct drm_display_mode *mode;
-+	uint32_t output, tmp;
-+
-+	output = nv_rd32(0x610050);
-+	if ((output & 0x00000003) == 0x00000002)
-+		output = 0x00000000;
-+	else
-+	if ((output & 0x00000300) == 0x00000200)
-+		output = 0x000000540;
-+	else {
-+		NV_ERROR(dev, "Unable to determine LVDS head: 0x%08x\n", output);
-+		return NULL;
-+	}
-+
-+	mode = drm_mode_create(dev);
-+	if (!mode)
-+		return NULL;
-+
-+	mode->clock = nv_rd32(0x610ad4 + output) & 0x003fffff;
-+	tmp = nv_rd32(0x610b4c + output);
-+	mode->hdisplay = (tmp & 0x00003fff);
-+	mode->vdisplay = (tmp & 0x3fff0000) >> 16;
-+	tmp = nv_rd32(0x610afc + output);
-+	mode->htotal = tmp & 0x3fff;
-+	mode->vtotal = tmp >> 16;
-+	tmp = nv_rd32(0x610ae8 + output);
-+	mode->hsync_start = mode->htotal - (tmp & 0x3fff) - 1;
-+	mode->vsync_start = mode->vtotal - (tmp >> 16) - 1;
-+	tmp = nv_rd32(0x610b00 + output);
-+	mode->hsync_end = mode->hsync_start + (tmp & 0x3fff) + 1;
-+	mode->vsync_end = mode->vsync_start + (tmp >> 16) + 1;
-+	mode->flags = 0;
-+	mode->type = DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER;
-+	mode->vrefresh = drm_mode_vrefresh(mode);
-+
-+	NV_DEBUG(dev, "Probed current LVDS mode:\n");
-+	drm_mode_debug_printmodeline(mode);
-+	return mode;
-+}
-+
 +static struct nouveau_encoder *
 +nv50_connector_to_encoder(struct nouveau_connector *connector, bool digital)
 +{
 +	struct drm_device *dev = connector->base.dev;
-+	struct drm_encoder *drm_encoder;
-+	bool digital_possible = false;
-+	bool analog_possible = false;
++	struct nouveau_encoder *encoder;
++	struct drm_mode_object *obj;
++	int i, id;
 +
-+	switch (connector->base.connector_type) {
-+	case DRM_MODE_CONNECTOR_VGA:
-+	case DRM_MODE_CONNECTOR_SVIDEO:
-+		analog_possible = true;
-+		break;
-+	case DRM_MODE_CONNECTOR_DVII:
-+		analog_possible = true;
-+		digital_possible = true;
-+		break;
-+	case DRM_MODE_CONNECTOR_DVID:
-+	case DRM_MODE_CONNECTOR_LVDS:
-+		digital_possible = true;
-+		break;
-+	default:
-+		return NULL;
-+	}
++	for (i = 0; i < DRM_CONNECTOR_MAX_ENCODER; i++) {
++		id = connector->base.encoder_ids[i];
++		if (!id)
++			break;
 +
-+	/* Return early on bad situations. */
-+	if (!analog_possible && !digital)
-+		return NULL;
-+
-+	if (!digital_possible && digital)
-+		return NULL;
-+
-+	list_for_each_entry(drm_encoder, &dev->mode_config.encoder_list, head) {
-+		struct nouveau_encoder *encoder = to_nouveau_encoder(drm_encoder);
-+
-+		if (connector->bus != encoder->dcb_entry->bus)
++		obj = drm_mode_object_find(dev, id, DRM_MODE_OBJECT_ENCODER);
++		if (!obj)
 +			continue;
++		encoder = to_nouveau_encoder(obj_to_encoder(obj));
 +
 +		if (digital) {
-+			switch (encoder->base.encoder_type) {
-+			case DRM_MODE_ENCODER_TMDS:
-+			case DRM_MODE_ENCODER_LVDS:
++			switch (encoder->dcb->type) {
++			case OUTPUT_TMDS:
++			case OUTPUT_LVDS:
 +				return encoder;
 +			default:
 +				break;
 +			}
 +		} else {
-+			switch (encoder->base.encoder_type) {
-+			case DRM_MODE_ENCODER_DAC:
-+			case DRM_MODE_ENCODER_TVDAC:
++			switch (encoder->dcb->type) {
++			case OUTPUT_ANALOG:
 +				return encoder;
 +			default:
 +				break;
@@ -23750,7 +23978,7 @@ index 0000000..bc43d4d
 +	struct drm_encoder_helper_funcs *helper = NULL;
 +
 +	if (drm_connector->connector_type == DRM_MODE_CONNECTOR_LVDS) {
-+		if (!connector->native_mode) {
++		if (!connector->native_mode && !nouveau_i2c_detect(connector)) {
 +			NV_ERROR(dev, "No native mode for LVDS.\n");
 +			return connector_status_disconnected;
 +		}
@@ -23938,6 +24166,30 @@ index 0000000..bc43d4d
 +		connector->to_encoder(connector, connector->digital);
 +	unsigned min_clock, max_clock;
 +
++	/* This really should not happen, but it appears it might do
++	 * somehow, debug!
++	 */
++	if (!encoder) {
++		int i;
++
++		NV_ERROR(dev, "no encoder for connector: %s %d\n",
++			 drm_get_connector_name(drm_connector),
++			 connector->digital);
++		for (i = 0; i < DRM_CONNECTOR_MAX_ENCODER; i++) {
++			struct drm_mode_object *obj;
++			if (!drm_connector->encoder_ids[i])
++				break;
++
++			obj = drm_mode_object_find(dev, drm_connector->encoder_ids[i], DRM_MODE_OBJECT_ENCODER);
++			if (!obj)
++				continue;
++			encoder = to_nouveau_encoder(obj_to_encoder(obj));
++			NV_ERROR(dev, " %d: %d", i, encoder->dcb->type);
++		}
++
++		return MODE_BAD;
++	}
++
 +	min_clock = 25000;
 +
 +	switch (encoder->base.encoder_type) {
@@ -23996,18 +24248,17 @@ index 0000000..bc43d4d
 +	.set_property = nv50_connector_set_property
 +};
 +
-+int nv50_connector_create(struct drm_device *dev, int bus, int i2c_index, int type)
++int nv50_connector_create(struct drm_device *dev, int i2c_index, int type)
 +{
 +	struct nouveau_connector *connector = NULL;
-+	int i;
++	struct drm_encoder *drm_encoder;
++	struct drm_display_mode native;
 +
 +	NV_DEBUG(dev, "\n");
 +
 +	connector = kzalloc(sizeof(*connector), GFP_KERNEL);
 +	if (!connector)
 +		return -ENOMEM;
-+
-+	connector->bus = bus;
 +
 +	switch (type) {
 +	case DRM_MODE_CONNECTOR_VGA:
@@ -24020,8 +24271,10 @@ index 0000000..bc43d4d
 +		NV_INFO(dev, "Detected a DVI-I connector\n");
 +		break;
 +	case DRM_MODE_CONNECTOR_LVDS:
-+		connector->native_mode = nv50_connector_lvds_native_mode(dev);
 +		NV_INFO(dev, "Detected a LVDS connector\n");
++
++		if (nouveau_bios_fp_mode(dev, &native))
++			connector->native_mode = drm_mode_duplicate(dev, &native);
 +		break;
 +	case DRM_MODE_CONNECTOR_SVIDEO:
 +		NV_INFO(dev, "Detected a TV connector\n");
@@ -24077,13 +24330,14 @@ index 0000000..bc43d4d
 +
 +	drm_connector_attach_property(&connector->base, dev->mode_config.dithering_mode_property, connector->use_dithering ? DRM_MODE_DITHERING_ON : DRM_MODE_DITHERING_OFF);
 +
-+	/* attach encoders, possibilities are analog + digital */
-+	for (i = 0; i < 2; i++) {
-+		struct nouveau_encoder *encoder = connector->to_encoder(connector, i);
-+		if (!encoder)
++	/* attach encoders */
++	list_for_each_entry(drm_encoder, &dev->mode_config.encoder_list, head) {
++		struct nouveau_encoder *encoder = to_nouveau_encoder(drm_encoder);
++
++		if (encoder->dcb->i2c_index != i2c_index)
 +			continue;
 +
-+		drm_mode_connector_attach_encoder(&connector->base, &encoder->base);
++		drm_mode_connector_attach_encoder(&connector->base, drm_encoder);
 +	}
 +
 +	drm_sysfs_connector_add(&connector->base);
@@ -25055,7 +25309,7 @@ index 0000000..763cffe
 +
 diff --git a/drivers/gpu/drm/nouveau/nv50_dac.c b/drivers/gpu/drm/nouveau/nv50_dac.c
 new file mode 100644
-index 0000000..2ac1c95
+index 0000000..e64c314
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nv50_dac.c
 @@ -0,0 +1,280 @@
@@ -25323,7 +25577,7 @@ index 0000000..2ac1c95
 +	if (!encoder)
 +		return -ENOMEM;
 +
-+	encoder->dcb_entry = entry;
++	encoder->dcb = entry;
 +	encoder->or = ffs(entry->or) - 1;
 +
 +	/* Set function pointers. */
@@ -25341,10 +25595,10 @@ index 0000000..2ac1c95
 +
 diff --git a/drivers/gpu/drm/nouveau/nv50_display.c b/drivers/gpu/drm/nouveau/nv50_display.c
 new file mode 100644
-index 0000000..6abdad7
+index 0000000..ac51e1a
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nv50_display.c
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,423 @@
 +/*
 + * Copyright (C) 2008 Maarten Maathuis.
 + * All Rights Reserved.
@@ -25571,8 +25825,7 @@ index 0000000..6abdad7
 +{
 +	struct drm_nouveau_private *dev_priv = dev->dev_private;
 +	struct parsed_dcb *dcb = dev_priv->vbios->dcb;
-+	uint32_t bus_mask = 0;
-+	uint32_t bus_digital = 0, bus_analog = 0;
++	uint32_t connector[16] = {};
 +	int ret, i;
 +
 +	NV_DEBUG(dev, "\n");
@@ -25599,71 +25852,62 @@ index 0000000..6abdad7
 +		return ret;
 +
 +	/* Create CRTC objects */
-+	for (i = 0; i < 2; i++) {
++	for (i = 0; i < 2; i++)
 +		nv50_crtc_create(dev, i);
-+	}
 +
-+	/* we setup the outputs up from the BIOS table */
++	/* We setup the encoders from the BIOS table */
 +	for (i = 0 ; i < dcb->entries; i++) {
 +		struct dcb_entry *entry = &dcb->entry[i];
 +
 +		switch (entry->type) {
 +		case OUTPUT_TMDS:
 +		case OUTPUT_LVDS:
-+			bus_digital |= (1 << entry->bus);
 +			nv50_sor_create(dev, entry);
 +			break;
 +		case OUTPUT_ANALOG:
-+			bus_analog |= (1 << entry->bus);
 +			nv50_dac_create(dev, entry);
 +			break;
 +		default:
-+			break;
++			NV_WARN(dev, "DCB encoder %d unknown\n", entry->type);
++			continue;
 +		}
++
++		connector[entry->i2c_index] |= (1 << entry->type);
 +	}
 +
-+	/* setup the connectors based on the output tables. */
++	/* Look at which encoders are attached to each i2c bus to
++	 * determine which connectors are present.
++	 */
 +	for (i = 0 ; i < dcb->entries; i++) {
 +		struct dcb_entry *entry = &dcb->entry[i];
-+		int connector = 0;
++		uint16_t encoders;
++		int type;
++
++		encoders = connector[entry->i2c_index];
++		connector[entry->i2c_index] = 0;
 +
 +		/* already done? */
-+		if (bus_mask & (1 << entry->bus))
++		if (!encoders)
 +			continue;
 +
-+		/* only do it for supported outputs */
-+		if (entry->type != OUTPUT_ANALOG &&
-+		    entry->type != OUTPUT_TMDS &&
-+		    entry->type != OUTPUT_LVDS)
-+			continue;
-+
-+		switch (entry->type) {
-+		case OUTPUT_TMDS:
-+		case OUTPUT_ANALOG:
-+			if ((bus_digital & (1 << entry->bus)) &&
-+			    (bus_analog & (1 << entry->bus)))
-+				connector = DRM_MODE_CONNECTOR_DVII;
++		if (encoders & (1 << OUTPUT_TMDS)) {
++			if (encoders & (1 << OUTPUT_ANALOG))
++				type = DRM_MODE_CONNECTOR_DVII;
 +			else
-+			if (bus_digital & (1 << entry->bus))
-+				connector = DRM_MODE_CONNECTOR_DVID;
-+			else
-+			if (bus_analog & (1 << entry->bus))
-+				connector = DRM_MODE_CONNECTOR_VGA;
-+			break;
-+		case OUTPUT_LVDS:
-+			connector = DRM_MODE_CONNECTOR_LVDS;
-+			break;
-+		default:
-+			connector = DRM_MODE_CONNECTOR_Unknown;
-+			break;
-+		}
++				type = DRM_MODE_CONNECTOR_DVID;
++		} else
++		if (encoders & (1 << OUTPUT_ANALOG)) {
++			type = DRM_MODE_CONNECTOR_VGA;
++		} else
++		if (encoders & (1 << OUTPUT_LVDS)) {
++			type = DRM_MODE_CONNECTOR_LVDS;
++		} else
++			type = DRM_MODE_CONNECTOR_Unknown;
 +
-+		if (connector == DRM_MODE_CONNECTOR_Unknown)
++		if (type == DRM_MODE_CONNECTOR_Unknown)
 +			continue;
 +
-+		nv50_connector_create(dev, entry->bus, entry->i2c_index,
-+				      connector);
-+		bus_mask |= (1 << entry->bus);
++		nv50_connector_create(dev, entry->i2c_index, type);
 +	}
 +
 +	ret = nv50_display_init(dev);
@@ -48324,10 +48568,10 @@ index 0000000..6572f12
 +}
 diff --git a/drivers/gpu/drm/nouveau/nv50_sor.c b/drivers/gpu/drm/nouveau/nv50_sor.c
 new file mode 100644
-index 0000000..c913950
+index 0000000..69a07e2
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nv50_sor.c
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,286 @@
 +/*
 + * Copyright (C) 2008 Maarten Maathuis.
 + * All Rights Reserved.
@@ -48366,6 +48610,7 @@ index 0000000..c913950
 +#include "nv50_display_commands.h"
 +
 +extern int nouveau_duallink;
++extern int nouveau_uscript;
 +
 +static void
 +nv50_sor_disconnect(struct nouveau_encoder *encoder)
@@ -48383,13 +48628,23 @@ index 0000000..c913950
 +			struct drm_display_mode *mode)
 +{
 +	struct drm_device *dev = encoder->base.dev;
-+	uint32_t limit = 165000;
++	uint32_t limit = encoder->dcb->type == OUTPUT_LVDS ? 112000 : 165000;
++	int ret;
 +
 +	NV_DEBUG(dev, "or %d\n", encoder->or);
 +
 +	/* We don't yet know what to do, if anything at all. */
-+	if (encoder->base.encoder_type == DRM_MODE_ENCODER_LVDS)
++	if (!nouveau_uscript && encoder->dcb->type == OUTPUT_LVDS)
 +		return 0;
++
++	if (nouveau_uscript) {
++		NV_TRACE(dev, "executing display table for %d %d %d %d\n",
++			 encoder->dcb->type, encoder->dcb->location,
++			 encoder->dcb->or, mode->clock);
++		ret = nouveau_bios_run_display_table(dev, encoder->dcb, mode->clock);
++		if (ret)
++			NV_ERROR(dev, "error running display table, may hang\n");
++	}
 +
 +	/* 0x70000 was a late addition to nv, mentioned as fixing tmds
 +	 * initialisation on certain gpu's. I presume it's some kind of
@@ -48576,7 +48831,7 @@ index 0000000..c913950
 +	if (!encoder)
 +		return -ENOMEM;
 +
-+	encoder->dcb_entry = entry;
++	encoder->dcb = entry;
 +	encoder->or = ffs(entry->or) - 1;
 +
 +	encoder->dual_link = nouveau_duallink;
@@ -48605,10 +48860,10 @@ index 0000000..c913950
 +}
 diff --git a/drivers/gpu/drm/nouveau/nvreg.h b/drivers/gpu/drm/nouveau/nvreg.h
 new file mode 100644
-index 0000000..6f142b3
+index 0000000..9afacbb
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nvreg.h
-@@ -0,0 +1,498 @@
+@@ -0,0 +1,495 @@
 +/* $XConsortium: nvreg.h /main/2 1996/10/28 05:13:41 kaleb $ */
 +/*
 + * Copyright 1996-1997  David J. McKay
@@ -48858,7 +49113,7 @@ index 0000000..6f142b3
 +#		define NV_CIO_SR_UNLOCK_RW_VALUE	0x57
 +#		define NV_CIO_SR_LOCK_VALUE		0x99
 +#	define NV_CIO_CRE_FFLWM__INDEX		0x20	/* fifo low water mark */
-+#	define NV_CIO_CRE_21			0x21	/* referred to by some .scp as `shadow lock' */
++#	define NV_CIO_CRE_21			0x21	/* vga shadow crtc lock */
 +#	define NV_CIO_CRE_LSR_INDEX		0x25	/* ? */
 +#		define NV_CIO_CRE_LSR_VDT_10		0:0
 +#		define NV_CIO_CRE_LSR_VDE_10		1:1
@@ -48908,7 +49163,7 @@ index 0000000..6f142b3
 +#	define NV_CIO_CRE_54			0x54	/* `fp_vtiming' according to Haiku */
 +#	define NV_CIO_CRE_57			0x57	/* index reg for cr58 */
 +#	define NV_CIO_CRE_58			0x58	/* data reg for cr57 */
-+#	define NV_CIO_CRE_59			0x59
++#	define NV_CIO_CRE_59			0x59	/* related to on/off-chip-ness of digital outputs */
 +#	define NV_CIO_CRE_5B			0x5B	/* newer colour saturation reg */
 +#	define NV_CIO_CRE_85			0x85
 +#	define NV_CIO_CRE_86			0x86
@@ -48998,6 +49253,7 @@ index 0000000..6f142b3
 +#	define NV_PRAMDAC_FP_DEBUG_0_YINTERP_BILINEAR		(1 << 12)
 +#	define NV_PRAMDAC_FP_DEBUG_0_XWEIGHT_ROUND		(1 << 20)
 +#	define NV_PRAMDAC_FP_DEBUG_0_YWEIGHT_ROUND		(1 << 24)
++#       define NV_PRAMDAC_FP_DEBUG_0_PWRDOWN_FPCLK              (1 << 28)
 +#define NV_PRAMDAC_FP_DEBUG_1				0x00680884
 +#	define NV_PRAMDAC_FP_DEBUG_1_XSCALE_VALUE		11:0
 +#	define NV_PRAMDAC_FP_DEBUG_1_XSCALE_TESTMODE_ENABLE	(1 << 12)
@@ -49005,10 +49261,6 @@ index 0000000..6f142b3
 +#	define NV_PRAMDAC_FP_DEBUG_1_YSCALE_TESTMODE_ENABLE	(1 << 28)
 +#define NV_PRAMDAC_FP_DEBUG_2				0x00680888
 +#define NV_PRAMDAC_FP_DEBUG_3				0x0068088C
-+
-+/* Some unknown regs, purely for NV30 it seems. */
-+#define NV_PRAMDAC_890					0x00680890
-+#define NV_PRAMDAC_89C					0x0068089C
 +
 +/* see NV_PRAMDAC_INDIR_TMDS in rules.xml */
 +#define NV_PRAMDAC_FP_TMDS_CONTROL			0x006808b0
@@ -49117,7 +49369,7 @@ index b940fdf..cfa6af4 100644
  unifdef-y += via_drm.h
 +unifdef-y += nouveau_drm.h
 diff --git a/include/drm/drmP.h b/include/drm/drmP.h
-index b61b0c6..5b7ce2d 100644
+index 04fbd1e..f2a6bff 100644
 --- a/include/drm/drmP.h
 +++ b/include/drm/drmP.h
 @@ -1267,6 +1267,8 @@ extern void drm_idlelock_release(struct drm_lock_data *lock_data);
