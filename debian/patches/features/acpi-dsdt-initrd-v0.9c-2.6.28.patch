@@ -13,15 +13,20 @@ v0.9a: Fix compilation on non-ACPI platforms by René Rebe <rene@exactcode.de>
 v0.9b: Declare more functions __init by Jan Beulich <jbeulich@novell.com>
 v0.9c: Allow root to be / instead of nothing, bug reported by Robert Hampovcan
 
+mandriva kernel version: diff is changed from patch present at
+http://gaugusch.at/acpi-dsdt-initrd-patches/acpi-dsdt-initrd-v0.9c-2.6.28.patch
+I adapted/fixed the patch for linux 2.6.30, and don't include acpi.h in
+initramfs.c if ACPI_CUSTOM_DSDT_INITRD is disabled -- herton
+
 Signed-off-by: Eric Piel <eric.piel@tremplin-utc.net>
 ---
- Documentation/acpi/dsdt-override.txt     |   12 +++-
- Documentation/acpi/initramfs-add-dsdt.sh |   43 ++++++++++++++
- Documentation/kernel-parameters.txt      |    3 +
- drivers/acpi/Kconfig                     |   11 ++++
- drivers/acpi/osl.c                       |   24 ++++++++
- init/initramfs.c                         |   89 ++++++++++++++++++++++++++++++
- 6 files changed, 180 insertions(+), 2 deletions(-)
+ Documentation/acpi/dsdt-override.txt     |   12 +++
+ Documentation/acpi/initramfs-add-dsdt.sh |   43 +++++++++++++
+ Documentation/kernel-parameters.txt      |    3 
+ drivers/acpi/Kconfig                     |   11 +++
+ drivers/acpi/osl.c                       |   24 +++++++
+ init/initramfs.c                         |   99 +++++++++++++++++++++++++++++++
+ 6 files changed, 190 insertions(+), 2 deletions(-)
  create mode 100644 Documentation/acpi/initramfs-add-dsdt.sh
 
 --- a/Documentation/acpi/dsdt-override.txt
@@ -92,7 +97,7 @@ Signed-off-by: Eric Piel <eric.piel@tremplin-utc.net>
 +
 --- a/Documentation/kernel-parameters.txt
 +++ b/Documentation/kernel-parameters.txt
-@@ -180,6 +180,9 @@ and is between 256 and 4096 characters. 
+@@ -216,6 +216,9 @@ and is between 256 and 4096 characters. 
  
  	acpi_no_auto_ssdt	[HW,ACPI] Disable automatic loading of SSDT
  
@@ -104,7 +109,7 @@ Signed-off-by: Eric Piel <eric.piel@tremplin-utc.net>
  
 --- a/drivers/acpi/Kconfig
 +++ b/drivers/acpi/Kconfig
-@@ -297,6 +297,17 @@ config ACPI_CUSTOM_DSDT
+@@ -233,6 +233,17 @@ config ACPI_CUSTOM_DSDT
  	bool
  	default ACPI_CUSTOM_DSDT_FILE != ""
  
@@ -136,7 +141,7 @@ Signed-off-by: Eric Piel <eric.piel@tremplin-utc.net>
  /*
   * The story of _OSI(Linux)
   *
-@@ -327,6 +332,16 @@ acpi_os_table_override(struct acpi_table
+@@ -334,6 +339,16 @@ acpi_os_table_override(struct acpi_table
  	if (strncmp(existing_table->signature, "DSDT", 4) == 0)
  		*new_table = (struct acpi_table_header *)AmlCode;
  #endif
@@ -153,7 +158,7 @@ Signed-off-by: Eric Piel <eric.piel@tremplin-utc.net>
  	if (*new_table != NULL) {
  		printk(KERN_WARNING PREFIX "Override [%4.4s-%8.8s], "
  			   "this is unsafe: tainting kernel\n",
-@@ -337,6 +352,15 @@ acpi_os_table_override(struct acpi_table
+@@ -344,6 +359,15 @@ acpi_os_table_override(struct acpi_table
  	return AE_OK;
  }
  
@@ -171,30 +176,32 @@ Signed-off-by: Eric Piel <eric.piel@tremplin-utc.net>
  	u32 handled;
 --- a/init/initramfs.c
 +++ b/init/initramfs.c
-@@ -7,6 +7,9 @@
- #include <linux/string.h>
+@@ -8,6 +8,9 @@
+ #include <linux/dirent.h>
  #include <linux/syscalls.h>
  #include <linux/utime.h>
-+#ifdef ACPI_CONFIG
++#ifdef CONFIG_ACPI_CUSTOM_DSDT_INITRD
 +#include <acpi/acpi.h>
 +#endif
  
  static __initdata char *message;
  static void __init error(char *x)
-@@ -124,6 +127,12 @@ static __initdata unsigned long body_len
+@@ -125,6 +128,14 @@ static __initdata unsigned long body_len
  static __initdata uid_t uid;
  static __initdata gid_t gid;
  static __initdata unsigned rdev;
 +#ifdef CONFIG_ACPI_CUSTOM_DSDT_INITRD
 +static __initdata char *file_looked_for;
 +static __initdata struct acpi_table_header *file_mem;
++static __initdata int find_dsdt;
 +#else
 +const char *file_looked_for = NULL;
++const int find_dsdt = 0;
 +#endif
  
  static void __init parse_header(char *s)
  {
-@@ -158,6 +167,7 @@ static __initdata enum state {
+@@ -159,6 +170,7 @@ static __initdata enum state {
  	SkipIt,
  	GotName,
  	CopyFile,
@@ -202,7 +209,18 @@ Signed-off-by: Eric Piel <eric.piel@tremplin-utc.net>
  	GotSymlink,
  	Reset
  } state, next_state;
-@@ -295,6 +305,54 @@ static void __init clean_path(char *path
+@@ -228,6 +240,10 @@ static int __init do_header(void)
+ 	parse_header(collected);
+ 	next_header = this_header + N_ALIGN(name_len) + body_len;
+ 	next_header = (next_header + 3) & ~3;
++	if (find_dsdt) {
++		read_into(name_buf, N_ALIGN(name_len), GotName);
++		return 0;
++	}
+ 	state = SkipIt;
+ 	if (name_len <= 0 || name_len > PATH_MAX)
+ 		return 0;
+@@ -290,6 +306,54 @@ static void __init clean_path(char *path
  
  static __initdata int wfd;
  
@@ -257,16 +275,18 @@ Signed-off-by: Eric Piel <eric.piel@tremplin-utc.net>
  static int __init do_name(void)
  {
  	state = SkipIt;
-@@ -303,6 +361,8 @@ static int __init do_name(void)
+@@ -298,6 +362,10 @@ static int __init do_name(void)
  		free_hash();
  		return 0;
  	}
 +	if (is_file_looked_for(file_looked_for))
 +		state = CopyFileMem;
- 	if (dry_run)
- 		return 0;
++	if (find_dsdt)
++		return 0;
  	clean_path(collected, mode);
-@@ -375,6 +435,7 @@ static __initdata int (*actions[])(void)
+ 	if (S_ISREG(mode)) {
+ 		int ml = maybe_link();
+@@ -370,6 +438,7 @@ static __initdata int (*actions[])(void)
  	[SkipIt]	= do_skip,
  	[GotName]	= do_name,
  	[CopyFile]	= do_copy,
@@ -274,7 +294,7 @@ Signed-off-by: Eric Piel <eric.piel@tremplin-utc.net>
  	[GotSymlink]	= do_symlink,
  	[Reset]		= do_reset,
  };
-@@ -613,3 +674,31 @@ static int __init populate_rootfs(void)
+@@ -606,3 +675,33 @@ static int __init populate_rootfs(void)
  	return 0;
  }
  rootfs_initcall(populate_rootfs);
@@ -286,10 +306,12 @@ Signed-off-by: Eric Piel <eric.piel@tremplin-utc.net>
 +
 +	printk(KERN_INFO "ACPI: Checking initramfs for custom DSDT\n");
 +	file_mem = NULL;
++	find_dsdt = 1;
 +	file_looked_for = ramfs_dsdt_name;
 +	err = unpack_to_rootfs((char *)initrd_start,
-+			initrd_end - initrd_start, 1);
++			initrd_end - initrd_start);
 +	file_looked_for = NULL;
++	find_dsdt = 0;
 +
 +	if (err) {
 +		/*
@@ -297,7 +319,7 @@ Signed-off-by: Eric Piel <eric.piel@tremplin-utc.net>
 +		 * we give up if the initramfs cannot be entirely read.
 +		 */
 +		kfree(file_mem);
-+		printk(KERN_ERR "ACPI: Aborded because %s.\n", err);
++		printk(KERN_ERR "ACPI: Aborted because %s.\n", err);
 +		return NULL;
 +	}
 +	if (file_mem)

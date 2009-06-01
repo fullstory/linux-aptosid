@@ -1,0 +1,109 @@
+Fix to some problems in acpi-dsdt-initrd-v0.9c-2.6.28.patch:
+* acpi_os_table_override isn't an __init function, so looks wrong it to
+  reference an __initdata variable, remove __initdata annotation from
+  acpi_no_initrd_override
+* The __init annotation from acpi_find_dsdt_initrd wasn't being taken
+  into account, as can be verified when building with
+  CONFIG_DEBUG_SECTION_MISMATCH=y. Changing
+  "struct __init acpi_table_header *acpi_find_dsdt_initrd(void)"
+  to
+  "struct acpi_table_header __init *acpi_find_dsdt_initrd(void)"
+  would fix the problem, but then debug section mismatch checker would
+  complain about non __init acpi_os_table_override using
+  acpi_find_dsdt_initrd, and it's right. We can't annotate
+  acpi_os_table_override with __init, thus change code to save the
+  loaded dsdt from initrd into global acpi_dsdt_initrd.
+* We must check for initrd_start before trying to load DSDT from initrd.
+
+Signed-off-by: Herton Ronaldo Krzesinski <herton@mandriva.com.br>
+---
+ drivers/acpi/osl.c |   13 ++++---------
+ init/initramfs.c   |    7 ++++---
+ init/main.c        |    7 +++++++
+ 3 files changed, 15 insertions(+), 12 deletions(-)
+
+--- a/drivers/acpi/osl.c
++++ b/drivers/acpi/osl.c
+@@ -96,8 +96,8 @@ static DEFINE_SPINLOCK(acpi_res_lock);
+ static char osi_additional_string[OSI_STRING_LENGTH_MAX];
+ 
+ #ifdef CONFIG_ACPI_CUSTOM_DSDT_INITRD
+-static __initdata int acpi_no_initrd_override;
+-extern struct acpi_table_header *acpi_find_dsdt_initrd(void);
++static int acpi_no_initrd_override;
++struct acpi_table_header *acpi_dsdt_initrd = NULL;
+ #endif
+ 
+ /*
+@@ -341,13 +341,8 @@ acpi_os_table_override(struct acpi_table
+ #endif
+ #ifdef CONFIG_ACPI_CUSTOM_DSDT_INITRD
+ 	if ((strncmp(existing_table->signature, "DSDT", 4) == 0) &&
+-	    !acpi_no_initrd_override) {
+-		struct acpi_table_header *initrd_table;
+-
+-		initrd_table = acpi_find_dsdt_initrd();
+-		if (initrd_table)
+-			*new_table = initrd_table;
+-	}
++	    !acpi_no_initrd_override && acpi_dsdt_initrd)
++		*new_table = acpi_dsdt_initrd;
+ #endif
+ 	if (*new_table != NULL) {
+ 		printk(KERN_WARNING PREFIX "Override [%4.4s-%8.8s], "
+--- a/init/initramfs.c
++++ b/init/initramfs.c
+@@ -132,6 +132,7 @@ static __initdata unsigned rdev;
+ static __initdata char *file_looked_for;
+ static __initdata struct acpi_table_header *file_mem;
+ static __initdata int find_dsdt;
++extern struct acpi_table_header *acpi_dsdt_initrd;
+ #else
+ const char *file_looked_for = NULL;
+ const int find_dsdt = 0;
+@@ -677,7 +678,7 @@ static int __init populate_rootfs(void)
+ rootfs_initcall(populate_rootfs);
+ 
+ #ifdef CONFIG_ACPI_CUSTOM_DSDT_INITRD
+-struct __init acpi_table_header *acpi_find_dsdt_initrd(void)
++void __init acpi_find_dsdt_initrd(void)
+ {
+ 	char *err, *ramfs_dsdt_name = "DSDT.aml";
+ 
+@@ -697,11 +698,11 @@ struct __init acpi_table_header *acpi_fi
+ 		 */
+ 		kfree(file_mem);
+ 		printk(KERN_ERR "ACPI: Aborted because %s.\n", err);
+-		return NULL;
++		return;
+ 	}
+ 	if (file_mem)
+ 		printk(KERN_INFO "ACPI: Found DSDT in %s.\n", ramfs_dsdt_name);
+ 
+-	return file_mem;
++	acpi_dsdt_initrd = file_mem;
+ }
+ #endif
+--- a/init/main.c
++++ b/init/main.c
+@@ -91,6 +91,11 @@ extern void acpi_early_init(void);
+ #else
+ static inline void acpi_early_init(void) { }
+ #endif
++#ifdef CONFIG_ACPI_CUSTOM_DSDT_INITRD
++extern void acpi_find_dsdt_initrd(void);
++#else
++static inline void acpi_find_dsdt_initrd(void) { }
++#endif
+ #ifndef CONFIG_DEBUG_RODATA
+ static inline void mark_rodata_ro(void) { }
+ #endif
+@@ -692,6 +697,8 @@ asmlinkage void __init start_kernel(void
+ 
+ 	check_bugs();
+ 
++	if (initrd_start)
++		acpi_find_dsdt_initrd();
+ 	acpi_early_init(); /* before LAPIC and SMP init */
+ 
+ 	ftrace_init();
