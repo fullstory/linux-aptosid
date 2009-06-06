@@ -1,0 +1,989 @@
+diff --git a/Makefile b/Makefile
+index 610d1c3..5c2c7db 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 30
+-EXTRAVERSION = -rc8
++EXTRAVERSION = -rc8-git3
+ NAME = Man-Eating Seals of Antiquity
+ 
+ # *DOCUMENTATION*
+@@ -533,7 +533,7 @@ endif
+ 
+ include $(srctree)/arch/$(SRCARCH)/Makefile
+ 
+-ifneq (CONFIG_FRAME_WARN,0)
++ifneq ($(CONFIG_FRAME_WARN),0)
+ KBUILD_CFLAGS += $(call cc-option,-Wframe-larger-than=${CONFIG_FRAME_WARN})
+ endif
+ 
+diff --git a/arch/x86/kernel/cpu/cpufreq/powernow-k8.c b/arch/x86/kernel/cpu/cpufreq/powernow-k8.c
+index f6b32d1..35dc8fb 100644
+--- a/arch/x86/kernel/cpu/cpufreq/powernow-k8.c
++++ b/arch/x86/kernel/cpu/cpufreq/powernow-k8.c
+@@ -835,7 +835,7 @@ static int powernow_k8_cpu_init_acpi(struct powernow_k8_data *data)
+ {
+ 	struct cpufreq_frequency_table *powernow_table;
+ 	int ret_val = -ENODEV;
+-	acpi_integer space_id;
++	acpi_integer control, status;
+ 
+ 	if (acpi_processor_register_performance(&data->acpi_data, data->cpu)) {
+ 		dprintk("register performance failed: bad ACPI data\n");
+@@ -848,12 +848,13 @@ static int powernow_k8_cpu_init_acpi(struct powernow_k8_data *data)
+ 		goto err_out;
+ 	}
+ 
+-	space_id = data->acpi_data.control_register.space_id;
+-	if ((space_id != ACPI_ADR_SPACE_FIXED_HARDWARE) ||
+-		(space_id != ACPI_ADR_SPACE_FIXED_HARDWARE)) {
++	control = data->acpi_data.control_register.space_id;
++	status = data->acpi_data.status_register.space_id;
++
++	if ((control != ACPI_ADR_SPACE_FIXED_HARDWARE) ||
++	    (status != ACPI_ADR_SPACE_FIXED_HARDWARE)) {
+ 		dprintk("Invalid control/status registers (%x - %x)\n",
+-			data->acpi_data.control_register.space_id,
+-			space_id);
++			control, status);
+ 		goto err_out;
+ 	}
+ 
+diff --git a/arch/x86/lguest/Makefile b/arch/x86/lguest/Makefile
+index 27f0c9e..94e0e54 100644
+--- a/arch/x86/lguest/Makefile
++++ b/arch/x86/lguest/Makefile
+@@ -1 +1,2 @@
+ obj-y		:= i386_head.o boot.o
++CFLAGS_boot.o	:= $(call cc-option, -fno-stack-protector)
+diff --git a/arch/x86/lguest/boot.c b/arch/x86/lguest/boot.c
+index ca7ec44..33a93b4 100644
+--- a/arch/x86/lguest/boot.c
++++ b/arch/x86/lguest/boot.c
+@@ -67,6 +67,7 @@
+ #include <asm/mce.h>
+ #include <asm/io.h>
+ #include <asm/i387.h>
++#include <asm/stackprotector.h>
+ #include <asm/reboot.h>		/* for struct machine_ops */
+ 
+ /*G:010 Welcome to the Guest!
+@@ -1088,13 +1089,21 @@ __init void lguest_init(void)
+ 	 * lguest_init() where the rest of the fairly chaotic boot setup
+ 	 * occurs. */
+ 
++	/* The stack protector is a weird thing where gcc places a canary
++	 * value on the stack and then checks it on return.  This file is
++	 * compiled with -fno-stack-protector it, so we got this far without
++	 * problems.  The value of the canary is kept at offset 20 from the
++	 * %gs register, so we need to set that up before calling C functions
++	 * in other files. */
++	setup_stack_canary_segment(0);
++	/* We could just call load_stack_canary_segment(), but we might as
++	 * call switch_to_new_gdt() which loads the whole table and sets up
++	 * the per-cpu segment descriptor register %fs as well. */
++	switch_to_new_gdt(0);
++
+ 	/* As described in head_32.S, we map the first 128M of memory. */
+ 	max_pfn_mapped = (128*1024*1024) >> PAGE_SHIFT;
+ 
+-	/* Load the %fs segment register (the per-cpu segment register) with
+-	 * the normal data segment to get through booting. */
+-	asm volatile ("mov %0, %%fs" : : "r" (__KERNEL_DS) : "memory");
+-
+ 	/* The Host<->Guest Switcher lives at the top of our address space, and
+ 	 * the Host told us how big it is when we made LGUEST_INIT hypercall:
+ 	 * it put the answer in lguest_data.reserve_mem  */
+diff --git a/drivers/ata/ahci.c b/drivers/ata/ahci.c
+index 08186ec..6b91c26 100644
+--- a/drivers/ata/ahci.c
++++ b/drivers/ata/ahci.c
+@@ -220,6 +220,7 @@ enum {
+ 	AHCI_HFLAG_NO_HOTPLUG		= (1 << 7), /* ignore PxSERR.DIAG.N */
+ 	AHCI_HFLAG_SECT255		= (1 << 8), /* max 255 sectors */
+ 	AHCI_HFLAG_YES_NCQ		= (1 << 9), /* force NCQ cap on */
++	AHCI_HFLAG_NO_SUSPEND		= (1 << 10), /* don't suspend */
+ 
+ 	/* ap->flags bits */
+ 
+@@ -2316,9 +2317,17 @@ static int ahci_port_suspend(struct ata_port *ap, pm_message_t mesg)
+ static int ahci_pci_device_suspend(struct pci_dev *pdev, pm_message_t mesg)
+ {
+ 	struct ata_host *host = dev_get_drvdata(&pdev->dev);
++	struct ahci_host_priv *hpriv = host->private_data;
+ 	void __iomem *mmio = host->iomap[AHCI_PCI_BAR];
+ 	u32 ctl;
+ 
++	if (mesg.event & PM_EVENT_SUSPEND &&
++	    hpriv->flags & AHCI_HFLAG_NO_SUSPEND) {
++		dev_printk(KERN_ERR, &pdev->dev,
++			   "BIOS update required for suspend/resume\n");
++		return -EIO;
++	}
++
+ 	if (mesg.event & PM_EVENT_SLEEP) {
+ 		/* AHCI spec rev1.1 section 8.3.3:
+ 		 * Software must disable interrupts prior to requesting a
+@@ -2610,6 +2619,63 @@ static bool ahci_broken_system_poweroff(struct pci_dev *pdev)
+ 	return false;
+ }
+ 
++static bool ahci_broken_suspend(struct pci_dev *pdev)
++{
++	static const struct dmi_system_id sysids[] = {
++		/*
++		 * On HP dv[4-6] and HDX18 with earlier BIOSen, link
++		 * to the harddisk doesn't become online after
++		 * resuming from STR.  Warn and fail suspend.
++		 */
++		{
++			.ident = "dv4",
++			.matches = {
++				DMI_MATCH(DMI_SYS_VENDOR, "Hewlett-Packard"),
++				DMI_MATCH(DMI_PRODUCT_NAME,
++					  "HP Pavilion dv4 Notebook PC"),
++			},
++			.driver_data = "F.30", /* cutoff BIOS version */
++		},
++		{
++			.ident = "dv5",
++			.matches = {
++				DMI_MATCH(DMI_SYS_VENDOR, "Hewlett-Packard"),
++				DMI_MATCH(DMI_PRODUCT_NAME,
++					  "HP Pavilion dv5 Notebook PC"),
++			},
++			.driver_data = "F.16", /* cutoff BIOS version */
++		},
++		{
++			.ident = "dv6",
++			.matches = {
++				DMI_MATCH(DMI_SYS_VENDOR, "Hewlett-Packard"),
++				DMI_MATCH(DMI_PRODUCT_NAME,
++					  "HP Pavilion dv6 Notebook PC"),
++			},
++			.driver_data = "F.21",	/* cutoff BIOS version */
++		},
++		{
++			.ident = "HDX18",
++			.matches = {
++				DMI_MATCH(DMI_SYS_VENDOR, "Hewlett-Packard"),
++				DMI_MATCH(DMI_PRODUCT_NAME,
++					  "HP HDX18 Notebook PC"),
++			},
++			.driver_data = "F.23",	/* cutoff BIOS version */
++		},
++		{ }	/* terminate list */
++	};
++	const struct dmi_system_id *dmi = dmi_first_match(sysids);
++	const char *ver;
++
++	if (!dmi || pdev->bus->number || pdev->devfn != PCI_DEVFN(0x1f, 2))
++		return false;
++
++	ver = dmi_get_system_info(DMI_BIOS_VERSION);
++
++	return !ver || strcmp(ver, dmi->driver_data) < 0;
++}
++
+ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ {
+ 	static int printed_version;
+@@ -2715,6 +2781,12 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 			"quirky BIOS, skipping spindown on poweroff\n");
+ 	}
+ 
++	if (ahci_broken_suspend(pdev)) {
++		hpriv->flags |= AHCI_HFLAG_NO_SUSPEND;
++		dev_printk(KERN_WARNING, &pdev->dev,
++			   "BIOS update required for suspend/resume\n");
++	}
++
+ 	/* CAP.NP sometimes indicate the index of the last enabled
+ 	 * port, at other times, that of the last possible port, so
+ 	 * determining the maximum port number requires looking at
+diff --git a/drivers/ata/ata_piix.c b/drivers/ata/ata_piix.c
+index d51a17c..1aeb708 100644
+--- a/drivers/ata/ata_piix.c
++++ b/drivers/ata/ata_piix.c
+@@ -1455,6 +1455,15 @@ static bool piix_broken_system_poweroff(struct pci_dev *pdev)
+ 			/* PCI slot number of the controller */
+ 			.driver_data = (void *)0x1FUL,
+ 		},
++		{
++			.ident = "HP Compaq nc6000",
++			.matches = {
++				DMI_MATCH(DMI_SYS_VENDOR, "Hewlett-Packard"),
++				DMI_MATCH(DMI_PRODUCT_NAME, "HP Compaq nc6000"),
++			},
++			/* PCI slot number of the controller */
++			.driver_data = (void *)0x1FUL,
++		},
+ 
+ 		{ }	/* terminate list */
+ 	};
+diff --git a/drivers/ata/pata_efar.c b/drivers/ata/pata_efar.c
+index 2085e0a..2a6412f 100644
+--- a/drivers/ata/pata_efar.c
++++ b/drivers/ata/pata_efar.c
+@@ -22,7 +22,7 @@
+ #include <linux/ata.h>
+ 
+ #define DRV_NAME	"pata_efar"
+-#define DRV_VERSION	"0.4.4"
++#define DRV_VERSION	"0.4.5"
+ 
+ /**
+  *	efar_pre_reset	-	Enable bits
+@@ -98,18 +98,17 @@ static void efar_set_piomode (struct ata_port *ap, struct ata_device *adev)
+ 			    { 2, 1 },
+ 			    { 2, 3 }, };
+ 
+-	if (pio > 2)
+-		control |= 1;	/* TIME1 enable */
++	if (pio > 1)
++		control |= 1;	/* TIME */
+ 	if (ata_pio_need_iordy(adev))	/* PIO 3/4 require IORDY */
+-		control |= 2;	/* IE enable */
+-	/* Intel specifies that the PPE functionality is for disk only */
++		control |= 2;	/* IE */
++	/* Intel specifies that the prefetch/posting is for disk only */
+ 	if (adev->class == ATA_DEV_ATA)
+-		control |= 4;	/* PPE enable */
++		control |= 4;	/* PPE */
+ 
+ 	pci_read_config_word(dev, idetm_port, &idetm_data);
+ 
+-	/* Enable PPE, IE and TIME as appropriate */
+-
++	/* Set PPE, IE, and TIME as appropriate */
+ 	if (adev->devno == 0) {
+ 		idetm_data &= 0xCCF0;
+ 		idetm_data |= control;
+@@ -129,7 +128,7 @@ static void efar_set_piomode (struct ata_port *ap, struct ata_device *adev)
+ 		pci_write_config_byte(dev, 0x44, slave_data);
+ 	}
+ 
+-	idetm_data |= 0x4000;	/* Ensure SITRE is enabled */
++	idetm_data |= 0x4000;	/* Ensure SITRE is set */
+ 	pci_write_config_word(dev, idetm_port, idetm_data);
+ }
+ 
+diff --git a/drivers/ata/pata_legacy.c b/drivers/ata/pata_legacy.c
+index f72c6c5..6932e56 100644
+--- a/drivers/ata/pata_legacy.c
++++ b/drivers/ata/pata_legacy.c
+@@ -48,6 +48,7 @@
+  *
+  */
+ 
++#include <linux/async.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/pci.h>
+@@ -1028,6 +1029,7 @@ static __init int legacy_init_one(struct legacy_probe *probe)
+ 				&legacy_sht);
+ 	if (ret)
+ 		goto fail;
++	async_synchronize_full();
+ 	ld->platform_dev = pdev;
+ 
+ 	/* Nothing found means we drop the port as its probably not there */
+diff --git a/drivers/char/mem.c b/drivers/char/mem.c
+index 8f05c38..65e12bc 100644
+--- a/drivers/char/mem.c
++++ b/drivers/char/mem.c
+@@ -694,6 +694,9 @@ static ssize_t read_zero(struct file * file, char __user * buf,
+ 		written += chunk - unwritten;
+ 		if (unwritten)
+ 			break;
++		/* Consider changing this to just 'signal_pending()' with lots of testing */
++		if (fatal_signal_pending(current))
++			return written ? written : -EINTR;
+ 		buf += chunk;
+ 		count -= chunk;
+ 		cond_resched();
+diff --git a/drivers/gpu/drm/drm_crtc.c b/drivers/gpu/drm/drm_crtc.c
+index 94a7688..8fab789 100644
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -2294,7 +2294,12 @@ int drm_mode_connector_property_set_ioctl(struct drm_device *dev,
+ 		}
+ 	}
+ 
+-	if (connector->funcs->set_property)
++	/* Do DPMS ourselves */
++	if (property == connector->dev->mode_config.dpms_property) {
++		if (connector->funcs->dpms)
++			(*connector->funcs->dpms)(connector, (int) out_resp->value);
++		ret = 0;
++	} else if (connector->funcs->set_property)
+ 		ret = connector->funcs->set_property(connector, property, out_resp->value);
+ 
+ 	/* store the property value if succesful */
+diff --git a/drivers/gpu/drm/drm_crtc_helper.c b/drivers/gpu/drm/drm_crtc_helper.c
+index 4589044..a6f73f1 100644
+--- a/drivers/gpu/drm/drm_crtc_helper.c
++++ b/drivers/gpu/drm/drm_crtc_helper.c
+@@ -199,6 +199,29 @@ static void drm_helper_add_std_modes(struct drm_device *dev,
+ }
+ 
+ /**
++ * drm_helper_encoder_in_use - check if a given encoder is in use
++ * @encoder: encoder to check
++ *
++ * LOCKING:
++ * Caller must hold mode config lock.
++ *
++ * Walk @encoders's DRM device's mode_config and see if it's in use.
++ *
++ * RETURNS:
++ * True if @encoder is part of the mode_config, false otherwise.
++ */
++bool drm_helper_encoder_in_use(struct drm_encoder *encoder)
++{
++	struct drm_connector *connector;
++	struct drm_device *dev = encoder->dev;
++	list_for_each_entry(connector, &dev->mode_config.connector_list, head)
++		if (connector->encoder == encoder)
++			return true;
++	return false;
++}
++EXPORT_SYMBOL(drm_helper_encoder_in_use);
++
++/**
+  * drm_helper_crtc_in_use - check if a given CRTC is in a mode_config
+  * @crtc: CRTC to check
+  *
+@@ -216,7 +239,7 @@ bool drm_helper_crtc_in_use(struct drm_crtc *crtc)
+ 	struct drm_device *dev = crtc->dev;
+ 	/* FIXME: Locking around list access? */
+ 	list_for_each_entry(encoder, &dev->mode_config.encoder_list, head)
+-		if (encoder->crtc == crtc)
++		if (encoder->crtc == crtc && drm_helper_encoder_in_use(encoder))
+ 			return true;
+ 	return false;
+ }
+@@ -240,7 +263,7 @@ void drm_helper_disable_unused_functions(struct drm_device *dev)
+ 
+ 	list_for_each_entry(encoder, &dev->mode_config.encoder_list, head) {
+ 		encoder_funcs = encoder->helper_private;
+-		if (!encoder->crtc)
++		if (!drm_helper_encoder_in_use(encoder))
+ 			(*encoder_funcs->dpms)(encoder, DRM_MODE_DPMS_OFF);
+ 	}
+ 
+@@ -935,6 +958,88 @@ bool drm_helper_initial_config(struct drm_device *dev)
+ }
+ EXPORT_SYMBOL(drm_helper_initial_config);
+ 
++static int drm_helper_choose_encoder_dpms(struct drm_encoder *encoder)
++{
++	int dpms = DRM_MODE_DPMS_OFF;
++	struct drm_connector *connector;
++	struct drm_device *dev = encoder->dev;
++
++	list_for_each_entry(connector, &dev->mode_config.connector_list, head)
++		if (connector->encoder == encoder)
++			if (connector->dpms < dpms)
++				dpms = connector->dpms;
++	return dpms;
++}
++
++static int drm_helper_choose_crtc_dpms(struct drm_crtc *crtc)
++{
++	int dpms = DRM_MODE_DPMS_OFF;
++	struct drm_connector *connector;
++	struct drm_device *dev = crtc->dev;
++
++	list_for_each_entry(connector, &dev->mode_config.connector_list, head)
++		if (connector->encoder && connector->encoder->crtc == crtc)
++			if (connector->dpms < dpms)
++				dpms = connector->dpms;
++	return dpms;
++}
++
++/**
++ * drm_helper_connector_dpms
++ * @connector affected connector
++ * @mode DPMS mode
++ *
++ * Calls the low-level connector DPMS function, then
++ * calls appropriate encoder and crtc DPMS functions as well
++ */
++void drm_helper_connector_dpms(struct drm_connector *connector, int mode)
++{
++	struct drm_encoder *encoder = connector->encoder;
++	struct drm_crtc *crtc = encoder ? encoder->crtc : NULL;
++	int old_dpms;
++
++	if (mode == connector->dpms)
++		return;
++
++	old_dpms = connector->dpms;
++	connector->dpms = mode;
++
++	/* from off to on, do crtc then encoder */
++	if (mode < old_dpms) {
++		if (crtc) {
++			struct drm_crtc_helper_funcs *crtc_funcs = crtc->helper_private;
++			if (crtc_funcs->dpms)
++				(*crtc_funcs->dpms) (crtc,
++						     drm_helper_choose_crtc_dpms(crtc));
++		}
++		if (encoder) {
++			struct drm_encoder_helper_funcs *encoder_funcs = encoder->helper_private;
++			if (encoder_funcs->dpms)
++				(*encoder_funcs->dpms) (encoder,
++							drm_helper_choose_encoder_dpms(encoder));
++		}
++	}
++
++	/* from on to off, do encoder then crtc */
++	if (mode > old_dpms) {
++		if (encoder) {
++			struct drm_encoder_helper_funcs *encoder_funcs = encoder->helper_private;
++			if (encoder_funcs->dpms)
++				(*encoder_funcs->dpms) (encoder,
++							drm_helper_choose_encoder_dpms(encoder));
++		}
++		if (crtc) {
++			struct drm_crtc_helper_funcs *crtc_funcs = crtc->helper_private;
++			if (crtc_funcs->dpms)
++				(*crtc_funcs->dpms) (crtc,
++						     drm_helper_choose_crtc_dpms(crtc));
++		}
++	}
++
++	return;
++}
++EXPORT_SYMBOL(drm_helper_connector_dpms);
++
+ /**
+  * drm_hotplug_stage_two
+  * @dev DRM device
+diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
+index ca9c616..6f6b264 100644
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -289,6 +289,11 @@ static struct drm_display_mode *drm_mode_detailed(struct drm_device *dev,
+ 	struct drm_display_mode *mode;
+ 	struct detailed_pixel_timing *pt = &timing->data.pixel_data;
+ 
++	/* ignore tiny modes */
++	if (((pt->hactive_hi << 8) | pt->hactive_lo) < 64 ||
++	    ((pt->vactive_hi << 8) | pt->hactive_lo) < 64)
++		return NULL;
++
+ 	if (pt->stereo) {
+ 		printk(KERN_WARNING "stereo mode not supported\n");
+ 		return NULL;
+diff --git a/drivers/gpu/drm/drm_irq.c b/drivers/gpu/drm/drm_irq.c
+index 93e677a..fc8e5ac 100644
+--- a/drivers/gpu/drm/drm_irq.c
++++ b/drivers/gpu/drm/drm_irq.c
+@@ -196,6 +196,7 @@ int drm_irq_install(struct drm_device *dev)
+ {
+ 	int ret = 0;
+ 	unsigned long sh_flags = 0;
++	char *irqname;
+ 
+ 	if (!drm_core_check_feature(dev, DRIVER_HAVE_IRQ))
+ 		return -EINVAL;
+@@ -227,8 +228,13 @@ int drm_irq_install(struct drm_device *dev)
+ 	if (drm_core_check_feature(dev, DRIVER_IRQ_SHARED))
+ 		sh_flags = IRQF_SHARED;
+ 
++	if (dev->devname)
++		irqname = dev->devname;
++	else
++		irqname = dev->driver->name;
++
+ 	ret = request_irq(drm_dev_to_irq(dev), dev->driver->irq_handler,
+-			  sh_flags, dev->devname, dev);
++			  sh_flags, irqname, dev);
+ 
+ 	if (ret < 0) {
+ 		mutex_lock(&dev->struct_mutex);
+diff --git a/drivers/gpu/drm/drm_sysfs.c b/drivers/gpu/drm/drm_sysfs.c
+index 8f93729..9987ab8 100644
+--- a/drivers/gpu/drm/drm_sysfs.c
++++ b/drivers/gpu/drm/drm_sysfs.c
+@@ -147,7 +147,7 @@ static ssize_t status_show(struct device *device,
+ 	enum drm_connector_status status;
+ 
+ 	status = connector->funcs->detect(connector);
+-	return snprintf(buf, PAGE_SIZE, "%s",
++	return snprintf(buf, PAGE_SIZE, "%s\n",
+ 			drm_get_connector_status_name(status));
+ }
+ 
+@@ -166,7 +166,7 @@ static ssize_t dpms_show(struct device *device,
+ 	if (ret)
+ 		return 0;
+ 
+-	return snprintf(buf, PAGE_SIZE, "%s",
++	return snprintf(buf, PAGE_SIZE, "%s\n",
+ 			drm_get_dpms_name((int)dpms_status));
+ }
+ 
+@@ -176,7 +176,7 @@ static ssize_t enabled_show(struct device *device,
+ {
+ 	struct drm_connector *connector = to_drm_connector(device);
+ 
+-	return snprintf(buf, PAGE_SIZE, connector->encoder ? "enabled" :
++	return snprintf(buf, PAGE_SIZE, "%s\n", connector->encoder ? "enabled" :
+ 			"disabled");
+ }
+ 
+@@ -317,6 +317,7 @@ static struct device_attribute connector_attrs_opt1[] = {
+ 
+ static struct bin_attribute edid_attr = {
+ 	.attr.name = "edid",
++	.attr.mode = 0444,
+ 	.size = 128,
+ 	.read = edid_show,
+ };
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 53d5445..0ccb63e 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -987,12 +987,6 @@ static int i915_load_modeset_init(struct drm_device *dev)
+ 	int fb_bar = IS_I9XX(dev) ? 2 : 0;
+ 	int ret = 0;
+ 
+-	dev->devname = kstrdup(DRIVER_NAME, GFP_KERNEL);
+-	if (!dev->devname) {
+-		ret = -ENOMEM;
+-		goto out;
+-	}
+-
+ 	dev->mode_config.fb_base = drm_get_resource_start(dev, fb_bar) &
+ 		0xff000000;
+ 
+@@ -1006,7 +1000,7 @@ static int i915_load_modeset_init(struct drm_device *dev)
+ 
+ 	ret = i915_probe_agp(dev, &agp_size, &prealloc_size);
+ 	if (ret)
+-		goto kfree_devname;
++		goto out;
+ 
+ 	/* Basic memrange allocator for stolen space (aka vram) */
+ 	drm_mm_init(&dev_priv->vram, 0, prealloc_size);
+@@ -1024,7 +1018,7 @@ static int i915_load_modeset_init(struct drm_device *dev)
+ 
+ 	ret = i915_gem_init_ringbuffer(dev);
+ 	if (ret)
+-		goto kfree_devname;
++		goto out;
+ 
+ 	/* Allow hardware batchbuffers unless told otherwise.
+ 	 */
+@@ -1056,8 +1050,6 @@ static int i915_load_modeset_init(struct drm_device *dev)
+ 
+ destroy_ringbuffer:
+ 	i915_gem_cleanup_ringbuffer(dev);
+-kfree_devname:
+-	kfree(dev->devname);
+ out:
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 670d128..39f5c65 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2260,9 +2260,6 @@ try_again:
+ 			goto try_again;
+ 		}
+ 
+-		BUG_ON(old_obj_priv->active ||
+-		       (reg->obj->write_domain & I915_GEM_GPU_DOMAINS));
+-
+ 		/*
+ 		 * Zap this virtual mapping so we can set up a fence again
+ 		 * for this object next time we need it.
+diff --git a/drivers/gpu/drm/i915/intel_crt.c b/drivers/gpu/drm/i915/intel_crt.c
+index 640f515..79acc4f 100644
+--- a/drivers/gpu/drm/i915/intel_crt.c
++++ b/drivers/gpu/drm/i915/intel_crt.c
+@@ -381,11 +381,6 @@ static int intel_crt_set_property(struct drm_connector *connector,
+ 				  struct drm_property *property,
+ 				  uint64_t value)
+ {
+-	struct drm_device *dev = connector->dev;
+-
+-	if (property == dev->mode_config.dpms_property && connector->encoder)
+-		intel_crt_dpms(connector->encoder, (uint32_t)(value & 0xf));
+-
+ 	return 0;
+ }
+ 
+@@ -402,6 +397,7 @@ static const struct drm_encoder_helper_funcs intel_crt_helper_funcs = {
+ };
+ 
+ static const struct drm_connector_funcs intel_crt_connector_funcs = {
++	.dpms = drm_helper_connector_dpms,
+ 	.detect = intel_crt_detect,
+ 	.fill_modes = drm_helper_probe_single_connector_modes,
+ 	.destroy = intel_crt_destroy,
+diff --git a/drivers/gpu/drm/i915/intel_dvo.c b/drivers/gpu/drm/i915/intel_dvo.c
+index 8b8d6e6..1ee3007 100644
+--- a/drivers/gpu/drm/i915/intel_dvo.c
++++ b/drivers/gpu/drm/i915/intel_dvo.c
+@@ -316,6 +316,7 @@ static const struct drm_encoder_helper_funcs intel_dvo_helper_funcs = {
+ };
+ 
+ static const struct drm_connector_funcs intel_dvo_connector_funcs = {
++	.dpms = drm_helper_connector_dpms,
+ 	.save = intel_dvo_save,
+ 	.restore = intel_dvo_restore,
+ 	.detect = intel_dvo_detect,
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index d0983bb..7d6bdd7 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -219,6 +219,7 @@ static const struct drm_encoder_helper_funcs intel_hdmi_helper_funcs = {
+ };
+ 
+ static const struct drm_connector_funcs intel_hdmi_connector_funcs = {
++	.dpms = drm_helper_connector_dpms,
+ 	.save = intel_hdmi_save,
+ 	.restore = intel_hdmi_restore,
+ 	.detect = intel_hdmi_detect,
+diff --git a/drivers/gpu/drm/i915/intel_lvds.c b/drivers/gpu/drm/i915/intel_lvds.c
+index 53731f0..53cccfa 100644
+--- a/drivers/gpu/drm/i915/intel_lvds.c
++++ b/drivers/gpu/drm/i915/intel_lvds.c
+@@ -343,11 +343,6 @@ static int intel_lvds_set_property(struct drm_connector *connector,
+ 				   struct drm_property *property,
+ 				   uint64_t value)
+ {
+-	struct drm_device *dev = connector->dev;
+-
+-	if (property == dev->mode_config.dpms_property && connector->encoder)
+-		intel_lvds_dpms(connector->encoder, (uint32_t)(value & 0xf));
+-
+ 	return 0;
+ }
+ 
+@@ -366,6 +361,7 @@ static const struct drm_connector_helper_funcs intel_lvds_connector_helper_funcs
+ };
+ 
+ static const struct drm_connector_funcs intel_lvds_connector_funcs = {
++	.dpms = drm_helper_connector_dpms,
+ 	.save = intel_lvds_save,
+ 	.restore = intel_lvds_restore,
+ 	.detect = intel_lvds_detect,
+@@ -391,7 +387,7 @@ static int __init intel_no_lvds_dmi_callback(const struct dmi_system_id *id)
+ }
+ 
+ /* These systems claim to have LVDS, but really don't */
+-static const struct dmi_system_id __initdata intel_no_lvds[] = {
++static const struct dmi_system_id intel_no_lvds[] = {
+ 	{
+ 		.callback = intel_no_lvds_dmi_callback,
+ 		.ident = "Apple Mac Mini (Core series)",
+diff --git a/drivers/gpu/drm/i915/intel_sdvo.c b/drivers/gpu/drm/i915/intel_sdvo.c
+index f3ef6bf..3093b4d 100644
+--- a/drivers/gpu/drm/i915/intel_sdvo.c
++++ b/drivers/gpu/drm/i915/intel_sdvo.c
+@@ -1616,6 +1616,7 @@ static const struct drm_encoder_helper_funcs intel_sdvo_helper_funcs = {
+ };
+ 
+ static const struct drm_connector_funcs intel_sdvo_connector_funcs = {
++	.dpms = drm_helper_connector_dpms,
+ 	.save = intel_sdvo_save,
+ 	.restore = intel_sdvo_restore,
+ 	.detect = intel_sdvo_detect,
+diff --git a/drivers/gpu/drm/i915/intel_tv.c b/drivers/gpu/drm/i915/intel_tv.c
+index d2c3298..98ac054 100644
+--- a/drivers/gpu/drm/i915/intel_tv.c
++++ b/drivers/gpu/drm/i915/intel_tv.c
+@@ -1626,6 +1626,7 @@ static const struct drm_encoder_helper_funcs intel_tv_helper_funcs = {
+ };
+ 
+ static const struct drm_connector_funcs intel_tv_connector_funcs = {
++	.dpms = drm_helper_connector_dpms,
+ 	.save = intel_tv_save,
+ 	.restore = intel_tv_restore,
+ 	.detect = intel_tv_detect,
+diff --git a/drivers/gpu/drm/radeon/radeon_cp.c b/drivers/gpu/drm/radeon/radeon_cp.c
+index 77a7a4d..aff90bb 100644
+--- a/drivers/gpu/drm/radeon/radeon_cp.c
++++ b/drivers/gpu/drm/radeon/radeon_cp.c
+@@ -2185,9 +2185,9 @@ void radeon_commit_ring(drm_radeon_private_t *dev_priv)
+ 
+ 	/* check if the ring is padded out to 16-dword alignment */
+ 
+-	tail_aligned = dev_priv->ring.tail & 0xf;
++	tail_aligned = dev_priv->ring.tail & (RADEON_RING_ALIGN-1);
+ 	if (tail_aligned) {
+-		int num_p2 = 16 - tail_aligned;
++		int num_p2 = RADEON_RING_ALIGN - tail_aligned;
+ 
+ 		ring = dev_priv->ring.start;
+ 		/* pad with some CP_PACKET2 */
+diff --git a/drivers/gpu/drm/radeon/radeon_drv.h b/drivers/gpu/drm/radeon/radeon_drv.h
+index 8071d96..0c6bfc1 100644
+--- a/drivers/gpu/drm/radeon/radeon_drv.h
++++ b/drivers/gpu/drm/radeon/radeon_drv.h
+@@ -1964,11 +1964,14 @@ do {								\
+ 
+ #define RING_LOCALS	int write, _nr, _align_nr; unsigned int mask; u32 *ring;
+ 
++#define RADEON_RING_ALIGN 16
++
+ #define BEGIN_RING( n ) do {						\
+ 	if ( RADEON_VERBOSE ) {						\
+ 		DRM_INFO( "BEGIN_RING( %d )\n", (n));			\
+ 	}								\
+-	_align_nr = (n + 0xf) & ~0xf;					\
++	_align_nr = RADEON_RING_ALIGN - ((dev_priv->ring.tail + n) & (RADEON_RING_ALIGN-1));	\
++	_align_nr += n;							\
+ 	if (dev_priv->ring.space <= (_align_nr * sizeof(u32))) {	\
+                 COMMIT_RING();						\
+ 		radeon_wait_ring( dev_priv, _align_nr * sizeof(u32));	\
+diff --git a/drivers/media/video/ivtv/ivtv-queue.c b/drivers/media/video/ivtv/ivtv-queue.c
+index ff7b7de..7fde36e 100644
+--- a/drivers/media/video/ivtv/ivtv-queue.c
++++ b/drivers/media/video/ivtv/ivtv-queue.c
+@@ -230,7 +230,8 @@ int ivtv_stream_alloc(struct ivtv_stream *s)
+ 		return -ENOMEM;
+ 	}
+ 	if (ivtv_might_use_dma(s)) {
+-		s->sg_handle = pci_map_single(itv->pdev, s->sg_dma, sizeof(struct ivtv_sg_element), s->dma);
++		s->sg_handle = pci_map_single(itv->pdev, s->sg_dma,
++				sizeof(struct ivtv_sg_element), PCI_DMA_TODEVICE);
+ 		ivtv_stream_sync_for_cpu(s);
+ 	}
+ 
+diff --git a/drivers/mtd/nand/davinci_nand.c b/drivers/mtd/nand/davinci_nand.c
+index 0119220..02700f7 100644
+--- a/drivers/mtd/nand/davinci_nand.c
++++ b/drivers/mtd/nand/davinci_nand.c
+@@ -407,16 +407,17 @@ static int __init nand_davinci_probe(struct platform_device *pdev)
+ 	}
+ 	info->chip.ecc.mode = ecc_mode;
+ 
+-	info->clk = clk_get(&pdev->dev, "AEMIFCLK");
++	info->clk = clk_get(&pdev->dev, "aemif");
+ 	if (IS_ERR(info->clk)) {
+ 		ret = PTR_ERR(info->clk);
+-		dev_dbg(&pdev->dev, "unable to get AEMIFCLK, err %d\n", ret);
++		dev_dbg(&pdev->dev, "unable to get AEMIF clock, err %d\n", ret);
+ 		goto err_clk;
+ 	}
+ 
+ 	ret = clk_enable(info->clk);
+ 	if (ret < 0) {
+-		dev_dbg(&pdev->dev, "unable to enable AEMIFCLK, err %d\n", ret);
++		dev_dbg(&pdev->dev, "unable to enable AEMIF clock, err %d\n",
++			ret);
+ 		goto err_clk_enable;
+ 	}
+ 
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 3e2c7c7..35af933 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -2622,7 +2622,18 @@ static noinline int find_free_extent(struct btrfs_trans_handle *trans,
+ 						       search_start);
+ 		if (block_group && block_group_bits(block_group, data)) {
+ 			down_read(&space_info->groups_sem);
+-			goto have_block_group;
++			if (list_empty(&block_group->list) ||
++			    block_group->ro) {
++				/*
++				 * someone is removing this block group,
++				 * we can't jump into the have_block_group
++				 * target because our list pointers are not
++				 * valid
++				 */
++				btrfs_put_block_group(block_group);
++				up_read(&space_info->groups_sem);
++			} else
++				goto have_block_group;
+ 		} else if (block_group) {
+ 			btrfs_put_block_group(block_group);
+ 		}
+@@ -2656,6 +2667,13 @@ have_block_group:
+ 			 * people trying to start a new cluster
+ 			 */
+ 			spin_lock(&last_ptr->refill_lock);
++			if (last_ptr->block_group &&
++			    (last_ptr->block_group->ro ||
++			    !block_group_bits(last_ptr->block_group, data))) {
++				offset = 0;
++				goto refill_cluster;
++			}
++
+ 			offset = btrfs_alloc_from_cluster(block_group, last_ptr,
+ 						 num_bytes, search_start);
+ 			if (offset) {
+@@ -2681,10 +2699,17 @@ have_block_group:
+ 
+ 				last_ptr_loop = 1;
+ 				search_start = block_group->key.objectid;
++				/*
++				 * we know this block group is properly
++				 * in the list because
++				 * btrfs_remove_block_group, drops the
++				 * cluster before it removes the block
++				 * group from the list
++				 */
+ 				goto have_block_group;
+ 			}
+ 			spin_unlock(&last_ptr->lock);
+-
++refill_cluster:
+ 			/*
+ 			 * this cluster didn't work out, free it and
+ 			 * start over
+@@ -5968,6 +5993,7 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
+ {
+ 	struct btrfs_path *path;
+ 	struct btrfs_block_group_cache *block_group;
++	struct btrfs_free_cluster *cluster;
+ 	struct btrfs_key key;
+ 	int ret;
+ 
+@@ -5979,6 +6005,21 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
+ 
+ 	memcpy(&key, &block_group->key, sizeof(key));
+ 
++	/* make sure this block group isn't part of an allocation cluster */
++	cluster = &root->fs_info->data_alloc_cluster;
++	spin_lock(&cluster->refill_lock);
++	btrfs_return_cluster_to_free_space(block_group, cluster);
++	spin_unlock(&cluster->refill_lock);
++
++	/*
++	 * make sure this block group isn't part of a metadata
++	 * allocation cluster
++	 */
++	cluster = &root->fs_info->meta_alloc_cluster;
++	spin_lock(&cluster->refill_lock);
++	btrfs_return_cluster_to_free_space(block_group, cluster);
++	spin_unlock(&cluster->refill_lock);
++
+ 	path = btrfs_alloc_path();
+ 	BUG_ON(!path);
+ 
+@@ -5988,7 +6029,11 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
+ 	spin_unlock(&root->fs_info->block_group_cache_lock);
+ 	btrfs_remove_free_space_cache(block_group);
+ 	down_write(&block_group->space_info->groups_sem);
+-	list_del(&block_group->list);
++	/*
++	 * we must use list_del_init so people can check to see if they
++	 * are still on the list after taking the semaphore
++	 */
++	list_del_init(&block_group->list);
+ 	up_write(&block_group->space_info->groups_sem);
+ 
+ 	spin_lock(&block_group->space_info->lock);
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index 5f01dad..a6d35b0 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -1440,6 +1440,7 @@ int btrfs_init_new_device(struct btrfs_root *root, char *device_path)
+ 	device->io_align = root->sectorsize;
+ 	device->sector_size = root->sectorsize;
+ 	device->total_bytes = i_size_read(bdev->bd_inode);
++	device->disk_total_bytes = device->total_bytes;
+ 	device->dev_root = root->fs_info->dev_root;
+ 	device->bdev = bdev;
+ 	device->in_fs_metadata = 1;
+diff --git a/include/drm/drm_crtc.h b/include/drm/drm_crtc.h
+index 3c1924c..7300fb8 100644
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -471,6 +471,9 @@ struct drm_connector {
+ 	u32 property_ids[DRM_CONNECTOR_MAX_PROPERTY];
+ 	uint64_t property_values[DRM_CONNECTOR_MAX_PROPERTY];
+ 
++	/* requested DPMS state */
++	int dpms;
++
+ 	void *helper_private;
+ 
+ 	uint32_t encoder_ids[DRM_CONNECTOR_MAX_ENCODER];
+diff --git a/include/drm/drm_crtc_helper.h b/include/drm/drm_crtc_helper.h
+index ec073d8..6769ff6 100644
+--- a/include/drm/drm_crtc_helper.h
++++ b/include/drm/drm_crtc_helper.h
+@@ -99,6 +99,8 @@ extern bool drm_crtc_helper_set_mode(struct drm_crtc *crtc,
+ 				     struct drm_framebuffer *old_fb);
+ extern bool drm_helper_crtc_in_use(struct drm_crtc *crtc);
+ 
++extern void drm_helper_connector_dpms(struct drm_connector *connector, int mode);
++
+ extern int drm_helper_mode_fill_fb_struct(struct drm_framebuffer *fb,
+ 					  struct drm_mode_fb_cmd *mode_cmd);
+ 
+diff --git a/include/linux/tracehook.h b/include/linux/tracehook.h
+index c7aa154..eb96603 100644
+--- a/include/linux/tracehook.h
++++ b/include/linux/tracehook.h
+@@ -259,14 +259,12 @@ static inline void tracehook_finish_clone(struct task_struct *child,
+ 
+ /**
+  * tracehook_report_clone - in parent, new child is about to start running
+- * @trace:		return value from tracehook_prepare_clone()
+  * @regs:		parent's user register state
+  * @clone_flags:	flags from parent's system call
+  * @pid:		new child's PID in the parent's namespace
+  * @child:		new child task
+  *
+- * Called after a child is set up, but before it has been started
+- * running.  @trace is the value returned by tracehook_prepare_clone().
++ * Called after a child is set up, but before it has been started running.
+  * This is not a good place to block, because the child has not started
+  * yet.  Suspend the child here if desired, and then block in
+  * tracehook_report_clone_complete().  This must prevent the child from
+@@ -276,13 +274,14 @@ static inline void tracehook_finish_clone(struct task_struct *child,
+  *
+  * Called with no locks held, but the child cannot run until this returns.
+  */
+-static inline void tracehook_report_clone(int trace, struct pt_regs *regs,
++static inline void tracehook_report_clone(struct pt_regs *regs,
+ 					  unsigned long clone_flags,
+ 					  pid_t pid, struct task_struct *child)
+ {
+-	if (unlikely(trace) || unlikely(clone_flags & CLONE_PTRACE)) {
++	if (unlikely(task_ptrace(child))) {
+ 		/*
+-		 * The child starts up with an immediate SIGSTOP.
++		 * It doesn't matter who attached/attaching to this
++		 * task, the pending SIGSTOP is right in any case.
+ 		 */
+ 		sigaddset(&child->pending.signal, SIGSTOP);
+ 		set_tsk_thread_flag(child, TIF_SIGPENDING);
+diff --git a/kernel/fork.c b/kernel/fork.c
+index b9e2edd..875ffbd 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1409,7 +1409,7 @@ long do_fork(unsigned long clone_flags,
+ 		}
+ 
+ 		audit_finish_fork(p);
+-		tracehook_report_clone(trace, regs, clone_flags, nr, p);
++		tracehook_report_clone(regs, clone_flags, nr, p);
+ 
+ 		/*
+ 		 * We set PF_STARTING at creation in case tracing wants to
+diff --git a/kernel/ptrace.c b/kernel/ptrace.c
+index 0692ab5..42c3178 100644
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -304,6 +304,8 @@ int ptrace_detach(struct task_struct *child, unsigned int data)
+ 	if (child->ptrace) {
+ 		child->exit_code = data;
+ 		dead = __ptrace_detach(current, child);
++		if (!child->exit_state)
++			wake_up_process(child);
+ 	}
+ 	write_unlock_irq(&tasklist_lock);
+ 
