@@ -22,7 +22,7 @@ index c302ddf..5236573 100644
  The default is 1 percent.
  
 diff --git a/Makefile b/Makefile
-index 03373bb..99cf4fe 100644
+index 03373bb..de7a2b6 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -1,7 +1,7 @@
@@ -30,7 +30,7 @@ index 03373bb..99cf4fe 100644
  PATCHLEVEL = 6
  SUBLEVEL = 30
 -EXTRAVERSION =
-+EXTRAVERSION = .1-rc1
++EXTRAVERSION = .1-rc2
  NAME = Man-Eating Seals of Antiquity
  
  # *DOCUMENTATION*
@@ -100,6 +100,31 @@ index bb83b1c..78dee4f 100644
  
  /* Intel-defined CPU features, CPUID level 0x00000001 (ecx), word 4 */
  #define X86_FEATURE_XMM3	(4*32+ 0) /* "pni" SSE-3 */
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index f0faf58..a93d1cc 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -371,6 +371,8 @@ struct kvm_vcpu_arch {
+ 	unsigned long dr6;
+ 	unsigned long dr7;
+ 	unsigned long eff_db[KVM_NR_DB_REGS];
++
++	u32 exit_reason;
+ };
+ 
+ struct kvm_mem_alias {
+diff --git a/arch/x86/include/asm/mce.h b/arch/x86/include/asm/mce.h
+index 4f8c199..5c70378 100644
+--- a/arch/x86/include/asm/mce.h
++++ b/arch/x86/include/asm/mce.h
+@@ -153,5 +153,7 @@ extern void mcheck_init(struct cpuinfo_x86 *c);
+ 
+ extern void (*mce_threshold_vector)(void);
+ 
++extern void (*machine_check_vector)(struct pt_regs *, long error_code);
++
+ #endif /* __KERNEL__ */
+ #endif /* _ASM_X86_MCE_H */
 diff --git a/arch/x86/include/asm/uv/uv_bau.h b/arch/x86/include/asm/uv/uv_bau.h
 index 9b0e61b..bddd44f 100644
 --- a/arch/x86/include/asm/uv/uv_bau.h
@@ -248,6 +273,18 @@ index 7e4a459..d869b3b 100644
  }
  
  static void __cpuinit init_amd(struct cpuinfo_x86 *c)
+diff --git a/arch/x86/kernel/cpu/mcheck/mce_32.c b/arch/x86/kernel/cpu/mcheck/mce_32.c
+index 3552119..07b523c 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce_32.c
++++ b/arch/x86/kernel/cpu/mcheck/mce_32.c
+@@ -29,6 +29,7 @@ static void unexpected_machine_check(struct pt_regs *regs, long error_code)
+ 
+ /* Call the installed machine check handler for this CPU setup. */
+ void (*machine_check_vector)(struct pt_regs *, long error_code) = unexpected_machine_check;
++EXPORT_SYMBOL_GPL(machine_check_vector);
+ 
+ /* This has to be run for each processor */
+ void mcheck_init(struct cpuinfo_x86 *c)
 diff --git a/arch/x86/kernel/cpu/mcheck/mce_64.c b/arch/x86/kernel/cpu/mcheck/mce_64.c
 index 09dd1d4..289cc48 100644
 --- a/arch/x86/kernel/cpu/mcheck/mce_64.c
@@ -491,7 +528,7 @@ index 44153af..25ee06a 100644
  		mask = __vsyscall_gtod_data.clock.mask;
  		mult = __vsyscall_gtod_data.clock.mult;
 diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
-index bb48133..a361815 100644
+index bb48133..fa0adcd 100644
 --- a/arch/x86/kvm/vmx.c
 +++ b/arch/x86/kvm/vmx.c
 @@ -32,6 +32,7 @@
@@ -502,29 +539,16 @@ index bb48133..a361815 100644
  
  #define __ex(x) __kvm_handle_fault_on_reboot(x)
  
-@@ -97,6 +98,7 @@ struct vcpu_vmx {
+@@ -97,6 +98,8 @@ struct vcpu_vmx {
  	int soft_vnmi_blocked;
  	ktime_t entry_time;
  	s64 vnmi_blocked_time;
++
 +	u32 exit_reason;
  };
  
  static inline struct vcpu_vmx *to_vmx(struct kvm_vcpu *vcpu)
-@@ -213,6 +215,13 @@ static inline int is_external_interrupt(u32 intr_info)
- 		== (INTR_TYPE_EXT_INTR | INTR_INFO_VALID_MASK);
- }
- 
-+static inline int is_machine_check(u32 intr_info)
-+{
-+	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VECTOR_MASK |
-+			     INTR_INFO_VALID_MASK)) ==
-+		(INTR_TYPE_HARD_EXCEPTION | MC_VECTOR | INTR_INFO_VALID_MASK);
-+}
-+
- static inline int cpu_has_vmx_msr_bitmap(void)
- {
- 	return (vmcs_config.cpu_based_exec_ctrl & CPU_BASED_USE_MSR_BITMAPS);
-@@ -478,7 +487,7 @@ static void update_exception_bitmap(struct kvm_vcpu *vcpu)
+@@ -478,7 +481,7 @@ static void update_exception_bitmap(struct kvm_vcpu *vcpu)
  {
  	u32 eb;
  
@@ -533,7 +557,7 @@ index bb48133..a361815 100644
  	if (!vcpu->fpu_active)
  		eb |= 1u << NM_VECTOR;
  	if (vcpu->guest_debug & KVM_GUESTDBG_ENABLE) {
-@@ -2585,6 +2594,31 @@ static int handle_rmode_exception(struct kvm_vcpu *vcpu,
+@@ -2585,6 +2588,35 @@ static int handle_rmode_exception(struct kvm_vcpu *vcpu,
  	return 0;
  }
  
@@ -546,13 +570,17 @@ index bb48133..a361815 100644
 + */
 +static void kvm_machine_check(void)
 +{
-+#if defined(CONFIG_X86_MCE) && defined(CONFIG_X86_64)
++#ifdef CONFIG_X86_MCE
 +	struct pt_regs regs = {
 +		.cs = 3, /* Fake ring 3 no matter what the guest ran on */
 +		.flags = X86_EFLAGS_IF,
 +	};
 +
++#ifdef CONFIG_X86_64
 +	do_machine_check(&regs, 0);
++#else
++	machine_check_vector(&regs, 0);
++#endif
 +#endif
 +}
 +
@@ -565,17 +593,26 @@ index bb48133..a361815 100644
  static int handle_exception(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
  {
  	struct vcpu_vmx *vmx = to_vmx(vcpu);
-@@ -2596,6 +2630,9 @@ static int handle_exception(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
+@@ -2596,6 +2628,10 @@ static int handle_exception(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
  	vect_info = vmx->idt_vectoring_info;
  	intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
  
-+	if (is_machine_check(intr_info))
++	ex_no = intr_info & INTR_INFO_VECTOR_MASK;
++	if (ex_no == MC_VECTOR)
 +		return handle_machine_check(vcpu, kvm_run);
 +
  	if ((vect_info & VECTORING_INFO_VALID_MASK) &&
  						!is_page_fault(intr_info))
  		printk(KERN_ERR "%s: unexpected, vectoring info 0x%x "
-@@ -2978,6 +3015,12 @@ static int handle_vmcall(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
+@@ -2648,7 +2684,6 @@ static int handle_exception(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
+ 		return 1;
+ 	}
+ 
+-	ex_no = intr_info & INTR_INFO_VECTOR_MASK;
+ 	switch (ex_no) {
+ 	case DB_VECTOR:
+ 		dr6 = vmcs_readl(EXIT_QUALIFICATION);
+@@ -2978,6 +3013,12 @@ static int handle_vmcall(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
  	return 1;
  }
  
@@ -588,7 +625,7 @@ index bb48133..a361815 100644
  static int handle_invlpg(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
  {
  	u64 exit_qualification = vmcs_read64(EXIT_QUALIFICATION);
-@@ -3145,11 +3188,21 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu,
+@@ -3145,11 +3186,21 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu,
  	[EXIT_REASON_HLT]                     = handle_halt,
  	[EXIT_REASON_INVLPG]		      = handle_invlpg,
  	[EXIT_REASON_VMCALL]                  = handle_vmcall,
@@ -610,7 +647,7 @@ index bb48133..a361815 100644
  };
  
  static const int kvm_vmx_max_exit_handlers =
-@@ -3161,8 +3214,8 @@ static const int kvm_vmx_max_exit_handlers =
+@@ -3161,8 +3212,8 @@ static const int kvm_vmx_max_exit_handlers =
   */
  static int kvm_handle_exit(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
  {
@@ -620,95 +657,20 @@ index bb48133..a361815 100644
  	u32 vectoring_info = vmx->idt_vectoring_info;
  
  	KVMTRACE_3D(VMEXIT, vcpu, exit_reason, (u32)kvm_rip_read(vcpu),
-@@ -3248,7 +3301,7 @@ static void update_tpr_threshold(struct kvm_vcpu *vcpu)
- static void vmx_complete_interrupts(struct vcpu_vmx *vmx)
- {
- 	u32 exit_intr_info;
--	u32 idt_vectoring_info;
-+	u32 idt_vectoring_info = vmx->idt_vectoring_info;
- 	bool unblock_nmi;
- 	u8 vector;
- 	int type;
-@@ -3256,28 +3309,50 @@ static void vmx_complete_interrupts(struct vcpu_vmx *vmx)
- 	u32 error;
+@@ -3512,6 +3563,13 @@ static void vmx_vcpu_run(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
  
- 	exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
-+
+ 	intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
+ 
 +	vmx->exit_reason = vmcs_read32(VM_EXIT_REASON);
 +
 +	/* Handle machine checks before interrupts are enabled */
-+	if ((vmx->exit_reason == EXIT_REASON_MCE_DURING_VMENTRY)
-+	    || (vmx->exit_reason == EXIT_REASON_EXCEPTION_NMI
-+		&& is_machine_check(exit_intr_info)))
++	if ((vmx->exit_reason == EXIT_REASON_MCE_DURING_VMENTRY) ||
++		(intr_info & INTR_INFO_VECTOR_MASK) == MC_VECTOR)
 +		kvm_machine_check();
 +
-+	/* We need to handle NMIs before interrupts are enabled */
-+	if ((exit_intr_info & INTR_INFO_INTR_TYPE_MASK) == INTR_TYPE_NMI_INTR &&
-+	    (exit_intr_info & INTR_INFO_VALID_MASK)) {
-+		KVMTRACE_0D(NMI, &vmx->vcpu, handler);
-+		asm("int $2");
-+	}
-+
-+	idtv_info_valid = idt_vectoring_info & VECTORING_INFO_VALID_MASK;
-+
- 	if (cpu_has_virtual_nmis()) {
- 		unblock_nmi = (exit_intr_info & INTR_INFO_UNBLOCK_NMI) != 0;
- 		vector = exit_intr_info & INTR_INFO_VECTOR_MASK;
- 		/*
--		 * SDM 3: 25.7.1.2
-+		 * SDM 3: 27.7.1.2 (September 2008)
- 		 * Re-set bit "block by NMI" before VM entry if vmexit caused by
- 		 * a guest IRET fault.
-+		 * SDM 3: 23.2.2 (September 2008)
-+		 * Bit 12 is undefined in any of the following cases:
-+		 *  If the VM exit sets the valid bit in the IDT-vectoring
-+		 *   information field.
-+		 *  If the VM exit is due to a double fault.
- 		 */
--		if (unblock_nmi && vector != DF_VECTOR)
-+		if ((exit_intr_info & INTR_INFO_VALID_MASK) && unblock_nmi &&
-+		    vector != DF_VECTOR && !idtv_info_valid)
- 			vmcs_set_bits(GUEST_INTERRUPTIBILITY_INFO,
- 				      GUEST_INTR_STATE_NMI);
- 	} else if (unlikely(vmx->soft_vnmi_blocked))
- 		vmx->vnmi_blocked_time +=
- 			ktime_to_ns(ktime_sub(ktime_get(), vmx->entry_time));
- 
--	idt_vectoring_info = vmx->idt_vectoring_info;
--	idtv_info_valid = idt_vectoring_info & VECTORING_INFO_VALID_MASK;
- 	vector = idt_vectoring_info & VECTORING_INFO_VECTOR_MASK;
- 	type = idt_vectoring_info & VECTORING_INFO_TYPE_MASK;
- 	if (vmx->vcpu.arch.nmi_injected) {
- 		/*
--		 * SDM 3: 25.7.1.2
-+		 * SDM 3: 27.7.1.2 (September 2008)
- 		 * Clear bit "block by NMI" before VM entry if a NMI delivery
- 		 * faulted.
- 		 */
-@@ -3381,7 +3456,6 @@ static void fixup_rmode_irq(struct vcpu_vmx *vmx)
- static void vmx_vcpu_run(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
- {
- 	struct vcpu_vmx *vmx = to_vmx(vcpu);
--	u32 intr_info;
- 
- 	/* Record the guest's net vcpu time for enforced NMI injections. */
- 	if (unlikely(!cpu_has_virtual_nmis() && vmx->soft_vnmi_blocked))
-@@ -3510,15 +3584,6 @@ static void vmx_vcpu_run(struct kvm_vcpu *vcpu, struct kvm_run *kvm_run)
- 	asm("mov %0, %%ds; mov %0, %%es" : : "r"(__USER_DS));
- 	vmx->launched = 1;
- 
--	intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
--
--	/* We need to handle NMIs before interrupts are enabled */
--	if ((intr_info & INTR_INFO_INTR_TYPE_MASK) == INTR_TYPE_NMI_INTR &&
--	    (intr_info & INTR_INFO_VALID_MASK)) {
--		KVMTRACE_0D(NMI, vcpu, handler);
--		asm("int $2");
--	}
--
- 	vmx_complete_interrupts(vmx);
- }
- 
+ 	/* We need to handle NMIs before interrupts are enabled */
+ 	if ((intr_info & INTR_INFO_INTR_TYPE_MASK) == INTR_TYPE_NMI_INTR &&
+ 	    (intr_info & INTR_INFO_VALID_MASK)) {
 diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
 index 3944e91..ee4714b 100644
 --- a/arch/x86/kvm/x86.c
@@ -1154,15 +1116,33 @@ index f852704..0685c19 100644
          int last_bfifo_cnt[2]; /* marker saving last b-fifo frame count */
  	struct timer_list timer;
 diff --git a/drivers/md/dm-exception-store.c b/drivers/md/dm-exception-store.c
-index a2e26c2..b86b3c9 100644
+index a2e26c2..14ce11e 100644
 --- a/drivers/md/dm-exception-store.c
 +++ b/drivers/md/dm-exception-store.c
-@@ -216,7 +216,7 @@ int dm_exception_store_create(struct dm_target *ti, int argc, char **argv,
+@@ -195,7 +195,7 @@ int dm_exception_store_create(struct dm_target *ti, int argc, char **argv,
+ 			      struct dm_exception_store **store)
+ {
+ 	int r = 0;
+-	struct dm_exception_store_type *type;
++	struct dm_exception_store_type *type = NULL;
+ 	struct dm_exception_store *tmp_store;
+ 	char persistent;
+ 
+@@ -211,12 +211,15 @@ int dm_exception_store_create(struct dm_target *ti, int argc, char **argv,
+ 	}
+ 
+ 	persistent = toupper(*argv[1]);
+-	if (persistent != 'P' && persistent != 'N') {
++	if (persistent == 'P')
++		type = get_type("P");
++	else if (persistent == 'N')
++		type = get_type("N");
++	else {
+ 		ti->error = "Persistent flag is not P or N";
  		return -EINVAL;
  	}
  
 -	type = get_type(argv[1]);
-+	type = get_type(&persistent);
  	if (!type) {
  		ti->error = "Exception store type not recognised";
  		r = -EINVAL;
@@ -4249,6 +4229,18 @@ index 3a6b193..0ff7566 100644
  		}
  	}
  
+diff --git a/fs/xfs/xfs_bmap.c b/fs/xfs/xfs_bmap.c
+index ca7c600..b5cba98 100644
+--- a/fs/xfs/xfs_bmap.c
++++ b/fs/xfs/xfs_bmap.c
+@@ -6085,6 +6085,7 @@ xfs_getbmap(
+ 			break;
+ 	}
+ 
++	kmem_free(out);
+ 	return error;
+ }
+ 
 diff --git a/include/linux/firmware-map.h b/include/linux/firmware-map.h
 index cca686b..875451f 100644
 --- a/include/linux/firmware-map.h
@@ -4495,6 +4487,33 @@ index fc3f03d..2cda040 100644
  extern int  x25_rx_call_request(struct sk_buff *, struct x25_neigh *, unsigned int);
  extern void x25_kill_by_neigh(struct x25_neigh *);
  
+diff --git a/kernel/acct.c b/kernel/acct.c
+index 7afa315..9f33910 100644
+--- a/kernel/acct.c
++++ b/kernel/acct.c
+@@ -215,6 +215,7 @@ static void acct_file_reopen(struct bsd_acct_struct *acct, struct file *file,
+ static int acct_on(char *name)
+ {
+ 	struct file *file;
++	struct vfsmount *mnt;
+ 	int error;
+ 	struct pid_namespace *ns;
+ 	struct bsd_acct_struct *acct = NULL;
+@@ -256,11 +257,12 @@ static int acct_on(char *name)
+ 		acct = NULL;
+ 	}
+ 
+-	mnt_pin(file->f_path.mnt);
++	mnt = file->f_path.mnt;
++	mnt_pin(mnt);
+ 	acct_file_reopen(ns->bacct, file, ns);
+ 	spin_unlock(&acct_lock);
+ 
+-	mntput(file->f_path.mnt); /* it's pinned, now give up active reference */
++	mntput(mnt); /* it's pinned, now give up active reference */
+ 	kfree(acct);
+ 
+ 	return 0;
 diff --git a/kernel/trace/trace_functions.c b/kernel/trace/trace_functions.c
 index c9a0b7d..90f1347 100644
 --- a/kernel/trace/trace_functions.c
