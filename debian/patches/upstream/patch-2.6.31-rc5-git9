@@ -94,6 +94,21 @@ index 7bb0d93..dbea4f9 100644
  'n'	E0-FF	video/matrox.h          matroxfb
  'o'	00-1F	fs/ocfs2/ocfs2_fs.h	OCFS2
  'o'     00-03   include/mtd/ubi-user.h  conflict! (OCFS2 and UBI overlaps)
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index dd1a6d4..7936b80 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -1115,6 +1115,10 @@ and is between 256 and 4096 characters. It is defined in the file
+ 			libata.dma=4	  Compact Flash DMA only 
+ 			Combinations also work, so libata.dma=3 enables DMA
+ 			for disks and CDROMs, but not CFs.
++	
++	libata.ignore_hpa=	[LIBATA] Ignore HPA limit
++			libata.ignore_hpa=0	  keep BIOS limits (default)
++			libata.ignore_hpa=1	  ignore limits, using full disk
+ 
+ 	libata.noacpi	[LIBATA] Disables use of ACPI in libata suspend/resume
+ 			when set.
 diff --git a/Documentation/laptops/thinkpad-acpi.txt b/Documentation/laptops/thinkpad-acpi.txt
 index f2296ec..e2ddcde 100644
 --- a/Documentation/laptops/thinkpad-acpi.txt
@@ -272,7 +287,7 @@ index d6befb2..b1114cf 100644
  F:	drivers/serial/serial_core.c
  F:	include/linux/serial_core.h
 diff --git a/Makefile b/Makefile
-index 0d46615..446d05c 100644
+index 0d46615..7adf5ff 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -1,7 +1,7 @@
@@ -280,7 +295,7 @@ index 0d46615..446d05c 100644
  PATCHLEVEL = 6
  SUBLEVEL = 31
 -EXTRAVERSION = -rc5
-+EXTRAVERSION = -rc5-git8
++EXTRAVERSION = -rc5-git9
  NAME = Man-Eating Seals of Antiquity
  
  # *DOCUMENTATION*
@@ -4819,6 +4834,303 @@ index 0944dae..9c61ab2 100644
  
  	return;
  }
+diff --git a/drivers/ata/ahci.c b/drivers/ata/ahci.c
+index 958c1fa..fe3eba5 100644
+--- a/drivers/ata/ahci.c
++++ b/drivers/ata/ahci.c
+@@ -219,6 +219,8 @@ enum {
+ 	AHCI_HFLAG_SECT255		= (1 << 8), /* max 255 sectors */
+ 	AHCI_HFLAG_YES_NCQ		= (1 << 9), /* force NCQ cap on */
+ 	AHCI_HFLAG_NO_SUSPEND		= (1 << 10), /* don't suspend */
++	AHCI_HFLAG_SRST_TOUT_IS_OFFLINE	= (1 << 11), /* treat SRST timeout as
++							link offline */
+ 
+ 	/* ap->flags bits */
+ 
+@@ -1663,6 +1665,7 @@ static int ahci_do_softreset(struct ata_link *link, unsigned int *class,
+ 			     int (*check_ready)(struct ata_link *link))
+ {
+ 	struct ata_port *ap = link->ap;
++	struct ahci_host_priv *hpriv = ap->host->private_data;
+ 	const char *reason = NULL;
+ 	unsigned long now, msecs;
+ 	struct ata_taskfile tf;
+@@ -1701,12 +1704,21 @@ static int ahci_do_softreset(struct ata_link *link, unsigned int *class,
+ 
+ 	/* wait for link to become ready */
+ 	rc = ata_wait_after_reset(link, deadline, check_ready);
+-	/* link occupied, -ENODEV too is an error */
+-	if (rc) {
++	if (rc == -EBUSY && hpriv->flags & AHCI_HFLAG_SRST_TOUT_IS_OFFLINE) {
++		/*
++		 * Workaround for cases where link online status can't
++		 * be trusted.  Treat device readiness timeout as link
++		 * offline.
++		 */
++		ata_link_printk(link, KERN_INFO,
++				"device not ready, treating as offline\n");
++		*class = ATA_DEV_NONE;
++	} else if (rc) {
++		/* link occupied, -ENODEV too is an error */
+ 		reason = "device not ready";
+ 		goto fail;
+-	}
+-	*class = ahci_dev_classify(ap);
++	} else
++		*class = ahci_dev_classify(ap);
+ 
+ 	DPRINTK("EXIT, class=%u\n", *class);
+ 	return 0;
+@@ -1773,7 +1785,8 @@ static int ahci_sb600_softreset(struct ata_link *link, unsigned int *class,
+ 		irq_sts = readl(port_mmio + PORT_IRQ_STAT);
+ 		if (irq_sts & PORT_IRQ_BAD_PMP) {
+ 			ata_link_printk(link, KERN_WARNING,
+-					"failed due to HW bug, retry pmp=0\n");
++					"applying SB600 PMP SRST workaround "
++					"and retrying\n");
+ 			rc = ahci_do_softreset(link, class, 0, deadline,
+ 					       ahci_check_ready);
+ 		}
+@@ -2726,6 +2739,56 @@ static bool ahci_broken_suspend(struct pci_dev *pdev)
+ 	return !ver || strcmp(ver, dmi->driver_data) < 0;
+ }
+ 
++static bool ahci_broken_online(struct pci_dev *pdev)
++{
++#define ENCODE_BUSDEVFN(bus, slot, func)			\
++	(void *)(unsigned long)(((bus) << 8) | PCI_DEVFN((slot), (func)))
++	static const struct dmi_system_id sysids[] = {
++		/*
++		 * There are several gigabyte boards which use
++		 * SIMG5723s configured as hardware RAID.  Certain
++		 * 5723 firmware revisions shipped there keep the link
++		 * online but fail to answer properly to SRST or
++		 * IDENTIFY when no device is attached downstream
++		 * causing libata to retry quite a few times leading
++		 * to excessive detection delay.
++		 *
++		 * As these firmwares respond to the second reset try
++		 * with invalid device signature, considering unknown
++		 * sig as offline works around the problem acceptably.
++		 */
++		{
++			.ident = "EP45-DQ6",
++			.matches = {
++				DMI_MATCH(DMI_BOARD_VENDOR,
++					  "Gigabyte Technology Co., Ltd."),
++				DMI_MATCH(DMI_BOARD_NAME, "EP45-DQ6"),
++			},
++			.driver_data = ENCODE_BUSDEVFN(0x0a, 0x00, 0),
++		},
++		{
++			.ident = "EP45-DS5",
++			.matches = {
++				DMI_MATCH(DMI_BOARD_VENDOR,
++					  "Gigabyte Technology Co., Ltd."),
++				DMI_MATCH(DMI_BOARD_NAME, "EP45-DS5"),
++			},
++			.driver_data = ENCODE_BUSDEVFN(0x03, 0x00, 0),
++		},
++		{ }	/* terminate list */
++	};
++#undef ENCODE_BUSDEVFN
++	const struct dmi_system_id *dmi = dmi_first_match(sysids);
++	unsigned int val;
++
++	if (!dmi)
++		return false;
++
++	val = (unsigned long)dmi->driver_data;
++
++	return pdev->bus->number == (val >> 8) && pdev->devfn == (val & 0xff);
++}
++
+ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ {
+ 	static int printed_version;
+@@ -2841,6 +2904,12 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 			   "BIOS update required for suspend/resume\n");
+ 	}
+ 
++	if (ahci_broken_online(pdev)) {
++		hpriv->flags |= AHCI_HFLAG_SRST_TOUT_IS_OFFLINE;
++		dev_info(&pdev->dev,
++			 "online status unreliable, applying workaround\n");
++	}
++
+ 	/* CAP.NP sometimes indicate the index of the last enabled
+ 	 * port, at other times, that of the last possible port, so
+ 	 * determining the maximum port number requires looking at
+diff --git a/drivers/ata/libata-core.c b/drivers/ata/libata-core.c
+index 8ac98ff..072ba5e 100644
+--- a/drivers/ata/libata-core.c
++++ b/drivers/ata/libata-core.c
+@@ -4302,6 +4302,9 @@ static const struct ata_blacklist_entry ata_device_blacklist [] = {
+ 	{ "WDC WD2500JD-00HBB0", "WD-WMAL71490727", ATA_HORKAGE_BROKEN_HPA },
+ 	{ "MAXTOR 6L080L4",	"A93.0500",	ATA_HORKAGE_BROKEN_HPA },
+ 
++	/* this one allows HPA unlocking but fails IOs on the area */
++	{ "OCZ-VERTEX",		    "1.30",	ATA_HORKAGE_BROKEN_HPA },
++
+ 	/* Devices which report 1 sector over size HPA */
+ 	{ "ST340823A",		NULL,		ATA_HORKAGE_HPA_SIZE, },
+ 	{ "ST320413A",		NULL,		ATA_HORKAGE_HPA_SIZE, },
+diff --git a/drivers/ata/pata_at91.c b/drivers/ata/pata_at91.c
+index 5702aff..41c94b1 100644
+--- a/drivers/ata/pata_at91.c
++++ b/drivers/ata/pata_at91.c
+@@ -250,7 +250,7 @@ static int __devinit pata_at91_probe(struct platform_device *pdev)
+ 		ata_port_desc(ap, "no IRQ, using PIO polling");
+ 	}
+ 
+-	info = kzalloc(sizeof(*info), GFP_KERNEL);
++	info = devm_kzalloc(dev, sizeof(*info), GFP_KERNEL);
+ 
+ 	if (!info) {
+ 		dev_err(dev, "failed to allocate memory for private data\n");
+@@ -275,7 +275,7 @@ static int __devinit pata_at91_probe(struct platform_device *pdev)
+ 	if (!info->ide_addr) {
+ 		dev_err(dev, "failed to map IO base\n");
+ 		ret = -ENOMEM;
+-		goto err_ide_ioremap;
++		goto err_put;
+ 	}
+ 
+ 	info->alt_addr = devm_ioremap(dev,
+@@ -284,7 +284,7 @@ static int __devinit pata_at91_probe(struct platform_device *pdev)
+ 	if (!info->alt_addr) {
+ 		dev_err(dev, "failed to map CTL base\n");
+ 		ret = -ENOMEM;
+-		goto err_alt_ioremap;
++		goto err_put;
+ 	}
+ 
+ 	ap->ioaddr.cmd_addr = info->ide_addr;
+@@ -303,13 +303,8 @@ static int __devinit pata_at91_probe(struct platform_device *pdev)
+ 			irq ? ata_sff_interrupt : NULL,
+ 			irq_flags, &pata_at91_sht);
+ 
+-err_alt_ioremap:
+-	devm_iounmap(dev, info->ide_addr);
+-
+-err_ide_ioremap:
++err_put:
+ 	clk_put(info->mck);
+-	kfree(info);
+-
+ 	return ret;
+ }
+ 
+@@ -317,7 +312,6 @@ static int __devexit pata_at91_remove(struct platform_device *pdev)
+ {
+ 	struct ata_host *host = dev_get_drvdata(&pdev->dev);
+ 	struct at91_ide_info *info;
+-	struct device *dev = &pdev->dev;
+ 
+ 	if (!host)
+ 		return 0;
+@@ -328,11 +322,8 @@ static int __devexit pata_at91_remove(struct platform_device *pdev)
+ 	if (!info)
+ 		return 0;
+ 
+-	devm_iounmap(dev, info->ide_addr);
+-	devm_iounmap(dev, info->alt_addr);
+ 	clk_put(info->mck);
+ 
+-	kfree(info);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/ata/pata_atiixp.c b/drivers/ata/pata_atiixp.c
+index bec0b8a..4591556 100644
+--- a/drivers/ata/pata_atiixp.c
++++ b/drivers/ata/pata_atiixp.c
+@@ -1,6 +1,7 @@
+ /*
+  * pata_atiixp.c 	- ATI PATA for new ATA layer
+  *			  (C) 2005 Red Hat Inc
++ *			  (C) 2009 Bartlomiej Zolnierkiewicz
+  *
+  * Based on
+  *
+@@ -61,20 +62,19 @@ static void atiixp_set_pio_timing(struct ata_port *ap, struct ata_device *adev,
+ 
+ 	struct pci_dev *pdev = to_pci_dev(ap->host->dev);
+ 	int dn = 2 * ap->port_no + adev->devno;
+-
+-	/* Check this is correct - the order is odd in both drivers */
+ 	int timing_shift = (16 * ap->port_no) + 8 * (adev->devno ^ 1);
+-	u16 pio_mode_data, pio_timing_data;
++	u32 pio_timing_data;
++	u16 pio_mode_data;
+ 
+ 	pci_read_config_word(pdev, ATIIXP_IDE_PIO_MODE, &pio_mode_data);
+ 	pio_mode_data &= ~(0x7 << (4 * dn));
+ 	pio_mode_data |= pio << (4 * dn);
+ 	pci_write_config_word(pdev, ATIIXP_IDE_PIO_MODE, pio_mode_data);
+ 
+-	pci_read_config_word(pdev, ATIIXP_IDE_PIO_TIMING, &pio_timing_data);
++	pci_read_config_dword(pdev, ATIIXP_IDE_PIO_TIMING, &pio_timing_data);
+ 	pio_timing_data &= ~(0xFF << timing_shift);
+ 	pio_timing_data |= (pio_timings[pio] << timing_shift);
+-	pci_write_config_word(pdev, ATIIXP_IDE_PIO_TIMING, pio_timing_data);
++	pci_write_config_dword(pdev, ATIIXP_IDE_PIO_TIMING, pio_timing_data);
+ }
+ 
+ /**
+@@ -119,16 +119,17 @@ static void atiixp_set_dmamode(struct ata_port *ap, struct ata_device *adev)
+ 		udma_mode_data |= dma << (4 * dn);
+ 		pci_write_config_word(pdev, ATIIXP_IDE_UDMA_MODE, udma_mode_data);
+ 	} else {
+-		u16 mwdma_timing_data;
+-		/* Check this is correct - the order is odd in both drivers */
+ 		int timing_shift = (16 * ap->port_no) + 8 * (adev->devno ^ 1);
++		u32 mwdma_timing_data;
+ 
+ 		dma -= XFER_MW_DMA_0;
+ 
+-		pci_read_config_word(pdev, ATIIXP_IDE_MWDMA_TIMING, &mwdma_timing_data);
++		pci_read_config_dword(pdev, ATIIXP_IDE_MWDMA_TIMING,
++				      &mwdma_timing_data);
+ 		mwdma_timing_data &= ~(0xFF << timing_shift);
+ 		mwdma_timing_data |= (mwdma_timings[dma] << timing_shift);
+-		pci_write_config_word(pdev, ATIIXP_IDE_MWDMA_TIMING, mwdma_timing_data);
++		pci_write_config_dword(pdev, ATIIXP_IDE_MWDMA_TIMING,
++				       mwdma_timing_data);
+ 	}
+ 	/*
+ 	 *	We must now look at the PIO mode situation. We may need to
+diff --git a/drivers/ata/sata_nv.c b/drivers/ata/sata_nv.c
+index b2d11f3..86a4058 100644
+--- a/drivers/ata/sata_nv.c
++++ b/drivers/ata/sata_nv.c
+@@ -602,6 +602,7 @@ MODULE_VERSION(DRV_VERSION);
+ 
+ static int adma_enabled;
+ static int swncq_enabled = 1;
++static int msi_enabled;
+ 
+ static void nv_adma_register_mode(struct ata_port *ap)
+ {
+@@ -2459,6 +2460,11 @@ static int nv_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	} else if (type == SWNCQ)
+ 		nv_swncq_host_init(host);
+ 
++	if (msi_enabled) {
++		dev_printk(KERN_NOTICE, &pdev->dev, "Using MSI\n");
++		pci_enable_msi(pdev);
++	}
++
+ 	pci_set_master(pdev);
+ 	return ata_host_activate(host, pdev->irq, ipriv->irq_handler,
+ 				 IRQF_SHARED, ipriv->sht);
+@@ -2558,4 +2564,6 @@ module_param_named(adma, adma_enabled, bool, 0444);
+ MODULE_PARM_DESC(adma, "Enable use of ADMA (Default: false)");
+ module_param_named(swncq, swncq_enabled, bool, 0444);
+ MODULE_PARM_DESC(swncq, "Enable use of SWNCQ (Default: true)");
++module_param_named(msi, msi_enabled, bool, 0444);
++MODULE_PARM_DESC(msi, "Enable use of MSI (Default: false)");
+ 
 diff --git a/drivers/base/platform.c b/drivers/base/platform.c
 index 81cb01b..456594b 100644
 --- a/drivers/base/platform.c
@@ -9082,9 +9394,10 @@ index 8bae7f9..5beb066 100644
  obj-$(CONFIG_MTD_IXP2000)	+= ixp2000.o
  obj-$(CONFIG_MTD_WRSBC8260)	+= wr_sbc82xx_flash.o
 diff --git a/drivers/mtd/maps/sbc8240.c b/drivers/mtd/maps/sbc8240.c
-index d5374cd..e69de29 100644
+deleted file mode 100644
+index d5374cd..0000000
 --- a/drivers/mtd/maps/sbc8240.c
-+++ b/drivers/mtd/maps/sbc8240.c
++++ /dev/null
 @@ -1,250 +0,0 @@
 -/*
 - * Handle mapping of the flash memory access routines on the SBC8240 board.
@@ -15056,6 +15369,146 @@ index 277c28a..7230787 100644
  		return mnt_want_write(file->f_path.mnt);
  	else
  		return mnt_clone_write(file->f_path.mnt);
+diff --git a/fs/nfs/direct.c b/fs/nfs/direct.c
+index 489fc01..e4e089a 100644
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@ -255,7 +255,7 @@ static void nfs_direct_read_release(void *calldata)
+ 
+ 	if (put_dreq(dreq))
+ 		nfs_direct_complete(dreq);
+-	nfs_readdata_release(calldata);
++	nfs_readdata_free(data);
+ }
+ 
+ static const struct rpc_call_ops nfs_read_direct_ops = {
+@@ -314,14 +314,14 @@ static ssize_t nfs_direct_read_schedule_segment(struct nfs_direct_req *dreq,
+ 					data->npages, 1, 0, data->pagevec, NULL);
+ 		up_read(&current->mm->mmap_sem);
+ 		if (result < 0) {
+-			nfs_readdata_release(data);
++			nfs_readdata_free(data);
+ 			break;
+ 		}
+ 		if ((unsigned)result < data->npages) {
+ 			bytes = result * PAGE_SIZE;
+ 			if (bytes <= pgbase) {
+ 				nfs_direct_release_pages(data->pagevec, result);
+-				nfs_readdata_release(data);
++				nfs_readdata_free(data);
+ 				break;
+ 			}
+ 			bytes -= pgbase;
+@@ -334,7 +334,7 @@ static ssize_t nfs_direct_read_schedule_segment(struct nfs_direct_req *dreq,
+ 		data->inode = inode;
+ 		data->cred = msg.rpc_cred;
+ 		data->args.fh = NFS_FH(inode);
+-		data->args.context = get_nfs_open_context(ctx);
++		data->args.context = ctx;
+ 		data->args.offset = pos;
+ 		data->args.pgbase = pgbase;
+ 		data->args.pages = data->pagevec;
+@@ -441,7 +441,7 @@ static void nfs_direct_free_writedata(struct nfs_direct_req *dreq)
+ 		struct nfs_write_data *data = list_entry(dreq->rewrite_list.next, struct nfs_write_data, pages);
+ 		list_del(&data->pages);
+ 		nfs_direct_release_pages(data->pagevec, data->npages);
+-		nfs_writedata_release(data);
++		nfs_writedata_free(data);
+ 	}
+ }
+ 
+@@ -534,7 +534,7 @@ static void nfs_direct_commit_release(void *calldata)
+ 
+ 	dprintk("NFS: %5u commit returned %d\n", data->task.tk_pid, status);
+ 	nfs_direct_write_complete(dreq, data->inode);
+-	nfs_commitdata_release(calldata);
++	nfs_commit_free(data);
+ }
+ 
+ static const struct rpc_call_ops nfs_commit_direct_ops = {
+@@ -570,7 +570,7 @@ static void nfs_direct_commit_schedule(struct nfs_direct_req *dreq)
+ 	data->args.fh = NFS_FH(data->inode);
+ 	data->args.offset = 0;
+ 	data->args.count = 0;
+-	data->args.context = get_nfs_open_context(dreq->ctx);
++	data->args.context = dreq->ctx;
+ 	data->res.count = 0;
+ 	data->res.fattr = &data->fattr;
+ 	data->res.verf = &data->verf;
+@@ -734,14 +734,14 @@ static ssize_t nfs_direct_write_schedule_segment(struct nfs_direct_req *dreq,
+ 					data->npages, 0, 0, data->pagevec, NULL);
+ 		up_read(&current->mm->mmap_sem);
+ 		if (result < 0) {
+-			nfs_writedata_release(data);
++			nfs_writedata_free(data);
+ 			break;
+ 		}
+ 		if ((unsigned)result < data->npages) {
+ 			bytes = result * PAGE_SIZE;
+ 			if (bytes <= pgbase) {
+ 				nfs_direct_release_pages(data->pagevec, result);
+-				nfs_writedata_release(data);
++				nfs_writedata_free(data);
+ 				break;
+ 			}
+ 			bytes -= pgbase;
+@@ -756,7 +756,7 @@ static ssize_t nfs_direct_write_schedule_segment(struct nfs_direct_req *dreq,
+ 		data->inode = inode;
+ 		data->cred = msg.rpc_cred;
+ 		data->args.fh = NFS_FH(inode);
+-		data->args.context = get_nfs_open_context(ctx);
++		data->args.context = ctx;
+ 		data->args.offset = pos;
+ 		data->args.pgbase = pgbase;
+ 		data->args.pages = data->pagevec;
+diff --git a/fs/nfs/read.c b/fs/nfs/read.c
+index 73ea5e8..12c9e66 100644
+--- a/fs/nfs/read.c
++++ b/fs/nfs/read.c
+@@ -60,17 +60,15 @@ struct nfs_read_data *nfs_readdata_alloc(unsigned int pagecount)
+ 	return p;
+ }
+ 
+-static void nfs_readdata_free(struct nfs_read_data *p)
++void nfs_readdata_free(struct nfs_read_data *p)
+ {
+ 	if (p && (p->pagevec != &p->page_array[0]))
+ 		kfree(p->pagevec);
+ 	mempool_free(p, nfs_rdata_mempool);
+ }
+ 
+-void nfs_readdata_release(void *data)
++static void nfs_readdata_release(struct nfs_read_data *rdata)
+ {
+-	struct nfs_read_data *rdata = data;
+-
+ 	put_nfs_open_context(rdata->args.context);
+ 	nfs_readdata_free(rdata);
+ }
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index 0a0a2ff..a34fae2 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -87,17 +87,15 @@ struct nfs_write_data *nfs_writedata_alloc(unsigned int pagecount)
+ 	return p;
+ }
+ 
+-static void nfs_writedata_free(struct nfs_write_data *p)
++void nfs_writedata_free(struct nfs_write_data *p)
+ {
+ 	if (p && (p->pagevec != &p->page_array[0]))
+ 		kfree(p->pagevec);
+ 	mempool_free(p, nfs_wdata_mempool);
+ }
+ 
+-void nfs_writedata_release(void *data)
++static void nfs_writedata_release(struct nfs_write_data *wdata)
+ {
+-	struct nfs_write_data *wdata = data;
+-
+ 	put_nfs_open_context(wdata->args.context);
+ 	nfs_writedata_free(wdata);
+ }
 diff --git a/fs/nilfs2/mdt.c b/fs/nilfs2/mdt.c
 index 3d3ddb3..2dfd477 100644
 --- a/fs/nilfs2/mdt.c
@@ -15168,6 +15621,147 @@ index 64a72e2..8f5c05d 100644
  
  	/* start from the Nth VMA */
  	for (p = rb_first(&mm->mm_rb); p; p = rb_next(p))
+diff --git a/fs/xfs/linux-2.6/xfs_buf.c b/fs/xfs/linux-2.6/xfs_buf.c
+index 0c93c7e..965df12 100644
+--- a/fs/xfs/linux-2.6/xfs_buf.c
++++ b/fs/xfs/linux-2.6/xfs_buf.c
+@@ -770,7 +770,7 @@ xfs_buf_associate_memory(
+ 	bp->b_pages = NULL;
+ 	bp->b_addr = mem;
+ 
+-	rval = _xfs_buf_get_pages(bp, page_count, 0);
++	rval = _xfs_buf_get_pages(bp, page_count, XBF_DONT_BLOCK);
+ 	if (rval)
+ 		return rval;
+ 
+diff --git a/fs/xfs/xfs_attr.c b/fs/xfs/xfs_attr.c
+index db15feb..4ece190 100644
+--- a/fs/xfs/xfs_attr.c
++++ b/fs/xfs/xfs_attr.c
+@@ -2010,7 +2010,9 @@ xfs_attr_rmtval_get(xfs_da_args_t *args)
+ 			dblkno = XFS_FSB_TO_DADDR(mp, map[i].br_startblock);
+ 			blkcnt = XFS_FSB_TO_BB(mp, map[i].br_blockcount);
+ 			error = xfs_read_buf(mp, mp->m_ddev_targp, dblkno,
+-					     blkcnt, XFS_BUF_LOCK, &bp);
++					     blkcnt,
++					     XFS_BUF_LOCK | XBF_DONT_BLOCK,
++					     &bp);
+ 			if (error)
+ 				return(error);
+ 
+@@ -2141,8 +2143,8 @@ xfs_attr_rmtval_set(xfs_da_args_t *args)
+ 		dblkno = XFS_FSB_TO_DADDR(mp, map.br_startblock),
+ 		blkcnt = XFS_FSB_TO_BB(mp, map.br_blockcount);
+ 
+-		bp = xfs_buf_get_flags(mp->m_ddev_targp, dblkno,
+-							blkcnt, XFS_BUF_LOCK);
++		bp = xfs_buf_get_flags(mp->m_ddev_targp, dblkno, blkcnt,
++				       XFS_BUF_LOCK | XBF_DONT_BLOCK);
+ 		ASSERT(bp);
+ 		ASSERT(!XFS_BUF_GETERROR(bp));
+ 
+diff --git a/fs/xfs/xfs_bmap.c b/fs/xfs/xfs_bmap.c
+index 7928b99..8ee5b5a 100644
+--- a/fs/xfs/xfs_bmap.c
++++ b/fs/xfs/xfs_bmap.c
+@@ -6009,7 +6009,7 @@ xfs_getbmap(
+ 	 */
+ 	error = ENOMEM;
+ 	subnex = 16;
+-	map = kmem_alloc(subnex * sizeof(*map), KM_MAYFAIL);
++	map = kmem_alloc(subnex * sizeof(*map), KM_MAYFAIL | KM_NOFS);
+ 	if (!map)
+ 		goto out_unlock_ilock;
+ 
+diff --git a/fs/xfs/xfs_btree.c b/fs/xfs/xfs_btree.c
+index e9df995..2671738 100644
+--- a/fs/xfs/xfs_btree.c
++++ b/fs/xfs/xfs_btree.c
+@@ -120,8 +120,8 @@ xfs_btree_check_sblock(
+ 			XFS_RANDOM_BTREE_CHECK_SBLOCK))) {
+ 		if (bp)
+ 			xfs_buftrace("SBTREE ERROR", bp);
+-		XFS_ERROR_REPORT("xfs_btree_check_sblock", XFS_ERRLEVEL_LOW,
+-				 cur->bc_mp);
++		XFS_CORRUPTION_ERROR("xfs_btree_check_sblock",
++			XFS_ERRLEVEL_LOW, cur->bc_mp, block);
+ 		return XFS_ERROR(EFSCORRUPTED);
+ 	}
+ 	return 0;
+diff --git a/fs/xfs/xfs_da_btree.c b/fs/xfs/xfs_da_btree.c
+index 9ff6e57..2847bbc 100644
+--- a/fs/xfs/xfs_da_btree.c
++++ b/fs/xfs/xfs_da_btree.c
+@@ -2201,7 +2201,7 @@ kmem_zone_t *xfs_dabuf_zone;		/* dabuf zone */
+ xfs_da_state_t *
+ xfs_da_state_alloc(void)
+ {
+-	return kmem_zone_zalloc(xfs_da_state_zone, KM_SLEEP);
++	return kmem_zone_zalloc(xfs_da_state_zone, KM_NOFS);
+ }
+ 
+ /*
+@@ -2261,9 +2261,9 @@ xfs_da_buf_make(int nbuf, xfs_buf_t **bps, inst_t *ra)
+ 	int		off;
+ 
+ 	if (nbuf == 1)
+-		dabuf = kmem_zone_alloc(xfs_dabuf_zone, KM_SLEEP);
++		dabuf = kmem_zone_alloc(xfs_dabuf_zone, KM_NOFS);
+ 	else
+-		dabuf = kmem_alloc(XFS_DA_BUF_SIZE(nbuf), KM_SLEEP);
++		dabuf = kmem_alloc(XFS_DA_BUF_SIZE(nbuf), KM_NOFS);
+ 	dabuf->dirty = 0;
+ #ifdef XFS_DABUF_DEBUG
+ 	dabuf->ra = ra;
+diff --git a/fs/xfs/xfs_dir2.c b/fs/xfs/xfs_dir2.c
+index c657bec..bb1d58e 100644
+--- a/fs/xfs/xfs_dir2.c
++++ b/fs/xfs/xfs_dir2.c
+@@ -256,7 +256,7 @@ xfs_dir_cilookup_result(
+ 					!(args->op_flags & XFS_DA_OP_CILOOKUP))
+ 		return EEXIST;
+ 
+-	args->value = kmem_alloc(len, KM_MAYFAIL);
++	args->value = kmem_alloc(len, KM_NOFS | KM_MAYFAIL);
+ 	if (!args->value)
+ 		return ENOMEM;
+ 
+diff --git a/fs/xfs/xfs_fsops.c b/fs/xfs/xfs_fsops.c
+index cbd451b..2d0b3e1 100644
+--- a/fs/xfs/xfs_fsops.c
++++ b/fs/xfs/xfs_fsops.c
+@@ -167,17 +167,25 @@ xfs_growfs_data_private(
+ 	new = nb - mp->m_sb.sb_dblocks;
+ 	oagcount = mp->m_sb.sb_agcount;
+ 	if (nagcount > oagcount) {
++		void *new_perag, *old_perag;
++
+ 		xfs_filestream_flush(mp);
++
++		new_perag = kmem_zalloc(sizeof(xfs_perag_t) * nagcount,
++					KM_MAYFAIL);
++		if (!new_perag)
++			return XFS_ERROR(ENOMEM);
++
+ 		down_write(&mp->m_peraglock);
+-		mp->m_perag = kmem_realloc(mp->m_perag,
+-			sizeof(xfs_perag_t) * nagcount,
+-			sizeof(xfs_perag_t) * oagcount,
+-			KM_SLEEP);
+-		memset(&mp->m_perag[oagcount], 0,
+-			(nagcount - oagcount) * sizeof(xfs_perag_t));
++		memcpy(new_perag, mp->m_perag, sizeof(xfs_perag_t) * oagcount);
++		old_perag = mp->m_perag;
++		mp->m_perag = new_perag;
++
+ 		mp->m_flags |= XFS_MOUNT_32BITINODES;
+ 		nagimax = xfs_initialize_perag(mp, nagcount);
+ 		up_write(&mp->m_peraglock);
++
++		kmem_free(old_perag);
+ 	}
+ 	tp = xfs_trans_alloc(mp, XFS_TRANS_GROWFS);
+ 	tp->t_flags |= XFS_TRANS_RESERVE;
 diff --git a/fs/xfs/xfs_iget.c b/fs/xfs/xfs_iget.c
 index 5fcec6f..34ec869 100644
 --- a/fs/xfs/xfs_iget.c
@@ -15356,6 +15950,27 @@ index 5fcec6f..34ec869 100644
  }
  
  /*
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 1f22d65..da428b3 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -343,6 +343,16 @@ xfs_iformat(
+ 		return XFS_ERROR(EFSCORRUPTED);
+ 	}
+ 
++	if (unlikely((ip->i_d.di_flags & XFS_DIFLAG_REALTIME) &&
++		     !ip->i_mount->m_rtdev_targp)) {
++		xfs_fs_repair_cmn_err(CE_WARN, ip->i_mount,
++			"corrupt dinode %Lu, has realtime flag set.",
++			ip->i_ino);
++		XFS_CORRUPTION_ERROR("xfs_iformat(realtime)",
++				     XFS_ERRLEVEL_LOW, ip->i_mount, dip);
++		return XFS_ERROR(EFSCORRUPTED);
++	}
++
+ 	switch (ip->i_d.di_mode & S_IFMT) {
+ 	case S_IFIFO:
+ 	case S_IFCHR:
 diff --git a/fs/xfs/xfs_inode.h b/fs/xfs/xfs_inode.h
 index 1804f86..65f24a3 100644
 --- a/fs/xfs/xfs_inode.h
@@ -15384,6 +15999,34 @@ index 1804f86..65f24a3 100644
   * i_flags helper functions
   */
  static inline void
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index 3750f04..9dbdff3 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -3180,7 +3180,7 @@ try_again:
+ STATIC void
+ xlog_state_want_sync(xlog_t *log, xlog_in_core_t *iclog)
+ {
+-	ASSERT(spin_is_locked(&log->l_icloglock));
++	assert_spin_locked(&log->l_icloglock);
+ 
+ 	if (iclog->ic_state == XLOG_STATE_ACTIVE) {
+ 		xlog_state_switch_iclogs(log, iclog, 0);
+diff --git a/fs/xfs/xfs_vnodeops.c b/fs/xfs/xfs_vnodeops.c
+index c4eca5e..492d75b 100644
+--- a/fs/xfs/xfs_vnodeops.c
++++ b/fs/xfs/xfs_vnodeops.c
+@@ -538,7 +538,9 @@ xfs_readlink_bmap(
+ 		d = XFS_FSB_TO_DADDR(mp, mval[n].br_startblock);
+ 		byte_cnt = XFS_FSB_TO_B(mp, mval[n].br_blockcount);
+ 
+-		bp = xfs_buf_read(mp->m_ddev_targp, d, BTOBB(byte_cnt), 0);
++		bp = xfs_buf_read_flags(mp->m_ddev_targp, d, BTOBB(byte_cnt),
++					XBF_LOCK | XBF_MAPPED |
++					XBF_DONT_BLOCK);
+ 		error = XFS_BUF_GETERROR(bp);
+ 		if (error) {
+ 			xfs_ioerror_alert("xfs_readlink",
 diff --git a/include/acpi/acpiosxf.h b/include/acpi/acpiosxf.h
 index 3e79859..ab0b85c 100644
 --- a/include/acpi/acpiosxf.h
@@ -15661,6 +16304,50 @@ index af6dcb9..b70313d 100644
  int add_mtd_partitions(struct mtd_info *, const struct mtd_partition *, int);
  int del_mtd_partitions(struct mtd_info *);
  
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index fdffb41..f6b9024 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -473,7 +473,6 @@ extern int  nfs_writepages(struct address_space *, struct writeback_control *);
+ extern int  nfs_flush_incompatible(struct file *file, struct page *page);
+ extern int  nfs_updatepage(struct file *, struct page *, unsigned int, unsigned int);
+ extern int nfs_writeback_done(struct rpc_task *, struct nfs_write_data *);
+-extern void nfs_writedata_release(void *);
+ 
+ /*
+  * Try to write back everything synchronously (but check the
+@@ -488,7 +487,6 @@ extern int nfs_wb_page_cancel(struct inode *inode, struct page* page);
+ extern int  nfs_commit_inode(struct inode *, int);
+ extern struct nfs_write_data *nfs_commitdata_alloc(void);
+ extern void nfs_commit_free(struct nfs_write_data *wdata);
+-extern void nfs_commitdata_release(void *wdata);
+ #else
+ static inline int
+ nfs_commit_inode(struct inode *inode, int how)
+@@ -507,6 +505,7 @@ nfs_have_writebacks(struct inode *inode)
+  * Allocate nfs_write_data structures
+  */
+ extern struct nfs_write_data *nfs_writedata_alloc(unsigned int npages);
++extern void nfs_writedata_free(struct nfs_write_data *);
+ 
+ /*
+  * linux/fs/nfs/read.c
+@@ -515,7 +514,6 @@ extern int  nfs_readpage(struct file *, struct page *);
+ extern int  nfs_readpages(struct file *, struct address_space *,
+ 		struct list_head *, unsigned);
+ extern int  nfs_readpage_result(struct rpc_task *, struct nfs_read_data *);
+-extern void nfs_readdata_release(void *data);
+ extern int  nfs_readpage_async(struct nfs_open_context *, struct inode *,
+ 			       struct page *);
+ 
+@@ -523,6 +521,7 @@ extern int  nfs_readpage_async(struct nfs_open_context *, struct inode *,
+  * Allocate nfs_read_data structures
+  */
+ extern struct nfs_read_data *nfs_readdata_alloc(unsigned int npages);
++extern void nfs_readdata_free(struct nfs_read_data *);
+ 
+ /*
+  * linux/fs/nfs3proc.c
 diff --git a/include/linux/nodemask.h b/include/linux/nodemask.h
 index 829b94b..b359c4a 100644
 --- a/include/linux/nodemask.h
@@ -16980,6 +17667,39 @@ index ad63d85..94188b8 100644
 +#ifdef CONFIG_HOTPLUG_CPU
  	case CPU_UP_CANCELED:
  	case CPU_UP_CANCELED_FROZEN:
+ 
+diff --git a/kernel/trace/blktrace.c b/kernel/trace/blktrace.c
+index 1090b0a..7a34cb5 100644
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@ -267,8 +267,8 @@ static void blk_trace_free(struct blk_trace *bt)
+ {
+ 	debugfs_remove(bt->msg_file);
+ 	debugfs_remove(bt->dropped_file);
+-	debugfs_remove(bt->dir);
+ 	relay_close(bt->rchan);
++	debugfs_remove(bt->dir);
+ 	free_percpu(bt->sequence);
+ 	free_percpu(bt->msg_data);
+ 	kfree(bt);
+@@ -378,18 +378,8 @@ static int blk_subbuf_start_callback(struct rchan_buf *buf, void *subbuf,
+ 
+ static int blk_remove_buf_file_callback(struct dentry *dentry)
+ {
+-	struct dentry *parent = dentry->d_parent;
+ 	debugfs_remove(dentry);
+ 
+-	/*
+-	* this will fail for all but the last file, but that is ok. what we
+-	* care about is the top level buts->name directory going away, when
+-	* the last trace file is gone. Then we don't have to rmdir() that
+-	* manually on trace stop, so it nicely solves the issue with
+-	* force killing of running traces.
+-	*/
+-
+-	debugfs_remove(parent);
+ 	return 0;
+ }
  
 diff --git a/kernel/trace/ftrace.c b/kernel/trace/ftrace.c
 index 1f3ec2a..1e1d23c 100644
@@ -18380,7 +19100,7 @@ index 77c1b84..175f07a 100644
  		return -EIO;
  	snd_printdd(SFX "codec #%d probed OK\n", addr);
 diff --git a/sound/pci/hda/patch_realtek.c b/sound/pci/hda/patch_realtek.c
-index b95df5d..51c44fd 100644
+index b95df5d..fea9767 100644
 --- a/sound/pci/hda/patch_realtek.c
 +++ b/sound/pci/hda/patch_realtek.c
 @@ -559,7 +559,7 @@ static int alc_pin_mode_get(struct snd_kcontrol *kcontrol,
@@ -18392,7 +19112,16 @@ index b95df5d..51c44fd 100644
  		i++;
  	*valp = i <= alc_pin_mode_max(dir) ? i: alc_pin_mode_min(dir);
  	return 0;
-@@ -15157,7 +15157,7 @@ static struct snd_pci_quirk alc861vd_cfg_tbl[] = {
+@@ -13563,6 +13563,8 @@ static int patch_alc269(struct hda_codec *codec)
+ 		set_capture_mixer(spec);
+ 	set_beep_amp(spec, 0x0b, 0x04, HDA_INPUT);
+ 
++	spec->vmaster_nid = 0x02;
++
+ 	codec->patch_ops = alc_patch_ops;
+ 	if (board_config == ALC269_AUTO)
+ 		spec->init_hook = alc269_auto_init;
+@@ -15157,7 +15159,7 @@ static struct snd_pci_quirk alc861vd_cfg_tbl[] = {
  	SND_PCI_QUIRK(0x10de, 0x03f0, "Realtek ALC660 demo", ALC660VD_3ST),
  	SND_PCI_QUIRK(0x1179, 0xff00, "Toshiba A135", ALC861VD_LENOVO),
  	/*SND_PCI_QUIRK(0x1179, 0xff00, "DALLAS", ALC861VD_DALLAS),*/ /*lenovo*/
@@ -18401,6 +19130,38 @@ index b95df5d..51c44fd 100644
  	SND_PCI_QUIRK(0x1179, 0xff03, "Toshiba P205", ALC861VD_LENOVO),
  	SND_PCI_QUIRK(0x1179, 0xff31, "Toshiba L30-149", ALC861VD_DALLAS),
  	SND_PCI_QUIRK(0x1565, 0x820d, "Biostar NF61S SE", ALC861VD_6ST_DIG),
+@@ -15577,9 +15579,12 @@ static int patch_alc861vd(struct hda_codec *codec)
+ 	spec->stream_digital_playback = &alc861vd_pcm_digital_playback;
+ 	spec->stream_digital_capture = &alc861vd_pcm_digital_capture;
+ 
+-	spec->adc_nids = alc861vd_adc_nids;
+-	spec->num_adc_nids = ARRAY_SIZE(alc861vd_adc_nids);
+-	spec->capsrc_nids = alc861vd_capsrc_nids;
++	if (!spec->adc_nids) {
++		spec->adc_nids = alc861vd_adc_nids;
++		spec->num_adc_nids = ARRAY_SIZE(alc861vd_adc_nids);
++	}
++	if (!spec->capsrc_nids)
++		spec->capsrc_nids = alc861vd_capsrc_nids;
+ 
+ 	set_capture_mixer(spec);
+ 	set_beep_amp(spec, 0x0b, 0x05, HDA_INPUT);
+@@ -17496,9 +17501,12 @@ static int patch_alc662(struct hda_codec *codec)
+ 	spec->stream_digital_playback = &alc662_pcm_digital_playback;
+ 	spec->stream_digital_capture = &alc662_pcm_digital_capture;
+ 
+-	spec->adc_nids = alc662_adc_nids;
+-	spec->num_adc_nids = ARRAY_SIZE(alc662_adc_nids);
+-	spec->capsrc_nids = alc662_capsrc_nids;
++	if (!spec->adc_nids) {
++		spec->adc_nids = alc662_adc_nids;
++		spec->num_adc_nids = ARRAY_SIZE(alc662_adc_nids);
++	}
++	if (!spec->capsrc_nids)
++		spec->capsrc_nids = alc662_capsrc_nids;
+ 
+ 	if (!spec->cap_mixer)
+ 		set_capture_mixer(spec);
 diff --git a/sound/pci/hda/patch_sigmatel.c b/sound/pci/hda/patch_sigmatel.c
 index 5383d8c..456ef6a 100644
 --- a/sound/pci/hda/patch_sigmatel.c
@@ -18427,6 +19188,32 @@ index 5383d8c..456ef6a 100644
 +		};
  		spec->dmic_nids = stac927x_dmic_nids;
  		spec->num_dmics = STAC927X_NUM_DMICS;
+ 
+diff --git a/sound/soc/fsl/efika-audio-fabric.c b/sound/soc/fsl/efika-audio-fabric.c
+index 85b0e75..3326e2a 100644
+--- a/sound/soc/fsl/efika-audio-fabric.c
++++ b/sound/soc/fsl/efika-audio-fabric.c
+@@ -30,6 +30,8 @@
+ #include "mpc5200_psc_ac97.h"
+ #include "../codecs/stac9766.h"
+ 
++#define DRV_NAME "efika-audio-fabric"
++
+ static struct snd_soc_device device;
+ static struct snd_soc_card card;
+ 
+diff --git a/sound/soc/fsl/pcm030-audio-fabric.c b/sound/soc/fsl/pcm030-audio-fabric.c
+index 8766f7a..b928ef7 100644
+--- a/sound/soc/fsl/pcm030-audio-fabric.c
++++ b/sound/soc/fsl/pcm030-audio-fabric.c
+@@ -30,6 +30,8 @@
+ #include "mpc5200_psc_ac97.h"
+ #include "../codecs/wm9712.h"
+ 
++#define DRV_NAME "pcm030-audio-fabric"
++
+ static struct snd_soc_device device;
+ static struct snd_soc_card card;
  
 diff --git a/tools/perf/Documentation/perf-examples.txt b/tools/perf/Documentation/perf-examples.txt
 new file mode 100644
