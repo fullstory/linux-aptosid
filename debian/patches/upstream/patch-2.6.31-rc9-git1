@@ -1,0 +1,441 @@
+diff --git a/Makefile b/Makefile
+index 7d3415c..ef0b1dc 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 31
+-EXTRAVERSION = -rc9
++EXTRAVERSION = -rc9-git1
+ NAME = Man-Eating Seals of Antiquity
+ 
+ # *DOCUMENTATION*
+diff --git a/drivers/char/agp/intel-agp.c b/drivers/char/agp/intel-agp.c
+index 8c9d50d..c585577 100644
+--- a/drivers/char/agp/intel-agp.c
++++ b/drivers/char/agp/intel-agp.c
+@@ -49,6 +49,7 @@
+ #define PCI_DEVICE_ID_INTEL_IGDNG_D_HB	    0x0040
+ #define PCI_DEVICE_ID_INTEL_IGDNG_D_IG	    0x0042
+ #define PCI_DEVICE_ID_INTEL_IGDNG_M_HB	    0x0044
++#define PCI_DEVICE_ID_INTEL_IGDNG_MA_HB	    0x0062
+ #define PCI_DEVICE_ID_INTEL_IGDNG_M_IG	    0x0046
+ 
+ /* cover 915 and 945 variants */
+@@ -81,7 +82,8 @@
+ 		agp_bridge->dev->device == PCI_DEVICE_ID_INTEL_GM45_HB || \
+ 		agp_bridge->dev->device == PCI_DEVICE_ID_INTEL_G41_HB || \
+ 		agp_bridge->dev->device == PCI_DEVICE_ID_INTEL_IGDNG_D_HB || \
+-		agp_bridge->dev->device == PCI_DEVICE_ID_INTEL_IGDNG_M_HB)
++		agp_bridge->dev->device == PCI_DEVICE_ID_INTEL_IGDNG_M_HB || \
++		agp_bridge->dev->device == PCI_DEVICE_ID_INTEL_IGDNG_MA_HB)
+ 
+ extern int agp_memory_reserved;
+ 
+@@ -1216,6 +1218,7 @@ static void intel_i965_get_gtt_range(int *gtt_offset, int *gtt_size)
+ 	case PCI_DEVICE_ID_INTEL_G41_HB:
+ 	case PCI_DEVICE_ID_INTEL_IGDNG_D_HB:
+ 	case PCI_DEVICE_ID_INTEL_IGDNG_M_HB:
++	case PCI_DEVICE_ID_INTEL_IGDNG_MA_HB:
+ 		*gtt_offset = *gtt_size = MB(2);
+ 		break;
+ 	default:
+@@ -2195,6 +2198,8 @@ static const struct intel_driver_description {
+ 	    "IGDNG/D", NULL, &intel_i965_driver },
+ 	{ PCI_DEVICE_ID_INTEL_IGDNG_M_HB, PCI_DEVICE_ID_INTEL_IGDNG_M_IG, 0,
+ 	    "IGDNG/M", NULL, &intel_i965_driver },
++	{ PCI_DEVICE_ID_INTEL_IGDNG_MA_HB, PCI_DEVICE_ID_INTEL_IGDNG_M_IG, 0,
++	    "IGDNG/MA", NULL, &intel_i965_driver },
+ 	{ 0, 0, 0, NULL, NULL, NULL }
+ };
+ 
+@@ -2398,6 +2403,7 @@ static struct pci_device_id agp_intel_pci_table[] = {
+ 	ID(PCI_DEVICE_ID_INTEL_G41_HB),
+ 	ID(PCI_DEVICE_ID_INTEL_IGDNG_D_HB),
+ 	ID(PCI_DEVICE_ID_INTEL_IGDNG_M_HB),
++	ID(PCI_DEVICE_ID_INTEL_IGDNG_MA_HB),
+ 	{ }
+ };
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 0c07a75..7edb5b9 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2267,8 +2267,6 @@ i915_gem_object_get_fence_reg(struct drm_gem_object *obj)
+ 				    fence_list) {
+ 			old_obj = old_obj_priv->obj;
+ 
+-			reg = &dev_priv->fence_regs[old_obj_priv->fence_reg];
+-
+ 			if (old_obj_priv->pin_count)
+ 				continue;
+ 
+@@ -2290,8 +2288,11 @@ i915_gem_object_get_fence_reg(struct drm_gem_object *obj)
+ 			 */
+ 			i915_gem_object_flush_gpu_write_domain(old_obj);
+ 			ret = i915_gem_object_wait_rendering(old_obj);
+-			if (ret != 0)
++			if (ret != 0) {
++				drm_gem_object_unreference(old_obj);
+ 				return ret;
++			}
++
+ 			break;
+ 		}
+ 
+@@ -2299,10 +2300,14 @@ i915_gem_object_get_fence_reg(struct drm_gem_object *obj)
+ 		 * Zap this virtual mapping so we can set up a fence again
+ 		 * for this object next time we need it.
+ 		 */
+-		i915_gem_release_mmap(reg->obj);
++		i915_gem_release_mmap(old_obj);
++
+ 		i = old_obj_priv->fence_reg;
++		reg = &dev_priv->fence_regs[i];
++
+ 		old_obj_priv->fence_reg = I915_FENCE_REG_NONE;
+ 		list_del_init(&old_obj_priv->fence_list);
++
+ 		drm_gem_object_unreference(old_obj);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 3fadb53..748ed50 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2005,7 +2005,21 @@ static void igd_enable_cxsr(struct drm_device *dev, unsigned long clock,
+ 	return;
+ }
+ 
+-const static int latency_ns = 3000; /* default for non-igd platforms */
++/*
++ * Latency for FIFO fetches is dependent on several factors:
++ *   - memory configuration (speed, channels)
++ *   - chipset
++ *   - current MCH state
++ * It can be fairly high in some situations, so here we assume a fairly
++ * pessimal value.  It's a tradeoff between extra memory fetches (if we
++ * set this value too high, the FIFO will fetch frequently to stay full)
++ * and power consumption (set it too low to save power and we might see
++ * FIFO underruns and display "flicker").
++ *
++ * A value of 5us seems to be a good balance; safe for very low end
++ * platforms but not overly aggressive on lower latency configs.
++ */
++const static int latency_ns = 5000;
+ 
+ static int intel_get_fifo_size(struct drm_device *dev, int plane)
+ {
+diff --git a/drivers/gpu/drm/radeon/r300.c b/drivers/gpu/drm/radeon/r300.c
+index 053f4ec..051bca6 100644
+--- a/drivers/gpu/drm/radeon/r300.c
++++ b/drivers/gpu/drm/radeon/r300.c
+@@ -995,7 +995,7 @@ static const unsigned r300_reg_safe_bm[159] = {
+ 	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+ 	0x00000000, 0xFFFF0000, 0xFFFFFFFF, 0xFF80FFFF,
+ 	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+-	0x0003FC01, 0xFFFFFFF8, 0xFE800B19,
++	0x0003FC01, 0xFFFFFCF8, 0xFF800B19,
+ };
+ 
+ static int r300_packet0_check(struct radeon_cs_parser *p,
+diff --git a/drivers/gpu/drm/radeon/radeon_asic.h b/drivers/gpu/drm/radeon/radeon_asic.h
+index 7ca6c13..93d8f88 100644
+--- a/drivers/gpu/drm/radeon/radeon_asic.h
++++ b/drivers/gpu/drm/radeon/radeon_asic.h
+@@ -266,6 +266,7 @@ static struct radeon_asic rs400_asic = {
+ /*
+  * rs600.
+  */
++int rs600_init(struct radeon_device *dev);
+ void rs600_errata(struct radeon_device *rdev);
+ void rs600_vram_info(struct radeon_device *rdev);
+ int rs600_mc_init(struct radeon_device *rdev);
+@@ -281,7 +282,7 @@ uint32_t rs600_mc_rreg(struct radeon_device *rdev, uint32_t reg);
+ void rs600_mc_wreg(struct radeon_device *rdev, uint32_t reg, uint32_t v);
+ void rs600_bandwidth_update(struct radeon_device *rdev);
+ static struct radeon_asic rs600_asic = {
+-	.init = &r300_init,
++	.init = &rs600_init,
+ 	.errata = &rs600_errata,
+ 	.vram_info = &rs600_vram_info,
+ 	.gpu_reset = &r300_gpu_reset,
+@@ -316,7 +317,6 @@ static struct radeon_asic rs600_asic = {
+ /*
+  * rs690,rs740
+  */
+-int rs690_init(struct radeon_device *rdev);
+ void rs690_errata(struct radeon_device *rdev);
+ void rs690_vram_info(struct radeon_device *rdev);
+ int rs690_mc_init(struct radeon_device *rdev);
+@@ -325,7 +325,7 @@ uint32_t rs690_mc_rreg(struct radeon_device *rdev, uint32_t reg);
+ void rs690_mc_wreg(struct radeon_device *rdev, uint32_t reg, uint32_t v);
+ void rs690_bandwidth_update(struct radeon_device *rdev);
+ static struct radeon_asic rs690_asic = {
+-	.init = &rs690_init,
++	.init = &rs600_init,
+ 	.errata = &rs690_errata,
+ 	.vram_info = &rs690_vram_info,
+ 	.gpu_reset = &r300_gpu_reset,
+diff --git a/drivers/gpu/drm/radeon/rs600.c b/drivers/gpu/drm/radeon/rs600.c
+index 7e8ce98..02fd11a 100644
+--- a/drivers/gpu/drm/radeon/rs600.c
++++ b/drivers/gpu/drm/radeon/rs600.c
+@@ -409,3 +409,68 @@ void rs600_mc_wreg(struct radeon_device *rdev, uint32_t reg, uint32_t v)
+ 		((reg) & RS600_MC_ADDR_MASK));
+ 	WREG32(RS600_MC_DATA, v);
+ }
++
++static const unsigned rs600_reg_safe_bm[219] = {
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0x17FF1FFF, 0xFFFFFFFC, 0xFFFFFFFF, 0xFF30FFBF,
++	0xFFFFFFF8, 0xC3E6FFFF, 0xFFFFF6DF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFF03F,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFEFCE, 0xF00EBFFF, 0x007C0000,
++	0xF0000078, 0xFF000009, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFF7FF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFC78, 0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFF,
++	0x38FF8F50, 0xFFF88082, 0xF000000C, 0xFAE009FF,
++	0x0000FFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
++	0x00000000, 0x0000C100, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0xFFFF0000, 0xFFFFFFFF, 0xFF80FFFF,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x0003FC01, 0xFFFFFCF8, 0xFF800B19, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
++};
++
++int rs600_init(struct radeon_device *rdev)
++{
++	rdev->config.r300.reg_safe_bm = rs600_reg_safe_bm;
++	rdev->config.r300.reg_safe_bm_size = ARRAY_SIZE(rs600_reg_safe_bm);
++	return 0;
++}
+diff --git a/drivers/gpu/drm/radeon/rs690.c b/drivers/gpu/drm/radeon/rs690.c
+index bc6b7c5..8798825 100644
+--- a/drivers/gpu/drm/radeon/rs690.c
++++ b/drivers/gpu/drm/radeon/rs690.c
+@@ -653,67 +653,3 @@ void rs690_mc_wreg(struct radeon_device *rdev, uint32_t reg, uint32_t v)
+ 	WREG32(RS690_MC_INDEX, RS690_MC_INDEX_WR_ACK);
+ }
+ 
+-static const unsigned rs690_reg_safe_bm[219] = {
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0x17FF1FFF,0xFFFFFFFC,0xFFFFFFFF,0xFF30FFBF,
+-	0xFFFFFFF8,0xC3E6FFFF,0xFFFFF6DF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFF03F,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFEFCE,0xF00EBFFF,0x007C0000,
+-	0xF0000078,0xFF000009,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFF7FF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFC78,0xFFFFFFFF,0xFFFFFFFE,0xFFFFFFFF,
+-	0x38FF8F50,0xFFF88082,0xF000000C,0xFAE009FF,
+-	0x0000FFFF,0xFFFFFFFF,0xFFFFFFFF,0x00000000,
+-	0x00000000,0x0000C100,0x00000000,0x00000000,
+-	0x00000000,0x00000000,0x00000000,0x00000000,
+-	0x00000000,0xFFFF0000,0xFFFFFFFF,0xFF80FFFF,
+-	0x00000000,0x00000000,0x00000000,0x00000000,
+-	0x0003FC01,0xFFFFFFF8,0xFE800B19,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-	0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,
+-};
+-
+-int rs690_init(struct radeon_device *rdev)
+-{
+-	rdev->config.r300.reg_safe_bm = rs690_reg_safe_bm;
+-	rdev->config.r300.reg_safe_bm_size = ARRAY_SIZE(rs690_reg_safe_bm);
+-	return 0;
+-}
+diff --git a/drivers/gpu/drm/radeon/rv515.c b/drivers/gpu/drm/radeon/rv515.c
+index 31a7f66..0566fb6 100644
+--- a/drivers/gpu/drm/radeon/rv515.c
++++ b/drivers/gpu/drm/radeon/rv515.c
+@@ -508,7 +508,7 @@ static const unsigned r500_reg_safe_bm[219] = {
+ 	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+ 	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF80FFFF,
+ 	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+-	0x0003FC01, 0x3FFFFCF8, 0xFE800B19, 0xFFFFFFFF,
++	0x0003FC01, 0x3FFFFCF8, 0xFF800B19, 0xFFDFFFFF,
+ 	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+ 	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+ 	0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+diff --git a/drivers/ide/ide-cs.c b/drivers/ide/ide-cs.c
+index 527908f..063b933 100644
+--- a/drivers/ide/ide-cs.c
++++ b/drivers/ide/ide-cs.c
+@@ -408,6 +408,7 @@ static struct pcmcia_device_id ide_ids[] = {
+ 	PCMCIA_DEVICE_PROD_ID123("PCMCIA", "IDE CARD", "F1", 0x281f1c5d, 0x1907960c, 0xf7fde8b9),
+ 	PCMCIA_DEVICE_PROD_ID12("ARGOSY", "CD-ROM", 0x78f308dc, 0x66536591),
+ 	PCMCIA_DEVICE_PROD_ID12("ARGOSY", "PnPIDE", 0x78f308dc, 0x0c694728),
++	PCMCIA_DEVICE_PROD_ID12("CNF   ", "CD-ROM", 0x46d7db81, 0x66536591),
+ 	PCMCIA_DEVICE_PROD_ID12("CNF CD-M", "CD-ROM", 0x7d93b852, 0x66536591),
+ 	PCMCIA_DEVICE_PROD_ID12("Creative Technology Ltd.", "PCMCIA CD-ROM Interface Card", 0xff8c8a45, 0xfe8020c4),
+ 	PCMCIA_DEVICE_PROD_ID12("Digital Equipment Corporation.", "Digital Mobile Media CD-ROM", 0x17692a66, 0xef1dcbde),
+diff --git a/drivers/net/gianfar.c b/drivers/net/gianfar.c
+index 24f7ca5..a00ec63 100644
+--- a/drivers/net/gianfar.c
++++ b/drivers/net/gianfar.c
+@@ -491,7 +491,7 @@ static int gfar_remove(struct of_device *ofdev)
+ 
+ 	dev_set_drvdata(&ofdev->dev, NULL);
+ 
+-	unregister_netdev(dev);
++	unregister_netdev(priv->ndev);
+ 	iounmap(priv->regs);
+ 	free_netdev(priv->ndev);
+ 
+diff --git a/fs/namei.c b/fs/namei.c
+index f3c5b27..1f13751 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -1542,28 +1542,31 @@ int may_open(struct path *path, int acc_mode, int flag)
+ 	 * An append-only file must be opened in append mode for writing.
+ 	 */
+ 	if (IS_APPEND(inode)) {
++		error = -EPERM;
+ 		if  ((flag & FMODE_WRITE) && !(flag & O_APPEND))
+-			return -EPERM;
++			goto err_out;
+ 		if (flag & O_TRUNC)
+-			return -EPERM;
++			goto err_out;
+ 	}
+ 
+ 	/* O_NOATIME can only be set by the owner or superuser */
+ 	if (flag & O_NOATIME)
+-		if (!is_owner_or_cap(inode))
+-			return -EPERM;
++		if (!is_owner_or_cap(inode)) {
++			error = -EPERM;
++			goto err_out;
++		}
+ 
+ 	/*
+ 	 * Ensure there are no outstanding leases on the file.
+ 	 */
+ 	error = break_lease(inode, flag);
+ 	if (error)
+-		return error;
++		goto err_out;
+ 
+ 	if (flag & O_TRUNC) {
+ 		error = get_write_access(inode);
+ 		if (error)
+-			return error;
++			goto err_out;
+ 
+ 		/*
+ 		 * Refuse to truncate files with mandatory locks held on them.
+@@ -1581,12 +1584,17 @@ int may_open(struct path *path, int acc_mode, int flag)
+ 		}
+ 		put_write_access(inode);
+ 		if (error)
+-			return error;
++			goto err_out;
+ 	} else
+ 		if (flag & FMODE_WRITE)
+ 			vfs_dq_init(inode);
+ 
+ 	return 0;
++err_out:
++	ima_counts_put(path, acc_mode ?
++		       acc_mode & (MAY_READ | MAY_WRITE | MAY_EXEC) :
++		       ACC_MODE(flag) & (MAY_READ | MAY_WRITE));
++	return error;
+ }
+ 
+ /*
+diff --git a/security/integrity/ima/ima_main.c b/security/integrity/ima/ima_main.c
+index 4732f5e..b85e61b 100644
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -249,7 +249,11 @@ void ima_counts_put(struct path *path, int mask)
+ 	struct inode *inode = path->dentry->d_inode;
+ 	struct ima_iint_cache *iint;
+ 
+-	if (!ima_initialized || !S_ISREG(inode->i_mode))
++	/* The inode may already have been freed, freeing the iint
++	 * with it. Verify the inode is not NULL before dereferencing
++	 * it.
++	 */
++	if (!ima_initialized || !inode || !S_ISREG(inode->i_mode))
+ 		return;
+ 	iint = ima_iint_find_insert_get(inode);
+ 	if (!iint)
