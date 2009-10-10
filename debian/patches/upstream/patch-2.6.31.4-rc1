@@ -1,0 +1,876 @@
+diff --git a/Documentation/networking/timestamping/timestamping.c b/Documentation/networking/timestamping/timestamping.c
+index 43d1431..a7936fe 100644
+--- a/Documentation/networking/timestamping/timestamping.c
++++ b/Documentation/networking/timestamping/timestamping.c
+@@ -381,7 +381,7 @@ int main(int argc, char **argv)
+ 	memset(&hwtstamp, 0, sizeof(hwtstamp));
+ 	strncpy(hwtstamp.ifr_name, interface, sizeof(hwtstamp.ifr_name));
+ 	hwtstamp.ifr_data = (void *)&hwconfig;
+-	memset(&hwconfig, 0, sizeof(&hwconfig));
++	memset(&hwconfig, 0, sizeof(hwconfig));
+ 	hwconfig.tx_type =
+ 		(so_timestamping_flags & SOF_TIMESTAMPING_TX_HARDWARE) ?
+ 		HWTSTAMP_TX_ON : HWTSTAMP_TX_OFF;
+diff --git a/Makefile b/Makefile
+index 0138557..48bfeed 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 31
+-EXTRAVERSION = .3
++EXTRAVERSION = .4-rc1
+ NAME = Man-Eating Seals of Antiquity
+ 
+ # *DOCUMENTATION*
+diff --git a/arch/x86/ia32/ia32entry.S b/arch/x86/ia32/ia32entry.S
+index e590261..d76b026 100644
+--- a/arch/x86/ia32/ia32entry.S
++++ b/arch/x86/ia32/ia32entry.S
+@@ -21,8 +21,8 @@
+ #define __AUDIT_ARCH_LE	   0x40000000
+ 
+ #ifndef CONFIG_AUDITSYSCALL
+-#define sysexit_audit int_ret_from_sys_call
+-#define sysretl_audit int_ret_from_sys_call
++#define sysexit_audit ia32_ret_from_sys_call
++#define sysretl_audit ia32_ret_from_sys_call
+ #endif
+ 
+ #define IA32_NR_syscalls ((ia32_syscall_end - ia32_sys_call_table)/8)
+@@ -39,12 +39,12 @@
+ 	.endm 
+ 
+ 	/* clobbers %eax */	
+-	.macro  CLEAR_RREGS _r9=rax
++	.macro  CLEAR_RREGS offset=0, _r9=rax
+ 	xorl 	%eax,%eax
+-	movq	%rax,R11(%rsp)
+-	movq	%rax,R10(%rsp)
+-	movq	%\_r9,R9(%rsp)
+-	movq	%rax,R8(%rsp)
++	movq	%rax,\offset+R11(%rsp)
++	movq	%rax,\offset+R10(%rsp)
++	movq	%\_r9,\offset+R9(%rsp)
++	movq	%rax,\offset+R8(%rsp)
+ 	.endm
+ 
+ 	/*
+@@ -172,6 +172,10 @@ sysexit_from_sys_call:
+ 	movl	RIP-R11(%rsp),%edx		/* User %eip */
+ 	CFI_REGISTER rip,rdx
+ 	RESTORE_ARGS 1,24,1,1,1,1
++	xorq	%r8,%r8
++	xorq	%r9,%r9
++	xorq	%r10,%r10
++	xorq	%r11,%r11
+ 	popfq
+ 	CFI_ADJUST_CFA_OFFSET -8
+ 	/*CFI_RESTORE rflags*/
+@@ -202,7 +206,7 @@ sysexit_from_sys_call:
+ 
+ 	.macro auditsys_exit exit,ebpsave=RBP
+ 	testl $(_TIF_ALLWORK_MASK & ~_TIF_SYSCALL_AUDIT),TI_flags(%r10)
+-	jnz int_ret_from_sys_call
++	jnz ia32_ret_from_sys_call
+ 	TRACE_IRQS_ON
+ 	sti
+ 	movl %eax,%esi		/* second arg, syscall return value */
+@@ -218,8 +222,9 @@ sysexit_from_sys_call:
+ 	cli
+ 	TRACE_IRQS_OFF
+ 	testl %edi,TI_flags(%r10)
+-	jnz int_with_check
+-	jmp \exit
++	jz \exit
++	CLEAR_RREGS -ARGOFFSET
++	jmp int_with_check
+ 	.endm
+ 
+ sysenter_auditsys:
+@@ -329,6 +334,9 @@ sysretl_from_sys_call:
+ 	CFI_REGISTER rip,rcx
+ 	movl EFLAGS-ARGOFFSET(%rsp),%r11d	
+ 	/*CFI_REGISTER rflags,r11*/
++	xorq	%r10,%r10
++	xorq	%r9,%r9
++	xorq	%r8,%r8
+ 	TRACE_IRQS_ON
+ 	movl RSP-ARGOFFSET(%rsp),%esp
+ 	CFI_RESTORE rsp
+@@ -353,7 +361,7 @@ cstar_tracesys:
+ #endif
+ 	xchgl %r9d,%ebp
+ 	SAVE_REST
+-	CLEAR_RREGS r9
++	CLEAR_RREGS 0, r9
+ 	movq $-ENOSYS,RAX(%rsp)	/* ptrace can change this for a bad syscall */
+ 	movq %rsp,%rdi        /* &pt_regs -> arg1 */
+ 	call syscall_trace_enter
+@@ -425,6 +433,8 @@ ia32_do_call:
+ 	call *ia32_sys_call_table(,%rax,8) # xxx: rip relative
+ ia32_sysret:
+ 	movq %rax,RAX-ARGOFFSET(%rsp)
++ia32_ret_from_sys_call:
++	CLEAR_RREGS -ARGOFFSET
+ 	jmp int_ret_from_sys_call 
+ 
+ ia32_tracesys:			 
+@@ -442,8 +452,8 @@ END(ia32_syscall)
+ 
+ ia32_badsys:
+ 	movq $0,ORIG_RAX-ARGOFFSET(%rsp)
+-	movq $-ENOSYS,RAX-ARGOFFSET(%rsp)
+-	jmp int_ret_from_sys_call
++	movq $-ENOSYS,%rax
++	jmp ia32_sysret
+ 
+ quiet_ni_syscall:
+ 	movq $-ENOSYS,%rax
+diff --git a/arch/x86/include/asm/checksum_32.h b/arch/x86/include/asm/checksum_32.h
+index 7c5ef8b..46fc474 100644
+--- a/arch/x86/include/asm/checksum_32.h
++++ b/arch/x86/include/asm/checksum_32.h
+@@ -161,7 +161,8 @@ static inline __sum16 csum_ipv6_magic(const struct in6_addr *saddr,
+ 	    "adcl $0, %0	;\n"
+ 	    : "=&r" (sum)
+ 	    : "r" (saddr), "r" (daddr),
+-	      "r" (htonl(len)), "r" (htonl(proto)), "0" (sum));
++	      "r" (htonl(len)), "r" (htonl(proto)), "0" (sum)
++	    : "memory");
+ 
+ 	return csum_fold(sum);
+ }
+diff --git a/arch/x86/kernel/acpi/cstate.c b/arch/x86/kernel/acpi/cstate.c
+index 8c44c23..59cdfa4 100644
+--- a/arch/x86/kernel/acpi/cstate.c
++++ b/arch/x86/kernel/acpi/cstate.c
+@@ -48,7 +48,7 @@ void acpi_processor_power_init_bm_check(struct acpi_processor_flags *flags,
+ 	 * P4, Core and beyond CPUs
+ 	 */
+ 	if (c->x86_vendor == X86_VENDOR_INTEL &&
+-	    (c->x86 > 0x6 || (c->x86 == 6 && c->x86_model >= 14)))
++	    (c->x86 > 0xf || (c->x86 == 6 && c->x86_model >= 14)))
+ 			flags->bm_control = 0;
+ }
+ EXPORT_SYMBOL(acpi_processor_power_init_bm_check);
+diff --git a/arch/x86/kernel/i8253.c b/arch/x86/kernel/i8253.c
+index 5cf36c0..da890f0 100644
+--- a/arch/x86/kernel/i8253.c
++++ b/arch/x86/kernel/i8253.c
+@@ -21,8 +21,10 @@ EXPORT_SYMBOL(i8253_lock);
+ 
+ #ifdef CONFIG_X86_32
+ static void pit_disable_clocksource(void);
++static void pit_enable_clocksource(void);
+ #else
+ static inline void pit_disable_clocksource(void) { }
++static inline void pit_enable_clocksource(void) { }
+ #endif
+ 
+ /*
+@@ -67,7 +69,7 @@ static void init_pit_timer(enum clock_event_mode mode,
+ 		break;
+ 
+ 	case CLOCK_EVT_MODE_RESUME:
+-		/* Nothing to do here */
++		pit_enable_clocksource();
+ 		break;
+ 	}
+ 	spin_unlock(&i8253_lock);
+@@ -200,19 +202,27 @@ static struct clocksource pit_cs = {
+ 	.shift		= 20,
+ };
+ 
++int pit_cs_registered;
+ static void pit_disable_clocksource(void)
+ {
+-	/*
+-	 * Use mult to check whether it is registered or not
+-	 */
+-	if (pit_cs.mult) {
++	if (pit_cs_registered) {
+ 		clocksource_unregister(&pit_cs);
+-		pit_cs.mult = 0;
++		pit_cs_registered = 0;
++	}
++}
++
++static void pit_enable_clocksource(void)
++{
++	if (!pit_cs_registered && !clocksource_register(&pit_cs)) {
++		pit_cs_registered = 1;
+ 	}
+ }
+ 
++
++
+ static int __init init_pit_clocksource(void)
+ {
++	int ret;
+ 	 /*
+ 	  * Several reasons not to register PIT as a clocksource:
+ 	  *
+@@ -226,7 +236,10 @@ static int __init init_pit_clocksource(void)
+ 
+ 	pit_cs.mult = clocksource_hz2mult(CLOCK_TICK_RATE, pit_cs.shift);
+ 
+-	return clocksource_register(&pit_cs);
++	ret = clocksource_register(&pit_cs);
++	if (!ret)
++		pit_cs_registered = 1;
++	return ret;
+ }
+ arch_initcall(init_pit_clocksource);
+ 
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index bb6277d..b225176 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -567,7 +567,7 @@ static void start_apic_timer(struct kvm_lapic *apic)
+ {
+ 	ktime_t now = apic->lapic_timer.timer.base->get_time();
+ 
+-	apic->lapic_timer.period = apic_get_reg(apic, APIC_TMICT) *
++	apic->lapic_timer.period = (u64)apic_get_reg(apic, APIC_TMICT) *
+ 		    APIC_BUS_CYCLE_NS * apic->divide_count;
+ 	atomic_set(&apic->lapic_timer.pending, 0);
+ 
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index b1f658a..632194a 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -709,6 +709,8 @@ static void svm_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 		rdtscll(tsc_this);
+ 		delta = vcpu->arch.host_tsc - tsc_this;
+ 		svm->vmcb->control.tsc_offset += delta;
++		if (is_nested(svm))
++			svm->nested.hsave->control.tsc_offset += delta;
+ 		vcpu->cpu = cpu;
+ 		kvm_migrate_timers(vcpu);
+ 		svm->asid_generation = 0;
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 6a768ff..ff72e4d 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -661,7 +661,7 @@ static void vmx_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 	if (vcpu->cpu != cpu) {
+ 		vcpu_clear(vmx);
+ 		kvm_migrate_timers(vcpu);
+-		vpid_sync_vcpu_all(vmx);
++		set_bit(KVM_REQ_TLB_FLUSH, &vcpu->requests);
+ 		local_irq_disable();
+ 		list_add(&vmx->local_vcpus_link,
+ 			 &per_cpu(vcpus_on_cpu, cpu));
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 91a077f..8aafb62 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1429,6 +1429,8 @@ static int kvm_dev_ioctl_get_supported_cpuid(struct kvm_cpuid2 *cpuid,
+ 
+ 	if (cpuid->nent < 1)
+ 		goto out;
++	if (cpuid->nent > KVM_MAX_CPUID_ENTRIES)
++		cpuid->nent = KVM_MAX_CPUID_ENTRIES;
+ 	r = -ENOMEM;
+ 	cpuid_entries = vmalloc(sizeof(struct kvm_cpuid_entry2) * cpuid->nent);
+ 	if (!cpuid_entries)
+diff --git a/drivers/acpi/osl.c b/drivers/acpi/osl.c
+index 5691f16..8dff236 100644
+--- a/drivers/acpi/osl.c
++++ b/drivers/acpi/osl.c
+@@ -1182,7 +1182,13 @@ int acpi_check_resource_conflict(struct resource *res)
+ 			       res_list_elem->name,
+ 			       (long long) res_list_elem->start,
+ 			       (long long) res_list_elem->end);
+-			printk(KERN_INFO "ACPI: Device needs an ACPI driver\n");
++			if (acpi_enforce_resources == ENFORCE_RESOURCES_LAX)
++				printk(KERN_NOTICE "ACPI: This conflict may"
++				       " cause random problems and system"
++				       " instability\n");
++			printk(KERN_INFO "ACPI: If an ACPI driver is available"
++			       " for this device, you should use it instead of"
++			       " the native driver\n");
+ 		}
+ 		if (acpi_enforce_resources == ENFORCE_RESOURCES_STRICT)
+ 			return -EBUSY;
+diff --git a/drivers/ata/libata-eh.c b/drivers/ata/libata-eh.c
+index 79711b6..c644fec 100644
+--- a/drivers/ata/libata-eh.c
++++ b/drivers/ata/libata-eh.c
+@@ -2541,14 +2541,14 @@ int ata_eh_reset(struct ata_link *link, int classify,
+ 		dev->pio_mode = XFER_PIO_0;
+ 		dev->flags &= ~ATA_DFLAG_SLEEPING;
+ 
+-		if (!ata_phys_link_offline(ata_dev_phys_link(dev))) {
+-			/* apply class override */
+-			if (lflags & ATA_LFLAG_ASSUME_ATA)
+-				classes[dev->devno] = ATA_DEV_ATA;
+-			else if (lflags & ATA_LFLAG_ASSUME_SEMB)
+-				classes[dev->devno] = ATA_DEV_SEMB_UNSUP;
+-		} else
+-			classes[dev->devno] = ATA_DEV_NONE;
++		if (ata_phys_link_offline(ata_dev_phys_link(dev)))
++			continue;
++
++		/* apply class override */
++		if (lflags & ATA_LFLAG_ASSUME_ATA)
++			classes[dev->devno] = ATA_DEV_ATA;
++		else if (lflags & ATA_LFLAG_ASSUME_SEMB)
++			classes[dev->devno] = ATA_DEV_SEMB_UNSUP;
+ 	}
+ 
+ 	/* record current link speed */
+@@ -2581,34 +2581,48 @@ int ata_eh_reset(struct ata_link *link, int classify,
+ 		slave->eh_info.serror = 0;
+ 	spin_unlock_irqrestore(link->ap->lock, flags);
+ 
+-	/* Make sure onlineness and classification result correspond.
++	/*
++	 * Make sure onlineness and classification result correspond.
+ 	 * Hotplug could have happened during reset and some
+ 	 * controllers fail to wait while a drive is spinning up after
+ 	 * being hotplugged causing misdetection.  By cross checking
+-	 * link onlineness and classification result, those conditions
+-	 * can be reliably detected and retried.
++	 * link on/offlineness and classification result, those
++	 * conditions can be reliably detected and retried.
+ 	 */
+ 	nr_unknown = 0;
+ 	ata_for_each_dev(dev, link, ALL) {
+-		/* convert all ATA_DEV_UNKNOWN to ATA_DEV_NONE */
+-		if (classes[dev->devno] == ATA_DEV_UNKNOWN) {
+-			classes[dev->devno] = ATA_DEV_NONE;
+-			if (ata_phys_link_online(ata_dev_phys_link(dev)))
++		if (ata_phys_link_online(ata_dev_phys_link(dev))) {
++			if (classes[dev->devno] == ATA_DEV_UNKNOWN) {
++				ata_dev_printk(dev, KERN_DEBUG, "link online "
++					       "but device misclassifed\n");
++				classes[dev->devno] = ATA_DEV_NONE;
+ 				nr_unknown++;
++			}
++		} else if (ata_phys_link_offline(ata_dev_phys_link(dev))) {
++			if (ata_class_enabled(classes[dev->devno]))
++				ata_dev_printk(dev, KERN_DEBUG, "link offline, "
++					       "clearing class %d to NONE\n",
++					       classes[dev->devno]);
++			classes[dev->devno] = ATA_DEV_NONE;
++		} else if (classes[dev->devno] == ATA_DEV_UNKNOWN) {
++			ata_dev_printk(dev, KERN_DEBUG, "link status unknown, "
++				       "clearing UNKNOWN to NONE\n");
++			classes[dev->devno] = ATA_DEV_NONE;
+ 		}
+ 	}
+ 
+ 	if (classify && nr_unknown) {
+ 		if (try < max_tries) {
+ 			ata_link_printk(link, KERN_WARNING, "link online but "
+-				       "device misclassified, retrying\n");
++					"%d devices misclassified, retrying\n",
++					nr_unknown);
+ 			failed_link = link;
+ 			rc = -EAGAIN;
+ 			goto fail;
+ 		}
+ 		ata_link_printk(link, KERN_WARNING,
+-			       "link online but device misclassified, "
+-			       "device detection might fail\n");
++				"link online but %d devices misclassified, "
++				"device detection might fail\n", nr_unknown);
+ 	}
+ 
+ 	/* reset successful, schedule revalidation */
+diff --git a/drivers/char/tty_ldisc.c b/drivers/char/tty_ldisc.c
+index e48af9f..414372a 100644
+--- a/drivers/char/tty_ldisc.c
++++ b/drivers/char/tty_ldisc.c
+@@ -516,7 +516,7 @@ static void tty_ldisc_restore(struct tty_struct *tty, struct tty_ldisc *old)
+ static int tty_ldisc_halt(struct tty_struct *tty)
+ {
+ 	clear_bit(TTY_LDISC, &tty->flags);
+-	return cancel_delayed_work(&tty->buf.work);
++	return cancel_delayed_work_sync(&tty->buf.work);
+ }
+ 
+ /**
+@@ -754,12 +754,9 @@ void tty_ldisc_hangup(struct tty_struct *tty)
+ 	 * N_TTY.
+ 	 */
+ 	if (tty->driver->flags & TTY_DRIVER_RESET_TERMIOS) {
+-		/* Make sure the old ldisc is quiescent */
+-		tty_ldisc_halt(tty);
+-		flush_scheduled_work();
+-
+ 		/* Avoid racing set_ldisc or tty_ldisc_release */
+ 		mutex_lock(&tty->ldisc_mutex);
++		tty_ldisc_halt(tty);
+ 		if (tty->ldisc) {	/* Not yet closed */
+ 			/* Switch back to N_TTY */
+ 			tty_ldisc_reinit(tty);
+diff --git a/drivers/ide/sis5513.c b/drivers/ide/sis5513.c
+index afca22b..3b88eba 100644
+--- a/drivers/ide/sis5513.c
++++ b/drivers/ide/sis5513.c
+@@ -2,7 +2,7 @@
+  * Copyright (C) 1999-2000	Andre Hedrick <andre@linux-ide.org>
+  * Copyright (C) 2002		Lionel Bouton <Lionel.Bouton@inet6.fr>, Maintainer
+  * Copyright (C) 2003		Vojtech Pavlik <vojtech@suse.cz>
+- * Copyright (C) 2007		Bartlomiej Zolnierkiewicz
++ * Copyright (C) 2007-2009	Bartlomiej Zolnierkiewicz
+  *
+  * May be copied or modified under the terms of the GNU General Public License
+  *
+@@ -281,11 +281,13 @@ static void config_drive_art_rwp(ide_drive_t *drive)
+ 
+ 	pci_read_config_byte(dev, 0x4b, &reg4bh);
+ 
++	rw_prefetch = reg4bh & ~(0x11 << drive->dn);
++
+ 	if (drive->media == ide_disk)
+-		rw_prefetch = 0x11 << drive->dn;
++		rw_prefetch |= 0x11 << drive->dn;
+ 
+-	if ((reg4bh & (0x11 << drive->dn)) != rw_prefetch)
+-		pci_write_config_byte(dev, 0x4b, reg4bh|rw_prefetch);
++	if (reg4bh != rw_prefetch)
++		pci_write_config_byte(dev, 0x4b, rw_prefetch);
+ }
+ 
+ static void sis_set_pio_mode(ide_drive_t *drive, const u8 pio)
+diff --git a/drivers/net/iseries_veth.c b/drivers/net/iseries_veth.c
+index e44215c..9048718 100644
+--- a/drivers/net/iseries_veth.c
++++ b/drivers/net/iseries_veth.c
+@@ -495,7 +495,7 @@ static void veth_take_cap_ack(struct veth_lpar_connection *cnx,
+ 			   cnx->remote_lp);
+ 	} else {
+ 		memcpy(&cnx->cap_ack_event, event,
+-		       sizeof(&cnx->cap_ack_event));
++		       sizeof(cnx->cap_ack_event));
+ 		cnx->state |= VETH_STATE_GOTCAPACK;
+ 		veth_kick_statemachine(cnx);
+ 	}
+diff --git a/fs/ecryptfs/main.c b/fs/ecryptfs/main.c
+index 101fe4c..c6ac85d 100644
+--- a/fs/ecryptfs/main.c
++++ b/fs/ecryptfs/main.c
+@@ -35,6 +35,7 @@
+ #include <linux/key.h>
+ #include <linux/parser.h>
+ #include <linux/fs_stack.h>
++#include <linux/ima.h>
+ #include "ecryptfs_kernel.h"
+ 
+ /**
+@@ -118,6 +119,7 @@ int ecryptfs_init_persistent_file(struct dentry *ecryptfs_dentry)
+ 	const struct cred *cred = current_cred();
+ 	struct ecryptfs_inode_info *inode_info =
+ 		ecryptfs_inode_to_private(ecryptfs_dentry->d_inode);
++	int opened_lower_file = 0;
+ 	int rc = 0;
+ 
+ 	mutex_lock(&inode_info->lower_file_mutex);
+@@ -134,9 +136,12 @@ int ecryptfs_init_persistent_file(struct dentry *ecryptfs_dentry)
+ 			       "for lower_dentry [0x%p] and lower_mnt [0x%p]; "
+ 			       "rc = [%d]\n", lower_dentry, lower_mnt, rc);
+ 			inode_info->lower_file = NULL;
+-		}
++		} else
++			opened_lower_file = 1;
+ 	}
+ 	mutex_unlock(&inode_info->lower_file_mutex);
++	if (opened_lower_file)
++		ima_counts_get(inode_info->lower_file);
+ 	return rc;
+ }
+ 
+diff --git a/fs/namei.c b/fs/namei.c
+index 1f13751..fcfc553 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -1533,9 +1533,11 @@ int may_open(struct path *path, int acc_mode, int flag)
+ 	if (error)
+ 		return error;
+ 
+-	error = ima_path_check(path,
+-			       acc_mode & (MAY_READ | MAY_WRITE | MAY_EXEC),
++	error = ima_path_check(path, acc_mode ?
++			       acc_mode & (MAY_READ | MAY_WRITE | MAY_EXEC) :
++			       ACC_MODE(flag) & (MAY_READ | MAY_WRITE),
+ 			       IMA_COUNT_UPDATE);
++
+ 	if (error)
+ 		return error;
+ 	/*
+diff --git a/include/linux/ftrace.h b/include/linux/ftrace.h
+index dc3b132..708085a 100644
+--- a/include/linux/ftrace.h
++++ b/include/linux/ftrace.h
+@@ -241,7 +241,7 @@ extern void ftrace_enable_daemon(void);
+ # define ftrace_set_filter(buf, len, reset)	do { } while (0)
+ # define ftrace_disable_daemon()		do { } while (0)
+ # define ftrace_enable_daemon()			do { } while (0)
+-static inline void ftrace_release(void *start, unsigned long size) { }
++static inline void ftrace_release_mod(struct module *mod) {}
+ static inline int register_ftrace_command(struct ftrace_func_command *cmd)
+ {
+ 	return -EINVAL;
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 869dc22..b8606f0 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -987,8 +987,6 @@ NORET_TYPE void do_exit(long code)
+ 	tsk->mempolicy = NULL;
+ #endif
+ #ifdef CONFIG_FUTEX
+-	if (unlikely(!list_empty(&tsk->pi_state_list)))
+-		exit_pi_state_list(tsk);
+ 	if (unlikely(current->pi_state_cache))
+ 		kfree(current->pi_state_cache);
+ #endif
+diff --git a/kernel/fork.c b/kernel/fork.c
+index e6c04d4..4b36858 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -544,12 +544,18 @@ void mm_release(struct task_struct *tsk, struct mm_struct *mm)
+ 
+ 	/* Get rid of any futexes when releasing the mm */
+ #ifdef CONFIG_FUTEX
+-	if (unlikely(tsk->robust_list))
++	if (unlikely(tsk->robust_list)) {
+ 		exit_robust_list(tsk);
++		tsk->robust_list = NULL;
++	}
+ #ifdef CONFIG_COMPAT
+-	if (unlikely(tsk->compat_robust_list))
++	if (unlikely(tsk->compat_robust_list)) {
+ 		compat_exit_robust_list(tsk);
++		tsk->compat_robust_list = NULL;
++	}
+ #endif
++	if (unlikely(!list_empty(&tsk->pi_state_list)))
++		exit_pi_state_list(tsk);
+ #endif
+ 
+ 	/* Get rid of any cached register state */
+diff --git a/kernel/futex.c b/kernel/futex.c
+index e18cfbd..2362d06 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -912,8 +912,8 @@ retry:
+ 	hb1 = hash_futex(&key1);
+ 	hb2 = hash_futex(&key2);
+ 
+-	double_lock_hb(hb1, hb2);
+ retry_private:
++	double_lock_hb(hb1, hb2);
+ 	op_ret = futex_atomic_op_inuser(op, uaddr2);
+ 	if (unlikely(op_ret < 0)) {
+ 
+@@ -2087,7 +2087,6 @@ int handle_early_requeue_pi_wakeup(struct futex_hash_bucket *hb,
+ 		 * Unqueue the futex_q and determine which it was.
+ 		 */
+ 		plist_del(&q->list, &q->list.plist);
+-		drop_futex_key_refs(&q->key);
+ 
+ 		if (timeout && !timeout->task)
+ 			ret = -ETIMEDOUT;
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index e0f59a2..89aed59 100644
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -231,6 +231,13 @@ void tick_nohz_stop_sched_tick(int inidle)
+ 	if (!inidle && !ts->inidle)
+ 		goto end;
+ 
++	/*
++	 * Set ts->inidle unconditionally. Even if the system did not
++	 * switch to NOHZ mode the cpu frequency governers rely on the
++	 * update of the idle time accounting in tick_nohz_start_idle().
++	 */
++	ts->inidle = 1;
++
+ 	now = tick_nohz_start_idle(ts);
+ 
+ 	/*
+@@ -248,8 +255,6 @@ void tick_nohz_stop_sched_tick(int inidle)
+ 	if (unlikely(ts->nohz_mode == NOHZ_MODE_INACTIVE))
+ 		goto end;
+ 
+-	ts->inidle = 1;
+-
+ 	if (need_resched())
+ 		goto end;
+ 
+diff --git a/kernel/trace/ftrace.c b/kernel/trace/ftrace.c
+index 25edd5c..52eb251 100644
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@ -1110,14 +1110,9 @@ static void ftrace_replace_code(int enable)
+ 		failed = __ftrace_replace_code(rec, enable);
+ 		if (failed) {
+ 			rec->flags |= FTRACE_FL_FAILED;
+-			if ((system_state == SYSTEM_BOOTING) ||
+-			    !core_kernel_text(rec->ip)) {
+-				ftrace_free_rec(rec);
+-				} else {
+-				ftrace_bug(failed, rec->ip);
+-					/* Stop processing */
+-					return;
+-				}
++			ftrace_bug(failed, rec->ip);
++			/* Stop processing */
++			return;
+ 		}
+ 	} while_for_each_ftrace_rec();
+ }
+@@ -2801,19 +2796,17 @@ static int ftrace_convert_nops(struct module *mod,
+ }
+ 
+ #ifdef CONFIG_MODULES
+-void ftrace_release(void *start, void *end)
++void ftrace_release_mod(struct module *mod)
+ {
+ 	struct dyn_ftrace *rec;
+ 	struct ftrace_page *pg;
+-	unsigned long s = (unsigned long)start;
+-	unsigned long e = (unsigned long)end;
+ 
+-	if (ftrace_disabled || !start || start == end)
++	if (ftrace_disabled)
+ 		return;
+ 
+ 	mutex_lock(&ftrace_lock);
+ 	do_for_each_ftrace_rec(pg, rec) {
+-		if ((rec->ip >= s) && (rec->ip < e)) {
++		if (within_module_core(rec->ip, mod)) {
+ 			/*
+ 			 * rec->ip is changed in ftrace_free_rec()
+ 			 * It should not between s and e if record was freed.
+@@ -2845,9 +2838,7 @@ static int ftrace_module_notify(struct notifier_block *self,
+ 				   mod->num_ftrace_callsites);
+ 		break;
+ 	case MODULE_STATE_GOING:
+-		ftrace_release(mod->ftrace_callsites,
+-			       mod->ftrace_callsites +
+-			       mod->num_ftrace_callsites);
++		ftrace_release_mod(mod);
+ 		break;
+ 	}
+ 
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index 42cd38e..0313a13 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -66,10 +66,10 @@ void show_swap_cache_info(void)
+ }
+ 
+ /*
+- * add_to_swap_cache resembles add_to_page_cache_locked on swapper_space,
++ * __add_to_swap_cache resembles add_to_page_cache_locked on swapper_space,
+  * but sets SwapCache flag and private instead of mapping and index.
+  */
+-int add_to_swap_cache(struct page *page, swp_entry_t entry, gfp_t gfp_mask)
++static int __add_to_swap_cache(struct page *page, swp_entry_t entry)
+ {
+ 	int error;
+ 
+@@ -77,28 +77,37 @@ int add_to_swap_cache(struct page *page, swp_entry_t entry, gfp_t gfp_mask)
+ 	VM_BUG_ON(PageSwapCache(page));
+ 	VM_BUG_ON(!PageSwapBacked(page));
+ 
++	page_cache_get(page);
++	SetPageSwapCache(page);
++	set_page_private(page, entry.val);
++
++	spin_lock_irq(&swapper_space.tree_lock);
++	error = radix_tree_insert(&swapper_space.page_tree, entry.val, page);
++	if (likely(!error)) {
++		total_swapcache_pages++;
++		__inc_zone_page_state(page, NR_FILE_PAGES);
++		INC_CACHE_INFO(add_total);
++	}
++	spin_unlock_irq(&swapper_space.tree_lock);
++
++	if (unlikely(error)) {
++		set_page_private(page, 0UL);
++		ClearPageSwapCache(page);
++		page_cache_release(page);
++	}
++
++	return error;
++}
++
++
++int add_to_swap_cache(struct page *page, swp_entry_t entry, gfp_t gfp_mask)
++{
++	int error;
++
+ 	error = radix_tree_preload(gfp_mask);
+ 	if (!error) {
+-		page_cache_get(page);
+-		SetPageSwapCache(page);
+-		set_page_private(page, entry.val);
+-
+-		spin_lock_irq(&swapper_space.tree_lock);
+-		error = radix_tree_insert(&swapper_space.page_tree,
+-						entry.val, page);
+-		if (likely(!error)) {
+-			total_swapcache_pages++;
+-			__inc_zone_page_state(page, NR_FILE_PAGES);
+-			INC_CACHE_INFO(add_total);
+-		}
+-		spin_unlock_irq(&swapper_space.tree_lock);
++		error = __add_to_swap_cache(page, entry);
+ 		radix_tree_preload_end();
+-
+-		if (unlikely(error)) {
+-			set_page_private(page, 0UL);
+-			ClearPageSwapCache(page);
+-			page_cache_release(page);
+-		}
+ 	}
+ 	return error;
+ }
+@@ -289,13 +298,24 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 		}
+ 
+ 		/*
++		 * call radix_tree_preload() while we can wait.
++		 */
++		err = radix_tree_preload(gfp_mask & GFP_KERNEL);
++		if (err)
++			break;
++
++		/*
+ 		 * Swap entry may have been freed since our caller observed it.
+ 		 */
+ 		err = swapcache_prepare(entry);
+-		if (err == -EEXIST) /* seems racy */
++		if (err == -EEXIST) {	/* seems racy */
++			radix_tree_preload_end();
+ 			continue;
+-		if (err)           /* swp entry is obsolete ? */
++		}
++		if (err) {		/* swp entry is obsolete ? */
++			radix_tree_preload_end();
+ 			break;
++		}
+ 
+ 		/*
+ 		 * Associate the page with swap entry in the swap cache.
+@@ -307,8 +327,9 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 		 */
+ 		__set_page_locked(new_page);
+ 		SetPageSwapBacked(new_page);
+-		err = add_to_swap_cache(new_page, entry, gfp_mask & GFP_KERNEL);
++		err = __add_to_swap_cache(new_page, entry);
+ 		if (likely(!err)) {
++			radix_tree_preload_end();
+ 			/*
+ 			 * Initiate read into locked page and return.
+ 			 */
+@@ -316,6 +337,7 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 			swap_readpage(new_page);
+ 			return new_page;
+ 		}
++		radix_tree_preload_end();
+ 		ClearPageSwapBacked(new_page);
+ 		__clear_page_locked(new_page);
+ 		swapcache_free(entry, NULL);
+diff --git a/sound/pci/hda/patch_realtek.c b/sound/pci/hda/patch_realtek.c
+index 30eeb30..713bf69 100644
+--- a/sound/pci/hda/patch_realtek.c
++++ b/sound/pci/hda/patch_realtek.c
+@@ -16876,6 +16876,7 @@ static struct snd_pci_quirk alc662_cfg_tbl[] = {
+ 	SND_PCI_QUIRK(0x105b, 0x0cd6, "Foxconn", ALC662_ECS),
+ 	SND_PCI_QUIRK(0x105b, 0x0d47, "Foxconn 45CMX/45GMX/45CMX-K",
+ 		      ALC662_3ST_6ch_DIG),
++	SND_PCI_QUIRK(0x1179, 0xff6e, "Toshiba NB200", ALC663_ASUS_MODE4),
+ 	SND_PCI_QUIRK(0x144d, 0xca00, "Samsung NC10", ALC272_SAMSUNG_NC10),
+ 	SND_PCI_QUIRK(0x1458, 0xa002, "Gigabyte 945GCM-S2L",
+ 		      ALC662_3ST_6ch_DIG),
+diff --git a/sound/pci/via82xx.c b/sound/pci/via82xx.c
+index acfa476..91683a3 100644
+--- a/sound/pci/via82xx.c
++++ b/sound/pci/via82xx.c
+@@ -1626,7 +1626,7 @@ static int snd_via8233_dxs_volume_get(struct snd_kcontrol *kcontrol,
+ 				      struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct via82xx *chip = snd_kcontrol_chip(kcontrol);
+-	unsigned int idx = snd_ctl_get_ioff(kcontrol, &ucontrol->id);
++	unsigned int idx = kcontrol->id.subdevice;
+ 
+ 	ucontrol->value.integer.value[0] = VIA_DXS_MAX_VOLUME - chip->playback_volume[idx][0];
+ 	ucontrol->value.integer.value[1] = VIA_DXS_MAX_VOLUME - chip->playback_volume[idx][1];
+@@ -1646,7 +1646,7 @@ static int snd_via8233_dxs_volume_put(struct snd_kcontrol *kcontrol,
+ 				      struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct via82xx *chip = snd_kcontrol_chip(kcontrol);
+-	unsigned int idx = snd_ctl_get_ioff(kcontrol, &ucontrol->id);
++	unsigned int idx = kcontrol->id.subdevice;
+ 	unsigned long port = chip->port + 0x10 * idx;
+ 	unsigned char val;
+ 	int i, change = 0;
+@@ -1705,11 +1705,12 @@ static struct snd_kcontrol_new snd_via8233_pcmdxs_volume_control __devinitdata =
+ };
+ 
+ static struct snd_kcontrol_new snd_via8233_dxs_volume_control __devinitdata = {
+-	.name = "VIA DXS Playback Volume",
+-	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
++	.iface = SNDRV_CTL_ELEM_IFACE_PCM,
++	.device = 0,
++	/* .subdevice set later */
++	.name = "PCM Playback Volume",
+ 	.access = (SNDRV_CTL_ELEM_ACCESS_READWRITE |
+ 		   SNDRV_CTL_ELEM_ACCESS_TLV_READ),
+-	.count = 4,
+ 	.info = snd_via8233_dxs_volume_info,
+ 	.get = snd_via8233_dxs_volume_get,
+ 	.put = snd_via8233_dxs_volume_put,
+@@ -1936,10 +1937,18 @@ static int __devinit snd_via8233_init_misc(struct via82xx *chip)
+ 		}
+ 		else /* Using DXS when PCM emulation is enabled is really weird */
+ 		{
+-			/* Standalone DXS controls */
+-			err = snd_ctl_add(chip->card, snd_ctl_new1(&snd_via8233_dxs_volume_control, chip));
+-			if (err < 0)
+-				return err;
++			for (i = 0; i < 4; ++i) {
++				struct snd_kcontrol *kctl;
++
++				kctl = snd_ctl_new1(
++					&snd_via8233_dxs_volume_control, chip);
++				if (!kctl)
++					return -ENOMEM;
++				kctl->id.subdevice = i;
++				err = snd_ctl_add(chip->card, kctl);
++				if (err < 0)
++					return err;
++			}
+ 		}
+ 	}
+ 	/* select spdif data slot 10/11 */
+diff --git a/sound/soc/codecs/wm8350.c b/sound/soc/codecs/wm8350.c
+index b3a2de8..003b742 100644
+--- a/sound/soc/codecs/wm8350.c
++++ b/sound/soc/codecs/wm8350.c
+@@ -580,7 +580,7 @@ static const struct snd_kcontrol_new wm8350_left_capt_mixer_controls[] = {
+ 	SOC_DAPM_SINGLE_TLV("L3 Capture Volume",
+ 			    WM8350_INPUT_MIXER_VOLUME_L, 9, 7, 0, out_mix_tlv),
+ 	SOC_DAPM_SINGLE("PGA Capture Switch",
+-			WM8350_LEFT_INPUT_VOLUME, 14, 1, 0),
++			WM8350_LEFT_INPUT_VOLUME, 14, 1, 1),
+ };
+ 
+ /* Right Input Mixer */
+@@ -590,7 +590,7 @@ static const struct snd_kcontrol_new wm8350_right_capt_mixer_controls[] = {
+ 	SOC_DAPM_SINGLE_TLV("L3 Capture Volume",
+ 			    WM8350_INPUT_MIXER_VOLUME_R, 13, 7, 0, out_mix_tlv),
+ 	SOC_DAPM_SINGLE("PGA Capture Switch",
+-			WM8350_RIGHT_INPUT_VOLUME, 14, 1, 0),
++			WM8350_RIGHT_INPUT_VOLUME, 14, 1, 1),
+ };
+ 
+ /* Left Mic Mixer */
