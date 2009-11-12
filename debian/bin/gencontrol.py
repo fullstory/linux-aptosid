@@ -38,26 +38,6 @@ class Gencontrol(Base):
         ):
             makeflags[i[1]] = data[i[0]]
 
-    def do_arch_packages(self, packages, makefile, arch, vars, makeflags, extra):
-        headers_arch = self.templates["control.headers.arch"]
-        packages_headers_arch = self.process_packages(headers_arch, vars)
-        
-        extra['headers_arch_depends'] = packages_headers_arch[-1]['Depends'] = PackageRelation()
-
-        for package in packages_headers_arch:
-            name = package['Package']
-            if packages.has_key(name):
-                package = packages.get(name)
-                package['Architecture'].append(arch)
-            else:
-                package['Architecture'] = [arch]
-                packages.append(package)
-
-        cmds_binary_arch = ["$(MAKE) -f debian/rules.real binary-arch-arch %s" % makeflags]
-        cmds_source = ["$(MAKE) -f debian/rules.real source-arch %s" % makeflags]
-        makefile.add('binary-arch_%s_real' % arch, cmds = cmds_binary_arch)
-        makefile.add('source_%s_real' % arch, cmds = cmds_source)
-
     def do_featureset_setup(self, vars, makeflags, arch, featureset, extra):
         config_base = self.config.merge('base', arch, featureset)
         makeflags['KERNEL_HEADER_DIRS'] = config_base.get('kernel-header-dirs', config_base.get('kernel-arch'))
@@ -169,7 +149,6 @@ class Gencontrol(Base):
             makeflags['MODULES'] = True
             package_headers = self.process_package(headers[0], vars)
             packages_own.append(package_headers)
-            extra['headers_arch_depends'].append('%s (= ${binary:Version})' % packages_own[-1]['Package'])
 
         for package in packages_own + packages_dummy:
             name = package['Package']

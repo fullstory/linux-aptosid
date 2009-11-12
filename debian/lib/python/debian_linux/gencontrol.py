@@ -147,7 +147,6 @@ class Gencontrol(object):
 
         self.do_arch_setup(vars, makeflags, arch, extra)
         self.do_arch_makefile(makefile, arch, makeflags, extra)
-        self.do_arch_packages(packages, makefile, arch, vars, makeflags, extra)
         self.do_arch_recurse(packages, makefile, arch, vars, makeflags, extra)
 
     def do_arch_setup(self, vars, makeflags, arch, extra):
@@ -162,9 +161,6 @@ class Gencontrol(object):
             target3 = '_'.join((target2, 'real'))
             makefile.add(target1, [target2])
             makefile.add(target2, [target3])
-
-    def do_arch_packages(self, packages, makefile, arch, vars, makeflags, extra):
-        pass
 
     def do_arch_recurse(self, packages, makefile, arch, vars, makeflags, extra):
         for featureset in self.config['base', arch]['featuresets']:
