@@ -434,7 +434,7 @@
 +        tristate "ATIUSB based hardware"
 +	depends on INPUT_LIRC
 +	help
-+	  Driver for the IR interface on ATI Remote Wonder, ATI Remote 
++	  Driver for the IR interface on ATI Remote Wonder, ATI Remote
 +	  Wonder II and X10 USB remotes.
 +
 +config LIRC_BT829
@@ -538,7 +538,7 @@
 +	depends on INPUT_LIRC
 +	help
 +	  Driver for the integrated CIR receiver found in Acer Aspire 6530G
-+	  and probably other models), based on the Winbond 8769L embedded 
++	  and probably other models), based on the Winbond 8769L embedded
 +	  controller. PVR-150/500, HVR-1200/1250/1700/1800, HD-PVR and other
 +	  cards
 +endif
@@ -2401,7 +2401,7 @@
 +EXPORT_NO_SYMBOLS;
 --- /dev/null
 +++ b/drivers/input/lirc/lirc_dev.c
-@@ -0,0 +1,1025 @@
+@@ -0,0 +1,1027 @@
 +/*
 + * LIRC base driver
 + *
@@ -2586,7 +2586,7 @@
 +
 +	if (ir->t_notify != NULL)
 +		complete(ir->t_notify);
-+	
++
 +#endif
 +	dprintk(LOGHEAD "poll thread started\n", ir->d.name, ir->d.minor);
 +
@@ -2945,7 +2945,7 @@
 +static int irctl_open(struct inode *inode, struct file *file)
 +{
 +	struct irctl *ir;
-+	int retval;
++	int retval = 0;
 +
 +	if (iminor(inode) >= MAX_IRCTL_DEVICES || !irctls[iminor(inode)]) {
 +		dprintk("lirc_dev [%d]: open result = -ENODEV\n",
@@ -2995,6 +2995,8 @@
 +		if (ir->task)
 +			wake_up_process(ir->task);
 +#endif
++	} else {
++		retval = -ENODEV;
 +	}
 + error:
 +	if (ir)
@@ -3429,7 +3431,7 @@
 +#endif /* MODULE */
 --- /dev/null
 +++ b/drivers/input/lirc/lirc_dev.h
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,418 @@
 +/*
 + * LIRC base driver
 + *
@@ -3462,13 +3464,18 @@
 +
 +struct lirc_buffer {
 +	wait_queue_head_t wait_poll;
-+	spinlock_t lock;
++	spinlock_t fifo_lock;
 +	unsigned int chunk_size;
 +	unsigned int size; /* in chunks */
 +	/* Using chunks instead of bytes pretends to simplify boundary checking
 +	 * And should allow for some performance fine tunning later */
 +#ifdef LIRC_HAVE_KFIFO
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
 +	struct kfifo *fifo;
++#else
++	struct kfifo fifo;
++	u8 fifo_initialized;
++#endif
 +#else
 +	unsigned int fill; /* in chunks */
 +	int head, tail;    /* in chunks */
@@ -3479,12 +3486,12 @@
 +static inline void lirc_buffer_lock(struct lirc_buffer *buf,
 +				    unsigned long *flags)
 +{
-+	spin_lock_irqsave(&buf->lock, *flags);
++	spin_lock_irqsave(&buf->fifo_lock, *flags);
 +}
 +static inline void lirc_buffer_unlock(struct lirc_buffer *buf,
 +				      unsigned long *flags)
 +{
-+	spin_unlock_irqrestore(&buf->lock, *flags);
++	spin_unlock_irqrestore(&buf->fifo_lock, *flags);
 +}
 +static inline void _lirc_buffer_clear(struct lirc_buffer *buf)
 +{
@@ -3495,11 +3502,20 @@
 +#endif
 +static inline void lirc_buffer_clear(struct lirc_buffer *buf)
 +{
++	unsigned long flags;
++
 +#ifdef LIRC_HAVE_KFIFO
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
 +	if (buf->fifo)
 +		kfifo_reset(buf->fifo);
 +#else
-+	unsigned long flags;
++	if (buf->fifo_initialized) {
++		spin_lock_irqsave(&buf->fifo_lock, flags);
++		kfifo_reset(&buf->fifo);
++		spin_unlock_irqrestore(&buf->fifo_lock, flags);
++	}
++#endif
++#else
 +	lirc_buffer_lock(buf, &flags);
 +	_lirc_buffer_clear(buf);
 +	lirc_buffer_unlock(buf, &flags);
@@ -3509,30 +3525,46 @@
 +				    unsigned int chunk_size,
 +				    unsigned int size)
 +{
++	int ret = 0;
++
 +	init_waitqueue_head(&buf->wait_poll);
-+	spin_lock_init(&buf->lock);
++	spin_lock_init(&buf->fifo_lock);
 +#ifndef LIRC_HAVE_KFIFO
 +	_lirc_buffer_clear(buf);
 +#endif
 +	buf->chunk_size = chunk_size;
 +	buf->size = size;
 +#ifdef LIRC_HAVE_KFIFO
-+	buf->fifo = kfifo_alloc(size*chunk_size, GFP_KERNEL, &buf->lock);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
++	buf->fifo = kfifo_alloc(size*chunk_size, GFP_KERNEL, &buf->fifo_lock);
 +	if (!buf->fifo)
 +		return -ENOMEM;
++#else
++	ret = kfifo_alloc(&buf->fifo, size * chunk_size, GFP_KERNEL);
++	if (ret == 0)
++		buf->fifo_initialized = 1;
++#endif
 +#else
 +	buf->data = kmalloc(size*chunk_size, GFP_KERNEL);
 +	if (buf->data == NULL)
 +		return -ENOMEM;
 +	memset(buf->data, 0, size*chunk_size);
 +#endif
-+	return 0;
++
++	return ret;
 +}
 +static inline void lirc_buffer_free(struct lirc_buffer *buf)
 +{
 +#ifdef LIRC_HAVE_KFIFO
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
 +	if (buf->fifo)
 +		kfifo_free(buf->fifo);
++#else
++	if (buf->fifo_initialized) {
++		kfifo_free(&buf->fifo);
++		buf->fifo_initialized = 0;
++	}
++#endif
 +#else
 +	kfree(buf->data);
 +	buf->data = NULL;
@@ -3543,6 +3575,25 @@
 +	buf->size = 0;
 +#endif
 +}
++
++#ifdef LIRC_HAVE_KFIFO
++static inline int lirc_buffer_len(struct lirc_buffer *buf)
++{
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
++	return kfifo_len(buf->fifo);
++#else
++	int len;
++	unsigned long flags;
++
++	spin_lock_irqsave(&buf->fifo_lock, flags);
++	len = kfifo_len(&buf->fifo);
++	spin_unlock_irqrestore(&buf->fifo_lock, flags);
++
++	return len;
++#endif
++}
++#endif
++
 +#ifndef LIRC_HAVE_KFIFO
 +static inline int  _lirc_buffer_full(struct lirc_buffer *buf)
 +{
@@ -3552,7 +3603,7 @@
 +static inline int  lirc_buffer_full(struct lirc_buffer *buf)
 +{
 +#ifdef LIRC_HAVE_KFIFO
-+	return kfifo_len(buf->fifo) == buf->size * buf->chunk_size;
++	return lirc_buffer_len(buf) == buf->size * buf->chunk_size;
 +#else
 +	unsigned long flags;
 +	int ret;
@@ -3571,7 +3622,7 @@
 +static inline int  lirc_buffer_empty(struct lirc_buffer *buf)
 +{
 +#ifdef LIRC_HAVE_KFIFO
-+	return !kfifo_len(buf->fifo);
++	return !lirc_buffer_len(buf);
 +#else
 +	unsigned long flags;
 +	int ret;
@@ -3590,7 +3641,7 @@
 +static inline int  lirc_buffer_available(struct lirc_buffer *buf)
 +{
 +#ifdef LIRC_HAVE_KFIFO
-+	return buf->size - (kfifo_len(buf->fifo) / buf->chunk_size);
++	return buf->size - (lirc_buffer_len(buf) / buf->chunk_size);
 +#else
 +	unsigned long flags;
 +	int ret;
@@ -3609,21 +3660,30 @@
 +	buf->fill -= 1;
 +}
 +#endif
-+static inline void lirc_buffer_read(struct lirc_buffer *buf,
-+				    unsigned char *dest)
++static inline unsigned int lirc_buffer_read(struct lirc_buffer *buf,
++					    unsigned char *dest)
 +{
++	unsigned int ret = 0;
++
 +#ifdef LIRC_HAVE_KFIFO
-+	if (kfifo_len(buf->fifo) >= buf->chunk_size)
-+		kfifo_get(buf->fifo, dest, buf->chunk_size);
++	if (lirc_buffer_len(buf) >= buf->chunk_size)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
++		ret = kfifo_get(buf->fifo, dest, buf->chunk_size);
++#else
++		ret = kfifo_out_locked(&buf->fifo, dest, buf->chunk_size,
++				       &buf->fifo_lock);
++#endif
 +#else
 +	unsigned long flags;
 +	lirc_buffer_lock(buf, &flags);
 +	_lirc_buffer_read_1(buf, dest);
 +	lirc_buffer_unlock(buf, &flags);
 +#endif
++
++	return ret;
 +}
 +#ifndef LIRC_HAVE_KFIFO
-+static inline void _lirc_buffer_write_1(struct lirc_buffer *buf,
++static inline  _lirc_buffer_write_1(struct lirc_buffer *buf,
 +				      unsigned char *orig)
 +{
 +	memcpy(&buf->data[buf->tail*buf->chunk_size], orig, buf->chunk_size);
@@ -3631,17 +3691,26 @@
 +	buf->fill++;
 +}
 +#endif
-+static inline void lirc_buffer_write(struct lirc_buffer *buf,
-+				     unsigned char *orig)
++static inline unsigned int lirc_buffer_write(struct lirc_buffer *buf,
++					     unsigned char *orig)
 +{
++	unsigned int ret = 0;
++
 +#ifdef LIRC_HAVE_KFIFO
-+	kfifo_put(buf->fifo, orig, buf->chunk_size);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
++	ret = kfifo_put(buf->fifo, orig, buf->chunk_size);
++#else
++	ret = kfifo_in_locked(&buf->fifo, orig, buf->chunk_size,
++			      &buf->fifo_lock);
++#endif
 +#else
 +	unsigned long flags;
 +	lirc_buffer_lock(buf, &flags);
 +	_lirc_buffer_write_1(buf, orig);
 +	lirc_buffer_unlock(buf, &flags);
 +#endif
++
++	return ret;
 +}
 +#ifndef LIRC_HAVE_KFIFO
 +static inline void _lirc_buffer_write_n(struct lirc_buffer *buf,
@@ -3666,17 +3735,26 @@
 +	buf->fill += count;
 +}
 +#endif
-+static inline void lirc_buffer_write_n(struct lirc_buffer *buf,
-+				       unsigned char *orig, int count)
++static inline unsigned int lirc_buffer_write_n(struct lirc_buffer *buf,
++					       unsigned char *orig, int count)
 +{
++	unsigned int ret = 0;
++
 +#ifdef LIRC_HAVE_KFIFO
-+	kfifo_put(buf->fifo, orig, count * buf->chunk_size);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
++	ret = kfifo_put(buf->fifo, orig, count * buf->chunk_size);
++#else
++	ret = kfifo_in_locked(&buf->fifo, orig, count * buf->chunk_size,
++			      &buf->fifo_lock);
++#endif
 +#else
 +	unsigned long flags;
 +	lirc_buffer_lock(buf, &flags);
 +	_lirc_buffer_write_n(buf, orig, count);
 +	lirc_buffer_unlock(buf, &flags);
 +#endif
++
++	return ret;
 +}
 +
 +struct lirc_driver {
@@ -5229,7 +5307,7 @@
 +#if defined(__linux__)
 +#include <linux/ioctl.h>
 +#elif defined(_NetBSD_)
-+#include <sys/ioctl.h> 
++#include <sys/ioctl.h>
 +#elif defined (__GLIBC__)
 +#include <features.h>
 +#include <sys/ioctl.h>
@@ -19609,7 +19687,7 @@
 +CONFIG_LIRC_STREAMZAP	?= m
 +CONFIG_LIRC_TTUSBIR	?= m
 +CONFIG_LIRC_WPC8769L	?= m
-+#IT87_CFLAGS		?= 
++#IT87_CFLAGS		?=
 +PARALLEL_CFLAGS		?= -DLIRC_PARALLEL_PORT=0x378 -DLIRC_PARALLEL_IRQ=7
 +SERIAL_CFLAGS		?= -DLIRC_SERIAL_PORT=0x2f8 -DLIRC_SERIAL_IRQ=3 -DLIRC_SERIAL_TRANSMITTER
 +SIR_CFLAGS		?= -DLIRC_SIR_PORT=0x2f8 -DLIRC_SIR_IRQ=3
