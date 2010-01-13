@@ -1,0 +1,217 @@
+add kernel 2.6.32 compatibility.
+
+Changes-licensed-under: ISC
+Signed-off-by: Riccardo Magliocchetti <riccardo.magliocchetti@gmail.com>
+Signed-off-by: Stefan Lippers-Hollmann <s.l-h@gmx.de>
+
+--- a/drivers/staging/ar5523/ar5523.c
++++ b/drivers/staging/ar5523/ar5523.c
+@@ -100,7 +100,6 @@ struct ar5523_rx_cmd {
+ struct ar5523_tx_data {
+ 	struct ar5523		*ar;
+ 	struct sk_buff		*skb;
+-	struct ieee80211_tx_control *control;
+ };
+ 
+ struct ar5523_rx_data {
+@@ -500,7 +499,8 @@ static int ar5523_tx_null(struct ar5523 
+ 	return error;
+ }
+ 
+-static int ar5523_set_rates(struct ar5523 *ar, struct ieee80211_if_conf *ifconf)
++static int ar5523_set_rates(struct ar5523 *ar,
++			    struct ieee80211_bss_conf *ifconf)
+ {
+         struct ar5523_cmd_rates rates;
+ 
+@@ -584,9 +584,10 @@ static void ar5523_data_rx_cb(struct urb
+ 	 */
+ 	rx_status.freq = be32_to_cpu(desc->freq);
+ 	rx_status.band = hw->conf.channel->band;
+-	rx_status.ssi = be32_to_cpu(desc->rssi);
+-	
+-	ieee80211_rx_irqsafe(hw, data->skb, &rx_status);
++	rx_status.signal = be32_to_cpu(desc->rssi);
++
++	memcpy(IEEE80211_SKB_RXCB(data->skb), &rx_status, sizeof(rx_status));
++	ieee80211_rx_irqsafe(hw, data->skb);
+ 	
+ 	data->skb = __dev_alloc_skb(ar->rxbufsz, GFP_ATOMIC);
+ 	if (!data->skb) {
+@@ -793,7 +794,7 @@ static void ar5523_data_tx_cb(struct urb
+ 	struct sk_buff *skb = urb->context;
+ 	struct ar5523_tx_data *data = (struct ar5523_tx_data *)skb->cb;
+ 	struct ar5523 *ar = data->ar;
+-	struct ieee80211_tx_status status = { {0} };
++	struct ieee80211_tx_info *txi;
+ 
+ 	ar5523_dbg(ar, "data tx urb completed\n");
+ 
+@@ -806,23 +807,23 @@ static void ar5523_data_tx_cb(struct urb
+ 		goto out;
+ 	}
+ 
+-	memcpy(&status.control, data->control, sizeof(status.control));
++	txi = IEEE80211_SKB_CB(skb);
+ 	skb_pull(skb, sizeof(struct ar5523_tx_desc) + sizeof(__be32));
+ 
+-	status.flags |= IEEE80211_TX_STATUS_ACK;
+-	ieee80211_tx_status_irqsafe(ar->hw, skb, &status);
++	txi->flags |= IEEE80211_TX_STAT_ACK;
++	ieee80211_tx_status_irqsafe(ar->hw, skb);
+  out:
+ 	atomic_dec(&ar->tx_data_queued);
+ 	usb_free_urb(urb);
+ }
+ 
+-static int ar5523_tx(struct ieee80211_hw *hw, struct sk_buff *skb,
+-		struct ieee80211_tx_control *control)
++static int ar5523_tx(struct ieee80211_hw *hw, struct sk_buff *skb)
+ {
+ 	struct ieee80211_hdr *wh = (struct ieee80211_hdr *)skb->data;
+ 	struct ar5523 *ar = hw->priv;
+ 	struct ar5523_tx_data *data;
+ 	struct ar5523_tx_desc *desc;
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	struct urb *urb;
+ 	int paylen = skb->len;
+ 	int error = 0;
+@@ -843,10 +844,6 @@ static int ar5523_tx(struct ieee80211_hw
+ 	data = (struct ar5523_tx_data *)skb->cb;
+ 	data->ar = ar;
+ 
+-	data->control = kmemdup(control, sizeof(*control), GFP_ATOMIC);
+-	if (!data->control)
+-		goto out_free_urb;
+-
+ 	desc = (struct ar5523_tx_desc *)skb_push(skb, sizeof(*desc));
+ 	hdr = (__be32 *)skb_push(skb, sizeof(__be32));
+ 
+@@ -877,7 +874,7 @@ static int ar5523_tx(struct ieee80211_hw
+ 	error = usb_submit_urb(urb, GFP_ATOMIC);
+ 	if (error) {
+ 		ar5523_err(ar, "error %d when submitting tx urb\n", error);
+-		goto out_free_control;
++		goto out_free_urb;
+ 	}
+ 
+ 
+@@ -885,8 +882,6 @@ static int ar5523_tx(struct ieee80211_hw
+ 
+ 	return NETDEV_TX_OK;
+ 
+- out_free_control:
+-	kfree(control);
+  out_free_urb:
+ 	usb_free_urb(urb);
+  out_free_skb:
+@@ -901,15 +896,15 @@ static int ar5523_add_interface(struct i
+ 
+ 	ar5523_dbg(ar, "add interface called\n");
+ 
+-	/* NOTE: using IEEE80211_IF_TYPE_MNTR to indicate no mode selected */
+-	if (ar->mode != IEEE80211_IF_TYPE_MNTR) {
++	/* NOTE: using NL80211_IFTYPE_MONITOR to indicate no mode selected */
++	if (ar->mode != NL80211_IFTYPE_MONITOR) {
+ 		ar5523_dbg(ar, "invalid add_interface\n");
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+ 	switch (conf->type) {
+-	case IEEE80211_IF_TYPE_STA:
+-	case IEEE80211_IF_TYPE_MNTR:
++	case NL80211_IFTYPE_STATION:
++	case NL80211_IFTYPE_MONITOR:
+ 		ar->mode = conf->type;
+ 		break;
+ 	default:
+@@ -926,12 +921,13 @@ static void ar5523_remove_interface(stru
+ 
+ 	ar5523_dbg(ar, "remove interface called\n");
+ 
+-	ar->mode = IEEE80211_IF_TYPE_MNTR;
++	ar->mode = NL80211_IFTYPE_MONITOR;
+ }
+ 
+-static int ar5523_config(struct ieee80211_hw *hw, struct ieee80211_conf *conf)
++static int ar5523_config(struct ieee80211_hw *hw, u32 changed)
+ {
+ 	struct ar5523 *ar = hw->priv;
++	struct ieee80211_conf *conf = &hw->conf;
+ 	__be32 val;
+ 	int error;
+ 
+@@ -975,9 +971,10 @@ static int ar5523_config(struct ieee8021
+ 	return 0;
+ }
+ 
+-static int ar5523_config_interface(struct ieee80211_hw *hw,
++static void ar5523_bss_info_changed(struct ieee80211_hw *hw,
+ 		struct ieee80211_vif *vif,
+-		struct ieee80211_if_conf *ifconf)
++		struct ieee80211_bss_conf *ifconf,
++		u32 changed)
+ {
+ 	struct ar5523 *ar = hw->priv;
+ 	struct ar5523_cmd_bssid bssid;
+@@ -986,10 +983,13 @@ static int ar5523_config_interface(struc
+ 	__be32 val;
+ 	int error;
+ 
+-	ar5523_dbg(ar, "config_interface called\n");
++	ar5523_dbg(ar, "bss_info_changed called\n");
+ 
+ 	ar5523_cmd_write(ar, AR5523_CMD_24, NULL, 0, 0);
+ 
++	if (!(changed & BSS_CHANGED_BSSID))
++		return;
++
+ 	memset(&bssid, 0, sizeof(bssid));
+ 	bssid.len = cpu_to_be32(AR5523_ADDR_LEN);
+ 	memcpy(&bssid.bssid, &ifconf->bssid, AR5523_ADDR_LEN);
+@@ -1009,7 +1009,7 @@ static int ar5523_config_interface(struc
+ 	error = ar5523_set_rates(ar, ifconf);
+ 	if (error) {
+ 		ar5523_err(ar, "could not set negotiated rate set\n");
+-		return error;
++		return;
+ 	}
+ 
+ 
+@@ -1035,13 +1035,11 @@ static int ar5523_config_interface(struc
+ 
+ 	/* start statistics timer */
+ 	mod_timer(&ar->stat_timer, jiffies + HZ);
+-
+-	return 0;
+ }
+ 
+ static void ar5523_configure_filter(struct ieee80211_hw *hw,
+ 		unsigned int changed_flags, unsigned int *total_flags,
+-		int mc_count, struct dev_addr_list *mc_list)
++		u64 multicast)
+ {
+ 	struct ar5523 *ar = hw->priv;
+ 
+@@ -1059,7 +1057,7 @@ static const struct ieee80211_ops ar5523
+ 	.add_interface		= ar5523_add_interface,
+ 	.remove_interface	= ar5523_remove_interface,
+ 	.config			= ar5523_config,
+-	.config_interface	= ar5523_config_interface,
++	.bss_info_changed	= ar5523_bss_info_changed,
+ 	.configure_filter	= ar5523_configure_filter,
+ };
+ 
+@@ -1526,10 +1524,11 @@ static int ar5523_probe(struct usb_inter
+ 
+ 	setup_timer(&ar->stat_timer, ar5523_stat, (unsigned long)ar);
+ 
+-	ar->mode = IEEE80211_IF_TYPE_MNTR;
++	ar->mode = NL80211_IFTYPE_MONITOR;
+ 
+ 	hw->flags |= IEEE80211_HW_RX_INCLUDES_FCS;
+ 	hw->extra_tx_headroom = sizeof(struct ar5523_tx_desc) + sizeof(__be32);
++	hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+ 	hw->queues = 1;
+ 
+ 	error = ar5523_init_modes(ar);
