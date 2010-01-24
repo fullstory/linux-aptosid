@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/carl9170.h
-@@ -0,0 +1,451 @@
+@@ -0,0 +1,453 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -228,6 +228,8 @@
 +	enum carl9170_firmware_types firmware_type;
 +	const struct carl9170fw_desc_head *fw_desc;
 +	bool separate_desc_file;
++	bool rx_stream;
++	bool tx_stream;
 +
 +	/* reset / stuck frames/queue detection */
 +	unsigned int restart_counter;
@@ -1623,7 +1625,7 @@
 +#endif /* __DEBUG_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/eeprom.h
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,214 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -1803,18 +1805,48 @@
 +	__le16	subsystem_id;
 +} __packed;
 +
++#define AR9170_LED_MODE_POWER_ON		0x0001
++#define AR9170_LED_MODE_RESERVED		0x0002
++#define AR9170_LED_MODE_DISABLE_STATE		0x0004
++#define AR9170_LED_MODE_OFF_IN_PSM		0x0008
++
++/* AR9170_LED_MODE BIT is set */
++#define AR9170_LED_MODE_FREQUENCY_S		4
++#define AR9170_LED_MODE_FREQUENCY		0x0030
++#define AR9170_LED_MODE_FREQUENCY_1HZ		0x0000
++#define AR9170_LED_MODE_FREQUENCY_0_5HZ		0x0010
++#define AR9170_LED_MODE_FREQUENCY_0_25HZ	0x0020
++#define AR9170_LED_MODE_FREQUENCY_0_125HZ	0x0030
++
++/* AR9170_LED_MODE BIT is not set */
++#define AR9170_LED_MODE_CONN_STATE_S		4
++#define AR9170_LED_MODE_CONN_STATE		0x0030
++#define AR9170_LED_MODE_CONN_STATE_FORCE_OFF	0x0000
++#define AR9170_LED_MODE_CONN_STATE_FORCE_ON	0x0010
++#define AR9170_LED_MODE_CONN_STATE_IOFF_AON	0x0020	/* Idle off / Active on */
++#define AR9170_LED_MODE_CONN_STATE_ION_AOFF	0x0010	/* Idle on / Active off */
++
++#define AR9170_LED_MODE_MODE			0x0040
++#define AR9170_LED_MODE_RESERVED2		0x0080
++
++#define AR9170_LED_MODE_TON_SCAN_S		8
++#define AR9170_LED_MODE_TON_SCAN		0x0f00
++
++#define AR9170_LED_MODE_TOFF_SCAN_S		12
++#define AR9170_LED_MODE_TOFF_SCAN		0xf000
++
 +struct ar9170_led_mode {
-+	uint8_t led[2];
++	__le16 led;
 +};
 +
 +#endif /* __SHARED_EEPROM_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/fw.c
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,291 @@
 +/*
 + * Atheros CARL9170 driver
 + *
-+ * firmware (parsing)
++ * firmware parser
 + *
 + * Copyright 2009, 2010, Christian Lamparter <chunkeey@googlemail.com>
 + *
@@ -1850,12 +1882,12 @@
 +
 +	carl9170fw_for_each_hdr(iter, ar->fw_desc) {
 +		if (carl9170fw_desc_cmp(iter, descid, len,
-+					 compatible_revision))
++					compatible_revision))
 +			return (void *)iter;
 +	}
 +
 +	if (carl9170fw_desc_cmp(iter, descid, len,
-+				 compatible_revision))
++				compatible_revision))
 +		return (void *)iter;
 +
 +	return NULL;
@@ -1865,43 +1897,43 @@
 +				  const struct carl9170fw_desc_head *head,
 +				  unsigned int max_len)
 +{
-+	const struct carl9170fw_desc_head *pos, *end;
++	const struct carl9170fw_desc_head *pos;
++	unsigned long pos_addr, end_addr;
++	unsigned int pos_length;
 +
-+	if (max_len < (sizeof(*pos)))
++	if (max_len < sizeof(*pos))
 +		return -ENODATA;
 +
 +	max_len = min_t(unsigned int, CARL9170FW_DESC_MAX_LENGTH, max_len);
 +
 +	pos = head;
-+	end = (void *) head + max_len;
++	pos_addr = (unsigned long) pos;
++	end_addr = pos_addr + max_len;
 +
-+	while (pos < end) {
-+		unsigned int pos_length;
-+
-+		if (((unsigned long)pos + sizeof(*head)) > (unsigned long)end)
-+			return -EINVAL;
++	while (pos_addr < end_addr) {
++		if (pos_addr + sizeof(*head) > end_addr)
++			return -E2BIG;
 +
 +		pos_length = le16_to_cpu(pos->length);
 +
-+		if (((unsigned long)pos + pos_length) > (unsigned long)end)
-+			return -EMSGSIZE;
++		if (pos_length < sizeof(*head))
++			return -EBADMSG;
 +
 +		if (pos_length > max_len)
-+			return -E2BIG;
++			return -EOVERFLOW;
 +
-+		if (pos_length < sizeof(*head))
-+			return -EINVAL;
-+
++		if (pos_addr + pos_length > end_addr)
++			return -EMSGSIZE;
 +
 +		if (carl9170fw_desc_cmp(pos, LAST_MAGIC,
-+					 CARL9170FW_LAST_DESC_SIZE,
-+					 CARL9170FW_LAST_DESC_CUR_VER))
++					CARL9170FW_LAST_DESC_SIZE,
++					CARL9170FW_LAST_DESC_CUR_VER))
 +			return 0;
 +
-+		pos = (void *)((unsigned long)pos + pos_length);
++		pos_addr += pos_length;
++		pos = (void *)pos_addr;
 +		max_len -= pos_length;
 +	}
-+
 +	return -EINVAL;
 +}
 +
@@ -1923,51 +1955,60 @@
 +		sizeof(*chk_desc), CARL9170FW_CHK_DESC_CUR_VER);
 +
 +	if (chk_desc) {
-+		unsigned long fin, diff;
-+		unsigned int prot_hdr_len;
++		unsigned int dsc_len;
 +		__le32 crc32;
 +
-+		prot_hdr_len = min_t(unsigned int, len,
++		dsc_len = min_t(unsigned int, len,
 +			(unsigned long)chk_desc - (unsigned long)otus_desc);
 +
-+		fin = (unsigned long) last_desc + sizeof(*last_desc);
-+		diff = fin - (unsigned long) otus_desc;
-+
 +		if (!ar->separate_desc_file) {
++			unsigned long fin, diff;
++			fin = (unsigned long) last_desc + sizeof(*last_desc);
++			diff = fin - (unsigned long) otus_desc;
++
 +			if (diff < fw_len)
 +				fw_len -= diff;
++
++			if (fw_len < 256)
++				return -EIO;
 +		}
 +
 +		crc32 = cpu_to_le32(crc32_le(~0, fw_data, fw_len));
 +		if (chk_desc->fw_crc32 && crc32 != chk_desc->fw_crc32) {
-+			dev_err(ar->pdev, "Firmware's CRC32 checksum mismatch!\n");
-+			return -EINVAL;
++			dev_err(ar->pdev, "firmware checksum mismatch "
++				"detected.\n");
++			return -ENOEXEC;
 +		}
 +
-+		crc32 = cpu_to_le32(crc32_le(~0, (void *)otus_desc, prot_hdr_len));
++		crc32 = cpu_to_le32(crc32_le(~0, (void *)otus_desc, dsc_len));
 +		if (chk_desc->hdr_crc32 && crc32 != chk_desc->hdr_crc32) {
-+			dev_err(ar->pdev, "FW Header's CRC32 checksum mismatch!\n");
++			dev_err(ar->pdev, "firmware descriptor checksum "
++				"mismatch detected.\n");
 +			return -EINVAL;
 +		}
++	} else {
++		dev_warn(ar->pdev, "Unprotected firmware image detected.\n");
 +	}
 +
 +#define SUPP(feat)						\
 +	(carl9170fw_supports(otus_desc->fw_feature_set, feat))
 +
 +	if (!SUPP(CARL9170FW_DUMMY_FEATURE)) {
-+		dev_err(ar->pdev, "invalid firmware header format detected\n");
++		dev_err(ar->pdev, "invalid firmware descriptor "
++			"format detected.\n");
 +		return -EINVAL;
 +	}
 +
 +	if (!SUPP(AR9170FW_COMMAND_BASIC) || !SUPP(AR9170FW_COMMAND_PHY) ||
 +	    SUPP(CARL9170FW_UNUSABLE) || !SUPP(AR9170FW_HANDLE_BACK_REQ)) {
-+		dev_err(ar->pdev, "Firmware does not provide "
-+			"the minimal feature list.\n");
++		dev_err(ar->pdev, "firmware does support all"
++			"mandatory features.\n");
 +		return -ECANCELED;
 +	}
 +
 +	if (!SUPP(AR9170FW_COMMAND_CAM)) {
-+		dev_info(ar->pdev, "crypto offloading disabled by firmware.\n");
++		dev_info(ar->pdev, "crypto offloading is disabled "
++			 "by firmware.\n");
 +		ar->disable_offload = true;
 +	}
 +
@@ -1979,7 +2020,7 @@
 +			 CARL9170FW_GET_MONTH(fw_date),
 +			 CARL9170FW_GET_DAY(fw_date));
 +	} else {
-+		dev_err(ar->pdev, "unsupported firmware.\n");
++		dev_err(ar->pdev, "unsupported firmware interface.\n");
 +		return -EINVAL;
 +	}
 +
@@ -2045,9 +2086,10 @@
 +		off = le32_to_cpu(fix_desc->data[i].address) -
 +		      AR9170_EEPROM_START;
 +
-+		if (off > sizeof(struct ar9170_eeprom) ||
-+		    (off & 3))
++		if (off >= sizeof(struct ar9170_eeprom) || (off & 3)) {
++			dev_err(ar->pdev, "Skip invalid entry %d\n", i);
 +			continue;
++		}
 +
 +		data[off / sizeof(*data)] &= le32_to_cpu(fix_desc->data[i].mask);
 +		data[off / sizeof(*data)] |= le32_to_cpu(fix_desc->data[i].value);
@@ -2080,17 +2122,15 @@
 +
 +	err = ar9170_fw_verify_descs(ar, fw_desc, hdr->size - header_offset);
 +	if (err) {
-+		dev_err(ar->pdev, "damaged firmware descriptor detected.\n");
++		dev_err(ar->pdev, "damaged firmware detected (%d).\n", err);
 +		return err;
 +	}
 +
 +	ar->fw_desc = fw_desc;
 +
 +	err = ar9170_fw_check(ar, hdr_data, hdr->size, fw->data, fw->size);
-+	if (err) {
-+		dev_err(ar->pdev, "unsupported firmware.\n");
++	if (err)
 +		return err;
-+	}
 +
 +	return 0;
 +}
@@ -2598,7 +2638,7 @@
 +#endif /* __SHARED_FWDESC_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/hw.h
-@@ -0,0 +1,650 @@
+@@ -0,0 +1,660 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -3203,7 +3243,7 @@
 +/* USB endpoints */
 +enum ar9170_usb_ep {
 +	/*
-+	 *Control EP is always EP 0 (USB SPEC)
++	 * Control EP is always EP 0 (USB SPEC)
 +	 *
 +	 * The weird thing is: the original firmware has a few
 +	 * comments that suggest that the actual EP numbers
@@ -3235,6 +3275,16 @@
 +
 +	/* keep last */
 +	__AR9170_NUM_TX_QUEUES = 5
++};
++
++#define AR9170_TX_STREAM_TAG		0x697e
++#define AR9170_RX_STREAM_TAG		0x4e00
++
++struct ar9170_stream {
++	__le16 length;
++	__le16 tag;
++
++	uint8_t payload[0];
 +};
 +
 +#define AR9170_USB_EP_CTRL_MAX				64
@@ -7098,7 +7148,7 @@
 +}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/phy.h
-@@ -0,0 +1,571 @@
+@@ -0,0 +1,576 @@
 +/*
 + * Copyright (c) 2008-2009 Atheros Communications Inc.
 + *
@@ -7334,15 +7384,20 @@
 +#define AR9170_PHY_REG_RADAR_0			(AR9170_PHY_REG_BASE + 0x0154)
 +#define		AR9170_PHY_RADAR_0_ENA			0x00000001
 +#define		AR9170_PHY_RADAR_0_FFT_ENA		0x80000000
-+#define		AR9170_PHY_RADAR_0_INBAND		0x0000003e /* inband pulse threshold */
++/* inband pulse threshold */
++#define		AR9170_PHY_RADAR_0_INBAND		0x0000003e
 +#define		AR9170_PHY_RADAR_0_INBAND_S		1
-+#define		AR9170_PHY_RADAR_0_PRSSI		0x00000fc0 /* pulse RSSI threshold */
++/* pulse RSSI threshold */
++#define		AR9170_PHY_RADAR_0_PRSSI		0x00000fc0
 +#define		AR9170_PHY_RADAR_0_PRSSI_S		6
-+#define		AR9170_PHY_RADAR_0_HEIGHT		0x0003f000 /* pulse height threshold */
++/* pulse height threshold */
++#define		AR9170_PHY_RADAR_0_HEIGHT		0x0003f000
 +#define		AR9170_PHY_RADAR_0_HEIGHT_S		12
-+#define		AR9170_PHY_RADAR_0_RRSSI		0x00fc0000 /* radar RSSI threshold */
++/* radar RSSI threshold */
++#define		AR9170_PHY_RADAR_0_RRSSI		0x00fc0000
 +#define		AR9170_PHY_RADAR_0_RRSSI_S		18
-+#define		AR9170_PHY_RADAR_0_FIRPWR		0x7f000000 /* radar firepower threshold */
++/* radar firepower threshold */
++#define		AR9170_PHY_RADAR_0_FIRPWR		0x7f000000
 +#define		AR9170_PHY_RADAR_0_FIRPWR_S		24
 +
 +#define AR9170_PHY_REG_RADAR_1			(AR9170_PHY_REG_BASE + 0x0158)
@@ -9470,7 +9525,7 @@
 +#endif /* RC_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/rx.c
-@@ -0,0 +1,674 @@
+@@ -0,0 +1,687 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -10000,20 +10055,43 @@
 +	}
 +}
 +
-+void ar9170_rx(struct ar9170 *ar, struct sk_buff *skb)
++static void __ar9170_rx(struct ar9170 *ar, uint8_t *buf, unsigned int len)
 +{
-+	unsigned int i, tlen, resplen, wlen = 0, clen = 0;
-+	u8 *tbuf, *respbuf;
++	unsigned int i = 0;
++
++	/* weird thing, but this is the same in the original driver */
++	while (len > 2 && i < 12 && buf[0] == 0xff && buf[1] == 0xff) {
++		i += 2;
++		len -= 2;
++		buf += 2;
++	}
++
++	if (unlikely(len < 4))
++		return ;
++
++	/* found the 6 * 0xffff marker? */
++	if (i == 12)
++		ar9170_rx_untie_cmds(ar, buf, len);
++	else
++		ar9170_handle_mpdu(ar, buf, len);
++}
++
++static void ar9170_rx_stream(struct ar9170 *ar, struct sk_buff *skb)
++{
++	unsigned int tlen, wlen = 0, clen = 0;
++	struct ar9170_stream *rx_stream;
++	u8 *tbuf;
 +
 +	tbuf = skb->data;
 +	tlen = skb->len;
 +
 +	while (tlen >= 4) {
-+		clen = tbuf[1] << 8 | tbuf[0];
++		rx_stream = (void *) tbuf;
++		clen = le16_to_cpu(rx_stream->length);
 +		wlen = ALIGN(clen, 4);
 +
 +		/* check if this is stream has a valid tag.*/
-+		if (tbuf[2] != 0 || tbuf[3] != 0x4e) {
++		if (rx_stream->tag != cpu_to_le16(AR9170_RX_STREAM_TAG)) {
 +			/*
 +			 * TODO: handle the highly unlikely event that the
 +			 * corrupted stream has the TAG at the right position.
@@ -10045,20 +10123,21 @@
 +
 +			if (ar->rx_failover_missing <= 0) {
 +				/*
-+				 * nested ar9170_rx call!
++				 * nested ar9170_rx_stream call!
++				 *
 +				 * termination is guranteed, even when the
-+				 * combined frame also have a element with
++				 * combined frame also have an element with
 +				 * a bad tag.
 +				 */
 +
 +				ar->rx_failover_missing = 0;
-+				ar9170_rx(ar, ar->rx_failover);
++				ar9170_rx_stream(ar, ar->rx_failover);
 +
 +				skb_reset_tail_pointer(ar->rx_failover);
 +				skb_trim(ar->rx_failover, 0);
 +			}
 +
-+			return ;
++			return;
 +		}
 +
 +		/* check if stream is clipped */
@@ -10084,29 +10163,10 @@
 +			ar->rx_failover_missing = clen - tlen;
 +			return ;
 +		}
-+		resplen = clen;
-+		respbuf = tbuf + 4;
++		__ar9170_rx(ar, rx_stream->payload, clen);
++
 +		tbuf += wlen + 4;
 +		tlen -= wlen + 4;
-+
-+		i = 0;
-+
-+		/* weird thing, but this is the same in the original driver */
-+		while (resplen > 2 && i < 12 &&
-+		       respbuf[0] == 0xff && respbuf[1] == 0xff) {
-+			i += 2;
-+			resplen -= 2;
-+			respbuf += 2;
-+		}
-+
-+		if (resplen < 4)
-+			continue;
-+
-+		/* found the 6 * 0xffff marker? */
-+		if (i == 12)
-+			ar9170_rx_untie_cmds(ar, respbuf, resplen);
-+		else
-+			ar9170_handle_mpdu(ar, respbuf, clen);
 +	}
 +
 +	if (tlen) {
@@ -10144,6 +10204,14 @@
 +		skb_trim(ar->rx_failover, 0);
 +		ar->rx_failover_missing = 0;
 +	}
++}
++
++void ar9170_rx(struct ar9170 *ar, struct sk_buff *skb)
++{
++	if (ar->rx_stream)
++		ar9170_rx_stream(ar, skb);
++	else
++		__ar9170_rx(ar, skb->data, skb->len);
 +}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/tx.c
@@ -11507,7 +11575,7 @@
 +}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/usb.c
-@@ -0,0 +1,1110 @@
+@@ -0,0 +1,1130 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -11672,6 +11740,9 @@
 +	atomic_dec(&aru->tx_submitted_urbs);
 +
 +	ar9170_usb_submit_urb(aru);
++
++	if (aru->common.tx_stream)
++		skb_pull(skb, sizeof(struct ar9170_stream));
 +
 +	ar9170_tx_callback(&aru->common, skb);
 +}
@@ -11984,6 +12055,7 @@
 +{
 +	struct ar9170_usb *aru = (struct ar9170_usb *) ar;
 +	struct urb *urb;
++	struct ar9170_stream *tx_stream;
 +
 +	if (unlikely(!IS_STARTED(ar))) {
 +		/* Seriously, what were you drink... err... thinking!? */
@@ -11993,6 +12065,13 @@
 +	urb = usb_alloc_urb(0, GFP_ATOMIC);
 +	if (unlikely(!urb))
 +		return -ENOMEM;
++
++	if (ar->tx_stream) {
++		tx_stream = (void *) skb_push(skb, sizeof(*tx_stream));
++
++		tx_stream->length = cpu_to_le16(skb->len);
++		tx_stream->tag = cpu_to_le16(AR9170_TX_STREAM_TAG);
++	}
 +
 +	usb_fill_bulk_urb(urb, aru->udev,
 +			  usb_sndbulkpipe(aru->udev, AR9170_USB_EP_TX),
@@ -12131,7 +12210,8 @@
 +	err = ar9170_parse_firmware(&aru->common, aru->firmware[0],
 +				    aru->firmware[aru->fw_files - 1]);
 +	if (err) {
-+		dev_err(&aru->udev->dev, "failed to parse firmware.\n");
++		dev_err(&aru->udev->dev, "failed to parse firmware (%d).\n",
++			err);
 +		goto fail;
 +	}
 +
@@ -12152,9 +12232,7 @@
 +		goto fail;
 +	}
 +
-+	if (!SUPP(AR9170FW_USB_INIT_FIRMWARE) ||
-+	    !SUPP(AR9170FW_USB_UP_STREAM) ||
-+	     SUPP(AR9170FW_USB_DOWN_STREAM)) {
++	if (!SUPP(AR9170FW_USB_INIT_FIRMWARE)) {
 +		dev_err(&aru->udev->dev, "usb firmware does not provide "
 +					 "mandatory interfaces.\n");
 +		err = -EINVAL;
@@ -12177,10 +12255,20 @@
 +	else
 +		aru->fw_offset = 0;
 +
++	if (SUPP(AR9170FW_USB_DOWN_STREAM)) {
++		aru->common.hw->extra_tx_headroom +=
++			sizeof(struct ar9170_stream);
++		aru->common.tx_stream = true;
++	}
++
++	if (SUPP(AR9170FW_USB_UP_STREAM))
++		aru->common.rx_stream = true;
++
 +	aru->rx_size = le16_to_cpu(usb_desc->rx_max_frame_len);
 +	aru->common.mem_blocks = usb_desc->tx_descs;
 +	atomic_set(&aru->common.mem_free_blocks, usb_desc->tx_descs);
 +	aru->common.mem_block_size = le16_to_cpu(usb_desc->tx_frag_len);
++
 +	return 0;
 +
 +fail:
