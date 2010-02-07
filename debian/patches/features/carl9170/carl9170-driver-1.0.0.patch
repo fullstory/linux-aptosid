@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/carl9170.h
-@@ -0,0 +1,453 @@
+@@ -0,0 +1,458 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -191,7 +191,6 @@
 +#define AR9170_JANITOR_DELAY		128
 +#define AR9170_QUEUE_STUCK_TIMEOUT	5500
 +
-+
 +#define AR9170_NUM_TX_AGG_MAX		30
 +#define AR9170_NUM_TX_LIMIT_HARD	(2 * AR9170_TXQ_DEPTH)
 +#define AR9170_NUM_TX_LIMIT_SOFT	(AR9170_TXQ_DEPTH - 8)
@@ -230,11 +229,15 @@
 +	bool separate_desc_file;
 +	bool rx_stream;
 +	bool tx_stream;
++	bool usb_watchdog;
 +
 +	/* reset / stuck frames/queue detection */
 +	unsigned int restart_counter;
++	unsigned int fw_err_counter;
++	unsigned int fw_bug_counter;
 +	unsigned long queue_stop_timeout[__AR9170_NUM_TXQ];
 +	struct work_struct restart_work;
++	struct work_struct watchdog_work;
 +	bool needs_full_reset;
 +
 +	/* interface mode settings */
@@ -356,8 +359,9 @@
 +	struct kref ref;
 +};
 +
-+#define IS_STARTED(a)		(((struct ar9170 *)a)->state >= AR9170_STARTED)
-+#define IS_ACCEPTING_CMD(a)	(((struct ar9170 *)a)->state >= AR9170_IDLE)
++#define CHK_DEV_STATE(a, s)	(((struct ar9170 *)a)->state >= (s))
++#define IS_STARTED(a)		(CHK_DEV_STATE(a, AR9170_STARTED))
++#define IS_ACCEPTING_CMD(a)	(CHK_DEV_STATE(a, AR9170_IDLE))
 +
 +/* exported interface */
 +void *ar9170_alloc(size_t priv_size);
@@ -366,6 +370,7 @@
 +void ar9170_unregister(struct ar9170 *ar);
 +void ar9170_tx_callback(struct ar9170 *ar, struct sk_buff *skb);
 +void ar9170_handle_command_response(struct ar9170 *ar, void *buf, u32 len);
++void ar9170_restart(struct ar9170 *ar);
 +int ar9170_nag_limiter(struct ar9170 *ar);
 +
 +/* MAC */
@@ -456,7 +461,7 @@
 +#endif /* __CARL9170_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/cmd.c
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,159 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -601,9 +606,24 @@
 +
 +	return err;
 +}
++
++int ar9170_usb_watchdog(struct ar9170 *ar, u32 state)
++{
++	__le32 new_state = cpu_to_le32(state);
++	int err;
++	uint32_t dummy;
++
++	if (unlikely(!IS_ACCEPTING_CMD(ar)))
++		return -ENODEV;
++
++	err = ar->exec_cmd(ar, CARL9170_CMD_USB_WD,
++			   4, &new_state, 4, &dummy);
++
++	return err;
++}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/cmd.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,94 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -653,6 +673,7 @@
 +int ar9170_echo_test(struct ar9170 *ar, u32 v);
 +int ar9170_reboot(struct ar9170 *ar);
 +int ar9170_mac_reset(struct ar9170 *ar);
++int ar9170_usb_watchdog(struct ar9170 *ar, u32 state);
 +
 +/*
 + * Macros to facilitate writing multiple registers in a single
@@ -699,7 +720,7 @@
 +#endif /* __CMD_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/debug.c
-@@ -0,0 +1,780 @@
+@@ -0,0 +1,808 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -761,6 +782,8 @@
 +		      ssize_t *len);
 +	ssize_t (*write)(struct ar9170_usb *aru, const char *buf, size_t size);
 +	const struct file_operations fops;
++
++	enum ar9170_device_state req_dev_state;
 +};
 +
 +static ssize_t ar9170_debugfs_read(struct file *file,
@@ -796,7 +819,7 @@
 +	}
 +
 +	mutex_lock(&aru->common.mutex);
-+	if (!IS_STARTED(&aru->common)) {
++	if (!CHK_DEV_STATE(&aru->common, dfops->req_dev_state)) {
 +		err = -ENODEV;
 +		goto out_unlock;
 +	}
@@ -850,7 +873,7 @@
 +	}
 +
 +	mutex_lock(&aru->common.mutex);
-+	if (!IS_STARTED(&aru->common)) {
++	if (!CHK_DEV_STATE(&aru->common, dfops->req_dev_state)) {
 +		err = -ENODEV;
 +		goto out_unlock;
 +	}
@@ -872,12 +895,14 @@
 +	return err;
 +}
 +
-+#define DEBUGFS_DECLARE_FILE(name, _read, _write, _read_bufsize, _attr)	\
++#define __DEBUGFS_DECLARE_FILE(name, _read, _write, _read_bufsize,	\
++			       _attr, _dstate)				\
 +static const struct ar9170_debugfs_fops ar9170_debugfs_##name ##_ops = {\
 +	.read_bufsize = _read_bufsize,					\
 +	.read = _read,							\
 +	.write = _write,						\
 +	.attr = _attr,							\
++	.req_dev_state = _dstate,					\
 +	.fops = {							\
 +		.open	= ar9170_debugfs_open,				\
 +		.read	= ar9170_debugfs_read,				\
@@ -885,6 +910,10 @@
 +		.owner = THIS_MODULE 					\
 +	},								\
 +}
++
++#define DEBUGFS_DECLARE_FILE(name, _read, _write, _read_bufsize, _attr)	\
++	__DEBUGFS_DECLARE_FILE(name, _read, _write, _read_bufsize,	\
++			       _attr, AR9170_STARTED)			\
 +
 +#define DEBUGFS_DECLARE_RO_FILE(name, _read_bufsize)			\
 +	DEBUGFS_DECLARE_FILE(name, ar9170_debugfs_##name ##_read, NULL, \
@@ -898,6 +927,11 @@
 +	DEBUGFS_DECLARE_FILE(name, ar9170_debugfs_##name ##_read,	\
 +			     ar9170_debugfs_##name ##_write,		\
 +			     _read_bufsize, S_IRUSR | S_IWUSR)
++
++#define __DEBUGFS_DECLARE_RW_FILE(name, _read_bufsize, _dstate)		\
++	__DEBUGFS_DECLARE_FILE(name, ar9170_debugfs_##name ##_read,	\
++			     ar9170_debugfs_##name ##_write,		\
++			     _read_bufsize, S_IRUSR | S_IWUSR, _dstate)
 +
 +
 +#define DEBUGFS_READONLY_FILE(name, _read_bufsize, fmt, value...)	\
@@ -1164,7 +1198,7 @@
 +
 +#define DEBUGFS_HW_TALLY_FILE(name, f)					\
 +static char *ar9170_debugfs_##name ## _read(struct ar9170_usb *aru,	\
-+					    char *dum, size_t bufsize,\
++					    char *dum, size_t bufsize,	\
 +					    ssize_t *ret)		\
 +{									\
 +	struct ar9170 *ar = &aru->common;				\
@@ -1299,10 +1333,11 @@
 +}
 +DEBUGFS_DECLARE_RW_FILE(hw_ioread32, AR9170_DEBUG_RING_SIZE * 40);
 +
-+static ssize_t ar9170_debugfs_restart_write(struct ar9170_usb *aru,
++static ssize_t ar9170_debugfs_fw_bug_write(struct ar9170_usb *aru,
 +					    const char *buf, size_t count)
 +{
 +	struct ar9170 *ar = &aru->common;
++	int err;
 +
 +	if (count < 1)
 +		return -EINVAL;
@@ -1317,7 +1352,20 @@
 +		break;
 +
 +	case 'M':
-+		ar9170_mac_reset(ar);
++		err = ar9170_mac_reset(ar);
++		if (err < 0)
++			count = err;
++
++		goto out;
++
++	case 'P':
++		err = ar9170_set_channel(ar, ar->hw->conf.channel,
++			AR9170_RFI_COLD,
++			nl80211_to_ar9170(ar->hw->conf.channel_type));
++
++		if (err < 0)
++			count = err;
++
 +		goto out;
 +
 +	default:
@@ -1330,15 +1378,19 @@
 +	return count;
 +}
 +
-+static char *ar9170_debugfs_restart_read(struct ar9170_usb *aru,
++static char *ar9170_debugfs_fw_bug_read(struct ar9170_usb *aru,
 +					     char *buf, size_t bufsize,
 +					     ssize_t *ret)
 +{
 +	ADD(buf, *ret, bufsize, "firmware restarts:%d\n",
 +		aru->common.restart_counter);
++	ADD(buf, *ret, bufsize, "reported firmware errors:%d\n",
++		aru->common.fw_err_counter);
++	ADD(buf, *ret, bufsize, "reported firmware BUGs:%d\n",
++		aru->common.fw_bug_counter);
 +	return buf;
 +}
-+DEBUGFS_DECLARE_RW_FILE(restart, 64);
++__DEBUGFS_DECLARE_RW_FILE(fw_bug, 240, AR9170_STOPPED);
 +
 +static ssize_t ar9170_debugfs_hw_iowrite32_write(struct ar9170_usb *aru,
 +						 const char *buf, size_t count)
@@ -1416,9 +1468,6 @@
 +DEBUGFS_READONLY_FILE(firmware_type, 20, "%d",
 +		      aru->common.firmware_type);
 +
-+DEBUGFS_READONLY_FILE(restart_count, 20, "%d",
-+		      aru->common.restart_counter);
-+
 +DEBUGFS_READONLY_FILE(tx_dropped, 20, "%d", aru->common.tx_dropped);
 +
 +void ar9170_register_debugfs(struct ar9170_usb *aru)
@@ -1468,7 +1517,7 @@
 +
 +	DEBUGFS_ADD(hw_ioread32);
 +	DEBUGFS_ADD(hw_iowrite32);
-+	DEBUGFS_ADD(restart);
++	DEBUGFS_ADD(fw_bug);
 +
 +	if (modparam_ht)
 +		DEBUGFS_ADD(rc_stats);
@@ -2136,7 +2185,7 @@
 +}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/fwcmd.h
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,236 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -2195,15 +2244,16 @@
 +	AR9170_CMD_SYNTH		= 0x32,
 +	AR9170_CMD_FREQ_START		= 0x33,
 +
-+	/* TX queuing status */
++	/* misc */
 +	CARL9170_CMD_TX_STUCK		= 0x40,
++	CARL9170_CMD_USB_WD		= 0x41,
 +
 +	/* Basic commands */
 +	AR9170_CMD_ECHO			= 0x80,
 +	AR9170_CMD_SWRST		= 0x90,
 +	AR9170_CMD_REBOOT		= 0x94,
 +
-+	/* responses */
++	/* responses and traps */
 +	AR9170_RSP_PRETBTT		= 0xc0,
 +	CARL9170_RSP_TXCOMP		= 0xc1,
 +	AR9170_RSP_TXCOMP		= 0xc1,
@@ -2214,7 +2264,8 @@
 +	AR9170_RSP_TEXT			= 0xca,
 +	AR9170_RSP_HEXDUMP		= 0xcc,
 +	CARL9170_RSP_RADAR		= 0xcd,
-+	CARL9170_RSP_GPIO		= 0xce
++	CARL9170_RSP_GPIO		= 0xce,
++	CARL9170_RSP_USB_WD		= 0xcf
 +};
 +
 +struct ar9170_set_key_cmd {
@@ -2263,7 +2314,6 @@
 +	__le32		regs[6];
 +} __packed;
 +
-+
 +#define CARL9170_TX_STUCK_STATUS_COOKIE_NOT_FOUND		0
 +#define CARL9170_TX_STUCK_STATUS_COOKIE_STUCK			1
 +
@@ -2280,6 +2330,13 @@
 +	uint8_t		padding;
 +} __packed;
 +
++#define CARL9170_USB_WATCHDOG_INACTIVE				0
++#define CARL9170_USB_WATCHDOG_ON_DUTY				1
++
++struct carl9170_watchdog_cmd {
++	__le32		state;
++} __packed;
++
 +struct ar9170_cmd {
 +	uint8_t	len;
 +	uint8_t	cmd;
@@ -2288,6 +2345,7 @@
 +		struct ar9170_set_key_cmd	setkey;
 +		struct ar9170_disable_key_cmd	disablekey;
 +		struct ar9170_u32_list		echo;
++		struct carl9170_watchdog_cmd	watchdog;
 +		struct ar9170_reg_list		rreg;
 +		struct ar9170_write_reg		wreg;
 +		struct ar9170_rf_init		rf_init;
@@ -2353,6 +2411,7 @@
 +		struct ar9170_rf_init_result	rf_init_res;
 +		struct ar9170_u32_list		rreg_res;
 +		struct ar9170_u32_list		echo;
++		struct carl9170_watchdog_cmd	watchdog;
 +		struct carl9170_tx_status	tx_status[0];
 +		struct _carl9170_tx_status	_tx_status[0];
 +		struct carl9170_tx_stuck_rsp	tx_stuck;
@@ -2365,7 +2424,7 @@
 +#endif /* __SHARED_FWCMD_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/fwdesc.h
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,273 @@
 +/*
 + * Firmware Descriptor definitions
 + *
@@ -2461,6 +2520,9 @@
 +
 +	/* usb upload (fw -> app) stream */
 +	AR9170FW_USB_UP_STREAM,
++
++	/* USB Watchdog */
++	CARL9170FW_USB_WATCHDOG,
 +
 +	/* KEEP LAST */
 +	__CARL9170FW_USB_FEATURE_NUM
@@ -2638,7 +2700,7 @@
 +#endif /* __SHARED_FWDESC_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/hw.h
-@@ -0,0 +1,660 @@
+@@ -0,0 +1,664 @@
 +/*
 + * Atheros AR9170 driver
 + *
@@ -2986,6 +3048,10 @@
 +#define AR9170_PWR_REG_BASE				0x1d4000
 +
 +#define AR9170_PWR_REG_ADDA_BB				(AR9170_PWR_REG_BASE + 0x004)
++#define		AR9170_PWR_ADDA_BB_USB_FIFO_RESET		0x00000005
++#define		AR9170_PWR_ADDA_BB_COLD_RESET			0x00000800
++#define		AR9170_PWR_ADDA_BB_WARM_RESET			0x00000400
++
 +#define AR9170_PWR_REG_CLOCK_SEL			(AR9170_PWR_REG_BASE + 0x008)
 +#define		AR9170_PWR_CLK_AHB_40MHZ			0
 +#define		AR9170_PWR_CLK_AHB_20_22MHZ			1
@@ -3415,7 +3481,7 @@
 +	bool rerun = false;
 +
 +	if (unlikely(!IS_ACCEPTING_CMD(ar)))
-+		return ;
++		return;
 +
 +	mutex_lock(&ar->mutex);
 +	for (i = 0; i < AR9170_NUM_LEDS; i++) {
@@ -3454,7 +3520,7 @@
 +	struct ar9170 *ar = arl->ar;
 +
 +	if (unlikely(!arl->registered))
-+		return ;
++		return;
 +
 +	if (arl->last_state != !!brightness) {
 +		arl->toggled++;
@@ -4005,7 +4071,7 @@
 +	struct ar9170 *ar = container_of(work, struct ar9170,
 +					 beacon_work);
 +	if (unlikely(!IS_STARTED(ar)))
-+		return ;
++		return;
 +
 +	mutex_lock(&ar->mutex);
 +
@@ -4052,7 +4118,7 @@
 +}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/main.c
-@@ -0,0 +1,1307 @@
+@@ -0,0 +1,1337 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -4263,23 +4329,26 @@
 +	return print_message;
 +}
 +
++/*
++ * Caller must take precautions so this routine never
++ * runs twice at the same time.
++ */
 +static void ar9170_ampdu_gc(struct ar9170 *ar)
 +{
 +	struct ar9170_sta_tid *tid_info;
++	unsigned long flags;
 +	LIST_HEAD(tid_gc);
 +
 +	rcu_read_lock();
 +	list_for_each_entry_rcu(tid_info, &ar->tx_ampdu_list, list) {
-+		spin_lock_irq(&tid_info->lock);
 +		if (tid_info->state <= AR9170_TID_STATE_SHUTDOWN) {
-+			spin_lock_irq(&ar->tx_ampdu_list_lock);
++			spin_lock_irqsave(&ar->tx_ampdu_list_lock, flags);
 +			list_del_rcu(&tid_info->list);
 +			ar->tx_ampdu_list_len--;
-+			spin_unlock_irq(&ar->tx_ampdu_list_lock);
++			spin_unlock_irqrestore(&ar->tx_ampdu_list_lock, flags);
 +
 +			list_add_tail(&tid_info->tmp_list, &tid_gc);
 +		}
-+		spin_unlock_irq(&tid_info->lock);
 +	}
 +	rcu_read_unlock();
 +
@@ -4370,6 +4439,11 @@
 +	if (err)
 +		goto out;
 +
++	err = ar9170_write_reg(ar, AR9170_MAC_REG_DMA_TRIGGER,
++			       AR9170_DMA_TRIGGER_RXQ);
++	if (err)
++		goto out;
++
 +	err = ar9170_init_phy(ar, IEEE80211_BAND_2GHZ);
 +	if (err)
 +		goto out;
@@ -4378,11 +4452,12 @@
 +	if (err)
 +		goto out;
 +
-+	/* start DMA */
-+	err = ar9170_write_reg(ar, AR9170_MAC_REG_DMA_TRIGGER,
-+			       AR9170_DMA_TRIGGER_RXQ);
-+	if (err)
-+		goto out;
++	if (ar->usb_watchdog) {
++		err = ar9170_usb_watchdog(ar, CARL9170_USB_WATCHDOG_ON_DUTY);
++
++		if (err)
++			goto out;
++	}
 +
 +	ar->state = AR9170_STARTED;
 +
@@ -4401,6 +4476,7 @@
 +	cancel_delayed_work_sync(&ar->led_work);
 +#endif /* CONFIG_CARL9170_LEDS */
 +	cancel_work_sync(&ar->beacon_work);
++	cancel_work_sync(&ar->watchdog_work);
 +	cancel_work_sync(&ar->ampdu_work);
 +}
 +
@@ -4417,6 +4493,9 @@
 +
 +	if (IS_ACCEPTING_CMD(ar)) {
 +		ar9170_set_leds_state(ar, 0);
++
++		if (ar->usb_watchdog)
++			ar9170_usb_watchdog(ar, CARL9170_USB_WATCHDOG_INACTIVE);
 +
 +		/* stop DMA */
 +		ar9170_write_reg(ar, AR9170_MAC_REG_DMA_TRIGGER, 0);
@@ -4468,12 +4547,31 @@
 +	}
 +}
 +
++void ar9170_restart(struct ar9170 *ar)
++{
++	ieee80211_queue_work(ar->hw, &ar->restart_work);
++}
++
++static void ar9170_watchdog_work(struct work_struct *work)
++{
++	struct ar9170 *ar = container_of(work, struct ar9170,
++					 watchdog_work);
++	int err;
++
++	mutex_lock(&ar->mutex);
++	err = ar9170_usb_watchdog(ar, CARL9170_USB_WATCHDOG_ON_DUTY);
++	mutex_unlock(&ar->mutex);
++
++	WARN_ON_ONCE(err);
++}
++
 +static int ar9170_op_add_interface(struct ieee80211_hw *hw,
 +				   struct ieee80211_vif *vif)
 +{
 +	struct ar9170 *ar = hw->priv;
 +	struct ath_common *common = &ar->common;
 +	int err = 0;
++	u32 ftf;
 +
 +	mutex_lock(&ar->mutex);
 +
@@ -4491,7 +4589,13 @@
 +	}
 +
 +	ar->cur_filter = 0;
-+	err = ar9170_update_frame_filter(ar, AR9170_MAC_FTF_DEFAULTS);
++
++	if (ar->vif->type != NL80211_IFTYPE_MONITOR)
++		ftf = AR9170_MAC_FTF_DEFAULTS;
++	else
++		ftf = AR9170_MAC_FTF_MONITOR;
++
++	err = ar9170_update_frame_filter(ar, ftf);
 +	if (err)
 +		goto unlock;
 +
@@ -4548,9 +4652,8 @@
 +		if (err)
 +			goto out;
 +
-+		err = ar9170_set_channel(ar, hw->conf.channel,
-+				AR9170_RFI_NONE,
-+				nl80211_to_ar9170(hw->conf.channel_type));
++		err = ar9170_set_channel(ar, hw->conf.channel, AR9170_RFI_NONE,
++			nl80211_to_ar9170(hw->conf.channel_type));
 +		if (err)
 +			goto out;
 +
@@ -4599,7 +4702,7 @@
 +		      FIF_PROMISC_IN_BSS | FIF_FCSFAIL | FIF_PLCPFAIL;
 +
 +	if (unlikely(!IS_ACCEPTING_CMD(ar)))
-+		return ;
++		return;
 +
 +	mutex_lock(&ar->mutex);
 +
@@ -4883,16 +4986,13 @@
 +		rcu_read_lock();
 +		for (i = 0; i < AR9170_NUM_TID; i++) {
 +			struct ar9170_sta_tid *tid_info;
-+			unsigned long flags;
 +
 +			tid_info = rcu_dereference(sta_info->agg[i]);
 +
 +			if (!tid_info)
 +				continue;
 +
-+			spin_lock_irqsave(&tid_info->lock, flags);
 +			tid_info->state = AR9170_TID_STATE_SHUTDOWN;
-+			spin_unlock_irqrestore(&tid_info->lock, flags);
 +
 +			rcu_assign_pointer(sta_info->agg[i], NULL);
 +
@@ -4988,11 +5088,9 @@
 +	case IEEE80211_AMPDU_TX_STOP:
 +		rcu_read_lock();
 +		tid_info = rcu_dereference(sta_info->agg[tid]);
-+		if (tid_info) {
-+			spin_lock_irqsave(&tid_info->lock, flags);
++		if (tid_info)
 +			tid_info->state = AR9170_TID_STATE_SHUTDOWN;
-+			spin_unlock_irqrestore(&tid_info->lock, flags);
-+		}
++
 +		rcu_assign_pointer(sta_info->agg[tid], NULL);
 +		rcu_read_unlock();
 +
@@ -5122,6 +5220,7 @@
 +	INIT_WORK(&ar->beacon_work, ar9170_new_beacon);
 +	INIT_WORK(&ar->restart_work, ar9170_restart_work);
 +	INIT_WORK(&ar->ampdu_work, ar9170_ampdu_work);
++	INIT_WORK(&ar->watchdog_work, ar9170_watchdog_work);
 +	INIT_DELAYED_WORK(&ar->tx_janitor, ar9170_tx_janitor);
 +	INIT_LIST_HEAD(&ar->tx_ampdu_list);
 +
@@ -5260,7 +5359,6 @@
 +	struct ath_regulatory *regulatory = &ar->common.regulatory;
 +	int err;
 +
-+	mutex_lock(&ar->mutex);
 +	ar->mem_cookie_jar = kzalloc(roundup(ar->mem_blocks, BITS_PER_LONG) *
 +				     sizeof(unsigned long), GFP_KERNEL);
 +
@@ -5321,7 +5419,6 @@
 +	dev_info(ar->pdev, "Atheros AR9170 is registered as '%s'\n",
 +		 wiphy_name(ar->hw->wiphy));
 +
-+	mutex_unlock(&ar->mutex);
 +	ar->registered = true;
 +	return 0;
 +
@@ -5329,7 +5426,6 @@
 +	ieee80211_unregister_hw(ar->hw);
 +
 +err_out:
-+	mutex_unlock(&ar->mutex);
 +
 +	return err;
 +}
@@ -5369,7 +5465,7 @@
 +obj-$(CONFIG_CARL9170_USB) += carl9170usb.o
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/phy.c
-@@ -0,0 +1,1776 @@
+@@ -0,0 +1,1809 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -5804,7 +5900,7 @@
 +{
 +	static const u8 xpd2pd[16] = {
 +		0x2, 0x2, 0x2, 0x1, 0x2, 0x2, 0x6, 0x2,
-+		0x2, 0x3, 0x7, 0x2, 0xB, 0x2, 0x2, 0x2
++		0x2, 0x3, 0x7, 0x2, 0xb, 0x2, 0x2, 0x2
 +	};
 +	u32 defval, newval;
 +	/* pointer to the modal_header acc. to band */
@@ -5814,41 +5910,50 @@
 +
 +	/* ant common control (index 0) */
 +	newval = le32_to_cpu(m->antCtrlCommon);
-+	ar9170_regwrite(0x1c5964, newval);
++	ar9170_regwrite(AR9170_PHY_REG_SWITCH_COM, newval);
 +
 +	/* ant control chain 0 (index 1) */
 +	newval = le32_to_cpu(m->antCtrlChain[0]);
-+	ar9170_regwrite(0x1c5960, newval);
++	ar9170_regwrite(AR9170_PHY_REG_SWITCH_CHAIN_0, newval);
 +
 +	/* ant control chain 2 (index 2) */
 +	newval = le32_to_cpu(m->antCtrlChain[1]);
-+	ar9170_regwrite(0x1c7960, newval);
++	ar9170_regwrite(AR9170_PHY_REG_SWITCH_CHAIN_2, newval);
 +
 +	/* SwSettle (index 3) */
 +	if (!is_40mhz) {
-+		defval = ar9170_get_default_phy_reg_val(0x1c5844,
++		defval = ar9170_get_default_phy_reg_val(AR9170_PHY_REG_SETTLING,
 +							is_2ghz, is_40mhz);
-+		newval = (defval & ~0x3f80) |
-+			((m->switchSettling & 0x7f) << 7);
-+		ar9170_regwrite(0x1c5844, newval);
++		newval = defval;
++		SET_VAL(AR9170_PHY_SETTLING_SWITCH, newval,
++			m->switchSettling);
++		ar9170_regwrite(AR9170_PHY_REG_SETTLING, newval);
 +	}
 +
 +	/* adcDesired, pdaDesired (index 4) */
-+	defval = ar9170_get_default_phy_reg_val(0x1c5850, is_2ghz, is_40mhz);
-+	newval = (defval & ~0xffff) | ((u8)m->pgaDesiredSize << 8) |
-+		((u8)m->adcDesiredSize);
-+	ar9170_regwrite(0x1c5850, newval);
++	defval = ar9170_get_default_phy_reg_val(AR9170_PHY_REG_DESIRED_SZ,
++						is_2ghz, is_40mhz);
++	newval = defval;
++	SET_VAL(AR9170_PHY_DESIRED_SZ_PGA, newval, m->pgaDesiredSize);
++	SET_VAL(AR9170_PHY_DESIRED_SZ_ADC, newval, m->adcDesiredSize);
++	ar9170_regwrite(AR9170_PHY_REG_DESIRED_SZ, newval);
 +
 +	/* TxEndToXpaOff, TxFrameToXpaOn (index 5) */
-+	defval = ar9170_get_default_phy_reg_val(0x1c5834, is_2ghz, is_40mhz);
-+	newval = (m->txEndToXpaOff << 24) | (m->txEndToXpaOff << 16) |
-+		(m->txFrameToXpaOn << 8) | m->txFrameToXpaOn;
-+	ar9170_regwrite(0x1c5834, newval);
++	defval = ar9170_get_default_phy_reg_val(AR9170_PHY_REG_RF_CTL4,
++						is_2ghz, is_40mhz);
++	newval = defval;
++	SET_VAL(AR9170_PHY_RF_CTL4_TX_END_XPAB_OFF, newval, m->txEndToXpaOff);
++	SET_VAL(AR9170_PHY_RF_CTL4_TX_END_XPAA_OFF, newval, m->txEndToXpaOff);
++	SET_VAL(AR9170_PHY_RF_CTL4_FRAME_XPAB_ON, newval, m->txFrameToXpaOn);
++	SET_VAL(AR9170_PHY_RF_CTL4_FRAME_XPAA_ON, newval, m->txFrameToXpaOn);
++	ar9170_regwrite(AR9170_PHY_REG_RF_CTL4, newval);
 +
 +	/* TxEndToRxOn (index 6) */
-+	defval = ar9170_get_default_phy_reg_val(0x1c5828, is_2ghz, is_40mhz);
-+	newval = (defval & ~0xff0000) | (m->txEndToRxOn << 16);
-+	ar9170_regwrite(0x1c5828, newval);
++	defval = ar9170_get_default_phy_reg_val(AR9170_PHY_REG_RF_CTL3,
++						is_2ghz, is_40mhz);
++	newval = defval;
++	SET_VAL(AR9170_PHY_RF_CTL3_TX_END_TO_A2_RX_ON, newval, m->txEndToRxOn);
++	ar9170_regwrite(AR9170_PHY_REG_RF_CTL3, newval);
 +
 +	/* thresh62 (index 7) */
 +	defval = ar9170_get_default_phy_reg_val(0x1c8864, is_2ghz, is_40mhz);
@@ -5856,44 +5961,59 @@
 +	ar9170_regwrite(0x1c8864, newval);
 +
 +	/* tx/rx attenuation chain 0 (index 8) */
-+	defval = ar9170_get_default_phy_reg_val(0x1c5848, is_2ghz, is_40mhz);
-+	newval = (defval & ~0x3f000) | ((m->txRxAttenCh[0] & 0x3f) << 12);
-+	ar9170_regwrite(0x1c5848, newval);
++	defval = ar9170_get_default_phy_reg_val(AR9170_PHY_REG_RXGAIN,
++						is_2ghz, is_40mhz);
++	newval = defval;
++	SET_VAL(AR9170_PHY_RXGAIN_TXRX_ATTEN, newval, m->txRxAttenCh[0]);
++	ar9170_regwrite(AR9170_PHY_REG_RXGAIN, newval);
 +
 +	/* tx/rx attenuation chain 2 (index 9) */
-+	defval = ar9170_get_default_phy_reg_val(0x1c7848, is_2ghz, is_40mhz);
-+	newval = (defval & ~0x3f000) | ((m->txRxAttenCh[1] & 0x3f) << 12);
-+	ar9170_regwrite(0x1c7848, newval);
++	defval = ar9170_get_default_phy_reg_val(AR9170_PHY_REG_RXGAIN_CHAIN_2,
++						is_2ghz, is_40mhz);
++	newval = defval;
++	SET_VAL(AR9170_PHY_RXGAIN_TXRX_ATTEN, newval, m->txRxAttenCh[1]);
++	ar9170_regwrite(AR9170_PHY_REG_RXGAIN_CHAIN_2, newval);
 +
 +	/* tx/rx margin chain 0 (index 10) */
-+	defval = ar9170_get_default_phy_reg_val(0x1c620c, is_2ghz, is_40mhz);
-+	newval = (defval & ~0xfc0000) | ((m->rxTxMarginCh[0] & 0x3f) << 18);
++	defval = ar9170_get_default_phy_reg_val(AR9170_PHY_REG_GAIN_2GHZ,
++						is_2ghz, is_40mhz);
++	newval = defval;
++	SET_VAL(AR9170_PHY_GAIN_2GHZ_RXTX_MARGIN, newval, m->rxTxMarginCh[0]);
 +	/* bsw margin chain 0 for 5GHz only */
 +	if (!is_2ghz)
-+		newval = (newval & ~0x3c00) | ((m->bswMargin[0] & 0xf) << 10);
-+	ar9170_regwrite(0x1c620c, newval);
++		SET_VAL(AR9170_PHY_GAIN_2GHZ_BSW_MARGIN, newval, m->bswMargin[0]);
++	ar9170_regwrite(AR9170_PHY_REG_GAIN_2GHZ, newval);
 +
 +	/* tx/rx margin chain 2 (index 11) */
-+	defval = ar9170_get_default_phy_reg_val(0x1c820c, is_2ghz, is_40mhz);
-+	newval = (defval & ~0xfc0000) | ((m->rxTxMarginCh[1] & 0x3f) << 18);
-+	ar9170_regwrite(0x1c820c, newval);
++	defval = ar9170_get_default_phy_reg_val(AR9170_PHY_REG_GAIN_2GHZ_CHAIN_2,
++						is_2ghz, is_40mhz);
++	newval = defval;
++	SET_VAL(AR9170_PHY_GAIN_2GHZ_RXTX_MARGIN, newval, m->rxTxMarginCh[2]);
++	ar9170_regwrite(AR9170_PHY_REG_GAIN_2GHZ_CHAIN_2, newval);
 +
 +	/* iqCall, iqCallq chain 0 (index 12) */
-+	defval = ar9170_get_default_phy_reg_val(0x1c5920, is_2ghz, is_40mhz);
-+	newval = (defval & ~0x7ff) | (((u8)m->iqCalICh[0] & 0x3f) << 5) |
-+		((u8)m->iqCalQCh[0] & 0x1f);
-+	ar9170_regwrite(0x1c5920, newval);
++	defval = ar9170_get_default_phy_reg_val(AR9170_PHY_REG_TIMING_CTRL4(0),
++						is_2ghz, is_40mhz);
++	newval = defval;
++	SET_VAL(AR9170_PHY_TIMING_CTRL4_IQCORR_Q_I_COFF, newval, m->iqCalICh[0]);
++	SET_VAL(AR9170_PHY_TIMING_CTRL4_IQCORR_Q_Q_COFF, newval, m->iqCalQCh[0]);
++	ar9170_regwrite(AR9170_PHY_REG_TIMING_CTRL4(0), newval);
 +
 +	/* iqCall, iqCallq chain 2 (index 13) */
-+	defval = ar9170_get_default_phy_reg_val(0x1c7920, is_2ghz, is_40mhz);
-+	newval = (defval & ~0x7ff) | (((u8)m->iqCalICh[1] & 0x3f) << 5) |
-+		((u8)m->iqCalQCh[1] & 0x1f);
-+	ar9170_regwrite(0x1c7920, newval);
++	defval = ar9170_get_default_phy_reg_val(AR9170_PHY_REG_TIMING_CTRL4(2),
++						is_2ghz, is_40mhz);
++	newval = defval;
++	SET_VAL(AR9170_PHY_TIMING_CTRL4_IQCORR_Q_I_COFF, newval, m->iqCalICh[1]);
++	SET_VAL(AR9170_PHY_TIMING_CTRL4_IQCORR_Q_Q_COFF, newval, m->iqCalQCh[1]);
++	ar9170_regwrite(AR9170_PHY_REG_TIMING_CTRL4(2), newval);
 +
 +	/* xpd gain mask (index 14) */
-+	defval = ar9170_get_default_phy_reg_val(0x1c6258, is_2ghz, is_40mhz);
-+	newval = (defval & ~0xf0000) | (xpd2pd[m->xpdGain & 0xf] << 16);
-+	ar9170_regwrite(0x1c6258, newval);
++	defval = ar9170_get_default_phy_reg_val(AR9170_PHY_REG_TPCRG1,
++						is_2ghz, is_40mhz);
++	newval = defval;
++	SET_VAL(AR9170_PHY_TPCRG1_PD_GAIN_1, newval, xpd2pd[m->xpdGain & 0xf] & 3);
++	SET_VAL(AR9170_PHY_TPCRG1_PD_GAIN_2, newval, xpd2pd[m->xpdGain & 0xf] >> 2);
++	ar9170_regwrite(AR9170_PHY_REG_TPCRG1, newval);
 +	ar9170_regwrite_finish();
 +
 +	return ar9170_regwrite_result();
@@ -6412,6 +6532,15 @@
 +	__le32 cmd[7];
 +	int err;
 +
++	err = ar9170_write_reg(ar, AR9170_PWR_REG_ADDA_BB,
++			       AR9170_PWR_ADDA_BB_COLD_RESET);
++	if (err)
++		return err;
++
++	err = ar9170_write_reg(ar, AR9170_PWR_REG_ADDA_BB, 0x0);
++	if (err)
++		return err;
++
 +	err = ar9170_init_rf_banks_0_7(ar, false);
 +	if (err)
 +		return err;
@@ -6437,7 +6566,7 @@
 +	if (err)
 +		return err;
 +
-+	msleep(1000);
++	msleep(100);
 +
 +	return ar9170_echo_test(ar, 0xaabbccdd);
 +}
@@ -6988,17 +7117,17 @@
 +		return err;
 +
 +	if (rfi != AR9170_RFI_NONE || bandswitch) {
-+		u32 val = 0x400;
++		u32 val = AR9170_PWR_ADDA_BB_WARM_RESET;
 +
 +		if (rfi == AR9170_RFI_COLD)
-+			val = 0x800;
++			val = AR9170_PWR_ADDA_BB_COLD_RESET;
 +
 +		/* warm/cold reset BB/ADDA */
-+		err = ar9170_write_reg(ar, 0x1d4004, val);
++		err = ar9170_write_reg(ar, AR9170_PWR_REG_ADDA_BB, val);
 +		if (err)
 +			return err;
 +
-+		err = ar9170_write_reg(ar, 0x1d4004, 0x0);
++		err = ar9170_write_reg(ar, AR9170_PWR_REG_ADDA_BB, 0x0);
 +		if (err)
 +			return err;
 +
@@ -7727,7 +7856,7 @@
 +#endif	/* __SHARED_PHY_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/rc.c
-@@ -0,0 +1,1598 @@
+@@ -0,0 +1,1621 @@
 +/*
 + * Copyright (c) 2004 Video54 Technologies, Inc.
 + * Copyright (c) 2004-2009 Atheros Communications, Inc.
@@ -7770,7 +7899,7 @@
 +			29300, 7, 108, 4, 7, 7, 7, 7 },
 +		{ VALID_2040, VALID_2040, WLAN_RC_PHY_HT_20_SS, 6500, /* 6.5 Mb */
 +			6400, 0, 0, 0, 8, 24, 8, 24 },
-+		{ VALID_20, VALID_20, WLAN_RC_PHY_HT_20_SS, 13000, /* 13 Mb */
++		{ VALID_2040, VALID_2040, WLAN_RC_PHY_HT_20_SS, 13000, /* 13 Mb */
 +			12700, 1, 1, 2, 9, 25, 9, 25 },
 +		{ VALID_20, VALID_20, WLAN_RC_PHY_HT_20_SS, 19500, /* 19.5 Mb */
 +			18800, 2, 2, 2, 10, 26, 10, 26 },
@@ -7810,11 +7939,11 @@
 +			49800, 3, 3, 4, 11, 27, 27, 27 },
 +		{ VALID_40, VALID_40, WLAN_RC_PHY_HT_40_SS, 81500, /* 81 Mb */
 +			72200, 4, 4, 4, 12, 28, 28, 28 },
-+		{ INVALID, VALID_40, WLAN_RC_PHY_HT_40_SS, 108000, /* 108 Mb */
++		{ VALID_40, VALID_40, WLAN_RC_PHY_HT_40_SS, 108000, /* 108 Mb */
 +			92900, 5, 5, 4, 13, 29, 29, 29 },
-+		{ INVALID, VALID_40, WLAN_RC_PHY_HT_40_SS, 121500, /* 121.5 Mb */
++		{ VALID_40, VALID_40, WLAN_RC_PHY_HT_40_SS, 121500, /* 121.5 Mb */
 +			102700, 6, 6, 4, 14, 30, 30, 30 },
-+		{ INVALID, VALID_40, WLAN_RC_PHY_HT_40_SS, 135000, /* 135 Mb */
++		{ VALID_40, VALID_40, WLAN_RC_PHY_HT_40_SS, 135000, /* 135 Mb */
 +			112000, 7, 7, 4, 15, 31, 32, 32 },
 +		{ INVALID, VALID_40, WLAN_RC_PHY_HT_40_SS_HGI, 150000, /* 150 Mb */
 +			122000, 7, 7, 4, 15, 31, 32, 32 },
@@ -7824,7 +7953,7 @@
 +			49800, 9, 9, 2, 17, 34, 34, 34 },
 +		{ INVALID, INVALID, WLAN_RC_PHY_HT_40_DS, 81000, /* 81 Mb */
 +			71900, 10, 10, 2, 18, 35, 35, 35 },
-+		{ VALID_40, INVALID, WLAN_RC_PHY_HT_40_DS, 108000, /* 108 Mb */
++		{ INVALID, INVALID, WLAN_RC_PHY_HT_40_DS, 108000, /* 108 Mb */
 +			92500, 11, 11, 4, 19, 36, 36, 36 },
 +		{ VALID_40, INVALID, WLAN_RC_PHY_HT_40_DS, 162000, /* 162 Mb */
 +			130300, 12, 12, 4, 20, 37, 37, 37 },
@@ -8985,7 +9114,7 @@
 +	}
 +
 +	if (WARN_ON_ONCE(final_ts_idx < 0))
-+		return ;
++		return;
 +
 +	if (tx_info->flags & IEEE80211_TX_STAT_ACK &&
 +	    rix >= 0 && rix < ath_rc_priv->rate_table_size) {
@@ -9092,9 +9221,7 @@
 +		if (ar->vif->type != NL80211_IFTYPE_STATION)
 +			return;
 +
-+		if (ar->hw->conf.channel_type == NL80211_CHAN_HT40MINUS ||
-+		    ar->hw->conf.channel_type == NL80211_CHAN_HT40PLUS)
-+			oper_cw40 = true;
++		oper_cw40 = sta->ht_cap.cap & IEEE80211_HT_CAP_SUP_WIDTH_20_40;
 +
 +		oper_sgi40 = (sta->ht_cap.cap & IEEE80211_HT_CAP_SGI_40) ?
 +			true : false;
@@ -9157,6 +9284,31 @@
 +#define ADD(buf, off, max, fmt, args...)				\
 +	off += snprintf(&buf[off], max - off, fmt, ##args);
 +
++static const char *carl9170_rc_rate_inf[] = {
++	"11B", "11G", "H20", "H40", "D20", "D40"
++};
++
++static unsigned int carl9170_rc_phy_to_idx(const uint8_t phy)
++{
++	if (WLAN_RC_PHY_HT(phy)) {
++		if (WLAN_RC_PHY_40(phy)) {
++			if (WLAN_RC_PHY_DS(phy))
++				return 5;
++			else
++				return 3;
++		} else {
++			if (WLAN_RC_PHY_DS(phy))
++				return 4;
++			else
++				return 2;
++		}
++	} else if (WLAN_RC_PHY_OFDM(phy)) {
++		return 1;
++	} else {
++		return 0;
++	}
++}
++
 +static ssize_t carl9170_rc_debugfs_rc_stats_read(struct file *file,
 +						 char __user *userbuf,
 +						 size_t count, loff_t *ppos)
@@ -9164,7 +9316,7 @@
 +	struct ath_rate_priv *rate_priv = file->private_data;
 +	struct ar9170 *ar = rate_priv->ar;
 +	const struct ath_rate_table *rate_table;
-+	unsigned int max = 6000, i, now_msecs;
++	unsigned int max = 6000, i, now_msecs, rt;
 +	char *buf = NULL;
 +	ssize_t off = 0;
 +	int err;
@@ -9206,11 +9358,11 @@
 +	for (i = 0; i < rate_priv->max_valid_rate; i++) {
 +		unsigned int rix;
 +		u32 ratekbps, tp;
-+		bool ht_rate;
 +
 +		rix = rate_priv->valid_rate_index[i];
 +		ratekbps = rate_table->info[rix].ratekbps;
-+		ht_rate = WLAN_RC_PHY_HT(rate_table->info[rix].phy);
++		rt = carl9170_rc_phy_to_idx(rate_table->info[rix].phy);
++
 +		tp = ((rate_table->info[rix].user_ratekbps / 100) *
 +		     (100 - rate_priv->per[rix]));
 +
@@ -9222,7 +9374,7 @@
 +		    (rix == rate_priv->last_best_rate ? 'B' : ' '),
 +		    (rix == rate_priv->rate_max_phy ? 'M' : ' '),
 +		    ratekbps / 1000, (ratekbps % 1000) / 100,
-+		    (ht_rate ? "MCS" : "Leg"), rate_priv->per[rix],
++		    carl9170_rc_rate_inf[rt], rate_priv->per[rix],
 +		    tp / 1000, (tp % 1000) / 100, rate_priv->attempts[rix],
 +		    rate_priv->success[rix]);
 +	}
@@ -9328,7 +9480,7 @@
 +}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/rc.h
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,196 @@
 +/*
 + * Copyright (c) 2004 Sam Leffler, Errno Consulting
 + * Copyright (c) 2004 Video54 Technologies, Inc.
@@ -9407,7 +9559,9 @@
 +				|| (_phy == WLAN_RC_PHY_HT_40_SS_HGI)   \
 +				|| (_phy == WLAN_RC_PHY_HT_40_DS_HGI))
 +
-+#define WLAN_RC_PHY_HT(_phy)    (_phy >= WLAN_RC_PHY_HT_20_SS)
++#define WLAN_RC_PHY_HT(_phy)	(_phy >= WLAN_RC_PHY_HT_20_SS)
++#define WLAN_RC_PHY_OFDM(_phy)	(_phy == WLAN_RC_PHY_OFDM)
++#define WLAN_RC_PHY_CCK(_phy)	(_phy == WLAN_RC_PHY_CCK)
 +
 +#define WLAN_RC_CAP_MODE(capflag) (((capflag & WLAN_RC_HT_FLAG) ?	\
 +		(capflag & WLAN_RC_40_FLAG) ? VALID_40 : VALID_20 : VALID))
@@ -9525,7 +9679,7 @@
 +#endif /* RC_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/rx.c
-@@ -0,0 +1,687 @@
+@@ -0,0 +1,682 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -9573,26 +9727,28 @@
 +#include "hw.h"
 +#include "cmd.h"
 +
-+static bool ar9170_dbg_message(struct ar9170 *ar, const char *buf, u32 len)
++static void ar9170_dbg_message(struct ar9170 *ar, const char *buf, u32 len)
 +{
-+	bool restart = false, print;
-+
-+	print = net_ratelimit();
++	bool restart = false;
 +
 +	if (len > 3) {
 +		if (memcmp(buf, CARL9170_ERR_MAGIC, 3) == 0) {
-+			if (ar9170_nag_limiter(ar))
++			ar->fw_err_counter++;
++			if (ar->fw_err_counter > 3)
 +				restart = true;
 +		}
 +
-+		if (memcmp(buf, CARL9170_BUG_MAGIC, 3) == 0)
++		if (memcmp(buf, CARL9170_BUG_MAGIC, 3) == 0) {
++			ar->fw_bug_counter++;
 +			restart = true;
++		}
 +	}
 +
-+	if (restart)
-+		ieee80211_queue_work(ar->hw, &ar->restart_work);
++	printk(KERN_DEBUG "%s FW: %.*s\n", wiphy_name(ar->hw->wiphy),
++	       len, buf);
 +
-+	return restart ? true : print;
++	if (restart)
++		ar9170_restart(ar);
 +}
 +
 +void ar9170_handle_command_response(struct ar9170 *ar, void *buf, u32 len)
@@ -9659,29 +9815,21 @@
 +		break;
 +
 +	case AR9170_RSP_WATCHDOG:
-+		/*
-+		 * Watchdog Interrupt
-+		 *
-+		 * TODO: reinitialize device.
-+		 */
++		/* Watchdog Interrupt */
 +
 +		printk(KERN_DEBUG "%s FW: ding dong! device died.\n",
 +		       wiphy_name(ar->hw->wiphy));
 +
-+		ieee80211_queue_work(ar->hw, &ar->restart_work);
++		ar9170_restart(ar);
 +		break;
 +
 +	case AR9170_RSP_RESET_BB:
 +		/* too many retransmissions */
 +		break;
 +
-+	/* firmware debug */
 +	case AR9170_RSP_TEXT:
-+		if (ar9170_dbg_message(ar, (char *)buf + 4, len - 4)) {
-+			printk(KERN_DEBUG "%s FW: %.*s\n",
-+			       wiphy_name(ar->hw->wiphy),
-+			       len - 4, (char *)buf + 4);
-+		}
++		/* firmware debug */
++		ar9170_dbg_message(ar, (char *)buf + 4, len - 4);
 +		break;
 +
 +	case AR9170_RSP_HEXDUMP:
@@ -9713,6 +9861,10 @@
 +			}
 +		}
 +#endif /* CONFIG_CARL9170_WPS_BUTTON */
++		break;
++
++	case CARL9170_RSP_USB_WD:
++		ieee80211_queue_work(ar->hw, &ar->watchdog_work);
 +		break;
 +
 +	default:
@@ -10025,11 +10177,6 @@
 +	if (phy)
 +		ar9170_rx_phy_status(ar, phy, &status);
 +
-+	if (ieee80211_is_back(*((__le16 *) buf))) {
-+		if (!ar->sniffer_enabled && !(ar->filter_state & FIF_CONTROL))
-+			return;
-+	}
-+
 +	skb = ar9170_rx_copy_data(buf, mpdu_len);
 +	if (likely(skb)) {
 +		memcpy(IEEE80211_SKB_RXCB(skb), &status, sizeof(status));
@@ -10067,7 +10214,7 @@
 +	}
 +
 +	if (unlikely(len < 4))
-+		return ;
++		return;
 +
 +	/* found the 6 * 0xffff marker? */
 +	if (i == 12)
@@ -10099,13 +10246,15 @@
 +
 +			/* check if the frame can be repaired. */
 +			if (!ar->rx_failover_missing) {
-+				/* this is no "short read". */
++
++				/* this is not "short read". */
 +				if (ar9170_nag_limiter(ar)) {
 +					printk(KERN_ERR "%s: missing tag!\n",
 +					       wiphy_name(ar->hw->wiphy));
-+					goto err_telluser;
-+				} else
-+					goto err_silent;
++				}
++
++				__ar9170_rx(ar, tbuf, tlen);
++				return;
 +			}
 +
 +			if (ar->rx_failover_missing > tlen) {
@@ -10161,7 +10310,7 @@
 +
 +			memcpy(skb_put(ar->rx_failover, tlen), tbuf, tlen);
 +			ar->rx_failover_missing = clen - tlen;
-+			return ;
++			return;
 +		}
 +		__ar9170_rx(ar, rx_stream->payload, clen);
 +
@@ -10178,7 +10327,7 @@
 +		goto err_telluser;
 +	}
 +
-+	return ;
++	return;
 +
 +err_telluser:
 +	printk(KERN_ERR "%s: damaged RX stream data [want:%d, "
@@ -10215,7 +10364,7 @@
 +}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/tx.c
-@@ -0,0 +1,1357 @@
+@@ -0,0 +1,1359 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -10483,7 +10632,7 @@
 +
 +	ar = arinfo->ar;
 +	if (WARN_ON_ONCE(!ar))
-+		return ;
++		return;
 +
 +	BUILD_BUG_ON(
 +	    offsetof(struct ieee80211_tx_info, status.ampdu_ack_len) != 23);
@@ -10517,7 +10666,7 @@
 +		       "frame[seq:%4d] at bitmap pos:%2d.\n",
 +		       wiphy_name(ar->hw->wiphy), tid_info->tid, seq, off);
 +#endif /* AR9170_TXAGG_DEBUG */
-+		return ;
++		return;
 +	}
 +
 +	if (!test_and_clear_bit(off, tid_info->bitmap)) {
@@ -10706,6 +10855,7 @@
 +static void ar9170_bump_expired_frames(struct ar9170 *ar)
 +{
 +	struct carl9170_tx_stuck_cmd stuck;
++	struct carl9170_tx_stuck_rsp resp;
 +	struct sk_buff_head *queue;
 +	struct sk_buff *skb;
 +	unsigned long flags;
@@ -10742,10 +10892,11 @@
 +		stuck.queue = ar9170_qmap[i];
 +		mutex_lock(&ar->mutex);
 +		err = ar->exec_cmd(ar, CARL9170_CMD_TX_STUCK, sizeof(stuck),
-+			   &stuck, sizeof(stuck), &stuck);
++			   &stuck, sizeof(resp), &resp);
 +		mutex_unlock(&ar->mutex);
-+		if (err)
-+			ieee80211_queue_work(ar->hw, &ar->restart_work);
++		if (err ||
++		    resp.status == CARL9170_TX_STUCK_STATUS_COOKIE_NOT_FOUND)
++			ar9170_restart(ar);
 +	}
 +}
 +
@@ -10766,7 +10917,7 @@
 +	spin_unlock_irqrestore(&ar->tx_stats_lock, flags);
 +
 +	if (restart)
-+		ieee80211_queue_work(ar->hw, &ar->restart_work);
++		ar9170_restart(ar);
 +}
 +
 +/*
@@ -10780,7 +10931,7 @@
 +	struct ar9170 *ar = container_of(work, struct ar9170,
 +					 tx_janitor.work);
 +	if (unlikely(!IS_STARTED(ar)))
-+		return ;
++		return;
 +
 +	ar->tx_janitor_last_run = jiffies;
 +
@@ -10822,7 +10973,7 @@
 +		skb = ar9170_get_queued_skb(ar, cmd->_tx_status[j].cookie,
 +					    &ar->tx_status[q]);
 +
-+		if (unlikely(WARN_ON_ONCE(!skb))) {
++		if (unlikely(!skb)) {
 +#ifdef AR9170_QUEUE_DEBUG
 +			printk(KERN_DEBUG "%s: orphaned cookie: %x q:%d\n",
 +			       wiphy_name(ar->hw->wiphy),
@@ -11131,7 +11282,7 @@
 +	struct _carl9170_tx_superframe *super;
 +
 +	if (unlikely(!skb))
-+		return ;
++		return;
 +
 +	super = (void *) skb->data;
 +
@@ -11148,7 +11299,7 @@
 +	struct _carl9170_tx_superframe *super;
 +
 +	if (unlikely(!skb))
-+		return ;
++		return;
 +
 +	super = (void *) skb->data;
 +
@@ -11175,7 +11326,7 @@
 +		       wiphy_name(ar->hw->wiphy),
 +		       atomic_read(&ar->tx_ampdu_pending));
 +#endif /* AR9170_TXAGG_DEBUG */
-+		return ;
++		return;
 +	}
 +
 +	__skb_queue_head_init(&agg);
@@ -11283,7 +11434,7 @@
 +		}
 +
 +		/* set aggregation push bit */
-+		ar9170_tx_indicate_immba(ar, skb_peek_tail(&agg), true);
++		ar9170_tx_indicate_immba(ar, skb_peek_tail(&agg), false);
 +
 +#ifdef AR9170_TXAGG_DEBUG
 +		printk(KERN_DEBUG "%s: generated A-MPDU looks like this:\n",
@@ -11362,7 +11513,7 @@
 +	bool schedule_garbagecollector = false;
 +
 +	if (unlikely(!IS_STARTED(ar)))
-+		return ;
++		return;
 +
 +	for (i = 0; i < ar->hw->queues; i++) {
 +		while (!skb_queue_empty(&ar->tx_pending[i])) {
@@ -11575,7 +11726,7 @@
 +}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/usb.c
-@@ -0,0 +1,1130 @@
+@@ -0,0 +1,1115 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -11627,7 +11778,7 @@
 +#include "usb.h"
 +
 +MODULE_AUTHOR("Johannes Berg <johannes@sipsolutions.net>");
-+MODULE_AUTHOR("Christian Lamparter <chunkeey@web.de>");
++MODULE_AUTHOR("Christian Lamparter <chunkeey@googlemail.com>");
 +MODULE_LICENSE("GPL");
 +MODULE_DESCRIPTION("Atheros AR9170 802.11n USB wireless");
 +MODULE_FIRMWARE("carl9170.fw");
@@ -11692,12 +11843,12 @@
 +	int err;
 +
 +	if (unlikely(!IS_STARTED(&aru->common)))
-+		return ;
++		return;
 +
 +	spin_lock_irqsave(&aru->tx_urb_lock, flags);
 +	if (atomic_read(&aru->tx_submitted_urbs) >= AR9170_NUM_TX_URBS) {
 +		spin_unlock_irqrestore(&aru->tx_urb_lock, flags);
-+		return ;
++		return;
 +	}
 +	atomic_inc(&aru->tx_submitted_urbs);
 +
@@ -11705,7 +11856,7 @@
 +	if (!urb) {
 +		atomic_dec(&aru->tx_submitted_urbs);
 +		spin_unlock_irqrestore(&aru->tx_urb_lock, flags);
-+		return ;
++		return;
 +	}
 +	spin_unlock_irqrestore(&aru->tx_urb_lock, flags);
 +
@@ -11734,7 +11885,7 @@
 +
 +	if (unlikely(!aru)) {
 +		dev_kfree_skb_irq(skb);
-+		return ;
++		return;
 +	}
 +
 +	atomic_dec(&aru->tx_submitted_urbs);
@@ -11827,7 +11978,7 @@
 +		goto free;
 +	}
 +
-+	return ;
++	return;
 +
 +free:
 +	dev_kfree_skb_irq(skb);
@@ -12038,6 +12189,8 @@
 +		print_hex_dump_bytes("ar9170 cmd: ", DUMP_PREFIX_NONE,
 +				     aru->common.cmdbuf, plen + 4);
 +		dump_stack();
++
++		ar9170_restart(ar);
 +	}
 +
 +	/* invalidate to avoid completing the next prematurely */
@@ -12095,7 +12248,7 @@
 +	u32 in, out;
 +
 +	if (unlikely(!buffer))
-+		return ;
++		return;
 +
 +	in = le32_to_cpup((__le32 *)buffer);
 +	out = le32_to_cpu(ar->cmdbuf[0]);
@@ -12127,7 +12280,7 @@
 +		 * Do not complete, then the command times out,
 +		 * and we get a stack trace from there.
 +		 */
-+		return ;
++		return;
 +	}
 +
 +	spin_lock_irqsave(&aru->common.cmdlock, flags);
@@ -12242,9 +12395,9 @@
 +	if (usb_desc->tx_descs < 16 ||
 +	    le16_to_cpu(usb_desc->tx_frag_len) < 64 ||
 +	    le16_to_cpu(usb_desc->tx_frag_len) > 512 ||
-+	    le16_to_cpu(usb_desc->rx_max_frame_len) < 1024 ||
++	    le16_to_cpu(usb_desc->rx_max_frame_len) < AR9170_MAX_RX_BUFFER_SIZE ||
 +	    le16_to_cpu(usb_desc->rx_max_frame_len) > 32768) {
-+		dev_err(&aru->udev->dev, "usb firmware has obvious signs of "
++		dev_err(&aru->udev->dev, "usb firmware shows obvious signs of "
 +					 "malicious tampering.\n");
 +		err = -EINVAL;
 +		goto fail;
@@ -12264,6 +12417,9 @@
 +	if (SUPP(AR9170FW_USB_UP_STREAM))
 +		aru->common.rx_stream = true;
 +
++	if (SUPP(CARL9170FW_USB_WATCHDOG))
++		aru->common.usb_watchdog = true;
++
 +	aru->rx_size = le16_to_cpu(usb_desc->rx_max_frame_len);
 +	aru->common.mem_blocks = usb_desc->tx_descs;
 +	atomic_set(&aru->common.mem_free_blocks, usb_desc->tx_descs);
@@ -12277,29 +12433,6 @@
 +	return err;
 +
 +#undef SUPP
-+}
-+
-+static int ar9170_usb_reset(struct ar9170_usb *aru)
-+{
-+	int ret, lock = (aru->intf->condition != USB_INTERFACE_BINDING);
-+
-+	if (lock) {
-+		ret = usb_lock_device_for_reset(aru->udev, aru->intf);
-+		if (ret < 0) {
-+			dev_err(&aru->udev->dev, "unable to lock device "
-+				"for reset (%d).\n", ret);
-+			return ret;
-+		}
-+	}
-+
-+	ret = usb_reset_device(aru->udev);
-+	if (lock)
-+		usb_unlock_device(aru->udev);
-+
-+	/* let it settle */
-+	msleep(100);
-+
-+	return ret;
 +}
 +
 +static void ar9170_usb_stop(struct ar9170 *ar)
@@ -12388,6 +12521,9 @@
 +{
 +	struct ar9170_usb *aru = (void *) ar;
 +	int err = 0;
++
++	if (aru->intf->condition != USB_INTERFACE_BOUND)
++		return 0;
 +
 +	if (!needs_usb_reset)
 +		err = ar9170_reboot(&aru->common);
@@ -12491,7 +12627,7 @@
 +	aru->common.has_wps_button = !!(aru->quirks & AR9170_WPS_BUTTON);
 +#endif /* CONFIG_CARL9170_WPS_BUTTON */
 +
-+	err = ar9170_usb_reset(aru);
++	err = usb_reset_device(aru->udev);
 +	if (err)
 +		goto err_freehw;
 +
@@ -12546,7 +12682,7 @@
 +	ar9170_register_debugfs(aru);
 +#endif /* CONFIG_CARL9170_DEBUGFS */
 +
-+	return ;
++	return;
 +
 +err_unrx:
 +	ar9170_usb_cancel_urbs(aru);
@@ -12629,8 +12765,8 @@
 +}
 +
 +#ifdef CONFIG_PM
-+static int ar9170_suspend(struct usb_interface *intf,
-+			  pm_message_t message)
++static int ar9170_usb_suspend(struct usb_interface *intf,
++			      pm_message_t message)
 +{
 +	struct ar9170_usb *aru = usb_get_intfdata(intf);
 +
@@ -12646,7 +12782,7 @@
 +	return 0;
 +}
 +
-+static int ar9170_resume(struct usb_interface *intf)
++static int ar9170_usb_resume(struct usb_interface *intf)
 +{
 +	struct ar9170_usb *aru = usb_get_intfdata(intf);
 +	int err;
@@ -12682,12 +12818,12 @@
 +	.id_table = ar9170_usb_ids,
 +	.soft_unbind = 1,
 +#ifdef CONFIG_PM
-+	.suspend = ar9170_suspend,
-+	.resume = ar9170_resume,
++	.suspend = ar9170_usb_suspend,
++	.resume = ar9170_usb_resume,
 +#endif /* CONFIG_PM */
 +};
 +
-+static int __init ar9170_init(void)
++static int __init carl9170_usb_init(void)
 +{
 +	int err;
 +
@@ -12698,14 +12834,14 @@
 +	return usb_register(&carl9170_driver);
 +}
 +
-+static void __exit ar9170_exit(void)
++static void __exit carl9170_usb_exit(void)
 +{
 +	usb_deregister(&carl9170_driver);
 +	carl9170_rate_control_unregister();
 +}
 +
-+module_init(ar9170_init);
-+module_exit(ar9170_exit);
++module_init(carl9170_usb_init);
++module_exit(carl9170_usb_exit);
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/usb.h
 @@ -0,0 +1,118 @@
