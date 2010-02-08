@@ -1,0 +1,638 @@
+diff --git a/Documentation/ABI/testing/ima_policy b/Documentation/ABI/testing/ima_policy
+index 6434f0d..6cd6dae 100644
+--- a/Documentation/ABI/testing/ima_policy
++++ b/Documentation/ABI/testing/ima_policy
+@@ -20,7 +20,7 @@ Description:
+ 			lsm:	[[subj_user=] [subj_role=] [subj_type=]
+ 				 [obj_user=] [obj_role=] [obj_type=]]
+ 
+-		base: 	func:= [BPRM_CHECK][FILE_MMAP][INODE_PERMISSION]
++		base: 	func:= [BPRM_CHECK][FILE_MMAP][FILE_CHECK]
+ 			mask:= [MAY_READ] [MAY_WRITE] [MAY_APPEND] [MAY_EXEC]
+ 			fsmagic:= hex value
+ 			uid:= decimal value
+@@ -40,11 +40,11 @@ Description:
+ 
+ 			measure func=BPRM_CHECK
+ 			measure func=FILE_MMAP mask=MAY_EXEC
+-			measure func=INODE_PERM mask=MAY_READ uid=0
++			measure func=FILE_CHECK mask=MAY_READ uid=0
+ 
+ 		The default policy measures all executables in bprm_check,
+ 		all files mmapped executable in file_mmap, and all files
+-		open for read by root in inode_permission.
++		open for read by root in do_filp_open.
+ 
+ 		Examples of LSM specific definitions:
+ 
+@@ -54,8 +54,8 @@ Description:
+ 
+ 			dont_measure obj_type=var_log_t
+ 			dont_measure obj_type=auditd_log_t
+-			measure subj_user=system_u func=INODE_PERM mask=MAY_READ
+-			measure subj_role=system_r func=INODE_PERM mask=MAY_READ
++			measure subj_user=system_u func=FILE_CHECK mask=MAY_READ
++			measure subj_role=system_r func=FILE_CHECK mask=MAY_READ
+ 
+ 		Smack:
+-			measure subj_user=_ func=INODE_PERM mask=MAY_READ
++			measure subj_user=_ func=FILE_CHECK mask=MAY_READ
+diff --git a/Makefile b/Makefile
+index f8e02e9..3ec1ca1 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 33
+-EXTRAVERSION = -rc7
++EXTRAVERSION = -rc7-git1
+ NAME = Man-Eating Seals of Antiquity
+ 
+ # *DOCUMENTATION*
+diff --git a/drivers/char/tty_io.c b/drivers/char/tty_io.c
+index c6f3b48..dcb9083 100644
+--- a/drivers/char/tty_io.c
++++ b/drivers/char/tty_io.c
+@@ -1951,8 +1951,10 @@ static int tty_fasync(int fd, struct file *filp, int on)
+ 			pid = task_pid(current);
+ 			type = PIDTYPE_PID;
+ 		}
+-		retval = __f_setown(filp, pid, type, 0);
++		get_pid(pid);
+ 		spin_unlock_irqrestore(&tty->ctrl_lock, flags);
++		retval = __f_setown(filp, pid, type, 0);
++		put_pid(pid);
+ 		if (retval)
+ 			goto out;
+ 	} else {
+diff --git a/fs/befs/linuxvfs.c b/fs/befs/linuxvfs.c
+index 33baf27..34ddda8 100644
+--- a/fs/befs/linuxvfs.c
++++ b/fs/befs/linuxvfs.c
+@@ -873,6 +873,7 @@ befs_fill_super(struct super_block *sb, void *data, int silent)
+ 	brelse(bh);
+ 
+       unacquire_priv_sbp:
++	kfree(befs_sb->mount_opts.iocharset);
+ 	kfree(sb->s_fs_info);
+ 
+       unacquire_none:
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 73d6a73..d11d028 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -246,7 +246,8 @@ struct super_block *freeze_bdev(struct block_device *bdev)
+ 	if (!sb)
+ 		goto out;
+ 	if (sb->s_flags & MS_RDONLY) {
+-		deactivate_locked_super(sb);
++		sb->s_frozen = SB_FREEZE_TRANS;
++		up_write(&sb->s_umount);
+ 		mutex_unlock(&bdev->bd_fsfreeze_mutex);
+ 		return sb;
+ 	}
+@@ -307,7 +308,7 @@ int thaw_bdev(struct block_device *bdev, struct super_block *sb)
+ 	BUG_ON(sb->s_bdev != bdev);
+ 	down_write(&sb->s_umount);
+ 	if (sb->s_flags & MS_RDONLY)
+-		goto out_deactivate;
++		goto out_unfrozen;
+ 
+ 	if (sb->s_op->unfreeze_fs) {
+ 		error = sb->s_op->unfreeze_fs(sb);
+@@ -321,11 +322,11 @@ int thaw_bdev(struct block_device *bdev, struct super_block *sb)
+ 		}
+ 	}
+ 
++out_unfrozen:
+ 	sb->s_frozen = SB_UNFROZEN;
+ 	smp_wmb();
+ 	wake_up(&sb->s_wait_unfrozen);
+ 
+-out_deactivate:
+ 	if (sb)
+ 		deactivate_locked_super(sb);
+ out_unlock:
+diff --git a/fs/fcntl.c b/fs/fcntl.c
+index 5ef953e..97e01dc 100644
+--- a/fs/fcntl.c
++++ b/fs/fcntl.c
+@@ -199,9 +199,7 @@ static int setfl(int fd, struct file * filp, unsigned long arg)
+ static void f_modown(struct file *filp, struct pid *pid, enum pid_type type,
+                      int force)
+ {
+-	unsigned long flags;
+-
+-	write_lock_irqsave(&filp->f_owner.lock, flags);
++	write_lock_irq(&filp->f_owner.lock);
+ 	if (force || !filp->f_owner.pid) {
+ 		put_pid(filp->f_owner.pid);
+ 		filp->f_owner.pid = get_pid(pid);
+@@ -213,7 +211,7 @@ static void f_modown(struct file *filp, struct pid *pid, enum pid_type type,
+ 			filp->f_owner.euid = cred->euid;
+ 		}
+ 	}
+-	write_unlock_irqrestore(&filp->f_owner.lock, flags);
++	write_unlock_irq(&filp->f_owner.lock);
+ }
+ 
+ int __f_setown(struct file *filp, struct pid *pid, enum pid_type type,
+diff --git a/fs/file_table.c b/fs/file_table.c
+index 69652c5..b98404b 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -253,6 +253,7 @@ void __fput(struct file *file)
+ 	if (file->f_op && file->f_op->release)
+ 		file->f_op->release(inode, file);
+ 	security_file_free(file);
++	ima_file_free(file);
+ 	if (unlikely(S_ISCHR(inode->i_mode) && inode->i_cdev != NULL))
+ 		cdev_put(inode->i_cdev);
+ 	fops_put(file->f_op);
+diff --git a/fs/namei.c b/fs/namei.c
+index 94a5e60..d62fdc8 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -1736,8 +1736,7 @@ do_last:
+ 		if (nd.root.mnt)
+ 			path_put(&nd.root);
+ 		if (!IS_ERR(filp)) {
+-			error = ima_path_check(&filp->f_path, filp->f_mode &
+-				       (MAY_READ | MAY_WRITE | MAY_EXEC));
++			error = ima_file_check(filp, acc_mode);
+ 			if (error) {
+ 				fput(filp);
+ 				filp = ERR_PTR(error);
+@@ -1797,8 +1796,7 @@ ok:
+ 	}
+ 	filp = nameidata_to_filp(&nd);
+ 	if (!IS_ERR(filp)) {
+-		error = ima_path_check(&filp->f_path, filp->f_mode &
+-			       (MAY_READ | MAY_WRITE | MAY_EXEC));
++		error = ima_file_check(filp, acc_mode);
+ 		if (error) {
+ 			fput(filp);
+ 			filp = ERR_PTR(error);
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index c194793..97d79ef 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -752,6 +752,7 @@ nfsd_open(struct svc_rqst *rqstp, struct svc_fh *fhp, int type,
+ 			    flags, current_cred());
+ 	if (IS_ERR(*filp))
+ 		host_err = PTR_ERR(*filp);
++	host_err = ima_file_check(*filp, access);
+ out_nfserr:
+ 	err = nfserrno(host_err);
+ out:
+@@ -2127,7 +2128,6 @@ nfsd_permission(struct svc_rqst *rqstp, struct svc_export *exp,
+ 	 */
+ 	path.mnt = exp->ex_path.mnt;
+ 	path.dentry = dentry;
+-	err = ima_path_check(&path, acc & (MAY_READ | MAY_WRITE | MAY_EXEC));
+ nfsd_out:
+ 	return err? nfserrno(err) : 0;
+ }
+diff --git a/include/linux/ima.h b/include/linux/ima.h
+index 99dc6d5..975837e 100644
+--- a/include/linux/ima.h
++++ b/include/linux/ima.h
+@@ -17,7 +17,7 @@ struct linux_binprm;
+ extern int ima_bprm_check(struct linux_binprm *bprm);
+ extern int ima_inode_alloc(struct inode *inode);
+ extern void ima_inode_free(struct inode *inode);
+-extern int ima_path_check(struct path *path, int mask);
++extern int ima_file_check(struct file *file, int mask);
+ extern void ima_file_free(struct file *file);
+ extern int ima_file_mmap(struct file *file, unsigned long prot);
+ extern void ima_counts_get(struct file *file);
+@@ -38,7 +38,7 @@ static inline void ima_inode_free(struct inode *inode)
+ 	return;
+ }
+ 
+-static inline int ima_path_check(struct path *path, int mask)
++static inline int ima_file_check(struct file *file, int mask)
+ {
+ 	return 0;
+ }
+diff --git a/init/main.c b/init/main.c
+index dac44a9..4cb47a1 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -657,9 +657,9 @@ asmlinkage void __init start_kernel(void)
+ 	proc_caches_init();
+ 	buffer_init();
+ 	key_init();
++	radix_tree_init();
+ 	security_init();
+ 	vfs_caches_init(totalram_pages);
+-	radix_tree_init();
+ 	signals_init();
+ 	/* rootfs populating might need page-writeback */
+ 	page_writeback_init();
+diff --git a/security/integrity/ima/ima.h b/security/integrity/ima/ima.h
+index c41afe6..47fb65d 100644
+--- a/security/integrity/ima/ima.h
++++ b/security/integrity/ima/ima.h
+@@ -65,7 +65,6 @@ void integrity_audit_msg(int audit_msgno, struct inode *inode,
+ 			 const char *cause, int result, int info);
+ 
+ /* Internal IMA function definitions */
+-void ima_iintcache_init(void);
+ int ima_init(void);
+ void ima_cleanup(void);
+ int ima_fs_init(void);
+@@ -131,7 +130,7 @@ void iint_free(struct kref *kref);
+ void iint_rcu_free(struct rcu_head *rcu);
+ 
+ /* IMA policy related functions */
+-enum ima_hooks { PATH_CHECK = 1, FILE_MMAP, BPRM_CHECK };
++enum ima_hooks { FILE_CHECK = 1, FILE_MMAP, BPRM_CHECK };
+ 
+ int ima_match_policy(struct inode *inode, enum ima_hooks func, int mask);
+ void ima_init_policy(void);
+diff --git a/security/integrity/ima/ima_api.c b/security/integrity/ima/ima_api.c
+index 3cd58b6..2a5e0bc 100644
+--- a/security/integrity/ima/ima_api.c
++++ b/security/integrity/ima/ima_api.c
+@@ -95,12 +95,12 @@ err_out:
+  * ima_must_measure - measure decision based on policy.
+  * @inode: pointer to inode to measure
+  * @mask: contains the permission mask (MAY_READ, MAY_WRITE, MAY_EXECUTE)
+- * @function: calling function (PATH_CHECK, BPRM_CHECK, FILE_MMAP)
++ * @function: calling function (FILE_CHECK, BPRM_CHECK, FILE_MMAP)
+  *
+  * The policy is defined in terms of keypairs:
+  * 		subj=, obj=, type=, func=, mask=, fsmagic=
+  *	subj,obj, and type: are LSM specific.
+- * 	func: PATH_CHECK | BPRM_CHECK | FILE_MMAP
++ * 	func: FILE_CHECK | BPRM_CHECK | FILE_MMAP
+  * 	mask: contains the permission mask
+  *	fsmagic: hex value
+  *
+diff --git a/security/integrity/ima/ima_iint.c b/security/integrity/ima/ima_iint.c
+index fa592ff..0d83edc 100644
+--- a/security/integrity/ima/ima_iint.c
++++ b/security/integrity/ima/ima_iint.c
+@@ -52,9 +52,6 @@ int ima_inode_alloc(struct inode *inode)
+ 	struct ima_iint_cache *iint = NULL;
+ 	int rc = 0;
+ 
+-	if (!ima_initialized)
+-		return 0;
+-
+ 	iint = kmem_cache_alloc(iint_cache, GFP_NOFS);
+ 	if (!iint)
+ 		return -ENOMEM;
+@@ -118,8 +115,6 @@ void ima_inode_free(struct inode *inode)
+ {
+ 	struct ima_iint_cache *iint;
+ 
+-	if (!ima_initialized)
+-		return;
+ 	spin_lock(&ima_iint_lock);
+ 	iint = radix_tree_delete(&ima_iint_store, (unsigned long)inode);
+ 	spin_unlock(&ima_iint_lock);
+@@ -141,9 +136,11 @@ static void init_once(void *foo)
+ 	kref_set(&iint->refcount, 1);
+ }
+ 
+-void __init ima_iintcache_init(void)
++static int __init ima_iintcache_init(void)
+ {
+ 	iint_cache =
+ 	    kmem_cache_create("iint_cache", sizeof(struct ima_iint_cache), 0,
+ 			      SLAB_PANIC, init_once);
++	return 0;
+ }
++security_initcall(ima_iintcache_init);
+diff --git a/security/integrity/ima/ima_main.c b/security/integrity/ima/ima_main.c
+index a89f44d..294b005 100644
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -14,7 +14,7 @@
+  *
+  * File: ima_main.c
+  *	implements the IMA hooks: ima_bprm_check, ima_file_mmap,
+- *	and ima_path_check.
++ *	and ima_file_check.
+  */
+ #include <linux/module.h>
+ #include <linux/file.h>
+@@ -84,6 +84,36 @@ out:
+ 	return found;
+ }
+ 
++/* ima_read_write_check - reflect possible reading/writing errors in the PCR.
++ *
++ * When opening a file for read, if the file is already open for write,
++ * the file could change, resulting in a file measurement error.
++ *
++ * Opening a file for write, if the file is already open for read, results
++ * in a time of measure, time of use (ToMToU) error.
++ *
++ * In either case invalidate the PCR.
++ */
++enum iint_pcr_error { TOMTOU, OPEN_WRITERS };
++static void ima_read_write_check(enum iint_pcr_error error,
++				 struct ima_iint_cache *iint,
++				 struct inode *inode,
++				 const unsigned char *filename)
++{
++	switch (error) {
++	case TOMTOU:
++		if (iint->readcount > 0)
++			ima_add_violation(inode, filename, "invalid_pcr",
++					  "ToMToU");
++		break;
++	case OPEN_WRITERS:
++		if (iint->writecount > 0)
++			ima_add_violation(inode, filename, "invalid_pcr",
++					  "open_writers");
++		break;
++	}
++}
++
+ /*
+  * Update the counts given an fmode_t
+  */
+@@ -99,6 +129,47 @@ static void ima_inc_counts(struct ima_iint_cache *iint, fmode_t mode)
+ }
+ 
+ /*
++ * ima_counts_get - increment file counts
++ *
++ * Maintain read/write counters for all files, but only
++ * invalidate the PCR for measured files:
++ * 	- Opening a file for write when already open for read,
++ *	  results in a time of measure, time of use (ToMToU) error.
++ *	- Opening a file for read when already open for write,
++ * 	  could result in a file measurement error.
++ *
++ */
++void ima_counts_get(struct file *file)
++{
++	struct dentry *dentry = file->f_path.dentry;
++	struct inode *inode = dentry->d_inode;
++	fmode_t mode = file->f_mode;
++	struct ima_iint_cache *iint;
++	int rc;
++
++	if (!ima_initialized || !S_ISREG(inode->i_mode))
++		return;
++	iint = ima_iint_find_get(inode);
++	if (!iint)
++		return;
++	mutex_lock(&iint->mutex);
++	rc = ima_must_measure(iint, inode, MAY_READ, FILE_CHECK);
++	if (rc < 0)
++		goto out;
++
++	if (mode & FMODE_WRITE) {
++		ima_read_write_check(TOMTOU, iint, inode, dentry->d_name.name);
++		goto out;
++	}
++	ima_read_write_check(OPEN_WRITERS, iint, inode, dentry->d_name.name);
++out:
++	ima_inc_counts(iint, file->f_mode);
++	mutex_unlock(&iint->mutex);
++
++	kref_put(&iint->refcount, iint_free);
++}
++
++/*
+  * Decrement ima counts
+  */
+ static void ima_dec_counts(struct ima_iint_cache *iint, struct inode *inode,
+@@ -153,123 +224,6 @@ void ima_file_free(struct file *file)
+ 	kref_put(&iint->refcount, iint_free);
+ }
+ 
+-/* ima_read_write_check - reflect possible reading/writing errors in the PCR.
+- *
+- * When opening a file for read, if the file is already open for write,
+- * the file could change, resulting in a file measurement error.
+- *
+- * Opening a file for write, if the file is already open for read, results
+- * in a time of measure, time of use (ToMToU) error.
+- *
+- * In either case invalidate the PCR.
+- */
+-enum iint_pcr_error { TOMTOU, OPEN_WRITERS };
+-static void ima_read_write_check(enum iint_pcr_error error,
+-				 struct ima_iint_cache *iint,
+-				 struct inode *inode,
+-				 const unsigned char *filename)
+-{
+-	switch (error) {
+-	case TOMTOU:
+-		if (iint->readcount > 0)
+-			ima_add_violation(inode, filename, "invalid_pcr",
+-					  "ToMToU");
+-		break;
+-	case OPEN_WRITERS:
+-		if (iint->writecount > 0)
+-			ima_add_violation(inode, filename, "invalid_pcr",
+-					  "open_writers");
+-		break;
+-	}
+-}
+-
+-static int get_path_measurement(struct ima_iint_cache *iint, struct file *file,
+-				const unsigned char *filename)
+-{
+-	int rc = 0;
+-
+-	ima_inc_counts(iint, file->f_mode);
+-
+-	rc = ima_collect_measurement(iint, file);
+-	if (!rc)
+-		ima_store_measurement(iint, file, filename);
+-	return rc;
+-}
+-
+-/**
+- * ima_path_check - based on policy, collect/store measurement.
+- * @path: contains a pointer to the path to be measured
+- * @mask: contains MAY_READ, MAY_WRITE or MAY_EXECUTE
+- *
+- * Measure the file being open for readonly, based on the
+- * ima_must_measure() policy decision.
+- *
+- * Keep read/write counters for all files, but only
+- * invalidate the PCR for measured files:
+- * 	- Opening a file for write when already open for read,
+- *	  results in a time of measure, time of use (ToMToU) error.
+- *	- Opening a file for read when already open for write,
+- * 	  could result in a file measurement error.
+- *
+- * Always return 0 and audit dentry_open failures.
+- * (Return code will be based upon measurement appraisal.)
+- */
+-int ima_path_check(struct path *path, int mask)
+-{
+-	struct inode *inode = path->dentry->d_inode;
+-	struct ima_iint_cache *iint;
+-	struct file *file = NULL;
+-	int rc;
+-
+-	if (!ima_initialized || !S_ISREG(inode->i_mode))
+-		return 0;
+-	iint = ima_iint_find_get(inode);
+-	if (!iint)
+-		return 0;
+-
+-	mutex_lock(&iint->mutex);
+-
+-	rc = ima_must_measure(iint, inode, MAY_READ, PATH_CHECK);
+-	if (rc < 0)
+-		goto out;
+-
+-	if ((mask & MAY_WRITE) || (mask == 0))
+-		ima_read_write_check(TOMTOU, iint, inode,
+-				     path->dentry->d_name.name);
+-
+-	if ((mask & (MAY_WRITE | MAY_READ | MAY_EXEC)) != MAY_READ)
+-		goto out;
+-
+-	ima_read_write_check(OPEN_WRITERS, iint, inode,
+-			     path->dentry->d_name.name);
+-	if (!(iint->flags & IMA_MEASURED)) {
+-		struct dentry *dentry = dget(path->dentry);
+-		struct vfsmount *mnt = mntget(path->mnt);
+-
+-		file = dentry_open(dentry, mnt, O_RDONLY | O_LARGEFILE,
+-				   current_cred());
+-		if (IS_ERR(file)) {
+-			int audit_info = 0;
+-
+-			integrity_audit_msg(AUDIT_INTEGRITY_PCR, inode,
+-					    dentry->d_name.name,
+-					    "add_measurement",
+-					    "dentry_open failed",
+-					    1, audit_info);
+-			file = NULL;
+-			goto out;
+-		}
+-		rc = get_path_measurement(iint, file, dentry->d_name.name);
+-	}
+-out:
+-	mutex_unlock(&iint->mutex);
+-	if (file)
+-		fput(file);
+-	kref_put(&iint->refcount, iint_free);
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(ima_path_check);
+-
+ static int process_measurement(struct file *file, const unsigned char *filename,
+ 			       int mask, int function)
+ {
+@@ -297,33 +251,6 @@ out:
+ 	return rc;
+ }
+ 
+-/*
+- * ima_counts_get - increment file counts
+- *
+- * - for IPC shm and shmat file.
+- * - for nfsd exported files.
+- *
+- * Increment the counts for these files to prevent unnecessary
+- * imbalance messages.
+- */
+-void ima_counts_get(struct file *file)
+-{
+-	struct inode *inode = file->f_dentry->d_inode;
+-	struct ima_iint_cache *iint;
+-
+-	if (!ima_initialized || !S_ISREG(inode->i_mode))
+-		return;
+-	iint = ima_iint_find_get(inode);
+-	if (!iint)
+-		return;
+-	mutex_lock(&iint->mutex);
+-	ima_inc_counts(iint, file->f_mode);
+-	mutex_unlock(&iint->mutex);
+-
+-	kref_put(&iint->refcount, iint_free);
+-}
+-EXPORT_SYMBOL_GPL(ima_counts_get);
+-
+ /**
+  * ima_file_mmap - based on policy, collect/store measurement.
+  * @file: pointer to the file to be measured (May be NULL)
+@@ -369,11 +296,31 @@ int ima_bprm_check(struct linux_binprm *bprm)
+ 	return 0;
+ }
+ 
++/**
++ * ima_path_check - based on policy, collect/store measurement.
++ * @file: pointer to the file to be measured
++ * @mask: contains MAY_READ, MAY_WRITE or MAY_EXECUTE
++ *
++ * Measure files based on the ima_must_measure() policy decision.
++ *
++ * Always return 0 and audit dentry_open failures.
++ * (Return code will be based upon measurement appraisal.)
++ */
++int ima_file_check(struct file *file, int mask)
++{
++	int rc;
++
++	rc = process_measurement(file, file->f_dentry->d_name.name,
++				 mask & (MAY_READ | MAY_WRITE | MAY_EXEC),
++				 FILE_CHECK);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(ima_file_check);
++
+ static int __init init_ima(void)
+ {
+ 	int error;
+ 
+-	ima_iintcache_init();
+ 	error = ima_init();
+ 	ima_initialized = 1;
+ 	return error;
+diff --git a/security/integrity/ima/ima_policy.c b/security/integrity/ima/ima_policy.c
+index e127839..4759d0f 100644
+--- a/security/integrity/ima/ima_policy.c
++++ b/security/integrity/ima/ima_policy.c
+@@ -67,7 +67,7 @@ static struct ima_measure_rule_entry default_rules[] = {
+ 	 .flags = IMA_FUNC | IMA_MASK},
+ 	{.action = MEASURE,.func = BPRM_CHECK,.mask = MAY_EXEC,
+ 	 .flags = IMA_FUNC | IMA_MASK},
+-	{.action = MEASURE,.func = PATH_CHECK,.mask = MAY_READ,.uid = 0,
++	{.action = MEASURE,.func = FILE_CHECK,.mask = MAY_READ,.uid = 0,
+ 	 .flags = IMA_FUNC | IMA_MASK | IMA_UID},
+ };
+ 
+@@ -282,8 +282,11 @@ static int ima_parse_rule(char *rule, struct ima_measure_rule_entry *entry)
+ 			break;
+ 		case Opt_func:
+ 			audit_log_format(ab, "func=%s ", args[0].from);
+-			if (strcmp(args[0].from, "PATH_CHECK") == 0)
+-				entry->func = PATH_CHECK;
++			if (strcmp(args[0].from, "FILE_CHECK") == 0)
++				entry->func = FILE_CHECK;
++			/* PATH_CHECK is for backwards compat */
++			else if (strcmp(args[0].from, "PATH_CHECK") == 0)
++				entry->func = FILE_CHECK;
+ 			else if (strcmp(args[0].from, "FILE_MMAP") == 0)
+ 				entry->func = FILE_MMAP;
+ 			else if (strcmp(args[0].from, "BPRM_CHECK") == 0)
+diff --git a/security/security.c b/security/security.c
+index 24e060b..122b748 100644
+--- a/security/security.c
++++ b/security/security.c
+@@ -666,8 +666,6 @@ int security_file_alloc(struct file *file)
+ void security_file_free(struct file *file)
+ {
+ 	security_ops->file_free_security(file);
+-	if (file->f_dentry)
+-		ima_file_free(file);
+ }
+ 
+ int security_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
