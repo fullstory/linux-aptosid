@@ -147,6 +147,7 @@ class Gencontrol(object):
 
         self.do_arch_setup(vars, makeflags, arch, extra)
         self.do_arch_makefile(makefile, arch, makeflags, extra)
+        self.do_arch_packages(packages, makefile, arch, vars, makeflags, extra)
         self.do_arch_recurse(packages, makefile, arch, vars, makeflags, extra)
 
     def do_arch_setup(self, vars, makeflags, arch, extra):
@@ -161,6 +162,9 @@ class Gencontrol(object):
             target3 = '_'.join((target2, 'real'))
             makefile.add(target1, [target2])
             makefile.add(target2, [target3])
+
+    def do_arch_packages(self, packages, makefile, arch, vars, makeflags, extra):
+        pass
 
     def do_arch_recurse(self, packages, makefile, arch, vars, makeflags, extra):
         for featureset in self.config['base', arch].get('featuresets', ()):
@@ -177,6 +181,7 @@ class Gencontrol(object):
 
         self.do_featureset_setup(vars, makeflags, arch, featureset, extra)
         self.do_featureset_makefile(makefile, arch, featureset, makeflags, extra)
+        self.do_featureset_packages(packages, makefile, arch, featureset, vars, makeflags, extra)
         self.do_featureset_recurse(packages, makefile, arch, featureset, vars, makeflags, extra)
 
     def do_featureset_setup(self, vars, makeflags, arch, featureset, extra):
@@ -192,15 +197,15 @@ class Gencontrol(object):
             makefile.add(target1, [target2])
             makefile.add(target2, [target3])
 
+    def do_featureset_packages(self, packages, makefile, arch, featureset, vars, makeflags, extra):
+        pass
+
     def do_featureset_recurse(self, packages, makefile, arch, featureset, vars, makeflags, extra):
         for flavour in self.config['base', arch, featureset]['flavours']:
             self.do_flavour(packages, makefile, arch, featureset, flavour, vars.copy(), makeflags.copy(), extra)
 
     def do_flavour(self, packages, makefile, arch, featureset, flavour, vars, makeflags, extra):
         config_base = self.config.merge('base', arch, featureset, flavour)
-
-        vars['class'] = config_base['class']
-        vars['longclass'] = config_base.get('longclass') or vars['class']
 
         vars['localversion'] += '-' + flavour
 
@@ -235,6 +240,8 @@ class Gencontrol(object):
         for groups in dep:
             for item in groups:
                 item.name = self.substitute(item.name, vars)
+                if item.version:
+                    item.version = self.substitute(item.version, vars)
         return dep
 
     def process_description(self, in_desc, vars):

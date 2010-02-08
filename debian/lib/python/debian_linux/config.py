@@ -112,9 +112,12 @@ class ConfigCoreHierarchy(ConfigCore):
             'flavours': SchemaItemList(),
             'modules': SchemaItemBoolean(),
         },
+        'build': {},
+        'description': {
+            'parts': SchemaItemList(),
+        },
         'image': {
             'configs': SchemaItemList(),
-            'desc-parts': SchemaItemList(),
             'initramfs': SchemaItemBoolean(),
             'initramfs-generators': SchemaItemList(),
         },

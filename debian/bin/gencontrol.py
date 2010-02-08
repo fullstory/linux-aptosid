@@ -38,14 +38,46 @@ class Gencontrol(Base):
         ):
             makeflags[i[1]] = data[i[0]]
 
+    def do_arch_packages(self, packages, makefile, arch, vars, makeflags, extra):
+        return
+        headers_arch = self.templates["control.headers.arch"]
+        packages_headers_arch = self.process_packages(headers_arch, vars)
+
+        libc_dev = self.templates["control.libc-dev"]
+        packages_headers_arch[0:0] = self.process_packages(libc_dev, {})
+        
+        extra['headers_arch_depends'] = packages_headers_arch[-1]['Depends'] = PackageRelation()
+
+        self.merge_packages(packages, packages_headers_arch, arch)
+
+        cmds_binary_arch = ["$(MAKE) -f debian/rules.real binary-arch-arch %s" % makeflags]
+        cmds_source = ["$(MAKE) -f debian/rules.real source-arch %s" % makeflags]
+        makefile.add('binary-arch_%s_real' % arch, cmds = cmds_binary_arch)
+        makefile.add('source_%s_real' % arch, cmds = cmds_source)
+
     def do_featureset_setup(self, vars, makeflags, arch, featureset, extra):
         config_base = self.config.merge('base', arch, featureset)
-        makeflags['KERNEL_HEADER_DIRS'] = config_base.get('kernel-header-dirs', config_base.get('kernel-arch'))
         makeflags['LOCALVERSION_HEADERS'] = vars['localversion_headers'] = vars['localversion']
+
+    def do_featureset_packages(self, packages, makefile, arch, featureset, vars, makeflags, extra):
+        return
+        headers_featureset = self.templates["control.headers.featureset"]
+        package_headers = self.process_package(headers_featureset[0], vars)
+
+        self.merge_packages(packages, (package_headers,), arch)
+
+        cmds_binary_arch = ["$(MAKE) -f debian/rules.real binary-arch-featureset %s" % makeflags]
+        cmds_source = ["$(MAKE) -f debian/rules.real source-featureset %s" % makeflags]
+        makefile.add('binary-arch_%s_%s_real' % (arch, featureset), cmds = cmds_binary_arch)
+        makefile.add('source_%s_%s_real' % (arch, featureset), cmds = cmds_source)
 
     def do_flavour_setup(self, vars, makeflags, arch, featureset, flavour, extra):
         config_base = self.config.merge('base', arch, featureset, flavour)
+        config_description = self.config.merge('description', arch, featureset, flavour)
         config_image = self.config.merge('image', arch, featureset, flavour)
+
+        vars['class'] = config_description['hardware']
+        vars['longclass'] = config_description.get('hardware-long') or vars['class']
 
         vars['localversion-image'] = vars['localversion']
         override_localversion = config_image.get('override-localversion', None)
@@ -78,6 +110,7 @@ class Gencontrol(Base):
         headers = self.templates["control.headers"]
 
         config_entry_base = self.config.merge('base', arch, featureset, flavour)
+        config_entry_description = self.config.merge('description', arch, featureset, flavour)
         config_entry_image = self.config.merge('image', arch, featureset, flavour)
         config_entry_relations = self.config.merge('relations', arch, featureset, flavour)
 
@@ -91,7 +124,7 @@ class Gencontrol(Base):
 
         image_fields = {'Description': PackageDescription()}
         for field in 'Depends', 'Provides', 'Suggests', 'Recommends', 'Conflicts':
-            image_fields[field] = PackageRelation(config_entry_image.get(field.lower(), None))
+            image_fields[field] = PackageRelation(config_entry_image.get(field.lower(), None), override_arches=(arch,))
 
         if config_entry_image.get('initramfs', True):
             generators = config_entry_image['initramfs-generators']
@@ -108,12 +141,12 @@ class Gencontrol(Base):
                     image_fields['Conflicts'].append(PackageRelationGroup([a]))
             image_fields['Depends'].append(l_depends)
 
-        desc_parts = self.config.get_merge('image', arch, featureset, flavour, 'desc-parts')
+        desc_parts = self.config.get_merge('description', arch, featureset, flavour, 'parts')
         if desc_parts:
             desc = image_fields['Description']
             for part in desc_parts[::-1]:
-                desc.append(config_entry_image['desc-long-part-' + part])
-                desc.append_short(config_entry_image.get('desc-short-part-' + part, ''))
+                desc.append(config_entry_description['part-long-' + part])
+                desc.append_short(config_entry_description.get('part-short-' + part, ''))
 
         packages_dummy = []
         packages_own = []
@@ -139,6 +172,7 @@ class Gencontrol(Base):
         else:
             build_modules = True
             image = self.templates["control.image.type-%s" % config_entry_image['type']]
+            #image = self.templates["control.image.type-modulesinline"]
 
         vars.setdefault('desc', None)
 
@@ -148,16 +182,11 @@ class Gencontrol(Base):
         if build_modules:
             makeflags['MODULES'] = True
             package_headers = self.process_package(headers[0], vars)
+            package_headers['Depends'].extend(relations_compiler)
             packages_own.append(package_headers)
+            #sidux#extra['headers_arch_depends'].append('%s (= ${binary:Version})' % packages_own[-1]['Package'])
 
-        for package in packages_own + packages_dummy:
-            name = package['Package']
-            if packages.has_key(name):
-                package = packages.get(name)
-                package['Architecture'].append(arch)
-            else:
-                package['Architecture'] = [arch]
-                packages.append(package)
+        self.merge_packages(packages, packages_own + packages_dummy, arch)
 
         if config_entry_image['type'] == 'plain-xen':
             for i in ('postinst', 'postrm', 'prerm'):
@@ -206,7 +235,7 @@ class Gencontrol(Base):
         kconfig.extend(check_config("%s/%s/config.%s" % (arch, featureset, flavour), False, arch, featureset, flavour))
         makeflags['KCONFIG'] = ' '.join(kconfig)
 
-	cmds_binary_arch = ["$(MAKE) -f debian/rules.real binary-arch-flavour %s" % makeflags]
+        cmds_binary_arch = ["$(MAKE) -f debian/rules.real binary-arch-flavour %s" % makeflags]
         if packages_dummy:
             cmds_binary_arch.append("$(MAKE) -f debian/rules.real install-dummy DH_OPTIONS='%s' %s" % (' '.join(["-p%s" % i['Package'] for i in packages_dummy]), makeflags))
         cmds_build = ["$(MAKE) -f debian/rules.real build %s" % makeflags]
@@ -214,6 +243,40 @@ class Gencontrol(Base):
         makefile.add('binary-arch_%s_%s_%s_real' % (arch, featureset, flavour), cmds = cmds_binary_arch)
         makefile.add('build_%s_%s_%s_real' % (arch, featureset, flavour), cmds = cmds_build)
         makefile.add('setup_%s_%s_%s_real' % (arch, featureset, flavour), cmds = cmds_setup)
+
+    def do_extra(self, packages, makefile):
+        return
+        apply = self.templates['patch.apply']
+
+        vars = {
+            'revisions': 'orig base ' + ' '.join([i.revision for i in self.versions[::-1]]),
+            'upstream': self.version.upstream,
+            'linux_upstream': self.version.linux_upstream,
+            'abiname': self.abiname,
+        }
+
+        apply = self.substitute(apply, vars)
+
+        file('debian/bin/patch.apply', 'w').write(apply)
+
+    def merge_packages(self, packages, new, arch):
+        for new_package in new:
+            name = new_package['Package']
+            if name in packages:
+                package = packages.get(name)
+                package['Architecture'].append(arch)
+
+                for field in 'Depends', 'Provides', 'Suggests', 'Recommends', 'Conflicts':
+                    if field in new_package:
+                        if field in package:
+                            v = package[field]
+                            v.extend(new_package[field])
+                        else:
+                            package[field] = new_package[field]
+
+            else:
+                new_package['Architecture'] = [arch]
+                packages.append(new_package)
 
     def process_changelog(self):
         act_upstream = self.changelog[0].version.linux_upstream
