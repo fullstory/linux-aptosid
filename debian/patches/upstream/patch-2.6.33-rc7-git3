@@ -1,0 +1,2253 @@
+diff --git a/Documentation/ABI/testing/ima_policy b/Documentation/ABI/testing/ima_policy
+index 6434f0d..6cd6dae 100644
+--- a/Documentation/ABI/testing/ima_policy
++++ b/Documentation/ABI/testing/ima_policy
+@@ -20,7 +20,7 @@ Description:
+ 			lsm:	[[subj_user=] [subj_role=] [subj_type=]
+ 				 [obj_user=] [obj_role=] [obj_type=]]
+ 
+-		base: 	func:= [BPRM_CHECK][FILE_MMAP][INODE_PERMISSION]
++		base: 	func:= [BPRM_CHECK][FILE_MMAP][FILE_CHECK]
+ 			mask:= [MAY_READ] [MAY_WRITE] [MAY_APPEND] [MAY_EXEC]
+ 			fsmagic:= hex value
+ 			uid:= decimal value
+@@ -40,11 +40,11 @@ Description:
+ 
+ 			measure func=BPRM_CHECK
+ 			measure func=FILE_MMAP mask=MAY_EXEC
+-			measure func=INODE_PERM mask=MAY_READ uid=0
++			measure func=FILE_CHECK mask=MAY_READ uid=0
+ 
+ 		The default policy measures all executables in bprm_check,
+ 		all files mmapped executable in file_mmap, and all files
+-		open for read by root in inode_permission.
++		open for read by root in do_filp_open.
+ 
+ 		Examples of LSM specific definitions:
+ 
+@@ -54,8 +54,8 @@ Description:
+ 
+ 			dont_measure obj_type=var_log_t
+ 			dont_measure obj_type=auditd_log_t
+-			measure subj_user=system_u func=INODE_PERM mask=MAY_READ
+-			measure subj_role=system_r func=INODE_PERM mask=MAY_READ
++			measure subj_user=system_u func=FILE_CHECK mask=MAY_READ
++			measure subj_role=system_r func=FILE_CHECK mask=MAY_READ
+ 
+ 		Smack:
+-			measure subj_user=_ func=INODE_PERM mask=MAY_READ
++			measure subj_user=_ func=FILE_CHECK mask=MAY_READ
+diff --git a/Documentation/cpu-freq/governors.txt b/Documentation/cpu-freq/governors.txt
+index aed082f..737988f 100644
+--- a/Documentation/cpu-freq/governors.txt
++++ b/Documentation/cpu-freq/governors.txt
+@@ -145,8 +145,8 @@ show_sampling_rate_max: THIS INTERFACE IS DEPRECATED, DON'T USE IT.
+ up_threshold: defines what the average CPU usage between the samplings
+ of 'sampling_rate' needs to be for the kernel to make a decision on
+ whether it should increase the frequency.  For example when it is set
+-to its default value of '80' it means that between the checking
+-intervals the CPU needs to be on average more than 80% in use to then
++to its default value of '95' it means that between the checking
++intervals the CPU needs to be on average more than 95% in use to then
+ decide that the CPU frequency needs to be increased.  
+ 
+ ignore_nice_load: this parameter takes a value of '0' or '1'. When
+diff --git a/Makefile b/Makefile
+index f8e02e9..634c205 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 33
+-EXTRAVERSION = -rc7
++EXTRAVERSION = -rc7-git3
+ NAME = Man-Eating Seals of Antiquity
+ 
+ # *DOCUMENTATION*
+diff --git a/arch/microblaze/kernel/setup.c b/arch/microblaze/kernel/setup.c
+index 5372b24..bb8c4b9 100644
+--- a/arch/microblaze/kernel/setup.c
++++ b/arch/microblaze/kernel/setup.c
+@@ -54,6 +54,7 @@ void __init setup_arch(char **cmdline_p)
+ 
+ 	microblaze_cache_init();
+ 
++	invalidate_dcache();
+ 	enable_dcache();
+ 
+ 	invalidate_icache();
+diff --git a/arch/powerpc/platforms/pseries/xics.c b/arch/powerpc/platforms/pseries/xics.c
+index 1ee66db..f5f7919 100644
+--- a/arch/powerpc/platforms/pseries/xics.c
++++ b/arch/powerpc/platforms/pseries/xics.c
+@@ -784,9 +784,13 @@ static void xics_set_cpu_priority(unsigned char cppr)
+ {
+ 	struct xics_cppr *os_cppr = &__get_cpu_var(xics_cppr);
+ 
+-	BUG_ON(os_cppr->index != 0);
++	/*
++	 * we only really want to set the priority when there's
++	 * just one cppr value on the stack
++	 */
++	WARN_ON(os_cppr->index != 0);
+ 
+-	os_cppr->stack[os_cppr->index] = cppr;
++	os_cppr->stack[0] = cppr;
+ 
+ 	if (firmware_has_feature(FW_FEATURE_LPAR))
+ 		lpar_cppr_info(cppr);
+@@ -821,8 +825,14 @@ void xics_setup_cpu(void)
+ 
+ void xics_teardown_cpu(void)
+ {
++	struct xics_cppr *os_cppr = &__get_cpu_var(xics_cppr);
+ 	int cpu = smp_processor_id();
+ 
++	/*
++	 * we have to reset the cppr index to 0 because we're
++	 * not going to return from the IPI
++	 */
++	os_cppr->index = 0;
+ 	xics_set_cpu_priority(0);
+ 
+ 	/* Clear any pending IPI request */
+diff --git a/arch/sh/kernel/cpu/sh3/entry.S b/arch/sh/kernel/cpu/sh3/entry.S
+index 3f7e2a2..f6a389c 100644
+--- a/arch/sh/kernel/cpu/sh3/entry.S
++++ b/arch/sh/kernel/cpu/sh3/entry.S
+@@ -132,7 +132,6 @@ ENTRY(tlb_protection_violation_store)
+ 	 mov	#1, r5
+ 
+ call_handle_tlbmiss:
+-	setup_frame_reg
+ 	mov.l	1f, r0
+ 	mov	r5, r8
+ 	mov.l	@r0, r6
+@@ -365,6 +364,8 @@ handle_exception:
+ 	 mov.l	@k2, k2		! read out vector and keep in k2
+ 
+ handle_exception_special:
++	setup_frame_reg
++
+ 	! Setup return address and jump to exception handler
+ 	mov.l	7f, r9		! fetch return address
+ 	stc	r2_bank, r0	! k2 (vector)
+diff --git a/arch/sh/kernel/dwarf.c b/arch/sh/kernel/dwarf.c
+index 88d28ec..e511680 100644
+--- a/arch/sh/kernel/dwarf.c
++++ b/arch/sh/kernel/dwarf.c
+@@ -540,6 +540,8 @@ void dwarf_free_frame(struct dwarf_frame *frame)
+ 	mempool_free(frame, dwarf_frame_pool);
+ }
+ 
++extern void ret_from_irq(void);
++
+ /**
+  *	dwarf_unwind_stack - unwind the stack
+  *
+@@ -678,6 +680,24 @@ struct dwarf_frame * dwarf_unwind_stack(unsigned long pc,
+ 	addr = frame->cfa + reg->addr;
+ 	frame->return_addr = __raw_readl(addr);
+ 
++	/*
++	 * Ah, the joys of unwinding through interrupts.
++	 *
++	 * Interrupts are tricky - the DWARF info needs to be _really_
++	 * accurate and unfortunately I'm seeing a lot of bogus DWARF
++	 * info. For example, I've seen interrupts occur in epilogues
++	 * just after the frame pointer (r14) had been restored. The
++	 * problem was that the DWARF info claimed that the CFA could be
++	 * reached by using the value of the frame pointer before it was
++	 * restored.
++	 *
++	 * So until the compiler can be trusted to produce reliable
++	 * DWARF info when it really matters, let's stop unwinding once
++	 * we've calculated the function that was interrupted.
++	 */
++	if (prev && prev->pc == (unsigned long)ret_from_irq)
++		frame->return_addr = 0;
++
+ 	return frame;
+ 
+ bail:
+diff --git a/arch/sh/kernel/entry-common.S b/arch/sh/kernel/entry-common.S
+index f0abd58..2b15ae6 100644
+--- a/arch/sh/kernel/entry-common.S
++++ b/arch/sh/kernel/entry-common.S
+@@ -70,8 +70,14 @@ ret_from_exception:
+ 	CFI_STARTPROC simple
+ 	CFI_DEF_CFA r14, 0
+ 	CFI_REL_OFFSET 17, 64
+-	CFI_REL_OFFSET 15, 0
++	CFI_REL_OFFSET 15, 60
+ 	CFI_REL_OFFSET 14, 56
++	CFI_REL_OFFSET 13, 52
++	CFI_REL_OFFSET 12, 48
++	CFI_REL_OFFSET 11, 44
++	CFI_REL_OFFSET 10, 40
++	CFI_REL_OFFSET 9, 36
++	CFI_REL_OFFSET 8, 32
+ 	preempt_stop()
+ ENTRY(ret_from_irq)
+ 	!
+diff --git a/arch/x86/kernel/cpu/cpufreq/powernow-k8.c b/arch/x86/kernel/cpu/cpufreq/powernow-k8.c
+index f125e5c..6e44519 100644
+--- a/arch/x86/kernel/cpu/cpufreq/powernow-k8.c
++++ b/arch/x86/kernel/cpu/cpufreq/powernow-k8.c
+@@ -1356,6 +1356,7 @@ static int __devexit powernowk8_cpu_exit(struct cpufreq_policy *pol)
+ 
+ 	kfree(data->powernow_table);
+ 	kfree(data);
++	per_cpu(powernow_data, pol->cpu) = NULL;
+ 
+ 	return 0;
+ }
+@@ -1375,7 +1376,7 @@ static unsigned int powernowk8_get(unsigned int cpu)
+ 	int err;
+ 
+ 	if (!data)
+-		return -EINVAL;
++		return 0;
+ 
+ 	smp_call_function_single(cpu, query_values_on_cpu, &err, true);
+ 	if (err)
+diff --git a/drivers/char/tty_io.c b/drivers/char/tty_io.c
+index c6f3b48..dcb9083 100644
+--- a/drivers/char/tty_io.c
++++ b/drivers/char/tty_io.c
+@@ -1951,8 +1951,10 @@ static int tty_fasync(int fd, struct file *filp, int on)
+ 			pid = task_pid(current);
+ 			type = PIDTYPE_PID;
+ 		}
+-		retval = __f_setown(filp, pid, type, 0);
++		get_pid(pid);
+ 		spin_unlock_irqrestore(&tty->ctrl_lock, flags);
++		retval = __f_setown(filp, pid, type, 0);
++		put_pid(pid);
+ 		if (retval)
+ 			goto out;
+ 	} else {
+diff --git a/drivers/cpufreq/cpufreq_ondemand.c b/drivers/cpufreq/cpufreq_ondemand.c
+index 4b34ade..bd444dc 100644
+--- a/drivers/cpufreq/cpufreq_ondemand.c
++++ b/drivers/cpufreq/cpufreq_ondemand.c
+@@ -554,6 +554,9 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
+ 				(dbs_tuners_ins.up_threshold -
+ 				 dbs_tuners_ins.down_differential);
+ 
++		if (freq_next < policy->min)
++			freq_next = policy->min;
++
+ 		if (!dbs_tuners_ins.powersave_bias) {
+ 			__cpufreq_driver_target(policy, freq_next,
+ 					CPUFREQ_RELATION_L);
+diff --git a/drivers/media/dvb/dvb-core/dmxdev.c b/drivers/media/dvb/dvb-core/dmxdev.c
+index c37790a..9ddc579 100644
+--- a/drivers/media/dvb/dvb-core/dmxdev.c
++++ b/drivers/media/dvb/dvb-core/dmxdev.c
+@@ -761,7 +761,6 @@ static int dvb_demux_open(struct inode *inode, struct file *file)
+ 	dvb_ringbuffer_init(&dmxdevfilter->buffer, NULL, 8192);
+ 	dmxdevfilter->type = DMXDEV_TYPE_NONE;
+ 	dvb_dmxdev_filter_state_set(dmxdevfilter, DMXDEV_STATE_ALLOCATED);
+-	INIT_LIST_HEAD(&dmxdevfilter->feed.ts);
+ 	init_timer(&dmxdevfilter->timer);
+ 
+ 	dvbdev->users++;
+@@ -887,6 +886,7 @@ static int dvb_dmxdev_pes_filter_set(struct dmxdev *dmxdev,
+ 	dmxdevfilter->type = DMXDEV_TYPE_PES;
+ 	memcpy(&dmxdevfilter->params, params,
+ 	       sizeof(struct dmx_pes_filter_params));
++	INIT_LIST_HEAD(&dmxdevfilter->feed.ts);
+ 
+ 	dvb_dmxdev_filter_state_set(dmxdevfilter, DMXDEV_STATE_SET);
+ 
+diff --git a/drivers/media/dvb/dvb-core/dvb_demux.c b/drivers/media/dvb/dvb-core/dvb_demux.c
+index b78cfb7..67f189b 100644
+--- a/drivers/media/dvb/dvb-core/dvb_demux.c
++++ b/drivers/media/dvb/dvb-core/dvb_demux.c
+@@ -426,16 +426,7 @@ static void dvb_dmx_swfilter_packet(struct dvb_demux *demux, const u8 *buf)
+ 		};
+ 	};
+ 
+-	if (dvb_demux_tscheck) {
+-		if (!demux->cnt_storage)
+-			demux->cnt_storage = vmalloc(MAX_PID + 1);
+-
+-		if (!demux->cnt_storage) {
+-			printk(KERN_WARNING "Couldn't allocate memory for TS/TEI check. Disabling it\n");
+-			dvb_demux_tscheck = 0;
+-			goto no_dvb_demux_tscheck;
+-		}
+-
++	if (demux->cnt_storage) {
+ 		/* check pkt counter */
+ 		if (pid < MAX_PID) {
+ 			if (buf[1] & 0x80)
+@@ -454,7 +445,6 @@ static void dvb_dmx_swfilter_packet(struct dvb_demux *demux, const u8 *buf)
+ 		};
+ 		/* end check */
+ 	};
+-no_dvb_demux_tscheck:
+ 
+ 	list_for_each_entry(feed, &demux->feed_list, list_head) {
+ 		if ((feed->pid != pid) && (feed->pid != 0x2000))
+@@ -1246,6 +1236,7 @@ int dvb_dmx_init(struct dvb_demux *dvbdemux)
+ 	dvbdemux->feed = vmalloc(dvbdemux->feednum * sizeof(struct dvb_demux_feed));
+ 	if (!dvbdemux->feed) {
+ 		vfree(dvbdemux->filter);
++		dvbdemux->filter = NULL;
+ 		return -ENOMEM;
+ 	}
+ 	for (i = 0; i < dvbdemux->filternum; i++) {
+@@ -1257,6 +1248,13 @@ int dvb_dmx_init(struct dvb_demux *dvbdemux)
+ 		dvbdemux->feed[i].index = i;
+ 	}
+ 
++	if (dvb_demux_tscheck) {
++		dvbdemux->cnt_storage = vmalloc(MAX_PID + 1);
++
++		if (!dvbdemux->cnt_storage)
++			printk(KERN_WARNING "Couldn't allocate memory for TS/TEI check. Disabling it\n");
++	}
++
+ 	INIT_LIST_HEAD(&dvbdemux->frontend_list);
+ 
+ 	for (i = 0; i < DMX_TS_PES_OTHER; i++) {
+diff --git a/drivers/usb/host/r8a66597-hcd.c b/drivers/usb/host/r8a66597-hcd.c
+index 0ceec12..bee558a 100644
+--- a/drivers/usb/host/r8a66597-hcd.c
++++ b/drivers/usb/host/r8a66597-hcd.c
+@@ -35,7 +35,9 @@
+ #include <linux/usb.h>
+ #include <linux/platform_device.h>
+ #include <linux/io.h>
++#include <linux/mm.h>
+ #include <linux/irq.h>
++#include <asm/cacheflush.h>
+ 
+ #include "../core/hcd.h"
+ #include "r8a66597.h"
+@@ -820,6 +822,26 @@ static void enable_r8a66597_pipe(struct r8a66597 *r8a66597, struct urb *urb,
+ 	enable_r8a66597_pipe_dma(r8a66597, dev, pipe, urb);
+ }
+ 
++static void r8a66597_urb_done(struct r8a66597 *r8a66597, struct urb *urb,
++			      int status)
++__releases(r8a66597->lock)
++__acquires(r8a66597->lock)
++{
++	if (usb_pipein(urb->pipe) && usb_pipetype(urb->pipe) != PIPE_CONTROL) {
++		void *ptr;
++
++		for (ptr = urb->transfer_buffer;
++		     ptr < urb->transfer_buffer + urb->transfer_buffer_length;
++		     ptr += PAGE_SIZE)
++			flush_dcache_page(virt_to_page(ptr));
++	}
++
++	usb_hcd_unlink_urb_from_ep(r8a66597_to_hcd(r8a66597), urb);
++	spin_unlock(&r8a66597->lock);
++	usb_hcd_giveback_urb(r8a66597_to_hcd(r8a66597), urb, status);
++	spin_lock(&r8a66597->lock);
++}
++
+ /* this function must be called with interrupt disabled */
+ static void force_dequeue(struct r8a66597 *r8a66597, u16 pipenum, u16 address)
+ {
+@@ -838,15 +860,9 @@ static void force_dequeue(struct r8a66597 *r8a66597, u16 pipenum, u16 address)
+ 		list_del(&td->queue);
+ 		kfree(td);
+ 
+-		if (urb) {
+-			usb_hcd_unlink_urb_from_ep(r8a66597_to_hcd(r8a66597),
+-					urb);
++		if (urb)
++			r8a66597_urb_done(r8a66597, urb, -ENODEV);
+ 
+-			spin_unlock(&r8a66597->lock);
+-			usb_hcd_giveback_urb(r8a66597_to_hcd(r8a66597), urb,
+-					-ENODEV);
+-			spin_lock(&r8a66597->lock);
+-		}
+ 		break;
+ 	}
+ }
+@@ -1006,6 +1022,8 @@ static void start_root_hub_sampling(struct r8a66597 *r8a66597, int port,
+ /* this function must be called with interrupt disabled */
+ static void r8a66597_check_syssts(struct r8a66597 *r8a66597, int port,
+ 					u16 syssts)
++__releases(r8a66597->lock)
++__acquires(r8a66597->lock)
+ {
+ 	if (syssts == SE0) {
+ 		r8a66597_write(r8a66597, ~ATTCH, get_intsts_reg(port));
+@@ -1023,7 +1041,9 @@ static void r8a66597_check_syssts(struct r8a66597 *r8a66597, int port,
+ 			usb_hcd_resume_root_hub(r8a66597_to_hcd(r8a66597));
+ 	}
+ 
++	spin_unlock(&r8a66597->lock);
+ 	usb_hcd_poll_rh_status(r8a66597_to_hcd(r8a66597));
++	spin_lock(&r8a66597->lock);
+ }
+ 
+ /* this function must be called with interrupt disabled */
+@@ -1283,10 +1303,7 @@ __releases(r8a66597->lock) __acquires(r8a66597->lock)
+ 		if (usb_pipeisoc(urb->pipe))
+ 			urb->start_frame = r8a66597_get_frame(hcd);
+ 
+-		usb_hcd_unlink_urb_from_ep(r8a66597_to_hcd(r8a66597), urb);
+-		spin_unlock(&r8a66597->lock);
+-		usb_hcd_giveback_urb(hcd, urb, status);
+-		spin_lock(&r8a66597->lock);
++		r8a66597_urb_done(r8a66597, urb, status);
+ 	}
+ 
+ 	if (restart) {
+diff --git a/fs/befs/linuxvfs.c b/fs/befs/linuxvfs.c
+index 33baf27..34ddda8 100644
+--- a/fs/befs/linuxvfs.c
++++ b/fs/befs/linuxvfs.c
+@@ -873,6 +873,7 @@ befs_fill_super(struct super_block *sb, void *data, int silent)
+ 	brelse(bh);
+ 
+       unacquire_priv_sbp:
++	kfree(befs_sb->mount_opts.iocharset);
+ 	kfree(sb->s_fs_info);
+ 
+       unacquire_none:
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 73d6a73..d11d028 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -246,7 +246,8 @@ struct super_block *freeze_bdev(struct block_device *bdev)
+ 	if (!sb)
+ 		goto out;
+ 	if (sb->s_flags & MS_RDONLY) {
+-		deactivate_locked_super(sb);
++		sb->s_frozen = SB_FREEZE_TRANS;
++		up_write(&sb->s_umount);
+ 		mutex_unlock(&bdev->bd_fsfreeze_mutex);
+ 		return sb;
+ 	}
+@@ -307,7 +308,7 @@ int thaw_bdev(struct block_device *bdev, struct super_block *sb)
+ 	BUG_ON(sb->s_bdev != bdev);
+ 	down_write(&sb->s_umount);
+ 	if (sb->s_flags & MS_RDONLY)
+-		goto out_deactivate;
++		goto out_unfrozen;
+ 
+ 	if (sb->s_op->unfreeze_fs) {
+ 		error = sb->s_op->unfreeze_fs(sb);
+@@ -321,11 +322,11 @@ int thaw_bdev(struct block_device *bdev, struct super_block *sb)
+ 		}
+ 	}
+ 
++out_unfrozen:
+ 	sb->s_frozen = SB_UNFROZEN;
+ 	smp_wmb();
+ 	wake_up(&sb->s_wait_unfrozen);
+ 
+-out_deactivate:
+ 	if (sb)
+ 		deactivate_locked_super(sb);
+ out_unlock:
+diff --git a/fs/fcntl.c b/fs/fcntl.c
+index 5ef953e..97e01dc 100644
+--- a/fs/fcntl.c
++++ b/fs/fcntl.c
+@@ -199,9 +199,7 @@ static int setfl(int fd, struct file * filp, unsigned long arg)
+ static void f_modown(struct file *filp, struct pid *pid, enum pid_type type,
+                      int force)
+ {
+-	unsigned long flags;
+-
+-	write_lock_irqsave(&filp->f_owner.lock, flags);
++	write_lock_irq(&filp->f_owner.lock);
+ 	if (force || !filp->f_owner.pid) {
+ 		put_pid(filp->f_owner.pid);
+ 		filp->f_owner.pid = get_pid(pid);
+@@ -213,7 +211,7 @@ static void f_modown(struct file *filp, struct pid *pid, enum pid_type type,
+ 			filp->f_owner.euid = cred->euid;
+ 		}
+ 	}
+-	write_unlock_irqrestore(&filp->f_owner.lock, flags);
++	write_unlock_irq(&filp->f_owner.lock);
+ }
+ 
+ int __f_setown(struct file *filp, struct pid *pid, enum pid_type type,
+diff --git a/fs/file_table.c b/fs/file_table.c
+index 69652c5..b98404b 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -253,6 +253,7 @@ void __fput(struct file *file)
+ 	if (file->f_op && file->f_op->release)
+ 		file->f_op->release(inode, file);
+ 	security_file_free(file);
++	ima_file_free(file);
+ 	if (unlikely(S_ISCHR(inode->i_mode) && inode->i_cdev != NULL))
+ 		cdev_put(inode->i_cdev);
+ 	fops_put(file->f_op);
+diff --git a/fs/namei.c b/fs/namei.c
+index 94a5e60..d62fdc8 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -1736,8 +1736,7 @@ do_last:
+ 		if (nd.root.mnt)
+ 			path_put(&nd.root);
+ 		if (!IS_ERR(filp)) {
+-			error = ima_path_check(&filp->f_path, filp->f_mode &
+-				       (MAY_READ | MAY_WRITE | MAY_EXEC));
++			error = ima_file_check(filp, acc_mode);
+ 			if (error) {
+ 				fput(filp);
+ 				filp = ERR_PTR(error);
+@@ -1797,8 +1796,7 @@ ok:
+ 	}
+ 	filp = nameidata_to_filp(&nd);
+ 	if (!IS_ERR(filp)) {
+-		error = ima_path_check(&filp->f_path, filp->f_mode &
+-			       (MAY_READ | MAY_WRITE | MAY_EXEC));
++		error = ima_file_check(filp, acc_mode);
+ 		if (error) {
+ 			fput(filp);
+ 			filp = ERR_PTR(error);
+diff --git a/fs/nfsd/export.c b/fs/nfsd/export.c
+index c487810..a0c4016 100644
+--- a/fs/nfsd/export.c
++++ b/fs/nfsd/export.c
+@@ -1316,19 +1316,11 @@ rqst_exp_parent(struct svc_rqst *rqstp, struct path *path)
+ 
+ static struct svc_export *find_fsidzero_export(struct svc_rqst *rqstp)
+ {
+-	struct svc_export *exp;
+ 	u32 fsidv[2];
+ 
+ 	mk_fsid(FSID_NUM, fsidv, 0, 0, 0, NULL);
+ 
+-	exp = rqst_exp_find(rqstp, FSID_NUM, fsidv);
+-	/*
+-	 * We shouldn't have accepting an nfsv4 request at all if we
+-	 * don't have a pseudoexport!:
+-	 */
+-	if (IS_ERR(exp) && PTR_ERR(exp) == -ENOENT)
+-		exp = ERR_PTR(-ESERVERFAULT);
+-	return exp;
++	return rqst_exp_find(rqstp, FSID_NUM, fsidv);
+ }
+ 
+ /*
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index c194793..97d79ef 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -752,6 +752,7 @@ nfsd_open(struct svc_rqst *rqstp, struct svc_fh *fhp, int type,
+ 			    flags, current_cred());
+ 	if (IS_ERR(*filp))
+ 		host_err = PTR_ERR(*filp);
++	host_err = ima_file_check(*filp, access);
+ out_nfserr:
+ 	err = nfserrno(host_err);
+ out:
+@@ -2127,7 +2128,6 @@ nfsd_permission(struct svc_rqst *rqstp, struct svc_export *exp,
+ 	 */
+ 	path.mnt = exp->ex_path.mnt;
+ 	path.dentry = dentry;
+-	err = ima_path_check(&path, acc & (MAY_READ | MAY_WRITE | MAY_EXEC));
+ nfsd_out:
+ 	return err? nfserrno(err) : 0;
+ }
+diff --git a/fs/ocfs2/aops.c b/fs/ocfs2/aops.c
+index 3dae4a1..7e9df11 100644
+--- a/fs/ocfs2/aops.c
++++ b/fs/ocfs2/aops.c
+@@ -599,7 +599,7 @@ bail:
+ 	return ret;
+ }
+ 
+-/* 
++/*
+  * ocfs2_dio_end_io is called by the dio core when a dio is finished.  We're
+  * particularly interested in the aio/dio case.  Like the core uses
+  * i_alloc_sem, we use the rw_lock DLM lock to protect io on one node from
+@@ -670,7 +670,7 @@ static ssize_t ocfs2_direct_IO(int rw,
+ 
+ 	ret = blockdev_direct_IO_no_locking(rw, iocb, inode,
+ 					    inode->i_sb->s_bdev, iov, offset,
+-					    nr_segs, 
++					    nr_segs,
+ 					    ocfs2_direct_IO_get_blocks,
+ 					    ocfs2_dio_end_io);
+ 
+diff --git a/fs/ocfs2/buffer_head_io.c b/fs/ocfs2/buffer_head_io.c
+index d43d34a..21c808f 100644
+--- a/fs/ocfs2/buffer_head_io.c
++++ b/fs/ocfs2/buffer_head_io.c
+@@ -368,7 +368,7 @@ int ocfs2_read_blocks(struct ocfs2_caching_info *ci, u64 block, int nr,
+ 	}
+ 	ocfs2_metadata_cache_io_unlock(ci);
+ 
+-	mlog(ML_BH_IO, "block=(%llu), nr=(%d), cached=%s, flags=0x%x\n", 
++	mlog(ML_BH_IO, "block=(%llu), nr=(%d), cached=%s, flags=0x%x\n",
+ 	     (unsigned long long)block, nr,
+ 	     ((flags & OCFS2_BH_IGNORE_CACHE) || ignore_cache) ? "no" : "yes",
+ 	     flags);
+diff --git a/fs/ocfs2/cluster/heartbeat.c b/fs/ocfs2/cluster/heartbeat.c
+index eda5b8b..5c98900 100644
+--- a/fs/ocfs2/cluster/heartbeat.c
++++ b/fs/ocfs2/cluster/heartbeat.c
+@@ -78,7 +78,7 @@ static struct o2hb_callback *hbcall_from_type(enum o2hb_callback_type type);
+ 
+ unsigned int o2hb_dead_threshold = O2HB_DEFAULT_DEAD_THRESHOLD;
+ 
+-/* Only sets a new threshold if there are no active regions. 
++/* Only sets a new threshold if there are no active regions.
+  *
+  * No locking or otherwise interesting code is required for reading
+  * o2hb_dead_threshold as it can't change once regions are active and
+@@ -170,7 +170,7 @@ static void o2hb_write_timeout(struct work_struct *work)
+ 
+ 	mlog(ML_ERROR, "Heartbeat write timeout to device %s after %u "
+ 	     "milliseconds\n", reg->hr_dev_name,
+-	     jiffies_to_msecs(jiffies - reg->hr_last_timeout_start)); 
++	     jiffies_to_msecs(jiffies - reg->hr_last_timeout_start));
+ 	o2quo_disk_timeout();
+ }
+ 
+@@ -624,7 +624,7 @@ static int o2hb_check_slot(struct o2hb_region *reg,
+ 	     "seq %llu last %llu changed %u equal %u\n",
+ 	     slot->ds_node_num, (long long)slot->ds_last_generation,
+ 	     le32_to_cpu(hb_block->hb_cksum),
+-	     (unsigned long long)le64_to_cpu(hb_block->hb_seq), 
++	     (unsigned long long)le64_to_cpu(hb_block->hb_seq),
+ 	     (unsigned long long)slot->ds_last_time, slot->ds_changed_samples,
+ 	     slot->ds_equal_samples);
+ 
+diff --git a/fs/ocfs2/cluster/tcp.c b/fs/ocfs2/cluster/tcp.c
+index 334f231..d8d0c65 100644
+--- a/fs/ocfs2/cluster/tcp.c
++++ b/fs/ocfs2/cluster/tcp.c
+@@ -485,7 +485,7 @@ static void o2net_set_nn_state(struct o2net_node *nn,
+ 	}
+ 
+ 	if (was_valid && !valid) {
+-		printk(KERN_INFO "o2net: no longer connected to "
++		printk(KERN_NOTICE "o2net: no longer connected to "
+ 		       SC_NODEF_FMT "\n", SC_NODEF_ARGS(old_sc));
+ 		o2net_complete_nodes_nsw(nn);
+ 	}
+@@ -493,7 +493,7 @@ static void o2net_set_nn_state(struct o2net_node *nn,
+ 	if (!was_valid && valid) {
+ 		o2quo_conn_up(o2net_num_from_nn(nn));
+ 		cancel_delayed_work(&nn->nn_connect_expired);
+-		printk(KERN_INFO "o2net: %s " SC_NODEF_FMT "\n",
++		printk(KERN_NOTICE "o2net: %s " SC_NODEF_FMT "\n",
+ 		       o2nm_this_node() > sc->sc_node->nd_num ?
+ 		       		"connected to" : "accepted connection from",
+ 		       SC_NODEF_ARGS(sc));
+@@ -930,7 +930,7 @@ static void o2net_sendpage(struct o2net_sock_container *sc,
+ 			cond_resched();
+ 			continue;
+ 		}
+-		mlog(ML_ERROR, "sendpage of size %zu to " SC_NODEF_FMT 
++		mlog(ML_ERROR, "sendpage of size %zu to " SC_NODEF_FMT
+ 		     " failed with %zd\n", size, SC_NODEF_ARGS(sc), ret);
+ 		o2net_ensure_shutdown(nn, sc, 0);
+ 		break;
+@@ -1476,14 +1476,14 @@ static void o2net_idle_timer(unsigned long data)
+ 
+ 	do_gettimeofday(&now);
+ 
+-	printk(KERN_INFO "o2net: connection to " SC_NODEF_FMT " has been idle for %u.%u "
++	printk(KERN_NOTICE "o2net: connection to " SC_NODEF_FMT " has been idle for %u.%u "
+ 	     "seconds, shutting it down.\n", SC_NODEF_ARGS(sc),
+ 		     o2net_idle_timeout() / 1000,
+ 		     o2net_idle_timeout() % 1000);
+ 	mlog(ML_NOTICE, "here are some times that might help debug the "
+ 	     "situation: (tmr %ld.%ld now %ld.%ld dr %ld.%ld adv "
+ 	     "%ld.%ld:%ld.%ld func (%08x:%u) %ld.%ld:%ld.%ld)\n",
+-	     sc->sc_tv_timer.tv_sec, (long) sc->sc_tv_timer.tv_usec, 
++	     sc->sc_tv_timer.tv_sec, (long) sc->sc_tv_timer.tv_usec,
+ 	     now.tv_sec, (long) now.tv_usec,
+ 	     sc->sc_tv_data_ready.tv_sec, (long) sc->sc_tv_data_ready.tv_usec,
+ 	     sc->sc_tv_advance_start.tv_sec,
+diff --git a/fs/ocfs2/cluster/tcp_internal.h b/fs/ocfs2/cluster/tcp_internal.h
+index 8d58cfe..96fa7eb 100644
+--- a/fs/ocfs2/cluster/tcp_internal.h
++++ b/fs/ocfs2/cluster/tcp_internal.h
+@@ -32,10 +32,10 @@
+  * on their number */
+ #define O2NET_QUORUM_DELAY_MS	((o2hb_dead_threshold + 2) * O2HB_REGION_TIMEOUT_MS)
+ 
+-/* 
++/*
+  * This version number represents quite a lot, unfortunately.  It not
+  * only represents the raw network message protocol on the wire but also
+- * locking semantics of the file system using the protocol.  It should 
++ * locking semantics of the file system using the protocol.  It should
+  * be somewhere else, I'm sure, but right now it isn't.
+  *
+  * With version 11, we separate out the filesystem locking portion.  The
+diff --git a/fs/ocfs2/dlm/dlmapi.h b/fs/ocfs2/dlm/dlmapi.h
+index b5786a7..3cfa114 100644
+--- a/fs/ocfs2/dlm/dlmapi.h
++++ b/fs/ocfs2/dlm/dlmapi.h
+@@ -95,7 +95,7 @@ const char *dlm_errname(enum dlm_status err);
+ 		mlog(ML_ERROR, "dlm status = %s\n", dlm_errname((st)));	\
+ } while (0)
+ 
+-#define DLM_LKSB_UNUSED1           0x01  
++#define DLM_LKSB_UNUSED1           0x01
+ #define DLM_LKSB_PUT_LVB           0x02
+ #define DLM_LKSB_GET_LVB           0x04
+ #define DLM_LKSB_UNUSED2           0x08
+diff --git a/fs/ocfs2/dlm/dlmast.c b/fs/ocfs2/dlm/dlmast.c
+index 01cf8cc..dccc439 100644
+--- a/fs/ocfs2/dlm/dlmast.c
++++ b/fs/ocfs2/dlm/dlmast.c
+@@ -123,7 +123,7 @@ static void __dlm_queue_ast(struct dlm_ctxt *dlm, struct dlm_lock *lock)
+ 		dlm_lock_put(lock);
+ 		/* free up the reserved bast that we are cancelling.
+ 		 * guaranteed that this will not be the last reserved
+-		 * ast because *both* an ast and a bast were reserved 
++		 * ast because *both* an ast and a bast were reserved
+ 		 * to get to this point.  the res->spinlock will not be
+ 		 * taken here */
+ 		dlm_lockres_release_ast(dlm, res);
+diff --git a/fs/ocfs2/dlm/dlmconvert.c b/fs/ocfs2/dlm/dlmconvert.c
+index ca96bce..f283bce 100644
+--- a/fs/ocfs2/dlm/dlmconvert.c
++++ b/fs/ocfs2/dlm/dlmconvert.c
+@@ -396,7 +396,7 @@ static enum dlm_status dlm_send_remote_convert_request(struct dlm_ctxt *dlm,
+ 			/* instead of logging the same network error over
+ 			 * and over, sleep here and wait for the heartbeat
+ 			 * to notice the node is dead.  times out after 5s. */
+-			dlm_wait_for_node_death(dlm, res->owner, 
++			dlm_wait_for_node_death(dlm, res->owner,
+ 						DLM_NODE_DEATH_WAIT_MAX);
+ 			ret = DLM_RECOVERING;
+ 			mlog(0, "node %u died so returning DLM_RECOVERING "
+diff --git a/fs/ocfs2/dlm/dlmdebug.c b/fs/ocfs2/dlm/dlmdebug.c
+index 42b0bad..0cd24cf 100644
+--- a/fs/ocfs2/dlm/dlmdebug.c
++++ b/fs/ocfs2/dlm/dlmdebug.c
+@@ -102,7 +102,7 @@ void __dlm_print_one_lock_resource(struct dlm_lock_resource *res)
+ 	assert_spin_locked(&res->spinlock);
+ 
+ 	stringify_lockname(res->lockname.name, res->lockname.len,
+-			   buf, sizeof(buf) - 1);
++			   buf, sizeof(buf));
+ 	printk("lockres: %s, owner=%u, state=%u\n",
+ 	       buf, res->owner, res->state);
+ 	printk("  last used: %lu, refcnt: %u, on purge list: %s\n",
+diff --git a/fs/ocfs2/dlm/dlmdomain.c b/fs/ocfs2/dlm/dlmdomain.c
+index 0334000..988c905 100644
+--- a/fs/ocfs2/dlm/dlmdomain.c
++++ b/fs/ocfs2/dlm/dlmdomain.c
+@@ -816,7 +816,7 @@ static int dlm_query_join_handler(struct o2net_msg *msg, u32 len, void *data,
+ 	}
+ 
+ 	/* Once the dlm ctxt is marked as leaving then we don't want
+-	 * to be put in someone's domain map. 
++	 * to be put in someone's domain map.
+ 	 * Also, explicitly disallow joining at certain troublesome
+ 	 * times (ie. during recovery). */
+ 	if (dlm && dlm->dlm_state != DLM_CTXT_LEAVING) {
+diff --git a/fs/ocfs2/dlm/dlmlock.c b/fs/ocfs2/dlm/dlmlock.c
+index 437698e..7333377 100644
+--- a/fs/ocfs2/dlm/dlmlock.c
++++ b/fs/ocfs2/dlm/dlmlock.c
+@@ -269,7 +269,7 @@ static enum dlm_status dlmlock_remote(struct dlm_ctxt *dlm,
+ 		}
+ 		dlm_revert_pending_lock(res, lock);
+ 		dlm_lock_put(lock);
+-	} else if (dlm_is_recovery_lock(res->lockname.name, 
++	} else if (dlm_is_recovery_lock(res->lockname.name,
+ 					res->lockname.len)) {
+ 		/* special case for the $RECOVERY lock.
+ 		 * there will never be an AST delivered to put
+diff --git a/fs/ocfs2/dlm/dlmmaster.c b/fs/ocfs2/dlm/dlmmaster.c
+index 03ccf9a..a659606 100644
+--- a/fs/ocfs2/dlm/dlmmaster.c
++++ b/fs/ocfs2/dlm/dlmmaster.c
+@@ -366,7 +366,7 @@ void dlm_hb_event_notify_attached(struct dlm_ctxt *dlm, int idx, int node_up)
+ 	struct dlm_master_list_entry *mle;
+ 
+ 	assert_spin_locked(&dlm->spinlock);
+-	
++
+ 	list_for_each_entry(mle, &dlm->mle_hb_events, hb_events) {
+ 		if (node_up)
+ 			dlm_mle_node_up(dlm, mle, NULL, idx);
+@@ -833,7 +833,7 @@ lookup:
+ 		__dlm_insert_mle(dlm, mle);
+ 
+ 		/* still holding the dlm spinlock, check the recovery map
+-		 * to see if there are any nodes that still need to be 
++		 * to see if there are any nodes that still need to be
+ 		 * considered.  these will not appear in the mle nodemap
+ 		 * but they might own this lockres.  wait on them. */
+ 		bit = find_next_bit(dlm->recovery_map, O2NM_MAX_NODES, 0);
+@@ -883,7 +883,7 @@ redo_request:
+ 				msleep(500);
+ 			}
+ 			continue;
+-		} 
++		}
+ 
+ 		dlm_kick_recovery_thread(dlm);
+ 		msleep(1000);
+@@ -939,8 +939,8 @@ wait:
+ 		     res->lockname.name, blocked);
+ 		if (++tries > 20) {
+ 			mlog(ML_ERROR, "%s:%.*s: spinning on "
+-			     "dlm_wait_for_lock_mastery, blocked=%d\n", 
+-			     dlm->name, res->lockname.len, 
++			     "dlm_wait_for_lock_mastery, blocked=%d\n",
++			     dlm->name, res->lockname.len,
+ 			     res->lockname.name, blocked);
+ 			dlm_print_one_lock_resource(res);
+ 			dlm_print_one_mle(mle);
+@@ -1029,7 +1029,7 @@ recheck:
+ 		ret = dlm_restart_lock_mastery(dlm, res, mle, *blocked);
+ 		b = (mle->type == DLM_MLE_BLOCK);
+ 		if ((*blocked && !b) || (!*blocked && b)) {
+-			mlog(0, "%s:%.*s: status change: old=%d new=%d\n", 
++			mlog(0, "%s:%.*s: status change: old=%d new=%d\n",
+ 			     dlm->name, res->lockname.len, res->lockname.name,
+ 			     *blocked, b);
+ 			*blocked = b;
+@@ -1602,7 +1602,7 @@ send_response:
+ 		}
+ 		mlog(0, "%u is the owner of %.*s, cleaning everyone else\n",
+ 			     dlm->node_num, res->lockname.len, res->lockname.name);
+-		ret = dlm_dispatch_assert_master(dlm, res, 0, request->node_idx, 
++		ret = dlm_dispatch_assert_master(dlm, res, 0, request->node_idx,
+ 						 DLM_ASSERT_MASTER_MLE_CLEANUP);
+ 		if (ret < 0) {
+ 			mlog(ML_ERROR, "failed to dispatch assert master work\n");
+@@ -1701,7 +1701,7 @@ again:
+ 
+ 		if (r & DLM_ASSERT_RESPONSE_REASSERT) {
+ 			mlog(0, "%.*s: node %u create mles on other "
+-			     "nodes and requests a re-assert\n", 
++			     "nodes and requests a re-assert\n",
+ 			     namelen, lockname, to);
+ 			reassert = 1;
+ 		}
+@@ -1812,7 +1812,7 @@ int dlm_assert_master_handler(struct o2net_msg *msg, u32 len, void *data,
+ 				spin_unlock(&dlm->master_lock);
+ 				spin_unlock(&dlm->spinlock);
+ 				goto done;
+-			}	
++			}
+ 		}
+ 	}
+ 	spin_unlock(&dlm->master_lock);
+@@ -1883,7 +1883,7 @@ ok:
+ 		int extra_ref = 0;
+ 		int nn = -1;
+ 		int rr, err = 0;
+-		
++
+ 		spin_lock(&mle->spinlock);
+ 		if (mle->type == DLM_MLE_BLOCK || mle->type == DLM_MLE_MIGRATION)
+ 			extra_ref = 1;
+@@ -1891,7 +1891,7 @@ ok:
+ 			/* MASTER mle: if any bits set in the response map
+ 			 * then the calling node needs to re-assert to clear
+ 			 * up nodes that this node contacted */
+-			while ((nn = find_next_bit (mle->response_map, O2NM_MAX_NODES, 
++			while ((nn = find_next_bit (mle->response_map, O2NM_MAX_NODES,
+ 						    nn+1)) < O2NM_MAX_NODES) {
+ 				if (nn != dlm->node_num && nn != assert->node_idx)
+ 					master_request = 1;
+@@ -2002,7 +2002,7 @@ kill:
+ 	__dlm_print_one_lock_resource(res);
+ 	spin_unlock(&res->spinlock);
+ 	spin_unlock(&dlm->spinlock);
+-	*ret_data = (void *)res; 
++	*ret_data = (void *)res;
+ 	dlm_put(dlm);
+ 	return -EINVAL;
+ }
+@@ -2040,10 +2040,10 @@ int dlm_dispatch_assert_master(struct dlm_ctxt *dlm,
+ 	item->u.am.request_from = request_from;
+ 	item->u.am.flags = flags;
+ 
+-	if (ignore_higher) 
+-		mlog(0, "IGNORE HIGHER: %.*s\n", res->lockname.len, 
++	if (ignore_higher)
++		mlog(0, "IGNORE HIGHER: %.*s\n", res->lockname.len,
+ 		     res->lockname.name);
+-		
++
+ 	spin_lock(&dlm->work_lock);
+ 	list_add_tail(&item->list, &dlm->work_list);
+ 	spin_unlock(&dlm->work_lock);
+@@ -2133,7 +2133,7 @@ put:
+  * think that $RECOVERY is currently mastered by a dead node.  If so,
+  * we wait a short time to allow that node to get notified by its own
+  * heartbeat stack, then check again.  All $RECOVERY lock resources
+- * mastered by dead nodes are purged when the hearbeat callback is 
++ * mastered by dead nodes are purged when the hearbeat callback is
+  * fired, so we can know for sure that it is safe to continue once
+  * the node returns a live node or no node.  */
+ static int dlm_pre_master_reco_lockres(struct dlm_ctxt *dlm,
+@@ -2174,7 +2174,7 @@ static int dlm_pre_master_reco_lockres(struct dlm_ctxt *dlm,
+ 				ret = -EAGAIN;
+ 			}
+ 			spin_unlock(&dlm->spinlock);
+-			mlog(0, "%s: reco lock master is %u\n", dlm->name, 
++			mlog(0, "%s: reco lock master is %u\n", dlm->name,
+ 			     master);
+ 			break;
+ 		}
+@@ -2602,7 +2602,7 @@ fail:
+ 
+ 			mlog(0, "%s:%.*s: timed out during migration\n",
+ 			     dlm->name, res->lockname.len, res->lockname.name);
+-			/* avoid hang during shutdown when migrating lockres 
++			/* avoid hang during shutdown when migrating lockres
+ 			 * to a node which also goes down */
+ 			if (dlm_is_node_dead(dlm, target)) {
+ 				mlog(0, "%s:%.*s: expected migration "
+@@ -2738,7 +2738,7 @@ static int dlm_migration_can_proceed(struct dlm_ctxt *dlm,
+ 	can_proceed = !!(res->state & DLM_LOCK_RES_MIGRATING);
+ 	spin_unlock(&res->spinlock);
+ 
+-	/* target has died, so make the caller break out of the 
++	/* target has died, so make the caller break out of the
+ 	 * wait_event, but caller must recheck the domain_map */
+ 	spin_lock(&dlm->spinlock);
+ 	if (!test_bit(mig_target, dlm->domain_map))
+diff --git a/fs/ocfs2/dlm/dlmrecovery.c b/fs/ocfs2/dlm/dlmrecovery.c
+index 2f9e4e1..344bcf9 100644
+--- a/fs/ocfs2/dlm/dlmrecovery.c
++++ b/fs/ocfs2/dlm/dlmrecovery.c
+@@ -1050,7 +1050,7 @@ static void dlm_move_reco_locks_to_list(struct dlm_ctxt *dlm,
+ 				if (lock->ml.node == dead_node) {
+ 					mlog(0, "AHA! there was "
+ 					     "a $RECOVERY lock for dead "
+-					     "node %u (%s)!\n", 
++					     "node %u (%s)!\n",
+ 					     dead_node, dlm->name);
+ 					list_del_init(&lock->list);
+ 					dlm_lock_put(lock);
+@@ -1164,6 +1164,39 @@ static void dlm_init_migratable_lockres(struct dlm_migratable_lockres *mres,
+ 	mres->master = master;
+ }
+ 
++static void dlm_prepare_lvb_for_migration(struct dlm_lock *lock,
++					  struct dlm_migratable_lockres *mres,
++					  int queue)
++{
++	if (!lock->lksb)
++	       return;
++
++	/* Ignore lvb in all locks in the blocked list */
++	if (queue == DLM_BLOCKED_LIST)
++		return;
++
++	/* Only consider lvbs in locks with granted EX or PR lock levels */
++	if (lock->ml.type != LKM_EXMODE && lock->ml.type != LKM_PRMODE)
++		return;
++
++	if (dlm_lvb_is_empty(mres->lvb)) {
++		memcpy(mres->lvb, lock->lksb->lvb, DLM_LVB_LEN);
++		return;
++	}
++
++	/* Ensure the lvb copied for migration matches in other valid locks */
++	if (!memcmp(mres->lvb, lock->lksb->lvb, DLM_LVB_LEN))
++		return;
++
++	mlog(ML_ERROR, "Mismatched lvb in lock cookie=%u:%llu, name=%.*s, "
++	     "node=%u\n",
++	     dlm_get_lock_cookie_node(be64_to_cpu(lock->ml.cookie)),
++	     dlm_get_lock_cookie_seq(be64_to_cpu(lock->ml.cookie)),
++	     lock->lockres->lockname.len, lock->lockres->lockname.name,
++	     lock->ml.node);
++	dlm_print_one_lock_resource(lock->lockres);
++	BUG();
++}
+ 
+ /* returns 1 if this lock fills the network structure,
+  * 0 otherwise */
+@@ -1181,20 +1214,7 @@ static int dlm_add_lock_to_array(struct dlm_lock *lock,
+ 	ml->list = queue;
+ 	if (lock->lksb) {
+ 		ml->flags = lock->lksb->flags;
+-		/* send our current lvb */
+-		if (ml->type == LKM_EXMODE ||
+-		    ml->type == LKM_PRMODE) {
+-			/* if it is already set, this had better be a PR
+-			 * and it has to match */
+-			if (!dlm_lvb_is_empty(mres->lvb) &&
+-			    (ml->type == LKM_EXMODE ||
+-			     memcmp(mres->lvb, lock->lksb->lvb, DLM_LVB_LEN))) {
+-				mlog(ML_ERROR, "mismatched lvbs!\n");
+-				dlm_print_one_lock_resource(lock->lockres);
+-				BUG();
+-			}
+-			memcpy(mres->lvb, lock->lksb->lvb, DLM_LVB_LEN);
+-		}
++		dlm_prepare_lvb_for_migration(lock, mres, queue);
+ 	}
+ 	ml->node = lock->ml.node;
+ 	mres->num_locks++;
+@@ -1730,6 +1750,7 @@ static int dlm_process_recovery_data(struct dlm_ctxt *dlm,
+ 	struct dlm_lock *lock = NULL;
+ 	u8 from = O2NM_MAX_NODES;
+ 	unsigned int added = 0;
++	__be64 c;
+ 
+ 	mlog(0, "running %d locks for this lockres\n", mres->num_locks);
+ 	for (i=0; i<mres->num_locks; i++) {
+@@ -1777,19 +1798,48 @@ static int dlm_process_recovery_data(struct dlm_ctxt *dlm,
+ 			/* lock is always created locally first, and
+ 			 * destroyed locally last.  it must be on the list */
+ 			if (!lock) {
+-				__be64 c = ml->cookie;
+-				mlog(ML_ERROR, "could not find local lock "
+-					       "with cookie %u:%llu!\n",
++				c = ml->cookie;
++				mlog(ML_ERROR, "Could not find local lock "
++					       "with cookie %u:%llu, node %u, "
++					       "list %u, flags 0x%x, type %d, "
++					       "conv %d, highest blocked %d\n",
+ 				     dlm_get_lock_cookie_node(be64_to_cpu(c)),
+-				     dlm_get_lock_cookie_seq(be64_to_cpu(c)));
++				     dlm_get_lock_cookie_seq(be64_to_cpu(c)),
++				     ml->node, ml->list, ml->flags, ml->type,
++				     ml->convert_type, ml->highest_blocked);
++				__dlm_print_one_lock_resource(res);
++				BUG();
++			}
++
++			if (lock->ml.node != ml->node) {
++				c = lock->ml.cookie;
++				mlog(ML_ERROR, "Mismatched node# in lock "
++				     "cookie %u:%llu, name %.*s, node %u\n",
++				     dlm_get_lock_cookie_node(be64_to_cpu(c)),
++				     dlm_get_lock_cookie_seq(be64_to_cpu(c)),
++				     res->lockname.len, res->lockname.name,
++				     lock->ml.node);
++				c = ml->cookie;
++				mlog(ML_ERROR, "Migrate lock cookie %u:%llu, "
++				     "node %u, list %u, flags 0x%x, type %d, "
++				     "conv %d, highest blocked %d\n",
++				     dlm_get_lock_cookie_node(be64_to_cpu(c)),
++				     dlm_get_lock_cookie_seq(be64_to_cpu(c)),
++				     ml->node, ml->list, ml->flags, ml->type,
++				     ml->convert_type, ml->highest_blocked);
+ 				__dlm_print_one_lock_resource(res);
+ 				BUG();
+ 			}
+-			BUG_ON(lock->ml.node != ml->node);
+ 
+ 			if (tmpq != queue) {
+-				mlog(0, "lock was on %u instead of %u for %.*s\n",
+-				     j, ml->list, res->lockname.len, res->lockname.name);
++				c = ml->cookie;
++				mlog(0, "Lock cookie %u:%llu was on list %u "
++				     "instead of list %u for %.*s\n",
++				     dlm_get_lock_cookie_node(be64_to_cpu(c)),
++				     dlm_get_lock_cookie_seq(be64_to_cpu(c)),
++				     j, ml->list, res->lockname.len,
++				     res->lockname.name);
++				__dlm_print_one_lock_resource(res);
+ 				spin_unlock(&res->spinlock);
+ 				continue;
+ 			}
+@@ -1839,7 +1889,7 @@ static int dlm_process_recovery_data(struct dlm_ctxt *dlm,
+ 				 * the lvb. */
+ 				memcpy(res->lvb, mres->lvb, DLM_LVB_LEN);
+ 			} else {
+-				/* otherwise, the node is sending its 
++				/* otherwise, the node is sending its
+ 				 * most recent valid lvb info */
+ 				BUG_ON(ml->type != LKM_EXMODE &&
+ 				       ml->type != LKM_PRMODE);
+@@ -1886,7 +1936,7 @@ skip_lvb:
+ 		spin_lock(&res->spinlock);
+ 		list_for_each_entry(lock, queue, list) {
+ 			if (lock->ml.cookie == ml->cookie) {
+-				__be64 c = lock->ml.cookie;
++				c = lock->ml.cookie;
+ 				mlog(ML_ERROR, "%s:%.*s: %u:%llu: lock already "
+ 				     "exists on this lockres!\n", dlm->name,
+ 				     res->lockname.len, res->lockname.name,
+@@ -2114,7 +2164,7 @@ static void dlm_revalidate_lvb(struct dlm_ctxt *dlm,
+ 	assert_spin_locked(&res->spinlock);
+ 
+ 	if (res->owner == dlm->node_num)
+-		/* if this node owned the lockres, and if the dead node 
++		/* if this node owned the lockres, and if the dead node
+ 		 * had an EX when he died, blank out the lvb */
+ 		search_node = dead_node;
+ 	else {
+@@ -2152,7 +2202,7 @@ static void dlm_free_dead_locks(struct dlm_ctxt *dlm,
+ 
+ 	/* this node is the lockres master:
+ 	 * 1) remove any stale locks for the dead node
+-	 * 2) if the dead node had an EX when he died, blank out the lvb 
++	 * 2) if the dead node had an EX when he died, blank out the lvb
+ 	 */
+ 	assert_spin_locked(&dlm->spinlock);
+ 	assert_spin_locked(&res->spinlock);
+@@ -2193,7 +2243,12 @@ static void dlm_free_dead_locks(struct dlm_ctxt *dlm,
+ 		mlog(0, "%s:%.*s: freed %u locks for dead node %u, "
+ 		     "dropping ref from lockres\n", dlm->name,
+ 		     res->lockname.len, res->lockname.name, freed, dead_node);
+-		BUG_ON(!test_bit(dead_node, res->refmap));
++		if(!test_bit(dead_node, res->refmap)) {
++			mlog(ML_ERROR, "%s:%.*s: freed %u locks for dead node %u, "
++			     "but ref was not set\n", dlm->name,
++			     res->lockname.len, res->lockname.name, freed, dead_node);
++			__dlm_print_one_lock_resource(res);
++		}
+ 		dlm_lockres_clear_refmap_bit(dead_node, res);
+ 	} else if (test_bit(dead_node, res->refmap)) {
+ 		mlog(0, "%s:%.*s: dead node %u had a ref, but had "
+@@ -2260,7 +2315,7 @@ static void dlm_do_local_recovery_cleanup(struct dlm_ctxt *dlm, u8 dead_node)
+ 				}
+ 				spin_unlock(&res->spinlock);
+ 				continue;
+-			}			
++			}
+ 			spin_lock(&res->spinlock);
+ 			/* zero the lvb if necessary */
+ 			dlm_revalidate_lvb(dlm, res, dead_node);
+@@ -2411,7 +2466,7 @@ static void dlm_reco_unlock_ast(void *astdata, enum dlm_status st)
+  * this function on each node racing to become the recovery
+  * master will not stop attempting this until either:
+  * a) this node gets the EX (and becomes the recovery master),
+- * or b) dlm->reco.new_master gets set to some nodenum 
++ * or b) dlm->reco.new_master gets set to some nodenum
+  * != O2NM_INVALID_NODE_NUM (another node will do the reco).
+  * so each time a recovery master is needed, the entire cluster
+  * will sync at this point.  if the new master dies, that will
+@@ -2424,7 +2479,7 @@ static int dlm_pick_recovery_master(struct dlm_ctxt *dlm)
+ 
+ 	mlog(0, "starting recovery of %s at %lu, dead=%u, this=%u\n",
+ 	     dlm->name, jiffies, dlm->reco.dead_node, dlm->node_num);
+-again:	
++again:
+ 	memset(&lksb, 0, sizeof(lksb));
+ 
+ 	ret = dlmlock(dlm, LKM_EXMODE, &lksb, LKM_NOQUEUE|LKM_RECOVERY,
+@@ -2437,8 +2492,8 @@ again:
+ 	if (ret == DLM_NORMAL) {
+ 		mlog(0, "dlm=%s dlmlock says I got it (this=%u)\n",
+ 		     dlm->name, dlm->node_num);
+-		
+-		/* got the EX lock.  check to see if another node 
++
++		/* got the EX lock.  check to see if another node
+ 		 * just became the reco master */
+ 		if (dlm_reco_master_ready(dlm)) {
+ 			mlog(0, "%s: got reco EX lock, but %u will "
+@@ -2451,12 +2506,12 @@ again:
+ 			/* see if recovery was already finished elsewhere */
+ 			spin_lock(&dlm->spinlock);
+ 			if (dlm->reco.dead_node == O2NM_INVALID_NODE_NUM) {
+-				status = -EINVAL;	
++				status = -EINVAL;
+ 				mlog(0, "%s: got reco EX lock, but "
+ 				     "node got recovered already\n", dlm->name);
+ 				if (dlm->reco.new_master != O2NM_INVALID_NODE_NUM) {
+ 					mlog(ML_ERROR, "%s: new master is %u "
+-					     "but no dead node!\n", 
++					     "but no dead node!\n",
+ 					     dlm->name, dlm->reco.new_master);
+ 					BUG();
+ 				}
+@@ -2468,7 +2523,7 @@ again:
+ 		 * set the master and send the messages to begin recovery */
+ 		if (!status) {
+ 			mlog(0, "%s: dead=%u, this=%u, sending "
+-			     "begin_reco now\n", dlm->name, 
++			     "begin_reco now\n", dlm->name,
+ 			     dlm->reco.dead_node, dlm->node_num);
+ 			status = dlm_send_begin_reco_message(dlm,
+ 				      dlm->reco.dead_node);
+@@ -2501,7 +2556,7 @@ again:
+ 		mlog(0, "dlm=%s dlmlock says another node got it (this=%u)\n",
+ 		     dlm->name, dlm->node_num);
+ 		/* another node is master. wait on
+-		 * reco.new_master != O2NM_INVALID_NODE_NUM 
++		 * reco.new_master != O2NM_INVALID_NODE_NUM
+ 		 * for at most one second */
+ 		wait_event_timeout(dlm->dlm_reco_thread_wq,
+ 					 dlm_reco_master_ready(dlm),
+@@ -2589,7 +2644,13 @@ retry:
+ 			     "begin reco msg (%d)\n", dlm->name, nodenum, ret);
+ 			ret = 0;
+ 		}
+-		if (ret == -EAGAIN) {
++
++		/*
++		 * Prior to commit aad1b15310b9bcd59fa81ab8f2b1513b59553ea8,
++		 * dlm_begin_reco_handler() returned EAGAIN and not -EAGAIN.
++		 * We are handling both for compatibility reasons.
++		 */
++		if (ret == -EAGAIN || ret == EAGAIN) {
+ 			mlog(0, "%s: trying to start recovery of node "
+ 			     "%u, but node %u is waiting for last recovery "
+ 			     "to complete, backoff for a bit\n", dlm->name,
+@@ -2599,7 +2660,7 @@ retry:
+ 		}
+ 		if (ret < 0) {
+ 			struct dlm_lock_resource *res;
+-			/* this is now a serious problem, possibly ENOMEM 
++			/* this is now a serious problem, possibly ENOMEM
+ 			 * in the network stack.  must retry */
+ 			mlog_errno(ret);
+ 			mlog(ML_ERROR, "begin reco of dlm %s to node %u "
+@@ -2612,7 +2673,7 @@ retry:
+ 			} else {
+ 				mlog(ML_ERROR, "recovery lock not found\n");
+ 			}
+-			/* sleep for a bit in hopes that we can avoid 
++			/* sleep for a bit in hopes that we can avoid
+ 			 * another ENOMEM */
+ 			msleep(100);
+ 			goto retry;
+@@ -2664,7 +2725,7 @@ int dlm_begin_reco_handler(struct o2net_msg *msg, u32 len, void *data,
+ 	}
+ 	if (dlm->reco.dead_node != O2NM_INVALID_NODE_NUM) {
+ 		mlog(ML_NOTICE, "%s: dead_node previously set to %u, "
+-		     "node %u changing it to %u\n", dlm->name, 
++		     "node %u changing it to %u\n", dlm->name,
+ 		     dlm->reco.dead_node, br->node_idx, br->dead_node);
+ 	}
+ 	dlm_set_reco_master(dlm, br->node_idx);
+@@ -2730,8 +2791,8 @@ stage2:
+ 		if (ret < 0) {
+ 			mlog_errno(ret);
+ 			if (dlm_is_host_down(ret)) {
+-				/* this has no effect on this recovery 
+-				 * session, so set the status to zero to 
++				/* this has no effect on this recovery
++				 * session, so set the status to zero to
+ 				 * finish out the last recovery */
+ 				mlog(ML_ERROR, "node %u went down after this "
+ 				     "node finished recovery.\n", nodenum);
+@@ -2768,7 +2829,7 @@ int dlm_finalize_reco_handler(struct o2net_msg *msg, u32 len, void *data,
+ 	mlog(0, "%s: node %u finalizing recovery stage%d of "
+ 	     "node %u (%u:%u)\n", dlm->name, fr->node_idx, stage,
+ 	     fr->dead_node, dlm->reco.dead_node, dlm->reco.new_master);
+- 
++
+ 	spin_lock(&dlm->spinlock);
+ 
+ 	if (dlm->reco.new_master != fr->node_idx) {
+diff --git a/fs/ocfs2/dlm/dlmunlock.c b/fs/ocfs2/dlm/dlmunlock.c
+index 00f53b2..49e29ec 100644
+--- a/fs/ocfs2/dlm/dlmunlock.c
++++ b/fs/ocfs2/dlm/dlmunlock.c
+@@ -190,8 +190,8 @@ static enum dlm_status dlmunlock_common(struct dlm_ctxt *dlm,
+ 			actions &= ~(DLM_UNLOCK_REMOVE_LOCK|
+ 				     DLM_UNLOCK_REGRANT_LOCK|
+ 				     DLM_UNLOCK_CLEAR_CONVERT_TYPE);
+-		} else if (status == DLM_RECOVERING || 
+-			   status == DLM_MIGRATING || 
++		} else if (status == DLM_RECOVERING ||
++			   status == DLM_MIGRATING ||
+ 			   status == DLM_FORWARD) {
+ 			/* must clear the actions because this unlock
+ 			 * is about to be retried.  cannot free or do
+@@ -661,14 +661,14 @@ retry:
+ 	if (call_ast) {
+ 		mlog(0, "calling unlockast(%p, %d)\n", data, status);
+ 		if (is_master) {
+-			/* it is possible that there is one last bast 
++			/* it is possible that there is one last bast
+ 			 * pending.  make sure it is flushed, then
+ 			 * call the unlockast.
+ 			 * not an issue if this is a mastered remotely,
+ 			 * since this lock has been removed from the
+ 			 * lockres queues and cannot be found. */
+ 			dlm_kick_thread(dlm, NULL);
+-			wait_event(dlm->ast_wq, 
++			wait_event(dlm->ast_wq,
+ 				   dlm_lock_basts_flushed(dlm, lock));
+ 		}
+ 		(*unlockast)(data, status);
+diff --git a/fs/ocfs2/dlmglue.c b/fs/ocfs2/dlmglue.c
+index c5e4a49..e044019 100644
+--- a/fs/ocfs2/dlmglue.c
++++ b/fs/ocfs2/dlmglue.c
+@@ -875,6 +875,14 @@ static inline void ocfs2_generic_handle_convert_action(struct ocfs2_lock_res *lo
+ 		lockres_or_flags(lockres, OCFS2_LOCK_NEEDS_REFRESH);
+ 
+ 	lockres->l_level = lockres->l_requested;
++
++	/*
++	 * We set the OCFS2_LOCK_UPCONVERT_FINISHING flag before clearing
++	 * the OCFS2_LOCK_BUSY flag to prevent the dc thread from
++	 * downconverting the lock before the upconvert has fully completed.
++	 */
++	lockres_or_flags(lockres, OCFS2_LOCK_UPCONVERT_FINISHING);
++
+ 	lockres_clear_flags(lockres, OCFS2_LOCK_BUSY);
+ 
+ 	mlog_exit_void();
+@@ -907,8 +915,6 @@ static int ocfs2_generic_handle_bast(struct ocfs2_lock_res *lockres,
+ 
+ 	assert_spin_locked(&lockres->l_lock);
+ 
+-	lockres_or_flags(lockres, OCFS2_LOCK_BLOCKED);
+-
+ 	if (level > lockres->l_blocking) {
+ 		/* only schedule a downconvert if we haven't already scheduled
+ 		 * one that goes low enough to satisfy the level we're
+@@ -921,6 +927,9 @@ static int ocfs2_generic_handle_bast(struct ocfs2_lock_res *lockres,
+ 		lockres->l_blocking = level;
+ 	}
+ 
++	if (needs_downconvert)
++		lockres_or_flags(lockres, OCFS2_LOCK_BLOCKED);
++
+ 	mlog_exit(needs_downconvert);
+ 	return needs_downconvert;
+ }
+@@ -1133,6 +1142,7 @@ static inline void ocfs2_recover_from_dlm_error(struct ocfs2_lock_res *lockres,
+ 	mlog_entry_void();
+ 	spin_lock_irqsave(&lockres->l_lock, flags);
+ 	lockres_clear_flags(lockres, OCFS2_LOCK_BUSY);
++	lockres_clear_flags(lockres, OCFS2_LOCK_UPCONVERT_FINISHING);
+ 	if (convert)
+ 		lockres->l_action = OCFS2_AST_INVALID;
+ 	else
+@@ -1323,13 +1333,13 @@ static int __ocfs2_cluster_lock(struct ocfs2_super *osb,
+ again:
+ 	wait = 0;
+ 
++	spin_lock_irqsave(&lockres->l_lock, flags);
++
+ 	if (catch_signals && signal_pending(current)) {
+ 		ret = -ERESTARTSYS;
+-		goto out;
++		goto unlock;
+ 	}
+ 
+-	spin_lock_irqsave(&lockres->l_lock, flags);
+-
+ 	mlog_bug_on_msg(lockres->l_flags & OCFS2_LOCK_FREEING,
+ 			"Cluster lock called on freeing lockres %s! flags "
+ 			"0x%lx\n", lockres->l_name, lockres->l_flags);
+@@ -1346,6 +1356,25 @@ again:
+ 		goto unlock;
+ 	}
+ 
++	if (lockres->l_flags & OCFS2_LOCK_UPCONVERT_FINISHING) {
++		/*
++		 * We've upconverted. If the lock now has a level we can
++		 * work with, we take it. If, however, the lock is not at the
++		 * required level, we go thru the full cycle. One way this could
++		 * happen is if a process requesting an upconvert to PR is
++		 * closely followed by another requesting upconvert to an EX.
++		 * If the process requesting EX lands here, we want it to
++		 * continue attempting to upconvert and let the process
++		 * requesting PR take the lock.
++		 * If multiple processes request upconvert to PR, the first one
++		 * here will take the lock. The others will have to go thru the
++		 * OCFS2_LOCK_BLOCKED check to ensure that there is no pending
++		 * downconvert request.
++		 */
++		if (level <= lockres->l_level)
++			goto update_holders;
++	}
++
+ 	if (lockres->l_flags & OCFS2_LOCK_BLOCKED &&
+ 	    !ocfs2_may_continue_on_blocked_lock(lockres, level)) {
+ 		/* is the lock is currently blocked on behalf of
+@@ -1416,11 +1445,14 @@ again:
+ 		goto again;
+ 	}
+ 
++update_holders:
+ 	/* Ok, if we get here then we're good to go. */
+ 	ocfs2_inc_holders(lockres, level);
+ 
+ 	ret = 0;
+ unlock:
++	lockres_clear_flags(lockres, OCFS2_LOCK_UPCONVERT_FINISHING);
++
+ 	spin_unlock_irqrestore(&lockres->l_lock, flags);
+ out:
+ 	/*
+@@ -3155,7 +3187,7 @@ out:
+ /* Mark the lockres as being dropped. It will no longer be
+  * queued if blocking, but we still may have to wait on it
+  * being dequeued from the downconvert thread before we can consider
+- * it safe to drop. 
++ * it safe to drop.
+  *
+  * You can *not* attempt to call cluster_lock on this lockres anymore. */
+ void ocfs2_mark_lockres_freeing(struct ocfs2_lock_res *lockres)
+@@ -3352,6 +3384,7 @@ static int ocfs2_unblock_lock(struct ocfs2_super *osb,
+ 	unsigned long flags;
+ 	int blocking;
+ 	int new_level;
++	int level;
+ 	int ret = 0;
+ 	int set_lvb = 0;
+ 	unsigned int gen;
+@@ -3360,9 +3393,17 @@ static int ocfs2_unblock_lock(struct ocfs2_super *osb,
+ 
+ 	spin_lock_irqsave(&lockres->l_lock, flags);
+ 
+-	BUG_ON(!(lockres->l_flags & OCFS2_LOCK_BLOCKED));
+-
+ recheck:
++	/*
++	 * Is it still blocking? If not, we have no more work to do.
++	 */
++	if (!(lockres->l_flags & OCFS2_LOCK_BLOCKED)) {
++		BUG_ON(lockres->l_blocking != DLM_LOCK_NL);
++		spin_unlock_irqrestore(&lockres->l_lock, flags);
++		ret = 0;
++		goto leave;
++	}
++
+ 	if (lockres->l_flags & OCFS2_LOCK_BUSY) {
+ 		/* XXX
+ 		 * This is a *big* race.  The OCFS2_LOCK_PENDING flag
+@@ -3401,6 +3442,31 @@ recheck:
+ 		goto leave;
+ 	}
+ 
++	/*
++	 * This prevents livelocks. OCFS2_LOCK_UPCONVERT_FINISHING flag is
++	 * set when the ast is received for an upconvert just before the
++	 * OCFS2_LOCK_BUSY flag is cleared. Now if the fs received a bast
++	 * on the heels of the ast, we want to delay the downconvert just
++	 * enough to allow the up requestor to do its task. Because this
++	 * lock is in the blocked queue, the lock will be downconverted
++	 * as soon as the requestor is done with the lock.
++	 */
++	if (lockres->l_flags & OCFS2_LOCK_UPCONVERT_FINISHING)
++		goto leave_requeue;
++
++	/*
++	 * How can we block and yet be at NL?  We were trying to upconvert
++	 * from NL and got canceled.  The code comes back here, and now
++	 * we notice and clear BLOCKING.
++	 */
++	if (lockres->l_level == DLM_LOCK_NL) {
++		BUG_ON(lockres->l_ex_holders || lockres->l_ro_holders);
++		lockres->l_blocking = DLM_LOCK_NL;
++		lockres_clear_flags(lockres, OCFS2_LOCK_BLOCKED);
++		spin_unlock_irqrestore(&lockres->l_lock, flags);
++		goto leave;
++	}
++
+ 	/* if we're blocking an exclusive and we have *any* holders,
+ 	 * then requeue. */
+ 	if ((lockres->l_blocking == DLM_LOCK_EX)
+@@ -3438,6 +3504,7 @@ recheck:
+ 	 * may sleep, so we save off a copy of what we're blocking as
+ 	 * it may change while we're not holding the spin lock. */
+ 	blocking = lockres->l_blocking;
++	level = lockres->l_level;
+ 	spin_unlock_irqrestore(&lockres->l_lock, flags);
+ 
+ 	ctl->unblock_action = lockres->l_ops->downconvert_worker(lockres, blocking);
+@@ -3446,7 +3513,7 @@ recheck:
+ 		goto leave;
+ 
+ 	spin_lock_irqsave(&lockres->l_lock, flags);
+-	if (blocking != lockres->l_blocking) {
++	if ((blocking != lockres->l_blocking) || (level != lockres->l_level)) {
+ 		/* If this changed underneath us, then we can't drop
+ 		 * it just yet. */
+ 		goto recheck;
+diff --git a/fs/ocfs2/export.c b/fs/ocfs2/export.c
+index 15713cb..19ad145 100644
+--- a/fs/ocfs2/export.c
++++ b/fs/ocfs2/export.c
+@@ -239,7 +239,7 @@ static int ocfs2_encode_fh(struct dentry *dentry, u32 *fh_in, int *max_len,
+ 		mlog(0, "Encoding parent: blkno: %llu, generation: %u\n",
+ 		     (unsigned long long)blkno, generation);
+ 	}
+-	
++
+ 	*max_len = len;
+ 
+ bail:
+diff --git a/fs/ocfs2/extent_map.c b/fs/ocfs2/extent_map.c
+index d35a27f..5328529 100644
+--- a/fs/ocfs2/extent_map.c
++++ b/fs/ocfs2/extent_map.c
+@@ -192,7 +192,7 @@ static int ocfs2_try_to_merge_extent_map(struct ocfs2_extent_map_item *emi,
+ 		emi->ei_clusters += ins->ei_clusters;
+ 		return 1;
+ 	} else if ((ins->ei_phys + ins->ei_clusters) == emi->ei_phys &&
+-		   (ins->ei_cpos + ins->ei_clusters) == emi->ei_phys &&
++		   (ins->ei_cpos + ins->ei_clusters) == emi->ei_cpos &&
+ 		   ins->ei_flags == emi->ei_flags) {
+ 		emi->ei_phys = ins->ei_phys;
+ 		emi->ei_cpos = ins->ei_cpos;
+diff --git a/fs/ocfs2/file.c b/fs/ocfs2/file.c
+index 06ccf6a..558ce03 100644
+--- a/fs/ocfs2/file.c
++++ b/fs/ocfs2/file.c
+@@ -749,7 +749,7 @@ static int ocfs2_write_zero_page(struct inode *inode,
+ 	int ret;
+ 
+ 	offset = (size & (PAGE_CACHE_SIZE-1)); /* Within page */
+-	/* ugh.  in prepare/commit_write, if from==to==start of block, we 
++	/* ugh.  in prepare/commit_write, if from==to==start of block, we
+ 	** skip the prepare.  make sure we never send an offset for the start
+ 	** of a block
+ 	*/
+@@ -1779,7 +1779,7 @@ static int ocfs2_prepare_inode_for_write(struct dentry *dentry,
+ 	struct inode *inode = dentry->d_inode;
+ 	loff_t saved_pos, end;
+ 
+-	/* 
++	/*
+ 	 * We start with a read level meta lock and only jump to an ex
+ 	 * if we need to make modifications here.
+ 	 */
+@@ -2013,8 +2013,8 @@ out_dio:
+ 	/* buffered aio wouldn't have proper lock coverage today */
+ 	BUG_ON(ret == -EIOCBQUEUED && !(file->f_flags & O_DIRECT));
+ 
+-	if ((file->f_flags & O_DSYNC && !direct_io) || IS_SYNC(inode) ||
+-	    (file->f_flags & O_DIRECT && has_refcount)) {
++	if (((file->f_flags & O_DSYNC) && !direct_io) || IS_SYNC(inode) ||
++	    ((file->f_flags & O_DIRECT) && has_refcount)) {
+ 		ret = filemap_fdatawrite_range(file->f_mapping, pos,
+ 					       pos + count - 1);
+ 		if (ret < 0)
+@@ -2033,7 +2033,7 @@ out_dio:
+ 						      pos + count - 1);
+ 	}
+ 
+-	/* 
++	/*
+ 	 * deep in g_f_a_w_n()->ocfs2_direct_IO we pass in a ocfs2_dio_end_io
+ 	 * function pointer which is called when o_direct io completes so that
+ 	 * it can unlock our rw lock.  (it's the clustered equivalent of
+@@ -2198,7 +2198,7 @@ static ssize_t ocfs2_file_aio_read(struct kiocb *iocb,
+ 		goto bail;
+ 	}
+ 
+-	/* 
++	/*
+ 	 * buffered reads protect themselves in ->readpage().  O_DIRECT reads
+ 	 * need locks to protect pending reads from racing with truncate.
+ 	 */
+@@ -2220,10 +2220,10 @@ static ssize_t ocfs2_file_aio_read(struct kiocb *iocb,
+ 	 * We're fine letting folks race truncates and extending
+ 	 * writes with read across the cluster, just like they can
+ 	 * locally. Hence no rw_lock during read.
+-	 * 
++	 *
+ 	 * Take and drop the meta data lock to update inode fields
+ 	 * like i_size. This allows the checks down below
+-	 * generic_file_aio_read() a chance of actually working. 
++	 * generic_file_aio_read() a chance of actually working.
+ 	 */
+ 	ret = ocfs2_inode_lock_atime(inode, filp->f_vfsmnt, &lock_level);
+ 	if (ret < 0) {
+@@ -2248,7 +2248,7 @@ static ssize_t ocfs2_file_aio_read(struct kiocb *iocb,
+ bail:
+ 	if (have_alloc_sem)
+ 		up_read(&inode->i_alloc_sem);
+-	if (rw_level != -1) 
++	if (rw_level != -1)
+ 		ocfs2_rw_unlock(inode, rw_level);
+ 	mlog_exit(ret);
+ 
+diff --git a/fs/ocfs2/inode.c b/fs/ocfs2/inode.c
+index 0297fb8..88459bd 100644
+--- a/fs/ocfs2/inode.c
++++ b/fs/ocfs2/inode.c
+@@ -475,7 +475,7 @@ static int ocfs2_read_locked_inode(struct inode *inode,
+ 	if (args->fi_flags & OCFS2_FI_FLAG_ORPHAN_RECOVERY) {
+ 		status = ocfs2_try_open_lock(inode, 0);
+ 		if (status) {
+-			make_bad_inode(inode);	
++			make_bad_inode(inode);
+ 			return status;
+ 		}
+ 	}
+@@ -684,7 +684,7 @@ bail:
+ 	return status;
+ }
+ 
+-/* 
++/*
+  * Serialize with orphan dir recovery. If the process doing
+  * recovery on this orphan dir does an iget() with the dir
+  * i_mutex held, we'll deadlock here. Instead we detect this
+diff --git a/fs/ocfs2/ioctl.c b/fs/ocfs2/ioctl.c
+index 31fbb06..7d9d9c1 100644
+--- a/fs/ocfs2/ioctl.c
++++ b/fs/ocfs2/ioctl.c
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/fs.h>
+ #include <linux/mount.h>
++#include <linux/compat.h>
+ 
+ #define MLOG_MASK_PREFIX ML_INODE
+ #include <cluster/masklog.h>
+@@ -181,6 +182,10 @@ long ocfs2_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ #ifdef CONFIG_COMPAT
+ long ocfs2_compat_ioctl(struct file *file, unsigned cmd, unsigned long arg)
+ {
++	bool preserve;
++	struct reflink_arguments args;
++	struct inode *inode = file->f_path.dentry->d_inode;
++
+ 	switch (cmd) {
+ 	case OCFS2_IOC32_GETFLAGS:
+ 		cmd = OCFS2_IOC_GETFLAGS;
+@@ -195,8 +200,15 @@ long ocfs2_compat_ioctl(struct file *file, unsigned cmd, unsigned long arg)
+ 	case OCFS2_IOC_GROUP_EXTEND:
+ 	case OCFS2_IOC_GROUP_ADD:
+ 	case OCFS2_IOC_GROUP_ADD64:
+-	case OCFS2_IOC_REFLINK:
+ 		break;
++	case OCFS2_IOC_REFLINK:
++		if (copy_from_user(&args, (struct reflink_arguments *)arg,
++				   sizeof(args)))
++			return -EFAULT;
++		preserve = (args.preserve != 0);
++
++		return ocfs2_reflink_ioctl(inode, compat_ptr(args.old_path),
++					   compat_ptr(args.new_path), preserve);
+ 	default:
+ 		return -ENOIOCTLCMD;
+ 	}
+diff --git a/fs/ocfs2/journal.c b/fs/ocfs2/journal.c
+index bf34c49..9336c60 100644
+--- a/fs/ocfs2/journal.c
++++ b/fs/ocfs2/journal.c
+@@ -2034,7 +2034,7 @@ static int ocfs2_queue_orphans(struct ocfs2_super *osb,
+ 		status = -ENOENT;
+ 		mlog_errno(status);
+ 		return status;
+-	}	
++	}
+ 
+ 	mutex_lock(&orphan_dir_inode->i_mutex);
+ 	status = ocfs2_inode_lock(orphan_dir_inode, NULL, 0);
+diff --git a/fs/ocfs2/ocfs2.h b/fs/ocfs2/ocfs2.h
+index 9362eea..740f448 100644
+--- a/fs/ocfs2/ocfs2.h
++++ b/fs/ocfs2/ocfs2.h
+@@ -136,6 +136,10 @@ enum ocfs2_unlock_action {
+ #define OCFS2_LOCK_PENDING       (0x00000400) /* This lockres is pending a
+ 						 call to dlm_lock.  Only
+ 						 exists with BUSY set. */
++#define OCFS2_LOCK_UPCONVERT_FINISHING (0x00000800) /* blocks the dc thread
++						     * from downconverting
++						     * before the upconvert
++						     * has completed */
+ 
+ struct ocfs2_lock_res_ops;
+ 
+diff --git a/fs/ocfs2/ocfs2_fs.h b/fs/ocfs2/ocfs2_fs.h
+index 1a1a679..7638a38 100644
+--- a/fs/ocfs2/ocfs2_fs.h
++++ b/fs/ocfs2/ocfs2_fs.h
+@@ -1417,9 +1417,16 @@ static inline int ocfs2_fast_symlink_chars(int blocksize)
+ 	return blocksize - offsetof(struct ocfs2_dinode, id2.i_symlink);
+ }
+ 
+-static inline int ocfs2_max_inline_data(int blocksize)
++static inline int ocfs2_max_inline_data_with_xattr(int blocksize,
++						   struct ocfs2_dinode *di)
+ {
+-	return blocksize - offsetof(struct ocfs2_dinode, id2.i_data.id_data);
++	if (di && (di->i_dyn_features & OCFS2_INLINE_XATTR_FL))
++		return blocksize -
++			offsetof(struct ocfs2_dinode, id2.i_data.id_data) -
++			di->i_xattr_inline_size;
++	else
++		return blocksize -
++			offsetof(struct ocfs2_dinode, id2.i_data.id_data);
+ }
+ 
+ static inline int ocfs2_extent_recs_per_inode(int blocksize)
+diff --git a/fs/ocfs2/refcounttree.c b/fs/ocfs2/refcounttree.c
+index 74db2be..8ae65c9 100644
+--- a/fs/ocfs2/refcounttree.c
++++ b/fs/ocfs2/refcounttree.c
+@@ -2945,7 +2945,7 @@ static int ocfs2_duplicate_clusters_by_page(handle_t *handle,
+ 
+ 	while (offset < end) {
+ 		page_index = offset >> PAGE_CACHE_SHIFT;
+-		map_end = (page_index + 1) << PAGE_CACHE_SHIFT;
++		map_end = ((loff_t)page_index + 1) << PAGE_CACHE_SHIFT;
+ 		if (map_end > end)
+ 			map_end = end;
+ 
+@@ -2957,8 +2957,12 @@ static int ocfs2_duplicate_clusters_by_page(handle_t *handle,
+ 
+ 		page = grab_cache_page(mapping, page_index);
+ 
+-		/* This page can't be dirtied before we CoW it out. */
+-		BUG_ON(PageDirty(page));
++		/*
++		 * In case PAGE_CACHE_SIZE <= CLUSTER_SIZE, This page
++		 * can't be dirtied before we CoW it out.
++		 */
++		if (PAGE_CACHE_SIZE <= OCFS2_SB(sb)->s_clustersize)
++			BUG_ON(PageDirty(page));
+ 
+ 		if (!PageUptodate(page)) {
+ 			ret = block_read_full_page(page, ocfs2_get_block);
+@@ -3170,7 +3174,7 @@ static int ocfs2_cow_sync_writeback(struct super_block *sb,
+ 
+ 	while (offset < end) {
+ 		page_index = offset >> PAGE_CACHE_SHIFT;
+-		map_end = (page_index + 1) << PAGE_CACHE_SHIFT;
++		map_end = ((loff_t)page_index + 1) << PAGE_CACHE_SHIFT;
+ 		if (map_end > end)
+ 			map_end = end;
+ 
+diff --git a/fs/ocfs2/stack_o2cb.c b/fs/ocfs2/stack_o2cb.c
+index e49c410..3038c92 100644
+--- a/fs/ocfs2/stack_o2cb.c
++++ b/fs/ocfs2/stack_o2cb.c
+@@ -277,7 +277,7 @@ static int o2cb_cluster_connect(struct ocfs2_cluster_connection *conn)
+ 	u32 dlm_key;
+ 	struct dlm_ctxt *dlm;
+ 	struct o2dlm_private *priv;
+-	struct dlm_protocol_version dlm_version;
++	struct dlm_protocol_version fs_version;
+ 
+ 	BUG_ON(conn == NULL);
+ 	BUG_ON(o2cb_stack.sp_proto == NULL);
+@@ -304,18 +304,18 @@ static int o2cb_cluster_connect(struct ocfs2_cluster_connection *conn)
+ 	/* used by the dlm code to make message headers unique, each
+ 	 * node in this domain must agree on this. */
+ 	dlm_key = crc32_le(0, conn->cc_name, conn->cc_namelen);
+-	dlm_version.pv_major = conn->cc_version.pv_major;
+-	dlm_version.pv_minor = conn->cc_version.pv_minor;
++	fs_version.pv_major = conn->cc_version.pv_major;
++	fs_version.pv_minor = conn->cc_version.pv_minor;
+ 
+-	dlm = dlm_register_domain(conn->cc_name, dlm_key, &dlm_version);
++	dlm = dlm_register_domain(conn->cc_name, dlm_key, &fs_version);
+ 	if (IS_ERR(dlm)) {
+ 		rc = PTR_ERR(dlm);
+ 		mlog_errno(rc);
+ 		goto out_free;
+ 	}
+ 
+-	conn->cc_version.pv_major = dlm_version.pv_major;
+-	conn->cc_version.pv_minor = dlm_version.pv_minor;
++	conn->cc_version.pv_major = fs_version.pv_major;
++	conn->cc_version.pv_minor = fs_version.pv_minor;
+ 	conn->cc_lockspace = dlm;
+ 
+ 	dlm_register_eviction_cb(dlm, &priv->op_eviction_cb);
+diff --git a/fs/ocfs2/super.c b/fs/ocfs2/super.c
+index 2606991..755cd49 100644
+--- a/fs/ocfs2/super.c
++++ b/fs/ocfs2/super.c
+@@ -1062,7 +1062,7 @@ static int ocfs2_fill_super(struct super_block *sb, void *data, int silent)
+ 				     "file system, but write access is "
+ 				     "unavailable.\n");
+ 			else
+-				mlog_errno(status);			
++				mlog_errno(status);
+ 			goto read_super_error;
+ 		}
+ 
+diff --git a/fs/ocfs2/symlink.c b/fs/ocfs2/symlink.c
+index 49b133c..32499d2 100644
+--- a/fs/ocfs2/symlink.c
++++ b/fs/ocfs2/symlink.c
+@@ -137,20 +137,20 @@ static void *ocfs2_fast_follow_link(struct dentry *dentry,
+ 	}
+ 
+ 	memcpy(link, target, len);
+-	nd_set_link(nd, link);
+ 
+ bail:
++	nd_set_link(nd, status ? ERR_PTR(status) : link);
+ 	brelse(bh);
+ 
+ 	mlog_exit(status);
+-	return status ? ERR_PTR(status) : link;
++	return NULL;
+ }
+ 
+ static void ocfs2_fast_put_link(struct dentry *dentry, struct nameidata *nd, void *cookie)
+ {
+-	char *link = cookie;
+-
+-	kfree(link);
++	char *link = nd_get_link(nd);
++	if (!IS_ERR(link))
++		kfree(link);
+ }
+ 
+ const struct inode_operations ocfs2_symlink_inode_operations = {
+diff --git a/fs/ocfs2/uptodate.c b/fs/ocfs2/uptodate.c
+index c613693..a0a120e 100644
+--- a/fs/ocfs2/uptodate.c
++++ b/fs/ocfs2/uptodate.c
+@@ -267,8 +267,8 @@ static int ocfs2_buffer_cached(struct ocfs2_caching_info *ci,
+ }
+ 
+ /* Warning: even if it returns true, this does *not* guarantee that
+- * the block is stored in our inode metadata cache. 
+- * 
++ * the block is stored in our inode metadata cache.
++ *
+  * This can be called under lock_buffer()
+  */
+ int ocfs2_buffer_uptodate(struct ocfs2_caching_info *ci,
+diff --git a/include/linux/ima.h b/include/linux/ima.h
+index 99dc6d5..975837e 100644
+--- a/include/linux/ima.h
++++ b/include/linux/ima.h
+@@ -17,7 +17,7 @@ struct linux_binprm;
+ extern int ima_bprm_check(struct linux_binprm *bprm);
+ extern int ima_inode_alloc(struct inode *inode);
+ extern void ima_inode_free(struct inode *inode);
+-extern int ima_path_check(struct path *path, int mask);
++extern int ima_file_check(struct file *file, int mask);
+ extern void ima_file_free(struct file *file);
+ extern int ima_file_mmap(struct file *file, unsigned long prot);
+ extern void ima_counts_get(struct file *file);
+@@ -38,7 +38,7 @@ static inline void ima_inode_free(struct inode *inode)
+ 	return;
+ }
+ 
+-static inline int ima_path_check(struct path *path, int mask)
++static inline int ima_file_check(struct file *file, int mask)
+ {
+ 	return 0;
+ }
+diff --git a/init/main.c b/init/main.c
+index dac44a9..4cb47a1 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -657,9 +657,9 @@ asmlinkage void __init start_kernel(void)
+ 	proc_caches_init();
+ 	buffer_init();
+ 	key_init();
++	radix_tree_init();
+ 	security_init();
+ 	vfs_caches_init(totalram_pages);
+-	radix_tree_init();
+ 	signals_init();
+ 	/* rootfs populating might need page-writeback */
+ 	page_writeback_init();
+diff --git a/security/integrity/ima/ima.h b/security/integrity/ima/ima.h
+index c41afe6..47fb65d 100644
+--- a/security/integrity/ima/ima.h
++++ b/security/integrity/ima/ima.h
+@@ -65,7 +65,6 @@ void integrity_audit_msg(int audit_msgno, struct inode *inode,
+ 			 const char *cause, int result, int info);
+ 
+ /* Internal IMA function definitions */
+-void ima_iintcache_init(void);
+ int ima_init(void);
+ void ima_cleanup(void);
+ int ima_fs_init(void);
+@@ -131,7 +130,7 @@ void iint_free(struct kref *kref);
+ void iint_rcu_free(struct rcu_head *rcu);
+ 
+ /* IMA policy related functions */
+-enum ima_hooks { PATH_CHECK = 1, FILE_MMAP, BPRM_CHECK };
++enum ima_hooks { FILE_CHECK = 1, FILE_MMAP, BPRM_CHECK };
+ 
+ int ima_match_policy(struct inode *inode, enum ima_hooks func, int mask);
+ void ima_init_policy(void);
+diff --git a/security/integrity/ima/ima_api.c b/security/integrity/ima/ima_api.c
+index 3cd58b6..2a5e0bc 100644
+--- a/security/integrity/ima/ima_api.c
++++ b/security/integrity/ima/ima_api.c
+@@ -95,12 +95,12 @@ err_out:
+  * ima_must_measure - measure decision based on policy.
+  * @inode: pointer to inode to measure
+  * @mask: contains the permission mask (MAY_READ, MAY_WRITE, MAY_EXECUTE)
+- * @function: calling function (PATH_CHECK, BPRM_CHECK, FILE_MMAP)
++ * @function: calling function (FILE_CHECK, BPRM_CHECK, FILE_MMAP)
+  *
+  * The policy is defined in terms of keypairs:
+  * 		subj=, obj=, type=, func=, mask=, fsmagic=
+  *	subj,obj, and type: are LSM specific.
+- * 	func: PATH_CHECK | BPRM_CHECK | FILE_MMAP
++ * 	func: FILE_CHECK | BPRM_CHECK | FILE_MMAP
+  * 	mask: contains the permission mask
+  *	fsmagic: hex value
+  *
+diff --git a/security/integrity/ima/ima_iint.c b/security/integrity/ima/ima_iint.c
+index fa592ff..0d83edc 100644
+--- a/security/integrity/ima/ima_iint.c
++++ b/security/integrity/ima/ima_iint.c
+@@ -52,9 +52,6 @@ int ima_inode_alloc(struct inode *inode)
+ 	struct ima_iint_cache *iint = NULL;
+ 	int rc = 0;
+ 
+-	if (!ima_initialized)
+-		return 0;
+-
+ 	iint = kmem_cache_alloc(iint_cache, GFP_NOFS);
+ 	if (!iint)
+ 		return -ENOMEM;
+@@ -118,8 +115,6 @@ void ima_inode_free(struct inode *inode)
+ {
+ 	struct ima_iint_cache *iint;
+ 
+-	if (!ima_initialized)
+-		return;
+ 	spin_lock(&ima_iint_lock);
+ 	iint = radix_tree_delete(&ima_iint_store, (unsigned long)inode);
+ 	spin_unlock(&ima_iint_lock);
+@@ -141,9 +136,11 @@ static void init_once(void *foo)
+ 	kref_set(&iint->refcount, 1);
+ }
+ 
+-void __init ima_iintcache_init(void)
++static int __init ima_iintcache_init(void)
+ {
+ 	iint_cache =
+ 	    kmem_cache_create("iint_cache", sizeof(struct ima_iint_cache), 0,
+ 			      SLAB_PANIC, init_once);
++	return 0;
+ }
++security_initcall(ima_iintcache_init);
+diff --git a/security/integrity/ima/ima_main.c b/security/integrity/ima/ima_main.c
+index a89f44d..294b005 100644
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -14,7 +14,7 @@
+  *
+  * File: ima_main.c
+  *	implements the IMA hooks: ima_bprm_check, ima_file_mmap,
+- *	and ima_path_check.
++ *	and ima_file_check.
+  */
+ #include <linux/module.h>
+ #include <linux/file.h>
+@@ -84,6 +84,36 @@ out:
+ 	return found;
+ }
+ 
++/* ima_read_write_check - reflect possible reading/writing errors in the PCR.
++ *
++ * When opening a file for read, if the file is already open for write,
++ * the file could change, resulting in a file measurement error.
++ *
++ * Opening a file for write, if the file is already open for read, results
++ * in a time of measure, time of use (ToMToU) error.
++ *
++ * In either case invalidate the PCR.
++ */
++enum iint_pcr_error { TOMTOU, OPEN_WRITERS };
++static void ima_read_write_check(enum iint_pcr_error error,
++				 struct ima_iint_cache *iint,
++				 struct inode *inode,
++				 const unsigned char *filename)
++{
++	switch (error) {
++	case TOMTOU:
++		if (iint->readcount > 0)
++			ima_add_violation(inode, filename, "invalid_pcr",
++					  "ToMToU");
++		break;
++	case OPEN_WRITERS:
++		if (iint->writecount > 0)
++			ima_add_violation(inode, filename, "invalid_pcr",
++					  "open_writers");
++		break;
++	}
++}
++
+ /*
+  * Update the counts given an fmode_t
+  */
+@@ -99,6 +129,47 @@ static void ima_inc_counts(struct ima_iint_cache *iint, fmode_t mode)
+ }
+ 
+ /*
++ * ima_counts_get - increment file counts
++ *
++ * Maintain read/write counters for all files, but only
++ * invalidate the PCR for measured files:
++ * 	- Opening a file for write when already open for read,
++ *	  results in a time of measure, time of use (ToMToU) error.
++ *	- Opening a file for read when already open for write,
++ * 	  could result in a file measurement error.
++ *
++ */
++void ima_counts_get(struct file *file)
++{
++	struct dentry *dentry = file->f_path.dentry;
++	struct inode *inode = dentry->d_inode;
++	fmode_t mode = file->f_mode;
++	struct ima_iint_cache *iint;
++	int rc;
++
++	if (!ima_initialized || !S_ISREG(inode->i_mode))
++		return;
++	iint = ima_iint_find_get(inode);
++	if (!iint)
++		return;
++	mutex_lock(&iint->mutex);
++	rc = ima_must_measure(iint, inode, MAY_READ, FILE_CHECK);
++	if (rc < 0)
++		goto out;
++
++	if (mode & FMODE_WRITE) {
++		ima_read_write_check(TOMTOU, iint, inode, dentry->d_name.name);
++		goto out;
++	}
++	ima_read_write_check(OPEN_WRITERS, iint, inode, dentry->d_name.name);
++out:
++	ima_inc_counts(iint, file->f_mode);
++	mutex_unlock(&iint->mutex);
++
++	kref_put(&iint->refcount, iint_free);
++}
++
++/*
+  * Decrement ima counts
+  */
+ static void ima_dec_counts(struct ima_iint_cache *iint, struct inode *inode,
+@@ -153,123 +224,6 @@ void ima_file_free(struct file *file)
+ 	kref_put(&iint->refcount, iint_free);
+ }
+ 
+-/* ima_read_write_check - reflect possible reading/writing errors in the PCR.
+- *
+- * When opening a file for read, if the file is already open for write,
+- * the file could change, resulting in a file measurement error.
+- *
+- * Opening a file for write, if the file is already open for read, results
+- * in a time of measure, time of use (ToMToU) error.
+- *
+- * In either case invalidate the PCR.
+- */
+-enum iint_pcr_error { TOMTOU, OPEN_WRITERS };
+-static void ima_read_write_check(enum iint_pcr_error error,
+-				 struct ima_iint_cache *iint,
+-				 struct inode *inode,
+-				 const unsigned char *filename)
+-{
+-	switch (error) {
+-	case TOMTOU:
+-		if (iint->readcount > 0)
+-			ima_add_violation(inode, filename, "invalid_pcr",
+-					  "ToMToU");
+-		break;
+-	case OPEN_WRITERS:
+-		if (iint->writecount > 0)
+-			ima_add_violation(inode, filename, "invalid_pcr",
+-					  "open_writers");
+-		break;
+-	}
+-}
+-
+-static int get_path_measurement(struct ima_iint_cache *iint, struct file *file,
+-				const unsigned char *filename)
+-{
+-	int rc = 0;
+-
+-	ima_inc_counts(iint, file->f_mode);
+-
+-	rc = ima_collect_measurement(iint, file);
+-	if (!rc)
+-		ima_store_measurement(iint, file, filename);
+-	return rc;
+-}
+-
+-/**
+- * ima_path_check - based on policy, collect/store measurement.
+- * @path: contains a pointer to the path to be measured
+- * @mask: contains MAY_READ, MAY_WRITE or MAY_EXECUTE
+- *
+- * Measure the file being open for readonly, based on the
+- * ima_must_measure() policy decision.
+- *
+- * Keep read/write counters for all files, but only
+- * invalidate the PCR for measured files:
+- * 	- Opening a file for write when already open for read,
+- *	  results in a time of measure, time of use (ToMToU) error.
+- *	- Opening a file for read when already open for write,
+- * 	  could result in a file measurement error.
+- *
+- * Always return 0 and audit dentry_open failures.
+- * (Return code will be based upon measurement appraisal.)
+- */
+-int ima_path_check(struct path *path, int mask)
+-{
+-	struct inode *inode = path->dentry->d_inode;
+-	struct ima_iint_cache *iint;
+-	struct file *file = NULL;
+-	int rc;
+-
+-	if (!ima_initialized || !S_ISREG(inode->i_mode))
+-		return 0;
+-	iint = ima_iint_find_get(inode);
+-	if (!iint)
+-		return 0;
+-
+-	mutex_lock(&iint->mutex);
+-
+-	rc = ima_must_measure(iint, inode, MAY_READ, PATH_CHECK);
+-	if (rc < 0)
+-		goto out;
+-
+-	if ((mask & MAY_WRITE) || (mask == 0))
+-		ima_read_write_check(TOMTOU, iint, inode,
+-				     path->dentry->d_name.name);
+-
+-	if ((mask & (MAY_WRITE | MAY_READ | MAY_EXEC)) != MAY_READ)
+-		goto out;
+-
+-	ima_read_write_check(OPEN_WRITERS, iint, inode,
+-			     path->dentry->d_name.name);
+-	if (!(iint->flags & IMA_MEASURED)) {
+-		struct dentry *dentry = dget(path->dentry);
+-		struct vfsmount *mnt = mntget(path->mnt);
+-
+-		file = dentry_open(dentry, mnt, O_RDONLY | O_LARGEFILE,
+-				   current_cred());
+-		if (IS_ERR(file)) {
+-			int audit_info = 0;
+-
+-			integrity_audit_msg(AUDIT_INTEGRITY_PCR, inode,
+-					    dentry->d_name.name,
+-					    "add_measurement",
+-					    "dentry_open failed",
+-					    1, audit_info);
+-			file = NULL;
+-			goto out;
+-		}
+-		rc = get_path_measurement(iint, file, dentry->d_name.name);
+-	}
+-out:
+-	mutex_unlock(&iint->mutex);
+-	if (file)
+-		fput(file);
+-	kref_put(&iint->refcount, iint_free);
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(ima_path_check);
+-
+ static int process_measurement(struct file *file, const unsigned char *filename,
+ 			       int mask, int function)
+ {
+@@ -297,33 +251,6 @@ out:
+ 	return rc;
+ }
+ 
+-/*
+- * ima_counts_get - increment file counts
+- *
+- * - for IPC shm and shmat file.
+- * - for nfsd exported files.
+- *
+- * Increment the counts for these files to prevent unnecessary
+- * imbalance messages.
+- */
+-void ima_counts_get(struct file *file)
+-{
+-	struct inode *inode = file->f_dentry->d_inode;
+-	struct ima_iint_cache *iint;
+-
+-	if (!ima_initialized || !S_ISREG(inode->i_mode))
+-		return;
+-	iint = ima_iint_find_get(inode);
+-	if (!iint)
+-		return;
+-	mutex_lock(&iint->mutex);
+-	ima_inc_counts(iint, file->f_mode);
+-	mutex_unlock(&iint->mutex);
+-
+-	kref_put(&iint->refcount, iint_free);
+-}
+-EXPORT_SYMBOL_GPL(ima_counts_get);
+-
+ /**
+  * ima_file_mmap - based on policy, collect/store measurement.
+  * @file: pointer to the file to be measured (May be NULL)
+@@ -369,11 +296,31 @@ int ima_bprm_check(struct linux_binprm *bprm)
+ 	return 0;
+ }
+ 
++/**
++ * ima_path_check - based on policy, collect/store measurement.
++ * @file: pointer to the file to be measured
++ * @mask: contains MAY_READ, MAY_WRITE or MAY_EXECUTE
++ *
++ * Measure files based on the ima_must_measure() policy decision.
++ *
++ * Always return 0 and audit dentry_open failures.
++ * (Return code will be based upon measurement appraisal.)
++ */
++int ima_file_check(struct file *file, int mask)
++{
++	int rc;
++
++	rc = process_measurement(file, file->f_dentry->d_name.name,
++				 mask & (MAY_READ | MAY_WRITE | MAY_EXEC),
++				 FILE_CHECK);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(ima_file_check);
++
+ static int __init init_ima(void)
+ {
+ 	int error;
+ 
+-	ima_iintcache_init();
+ 	error = ima_init();
+ 	ima_initialized = 1;
+ 	return error;
+diff --git a/security/integrity/ima/ima_policy.c b/security/integrity/ima/ima_policy.c
+index e127839..4759d0f 100644
+--- a/security/integrity/ima/ima_policy.c
++++ b/security/integrity/ima/ima_policy.c
+@@ -67,7 +67,7 @@ static struct ima_measure_rule_entry default_rules[] = {
+ 	 .flags = IMA_FUNC | IMA_MASK},
+ 	{.action = MEASURE,.func = BPRM_CHECK,.mask = MAY_EXEC,
+ 	 .flags = IMA_FUNC | IMA_MASK},
+-	{.action = MEASURE,.func = PATH_CHECK,.mask = MAY_READ,.uid = 0,
++	{.action = MEASURE,.func = FILE_CHECK,.mask = MAY_READ,.uid = 0,
+ 	 .flags = IMA_FUNC | IMA_MASK | IMA_UID},
+ };
+ 
+@@ -282,8 +282,11 @@ static int ima_parse_rule(char *rule, struct ima_measure_rule_entry *entry)
+ 			break;
+ 		case Opt_func:
+ 			audit_log_format(ab, "func=%s ", args[0].from);
+-			if (strcmp(args[0].from, "PATH_CHECK") == 0)
+-				entry->func = PATH_CHECK;
++			if (strcmp(args[0].from, "FILE_CHECK") == 0)
++				entry->func = FILE_CHECK;
++			/* PATH_CHECK is for backwards compat */
++			else if (strcmp(args[0].from, "PATH_CHECK") == 0)
++				entry->func = FILE_CHECK;
+ 			else if (strcmp(args[0].from, "FILE_MMAP") == 0)
+ 				entry->func = FILE_MMAP;
+ 			else if (strcmp(args[0].from, "BPRM_CHECK") == 0)
+diff --git a/security/security.c b/security/security.c
+index 24e060b..122b748 100644
+--- a/security/security.c
++++ b/security/security.c
+@@ -666,8 +666,6 @@ int security_file_alloc(struct file *file)
+ void security_file_free(struct file *file)
+ {
+ 	security_ops->file_free_security(file);
+-	if (file->f_dentry)
+-		ima_file_free(file);
+ }
+ 
+ int security_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
