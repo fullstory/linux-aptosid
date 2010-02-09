@@ -242,6 +242,7 @@
 +	unsigned int restart_counter;
 +	unsigned int fw_err_counter;
 +	unsigned int fw_bug_counter;
++	unsigned int fw_chan_fail;
 +	unsigned long queue_stop_timeout[__AR9170_NUM_TXQ];
 +	struct work_struct restart_work;
 +	struct work_struct watchdog_work;
@@ -282,6 +283,7 @@
 +	u8 power_2G_ht40[8];
 +
 +	u8 phy_heavy_clip;
++	unsigned int phy_chan_fail;
 +
 +#ifdef CONFIG_CARL9170_LEDS
 +	struct delayed_work led_work;
@@ -416,8 +418,6 @@
 +int ar9170_set_leds_state(struct ar9170 *ar, u32 led_state);
 +
 +/* PHY / RF */
-+int ar9170_init_phy(struct ar9170 *ar, enum ieee80211_band band);
-+int ar9170_init_rf(struct ar9170 *ar);
 +int ar9170_set_channel(struct ar9170 *ar, struct ieee80211_channel *channel,
 +		       enum ar9170_rf_init_mode rfi, enum ar9170_bw bw);
 +int ar9170_powersave(struct ar9170 *ar, bool power_on);
@@ -727,7 +727,7 @@
 +#endif /* __CMD_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/debug.c
-@@ -0,0 +1,808 @@
+@@ -0,0 +1,810 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -1340,8 +1340,8 @@
 +}
 +DEBUGFS_DECLARE_RW_FILE(hw_ioread32, AR9170_DEBUG_RING_SIZE * 40);
 +
-+static ssize_t ar9170_debugfs_fw_bug_write(struct ar9170_usb *aru,
-+					    const char *buf, size_t count)
++static ssize_t ar9170_debugfs_bug_write(struct ar9170_usb *aru,
++					const char *buf, size_t count)
 +{
 +	struct ar9170 *ar = &aru->common;
 +	int err;
@@ -1385,19 +1385,21 @@
 +	return count;
 +}
 +
-+static char *ar9170_debugfs_fw_bug_read(struct ar9170_usb *aru,
-+					     char *buf, size_t bufsize,
-+					     ssize_t *ret)
++static char *ar9170_debugfs_bug_read(struct ar9170_usb *aru,
++				     char *buf, size_t bufsize,
++				     ssize_t *ret)
 +{
 +	ADD(buf, *ret, bufsize, "firmware restarts:%d\n",
 +		aru->common.restart_counter);
++	ADD(buf, *ret, bufsize, "phy reset errors:%d\n",
++		aru->common.phy_chan_fail);
 +	ADD(buf, *ret, bufsize, "reported firmware errors:%d\n",
 +		aru->common.fw_err_counter);
 +	ADD(buf, *ret, bufsize, "reported firmware BUGs:%d\n",
 +		aru->common.fw_bug_counter);
 +	return buf;
 +}
-+__DEBUGFS_DECLARE_RW_FILE(fw_bug, 240, AR9170_STOPPED);
++__DEBUGFS_DECLARE_RW_FILE(bug, 240, AR9170_STOPPED);
 +
 +static ssize_t ar9170_debugfs_hw_iowrite32_write(struct ar9170_usb *aru,
 +						 const char *buf, size_t count)
@@ -1524,7 +1526,7 @@
 +
 +	DEBUGFS_ADD(hw_ioread32);
 +	DEBUGFS_ADD(hw_iowrite32);
-+	DEBUGFS_ADD(fw_bug);
++	DEBUGFS_ADD(bug);
 +
 +	if (modparam_ht)
 +		DEBUGFS_ADD(rc_stats);
@@ -4124,7 +4126,7 @@
 +}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/main.c
-@@ -0,0 +1,1337 @@
+@@ -0,0 +1,1326 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -4447,14 +4449,6 @@
 +
 +	err = ar9170_write_reg(ar, AR9170_MAC_REG_DMA_TRIGGER,
 +			       AR9170_DMA_TRIGGER_RXQ);
-+	if (err)
-+		goto out;
-+
-+	err = ar9170_init_phy(ar, IEEE80211_BAND_2GHZ);
-+	if (err)
-+		goto out;
-+
-+	err = ar9170_init_rf(ar);
 +	if (err)
 +		goto out;
 +
@@ -5230,9 +5224,6 @@
 +	INIT_DELAYED_WORK(&ar->tx_janitor, ar9170_tx_janitor);
 +	INIT_LIST_HEAD(&ar->tx_ampdu_list);
 +
-+	/* all hw supports 2.4 GHz, so set channel to 1 by default */
-+	ar->channel = &ar9170_2ghz_chantable[0];
-+
 +	/* first part of wiphy init */
 +	ar->hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
 +					 BIT(NL80211_IFTYPE_WDS) |
@@ -5471,7 +5462,7 @@
 +obj-$(CONFIG_CARL9170_USB) += carl9170usb.o
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/phy.c
-@@ -0,0 +1,1809 @@
+@@ -0,0 +1,1794 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -6025,7 +6016,7 @@
 +	return ar9170_regwrite_result();
 +}
 +
-+int ar9170_init_phy(struct ar9170 *ar, enum ieee80211_band band)
++static int ar9170_init_phy(struct ar9170 *ar, enum ieee80211_band band)
 +{
 +	int i, err;
 +	u32 val;
@@ -6529,52 +6520,6 @@
 +	WARN_ON(ar9170_phy_freq_params[chanidx].freq != freq);
 +
 +	return &ar9170_phy_freq_params[chanidx].params[bw];
-+}
-+
-+
-+int ar9170_init_rf(struct ar9170 *ar)
-+{
-+	const struct ar9170_phy_freq_params *freqpar;
-+	__le32 cmd[7];
-+	int err;
-+
-+	err = ar9170_write_reg(ar, AR9170_PWR_REG_ADDA_BB,
-+			       AR9170_PWR_ADDA_BB_COLD_RESET);
-+	if (err)
-+		return err;
-+
-+	err = ar9170_write_reg(ar, AR9170_PWR_REG_ADDA_BB, 0x0);
-+	if (err)
-+		return err;
-+
-+	err = ar9170_init_rf_banks_0_7(ar, false);
-+	if (err)
-+		return err;
-+
-+	err = ar9170_init_rf_bank4_pwr(ar, false, 2412, AR9170_BW_20);
-+	if (err)
-+		return err;
-+
-+	freqpar = ar9170_get_hw_dyn_params(NULL, AR9170_BW_20);
-+
-+	cmd[0] = cpu_to_le32(2412 * 1000);
-+	cmd[1] = cpu_to_le32(0);
-+	cmd[2] = cpu_to_le32(1);
-+	cmd[3] = cpu_to_le32(freqpar->coeff_exp);
-+	cmd[4] = cpu_to_le32(freqpar->coeff_man);
-+	cmd[5] = cpu_to_le32(freqpar->coeff_exp_shgi);
-+	cmd[6] = cpu_to_le32(freqpar->coeff_man_shgi);
-+
-+	/* RF_INIT echoes the command back to us */
-+	err = ar->exec_cmd(ar, AR9170_CMD_RF_INIT,
-+			   sizeof(cmd), (u8 *)cmd,
-+			   sizeof(cmd), (u8 *)cmd);
-+	if (err)
-+		return err;
-+
-+	msleep(100);
-+
-+	return ar9170_echo_test(ar, 0xaabbccdd);
 +}
 +
 +static int ar9170_find_freq_idx(int nfreqs, u8 *freqs, u8 f)
@@ -7098,14 +7043,10 @@
 +{
 +	const struct ar9170_phy_freq_params *freqpar;
 +	u32 cmd, tmp, offs = 0;
-+	__le32 vals[8];
++	struct ar9170_rf_init_result rf_res;
++	struct ar9170_rf_init rf;
 +	int i, err;
 +	bool bandswitch;
-+
-+	/* clear BB heavy clip enable */
-+	err = ar9170_write_reg(ar, AR9170_PHY_REG_HEAVY_CLIP_ENABLE, 0x200);
-+	if (err)
-+		return err;
 +
 +	/* may be NULL at first setup */
 +	if (ar->channel)
@@ -7113,14 +7054,12 @@
 +	else
 +		bandswitch = true;
 +
++	ar->channel = NULL;
++
 +	/* HW workaround */
 +	if (!ar->hw->wiphy->bands[IEEE80211_BAND_5GHZ] &&
 +	    channel->center_freq <= 2417)
 +		bandswitch = true;
-+
-+	err = ar->exec_cmd(ar, AR9170_CMD_FREQ_START, 0, NULL, 0, NULL);
-+	if (err)
-+		return err;
 +
 +	if (rfi != AR9170_RFI_NONE || bandswitch) {
 +		u32 val = AR9170_PWR_ADDA_BB_WARM_RESET;
@@ -7147,9 +7086,22 @@
 +			return err;
 +
 +		cmd = AR9170_CMD_RF_INIT;
++
++		msleep(100);
++
++		err = ar9170_echo_test(ar, 0xaabbccdd);
++		if (err)
++			return err;
 +	} else {
 +		cmd = AR9170_CMD_FREQUENCY;
 +	}
++
++	err = ar->exec_cmd(ar, AR9170_CMD_FREQ_START, 0, NULL, 0, NULL);
++	if (err)
++		return err;
++
++	err = ar9170_write_reg(ar, AR9170_PHY_REG_HEAVY_CLIP_ENABLE,
++			       0x200);
 +
 +	err = ar9170_init_rf_bank4_pwr(ar,
 +		channel->band == IEEE80211_BAND_5GHZ,
@@ -7196,17 +7148,21 @@
 +
 +	freqpar = ar9170_get_hw_dyn_params(channel, bw);
 +
-+	vals[0] = cpu_to_le32(channel->center_freq * 1000);
-+	vals[1] = cpu_to_le32(conf_is_ht40(&ar->hw->conf));
-+	vals[2] = cpu_to_le32(offs << 2 | 1);
-+	vals[3] = cpu_to_le32(freqpar->coeff_exp);
-+	vals[4] = cpu_to_le32(freqpar->coeff_man);
-+	vals[5] = cpu_to_le32(freqpar->coeff_exp_shgi);
-+	vals[6] = cpu_to_le32(freqpar->coeff_man_shgi);
-+	vals[7] = cpu_to_le32(1000);
++	rf.freq = cpu_to_le32(channel->center_freq * 1000);
++	rf.dynht2040 = conf_is_ht40(&ar->hw->conf);
++	rf.ht_settings = (offs << 2) | 1;
++	rf.delta_slope_coeff_exp = cpu_to_le32(freqpar->coeff_exp);
++	rf.delta_slope_coeff_man = cpu_to_le32(freqpar->coeff_man);
++	rf.delta_slope_coeff_exp_shgi = cpu_to_le32(freqpar->coeff_exp_shgi);
++	rf.delta_slope_coeff_man_shgi = cpu_to_le32(freqpar->coeff_man_shgi);
 +
-+	err = ar->exec_cmd(ar, cmd, sizeof(vals), (u8 *)vals,
-+			   sizeof(vals), (u8 *)vals);
++	if (rfi != AR9170_RFI_NONE)
++		rf.finiteLoopCount = cpu_to_le32(2000);
++	else
++		rf.finiteLoopCount = cpu_to_le32(1000);
++
++	err = ar->exec_cmd(ar, cmd, sizeof(rf), &rf,
++			   sizeof(rf_res), &rf_res);
 +	if (err)
 +		return err;
 +
@@ -7219,14 +7175,34 @@
 +				       "heavy clip\n",
 +				       wiphy_name(ar->hw->wiphy));
 +		}
++
++		return err;
++	}
++
++	err = le32_to_cpu(rf_res.ret);
++	if (err != 0) {
++		if (rfi == AR9170_RFI_COLD)
++			return -EINVAL;
++
++		ar->fw_chan_fail++;
++		ar->phy_chan_fail++;
++
++		if (ar->fw_chan_fail > 3)
++			ar9170_restart(ar);
++
++		err = ar9170_set_channel(ar, channel, AR9170_RFI_COLD, bw);
++		if (err)
++			return err;
++	} else {
++		ar->fw_chan_fail = 0;
 +	}
 +
 +	for (i = 0; i < 2; i++) {
 +		ar->noise[i] = ar9170_calc_noise_dbm(
-+				(le32_to_cpu(vals[2 + i]) >> 19) & 0x1ff);
++				(le32_to_cpu(rf_res.regs[2 + i]) >> 19) & 0x1ff);
 +
 +		ar->noise[i + 2] = ar9170_calc_noise_dbm(
-+				    (le32_to_cpu(vals[5 + i]) >> 23) & 0x1ff);
++				    (le32_to_cpu(rf_res.regs[5 + i]) >> 23) & 0x1ff);
 +	}
 +
 +	ar->channel = channel;
@@ -9685,7 +9661,7 @@
 +#endif /* RC_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/rx.c
-@@ -0,0 +1,682 @@
+@@ -0,0 +1,684 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -9943,8 +9919,10 @@
 +		return -EINVAL;
 +	}
 +
-+	status->band = ar->channel->band;
-+	status->freq = ar->channel->center_freq;
++	if (ar->channel) {
++		status->band = ar->channel->band;
++		status->freq = ar->channel->center_freq;
++	}
 +
 +	switch (mac->status & AR9170_RX_STATUS_MODULATION_MASK) {
 +	case AR9170_RX_STATUS_MODULATION_CCK:
@@ -11732,7 +11710,7 @@
 +}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/carl9170/usb.c
-@@ -0,0 +1,1115 @@
+@@ -0,0 +1,1100 @@
 +/*
 + * Atheros CARL9170 driver
 + *
@@ -12153,14 +12131,14 @@
 +	if (plen && payload != (u8 *)(&ar->cmdbuf[1]))
 +		memcpy(&ar->cmdbuf[1], payload, plen);
 +
-+	spin_lock_irqsave(&aru->common.cmdlock, flags);
++	spin_lock_irqsave(&ar->cmdlock, flags);
 +	aru->readbuf = (u8 *)out;
 +	aru->readlen = outlen;
-+	spin_unlock_irqrestore(&aru->common.cmdlock, flags);
++	spin_unlock_irqrestore(&ar->cmdlock, flags);
 +
 +	usb_fill_int_urb(urb, aru->udev,
 +			 usb_sndbulkpipe(aru->udev, AR9170_USB_EP_CMD),
-+			 aru->common.cmdbuf, plen + 4,
++			 ar->cmdbuf, plen + 4,
 +			 ar9170_usb_tx_urb_complete, NULL, 1);
 +
 +	usb_anchor_urb(urb, &aru->tx_submitted);
@@ -12193,17 +12171,17 @@
 +
 +		/* provide some maybe useful debug information */
 +		print_hex_dump_bytes("ar9170 cmd: ", DUMP_PREFIX_NONE,
-+				     aru->common.cmdbuf, plen + 4);
++				     ar->cmdbuf, plen + 4);
 +		dump_stack();
 +
 +		ar9170_restart(ar);
 +	}
 +
 +	/* invalidate to avoid completing the next prematurely */
-+	spin_lock_irqsave(&aru->common.cmdlock, flags);
++	spin_lock_irqsave(&ar->cmdlock, flags);
 +	aru->readbuf = NULL;
 +	aru->readlen = 0;
-+	spin_unlock_irqrestore(&aru->common.cmdlock, flags);
++	spin_unlock_irqrestore(&ar->cmdlock, flags);
 +
 +err_free:
 +
@@ -12247,39 +12225,23 @@
 +	return 0;
 +}
 +
-+static void ar9170_usb_callback_cmd(struct ar9170 *ar, u32 len , void *buffer)
++static void ar9170_usb_callback_cmd(struct ar9170 *ar, u32 len, void *buffer)
 +{
 +	struct ar9170_usb *aru = (void *) ar;
 +	unsigned long flags;
-+	u32 in, out;
 +
 +	if (unlikely(!buffer))
 +		return;
-+
-+	in = le32_to_cpup((__le32 *)buffer);
-+	out = le32_to_cpu(ar->cmdbuf[0]);
-+
-+	/* mask off length byte */
-+	out &= ~0xFF;
-+
-+	if (aru->readlen >= 0) {
-+		/* add expected length */
-+		out |= aru->readlen;
-+	} else {
-+		/* add obtained length */
-+		out |= in & 0xFF;
-+	}
 +
 +	/*
 +	 * Some commands (e.g: AR9170_CMD_FREQUENCY) have a variable response
 +	 * length and we cannot predict the correct length in advance.
 +	 * So we only check if we provided enough space for the data.
 +	 */
-+	if (unlikely(out < in)) {
++	if (unlikely(aru->readlen != (len - 4))) {
 +		dev_warn(&aru->udev->dev, "received invalid command response "
-+					  "got %d bytes, instead of %d bytes "
-+					  "and the resp length is %d bytes\n",
-+			 in, out, len);
++					  "got %d bytes, instead of %d bytes\n",
++			 len - 4, aru->readlen);
 +		print_hex_dump_bytes("ar9170 invalid resp: ",
 +				     DUMP_PREFIX_OFFSET, buffer, len);
 +		/*
@@ -12289,13 +12251,14 @@
 +		return;
 +	}
 +
-+	spin_lock_irqsave(&aru->common.cmdlock, flags);
-+	if (aru->readbuf && len > 0) {
-+		memcpy(aru->readbuf, buffer + 4, len - 4);
++	spin_lock_irqsave(&ar->cmdlock, flags);
++	if (aru->readbuf) {
++		if (len >= 4)
++			memcpy(aru->readbuf, buffer + 4, len - 4);
 +		aru->readbuf = NULL;
 +	}
 +	complete(&aru->cmd_wait);
-+	spin_unlock_irqrestore(&aru->common.cmdlock, flags);
++	spin_unlock_irqrestore(&ar->cmdlock, flags);
 +}
 +
 +static int ar9170_usb_upload(struct ar9170_usb *aru, const void *data,
