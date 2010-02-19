@@ -1,3 +1,30 @@
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -199,6 +199,10 @@ and is between 256 and 4096 characters.
+ 			acpi_display_output=video
+ 			See above.
+ 
++	acpi_early_pdc_eval	[HW,ACPI] Evaluate processor _PDC methods
++				early. Needed on some platforms to properly
++				initialize the EC.
++
+ 	acpi_irq_balance [HW,ACPI]
+ 			ACPI will balance active IRQs
+ 			default in APIC mode
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -1733,10 +1733,9 @@ F:	include/linux/tfrc.h
+ F:	net/dccp/
+ 
+ DECnet NETWORK LAYER
+-M:	Christine Caulfield <christine.caulfield@googlemail.com>
+ W:	http://linux-decnet.sourceforge.net
+ L:	linux-decnet-user@lists.sourceforge.net
+-S:	Maintained
++S:	Orphan
+ F:	Documentation/networking/decnet.txt
+ F:	net/decnet/
+ 
 --- a/Makefile
 +++ b/Makefile
 @@ -1,7 +1,7 @@
@@ -5,10 +32,20 @@
  PATCHLEVEL = 6
  SUBLEVEL = 33
 -EXTRAVERSION = -rc8
-+EXTRAVERSION = -rc8-git3
++EXTRAVERSION = -rc8-git4
  NAME = Man-Eating Seals of Antiquity
  
  # *DOCUMENTATION*
+--- a/arch/ia64/include/asm/acpi.h
++++ b/arch/ia64/include/asm/acpi.h
+@@ -94,6 +94,7 @@ ia64_acpi_release_global_lock (unsigned
+ #define acpi_noirq 0	/* ACPI always enabled on IA64 */
+ #define acpi_pci_disabled 0 /* ACPI PCI always enabled on IA64 */
+ #define acpi_strict 1	/* no ACPI spec workarounds on IA64 */
++#define acpi_ht 0	/* no HT-only mode on IA64 */
+ #endif
+ #define acpi_processor_cstate_check(x) (x) /* no idle limits on IA64 :) */
+ static inline void disable_acpi(void) { }
 --- a/arch/ia64/include/asm/elf.h
 +++ b/arch/ia64/include/asm/elf.h
 @@ -201,7 +201,9 @@ extern void ia64_elf_core_copy_regs (str
@@ -22,6 +59,68 @@
  #define elf_read_implies_exec(ex, executable_stack)					\
  	((executable_stack!=EXSTACK_DISABLE_X) && ((ex).e_flags & EF_IA_64_LINUX_EXECUTABLE_STACK) != 0)
  
+--- a/arch/powerpc/platforms/85xx/mpc85xx_mds.c
++++ b/arch/powerpc/platforms/85xx/mpc85xx_mds.c
+@@ -338,7 +338,8 @@ static void __init mpc85xx_mds_pic_init(
+ 	}
+ 
+ 	mpic = mpic_alloc(np, r.start,
+-			MPIC_PRIMARY | MPIC_WANTS_RESET | MPIC_BIG_ENDIAN,
++			MPIC_PRIMARY | MPIC_WANTS_RESET | MPIC_BIG_ENDIAN |
++			MPIC_BROKEN_FRR_NIRQS,
+ 			0, 256, " OpenPIC  ");
+ 	BUG_ON(mpic == NULL);
+ 	of_node_put(np);
+--- a/arch/powerpc/platforms/85xx/smp.c
++++ b/arch/powerpc/platforms/85xx/smp.c
+@@ -46,6 +46,7 @@ smp_85xx_kick_cpu(int nr)
+ 	__iomem u32 *bptr_vaddr;
+ 	struct device_node *np;
+ 	int n = 0;
++	int ioremappable;
+ 
+ 	WARN_ON (nr < 0 || nr >= NR_CPUS);
+ 
+@@ -59,21 +60,37 @@ smp_85xx_kick_cpu(int nr)
+ 		return;
+ 	}
+ 
++	/*
++	 * A secondary core could be in a spinloop in the bootpage
++	 * (0xfffff000), somewhere in highmem, or somewhere in lowmem.
++	 * The bootpage and highmem can be accessed via ioremap(), but
++	 * we need to directly access the spinloop if its in lowmem.
++	 */
++	ioremappable = *cpu_rel_addr > virt_to_phys(high_memory);
++
+ 	/* Map the spin table */
+-	bptr_vaddr = ioremap(*cpu_rel_addr, SIZE_BOOT_ENTRY);
++	if (ioremappable)
++		bptr_vaddr = ioremap(*cpu_rel_addr, SIZE_BOOT_ENTRY);
++	else
++		bptr_vaddr = phys_to_virt(*cpu_rel_addr);
+ 
+ 	local_irq_save(flags);
+ 
+ 	out_be32(bptr_vaddr + BOOT_ENTRY_PIR, nr);
+ 	out_be32(bptr_vaddr + BOOT_ENTRY_ADDR_LOWER, __pa(__early_start));
+ 
++	if (!ioremappable)
++		flush_dcache_range((ulong)bptr_vaddr,
++				(ulong)(bptr_vaddr + SIZE_BOOT_ENTRY));
++
+ 	/* Wait a bit for the CPU to ack. */
+ 	while ((__secondary_hold_acknowledge != nr) && (++n < 1000))
+ 		mdelay(1);
+ 
+ 	local_irq_restore(flags);
+ 
+-	iounmap(bptr_vaddr);
++	if (ioremappable)
++		iounmap(bptr_vaddr);
+ 
+ 	pr_debug("waited %d msecs for CPU #%d.\n", n, nr);
+ }
 --- a/arch/sh/kernel/ptrace_64.c
 +++ b/arch/sh/kernel/ptrace_64.c
 @@ -133,6 +133,8 @@ void user_enable_single_step(struct task
@@ -90,6 +189,23 @@
  
  #define	COMPAT_ELF_PLAT_INIT(regs, load_addr)		\
  	elf_common_init(&current->thread, regs, __USER_DS)
+--- a/arch/x86/kernel/acpi/boot.c
++++ b/arch/x86/kernel/acpi/boot.c
+@@ -1344,14 +1344,6 @@ static struct dmi_system_id __initdata a
+ 	 },
+ 	{
+ 	 .callback = force_acpi_ht,
+-	 .ident = "ASUS P2B-DS",
+-	 .matches = {
+-		     DMI_MATCH(DMI_BOARD_VENDOR, "ASUSTeK Computer INC."),
+-		     DMI_MATCH(DMI_BOARD_NAME, "P2B-DS"),
+-		     },
+-	 },
+-	{
+-	 .callback = force_acpi_ht,
+ 	 .ident = "ASUS CUR-DLS",
+ 	 .matches = {
+ 		     DMI_MATCH(DMI_BOARD_VENDOR, "ASUSTeK Computer INC."),
 --- a/arch/x86/kernel/process_64.c
 +++ b/arch/x86/kernel/process_64.c
 @@ -527,6 +527,7 @@ void set_personality_ia32(void)
@@ -100,6 +216,150 @@
  
  	/* Prepare the first "return" to user space */
  	current_thread_info()->status |= TS_COMPAT;
+--- a/drivers/acpi/dock.c
++++ b/drivers/acpi/dock.c
+@@ -935,6 +935,7 @@ static int dock_add(acpi_handle handle)
+ 	struct platform_device *dd;
+ 
+ 	id = dock_station_count;
++	memset(&ds, 0, sizeof(ds));
+ 	dd = platform_device_register_data(NULL, "dock", id, &ds, sizeof(ds));
+ 	if (IS_ERR(dd))
+ 		return PTR_ERR(dd);
+--- a/drivers/acpi/processor_idle.c
++++ b/drivers/acpi/processor_idle.c
+@@ -110,6 +110,14 @@ static struct dmi_system_id __cpuinitdat
+ 	  DMI_MATCH(DMI_BIOS_VENDOR,"Phoenix Technologies LTD"),
+ 	  DMI_MATCH(DMI_BIOS_VERSION,"SHE845M0.86C.0013.D.0302131307")},
+ 	 (void *)2},
++	{ set_max_cstate, "Pavilion zv5000", {
++	  DMI_MATCH(DMI_SYS_VENDOR, "Hewlett-Packard"),
++	  DMI_MATCH(DMI_PRODUCT_NAME,"Pavilion zv5000 (DS502A#ABA)")},
++	 (void *)1},
++	{ set_max_cstate, "Asus L8400B", {
++	  DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK Computer Inc."),
++	  DMI_MATCH(DMI_PRODUCT_NAME,"L8400B series Notebook PC")},
++	 (void *)1},
+ 	{},
+ };
+ 
+--- a/drivers/acpi/processor_pdc.c
++++ b/drivers/acpi/processor_pdc.c
+@@ -125,6 +125,8 @@ acpi_processor_eval_pdc(acpi_handle hand
+ 	return status;
+ }
+ 
++static int early_pdc_done;
++
+ void acpi_processor_set_pdc(acpi_handle handle)
+ {
+ 	struct acpi_object_list *obj_list;
+@@ -132,6 +134,9 @@ void acpi_processor_set_pdc(acpi_handle
+ 	if (arch_has_acpi_pdc() == false)
+ 		return;
+ 
++	if (early_pdc_done)
++		return;
++
+ 	obj_list = acpi_processor_alloc_pdc();
+ 	if (!obj_list)
+ 		return;
+@@ -151,6 +156,13 @@ static int set_early_pdc_optin(const str
+ 	return 0;
+ }
+ 
++static int param_early_pdc_optin(char *s)
++{
++	early_pdc_optin = 1;
++	return 1;
++}
++__setup("acpi_early_pdc_eval", param_early_pdc_optin);
++
+ static struct dmi_system_id __cpuinitdata early_pdc_optin_table[] = {
+ 	{
+ 	set_early_pdc_optin, "HP Envy", {
+@@ -192,4 +204,6 @@ void __init acpi_early_processor_set_pdc
+ 	acpi_walk_namespace(ACPI_TYPE_PROCESSOR, ACPI_ROOT_OBJECT,
+ 			    ACPI_UINT32_MAX,
+ 			    early_init_pdc, NULL, NULL, NULL);
++
++	early_pdc_done = 1;
+ }
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -1336,9 +1336,25 @@ static int acpi_bus_scan(acpi_handle han
+ 
+ 	if (child)
+ 		*child = device;
+-	return 0;
++
++	if (device)
++		return 0;
++	else
++		return -ENODEV;
+ }
+ 
++/*
++ * acpi_bus_add and acpi_bus_start
++ *
++ * scan a given ACPI tree and (probably recently hot-plugged)
++ * create and add or starts found devices.
++ *
++ * If no devices were found -ENODEV is returned which does not
++ * mean that this is a real error, there just have been no suitable
++ * ACPI objects in the table trunk from which the kernel could create
++ * a device and add/start an appropriate driver.
++ */
++
+ int
+ acpi_bus_add(struct acpi_device **child,
+ 	     struct acpi_device *parent, acpi_handle handle, int type)
+@@ -1348,8 +1364,7 @@ acpi_bus_add(struct acpi_device **child,
+ 	memset(&ops, 0, sizeof(ops));
+ 	ops.acpi_op_add = 1;
+ 
+-	acpi_bus_scan(handle, &ops, child);
+-	return 0;
++	return acpi_bus_scan(handle, &ops, child);
+ }
+ EXPORT_SYMBOL(acpi_bus_add);
+ 
+@@ -1357,11 +1372,13 @@ int acpi_bus_start(struct acpi_device *d
+ {
+ 	struct acpi_bus_ops ops;
+ 
++	if (!device)
++		return -EINVAL;
++
+ 	memset(&ops, 0, sizeof(ops));
+ 	ops.acpi_op_start = 1;
+ 
+-	acpi_bus_scan(device->handle, &ops, NULL);
+-	return 0;
++	return acpi_bus_scan(device->handle, &ops, NULL);
+ }
+ EXPORT_SYMBOL(acpi_bus_start);
+ 
+--- a/drivers/acpi/tables.c
++++ b/drivers/acpi/tables.c
+@@ -213,7 +213,7 @@ acpi_table_parse_entries(char *id,
+ 	unsigned long table_end;
+ 	acpi_size tbl_size;
+ 
+-	if (acpi_disabled)
++	if (acpi_disabled && !acpi_ht)
+ 		return -ENODEV;
+ 
+ 	if (!handler)
+@@ -280,7 +280,7 @@ int __init acpi_table_parse(char *id, ac
+ 	struct acpi_table_header *table = NULL;
+ 	acpi_size tbl_size;
+ 
+-	if (acpi_disabled)
++	if (acpi_disabled && !acpi_ht)
+ 		return -ENODEV;
+ 
+ 	if (!handler)
 --- a/drivers/base/class.c
 +++ b/drivers/base/class.c
 @@ -59,6 +59,8 @@ static void class_release(struct kobject
@@ -253,6 +513,69 @@
  
  		header = (__le32 *) &d[1];
  		header[0] = cpu_to_le32(IT_HEADER_SY(p->sy) |
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -598,6 +598,50 @@ struct drm_display_mode *drm_mode_std(st
+ 	return mode;
+ }
+ 
++/*
++ * EDID is delightfully ambiguous about how interlaced modes are to be
++ * encoded.  Our internal representation is of frame height, but some
++ * HDTV detailed timings are encoded as field height.
++ *
++ * The format list here is from CEA, in frame size.  Technically we
++ * should be checking refresh rate too.  Whatever.
++ */
++static void
++drm_mode_do_interlace_quirk(struct drm_display_mode *mode,
++			    struct detailed_pixel_timing *pt)
++{
++	int i;
++	static const struct {
++		int w, h;
++	} cea_interlaced[] = {
++		{ 1920, 1080 },
++		{  720,  480 },
++		{ 1440,  480 },
++		{ 2880,  480 },
++		{  720,  576 },
++		{ 1440,  576 },
++		{ 2880,  576 },
++	};
++	static const int n_sizes =
++		sizeof(cea_interlaced)/sizeof(cea_interlaced[0]);
++
++	if (!(pt->misc & DRM_EDID_PT_INTERLACED))
++		return;
++
++	for (i = 0; i < n_sizes; i++) {
++		if ((mode->hdisplay == cea_interlaced[i].w) &&
++		    (mode->vdisplay == cea_interlaced[i].h / 2)) {
++			mode->vdisplay *= 2;
++			mode->vsync_start *= 2;
++			mode->vsync_end *= 2;
++			mode->vtotal *= 2;
++			mode->vtotal |= 1;
++		}
++	}
++
++	mode->flags |= DRM_MODE_FLAG_INTERLACE;
++}
++
+ /**
+  * drm_mode_detailed - create a new mode from an EDID detailed timing section
+  * @dev: DRM device (needed to create new mode)
+@@ -680,8 +724,7 @@ static struct drm_display_mode *drm_mode
+ 
+ 	drm_mode_set_name(mode);
+ 
+-	if (pt->misc & DRM_EDID_PT_INTERLACED)
+-		mode->flags |= DRM_MODE_FLAG_INTERLACE;
++	drm_mode_do_interlace_quirk(mode, pt);
+ 
+ 	if (quirks & EDID_QUIRK_DETAILED_SYNC_PP) {
+ 		pt->misc |= DRM_EDID_PT_HSYNC_POSITIVE | DRM_EDID_PT_VSYNC_POSITIVE;
 --- a/drivers/gpu/drm/drm_mm.c
 +++ b/drivers/gpu/drm/drm_mm.c
 @@ -405,7 +405,8 @@ struct drm_mm_node *drm_mm_search_free_i
@@ -265,6 +588,71 @@
  			if (!best_match)
  				return entry;
  			if (entry->size < best_size) {
+--- a/drivers/gpu/drm/i915/intel_lvds.c
++++ b/drivers/gpu/drm/i915/intel_lvds.c
+@@ -636,6 +636,13 @@ static const struct dmi_system_id bad_li
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "PC-81005"),
+ 		},
+ 	},
++	{
++		.ident = "Clevo M5x0N",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "CLEVO Co."),
++			DMI_MATCH(DMI_BOARD_NAME, "M5x0N"),
++		},
++	},
+ 	{ }
+ };
+ 
+--- a/drivers/gpu/drm/nouveau/nouveau_bios.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bios.c
+@@ -5861,13 +5861,12 @@ nouveau_bios_run_init_table(struct drm_d
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+ 	struct nvbios *bios = &dev_priv->VBIOS;
+ 	struct init_exec iexec = { true, false };
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&bios->lock, flags);
++	mutex_lock(&bios->lock);
+ 	bios->display.output = dcbent;
+ 	parse_init_table(bios, table, &iexec);
+ 	bios->display.output = NULL;
+-	spin_unlock_irqrestore(&bios->lock, flags);
++	mutex_unlock(&bios->lock);
+ }
+ 
+ static bool NVInitVBIOS(struct drm_device *dev)
+@@ -5876,7 +5875,7 @@ static bool NVInitVBIOS(struct drm_devic
+ 	struct nvbios *bios = &dev_priv->VBIOS;
+ 
+ 	memset(bios, 0, sizeof(struct nvbios));
+-	spin_lock_init(&bios->lock);
++	mutex_init(&bios->lock);
+ 	bios->dev = dev;
+ 
+ 	if (!NVShadowVBIOS(dev, bios->data))
+--- a/drivers/gpu/drm/nouveau/nouveau_bios.h
++++ b/drivers/gpu/drm/nouveau/nouveau_bios.h
+@@ -205,7 +205,7 @@ struct nvbios {
+ 	struct drm_device *dev;
+ 	struct nouveau_bios_info pub;
+ 
+-	spinlock_t lock;
++	struct mutex lock;
+ 
+ 	uint8_t data[NV_PROM_SIZE];
+ 	unsigned int length;
+--- a/drivers/gpu/drm/nouveau/nv17_tv.c
++++ b/drivers/gpu/drm/nouveau/nv17_tv.c
+@@ -579,6 +579,8 @@ static void nv17_tv_restore(struct drm_e
+ 				nouveau_encoder(encoder)->restore.output);
+ 
+ 	nv17_tv_state_load(dev, &to_tv_enc(encoder)->saved_state);
++
++	nouveau_encoder(encoder)->last_dpms = NV_DPMS_CLEARED;
+ }
+ 
+ static int nv17_tv_create_resources(struct drm_encoder *encoder,
 --- a/drivers/gpu/drm/radeon/atom.c
 +++ b/drivers/gpu/drm/radeon/atom.c
 @@ -24,6 +24,7 @@
@@ -286,6 +674,15 @@
  		if (print)
  			DEBUG("PS[0x%02X,0x%04X]", idx, val);
  		break;
+@@ -640,7 +643,7 @@ static void atom_op_delay(atom_exec_cont
+ 	uint8_t count = U8((*ptr)++);
+ 	SDEBUG("   count: %d\n", count);
+ 	if (arg == ATOM_UNIT_MICROSEC)
+-		schedule_timeout_uninterruptible(usecs_to_jiffies(count));
++		udelay(count);
+ 	else
+ 		schedule_timeout_uninterruptible(msecs_to_jiffies(count));
+ }
 --- a/drivers/gpu/drm/radeon/atombios_dp.c
 +++ b/drivers/gpu/drm/radeon/atombios_dp.c
 @@ -350,7 +350,7 @@ retry:
@@ -297,6 +694,337 @@
  			goto retry;
  		DRM_DEBUG("failed to get auxch %02x%02x %02x %02x 0x%02x %02x after %d retries\n",
  			  req_bytes[1], req_bytes[0], req_bytes[2], req_bytes[3],
+--- a/drivers/gpu/drm/radeon/r600_blit_kms.c
++++ b/drivers/gpu/drm/radeon/r600_blit_kms.c
+@@ -543,9 +543,6 @@ int r600_vb_ib_get(struct radeon_device
+ void r600_vb_ib_put(struct radeon_device *rdev)
+ {
+ 	radeon_fence_emit(rdev, rdev->r600_blit.vb_ib->fence);
+-	mutex_lock(&rdev->ib_pool.mutex);
+-	list_add_tail(&rdev->r600_blit.vb_ib->list, &rdev->ib_pool.scheduled_ibs);
+-	mutex_unlock(&rdev->ib_pool.mutex);
+ 	radeon_ib_free(rdev, &rdev->r600_blit.vb_ib);
+ }
+ 
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -96,6 +96,7 @@ extern int radeon_audio;
+  * symbol;
+  */
+ #define RADEON_MAX_USEC_TIMEOUT		100000	/* 100 ms */
++/* RADEON_IB_POOL_SIZE must be a power of 2 */
+ #define RADEON_IB_POOL_SIZE		16
+ #define RADEON_DEBUGFS_MAX_NUM_FILES	32
+ #define RADEONFB_CONN_LIMIT		4
+@@ -363,11 +364,12 @@ void radeon_irq_kms_sw_irq_put(struct ra
+  */
+ struct radeon_ib {
+ 	struct list_head	list;
+-	unsigned long		idx;
++	unsigned		idx;
+ 	uint64_t		gpu_addr;
+ 	struct radeon_fence	*fence;
+-	uint32_t	*ptr;
++	uint32_t		*ptr;
+ 	uint32_t		length_dw;
++	bool			free;
+ };
+ 
+ /*
+@@ -377,10 +379,9 @@ struct radeon_ib {
+ struct radeon_ib_pool {
+ 	struct mutex		mutex;
+ 	struct radeon_bo	*robj;
+-	struct list_head	scheduled_ibs;
+ 	struct radeon_ib	ibs[RADEON_IB_POOL_SIZE];
+ 	bool			ready;
+-	DECLARE_BITMAP(alloc_bm, RADEON_IB_POOL_SIZE);
++	unsigned		head_id;
+ };
+ 
+ struct radeon_cp {
+--- a/drivers/gpu/drm/radeon/radeon_cs.c
++++ b/drivers/gpu/drm/radeon/radeon_cs.c
+@@ -86,7 +86,7 @@ int radeon_cs_parser_relocs(struct radeo
+ 						&p->validated);
+ 		}
+ 	}
+-	return radeon_bo_list_validate(&p->validated, p->ib->fence);
++	return radeon_bo_list_validate(&p->validated);
+ }
+ 
+ int radeon_cs_parser_init(struct radeon_cs_parser *p, void *data)
+@@ -189,12 +189,10 @@ static void radeon_cs_parser_fini(struct
+ {
+ 	unsigned i;
+ 
+-	if (error && parser->ib) {
+-		radeon_bo_list_unvalidate(&parser->validated,
+-						parser->ib->fence);
+-	} else {
+-		radeon_bo_list_unreserve(&parser->validated);
++	if (!error && parser->ib) {
++		radeon_bo_list_fence(&parser->validated, parser->ib->fence);
+ 	}
++	radeon_bo_list_unreserve(&parser->validated);
+ 	for (i = 0; i < parser->nrelocs; i++) {
+ 		if (parser->relocs[i].gobj) {
+ 			mutex_lock(&parser->rdev->ddev->struct_mutex);
+--- a/drivers/gpu/drm/radeon/radeon_object.c
++++ b/drivers/gpu/drm/radeon/radeon_object.c
+@@ -306,11 +306,10 @@ void radeon_bo_list_unreserve(struct lis
+ 	}
+ }
+ 
+-int radeon_bo_list_validate(struct list_head *head, void *fence)
++int radeon_bo_list_validate(struct list_head *head)
+ {
+ 	struct radeon_bo_list *lobj;
+ 	struct radeon_bo *bo;
+-	struct radeon_fence *old_fence = NULL;
+ 	int r;
+ 
+ 	r = radeon_bo_list_reserve(head);
+@@ -334,32 +333,27 @@ int radeon_bo_list_validate(struct list_
+ 		}
+ 		lobj->gpu_offset = radeon_bo_gpu_offset(bo);
+ 		lobj->tiling_flags = bo->tiling_flags;
+-		if (fence) {
+-			old_fence = (struct radeon_fence *)bo->tbo.sync_obj;
+-			bo->tbo.sync_obj = radeon_fence_ref(fence);
+-			bo->tbo.sync_obj_arg = NULL;
+-		}
+-		if (old_fence) {
+-			radeon_fence_unref(&old_fence);
+-		}
+ 	}
+ 	return 0;
+ }
+ 
+-void radeon_bo_list_unvalidate(struct list_head *head, void *fence)
++void radeon_bo_list_fence(struct list_head *head, void *fence)
+ {
+ 	struct radeon_bo_list *lobj;
+-	struct radeon_fence *old_fence;
++	struct radeon_bo *bo;
++	struct radeon_fence *old_fence = NULL;
+ 
+-	if (fence)
+-		list_for_each_entry(lobj, head, list) {
+-			old_fence = to_radeon_fence(lobj->bo->tbo.sync_obj);
+-			if (old_fence == fence) {
+-				lobj->bo->tbo.sync_obj = NULL;
+-				radeon_fence_unref(&old_fence);
+-			}
++	list_for_each_entry(lobj, head, list) {
++		bo = lobj->bo;
++		spin_lock(&bo->tbo.lock);
++		old_fence = (struct radeon_fence *)bo->tbo.sync_obj;
++		bo->tbo.sync_obj = radeon_fence_ref(fence);
++		bo->tbo.sync_obj_arg = NULL;
++		spin_unlock(&bo->tbo.lock);
++		if (old_fence) {
++			radeon_fence_unref(&old_fence);
+ 		}
+-	radeon_bo_list_unreserve(head);
++	}
+ }
+ 
+ int radeon_bo_fbdev_mmap(struct radeon_bo *bo,
+--- a/drivers/gpu/drm/radeon/radeon_object.h
++++ b/drivers/gpu/drm/radeon/radeon_object.h
+@@ -156,8 +156,8 @@ extern void radeon_bo_list_add_object(st
+ 				struct list_head *head);
+ extern int radeon_bo_list_reserve(struct list_head *head);
+ extern void radeon_bo_list_unreserve(struct list_head *head);
+-extern int radeon_bo_list_validate(struct list_head *head, void *fence);
+-extern void radeon_bo_list_unvalidate(struct list_head *head, void *fence);
++extern int radeon_bo_list_validate(struct list_head *head);
++extern void radeon_bo_list_fence(struct list_head *head, void *fence);
+ extern int radeon_bo_fbdev_mmap(struct radeon_bo *bo,
+ 				struct vm_area_struct *vma);
+ extern int radeon_bo_set_tiling_flags(struct radeon_bo *bo,
+--- a/drivers/gpu/drm/radeon/radeon_ring.c
++++ b/drivers/gpu/drm/radeon/radeon_ring.c
+@@ -41,68 +41,55 @@ int radeon_ib_get(struct radeon_device *
+ {
+ 	struct radeon_fence *fence;
+ 	struct radeon_ib *nib;
+-	unsigned long i;
+-	int r = 0;
++	int r = 0, i, c;
+ 
+ 	*ib = NULL;
+ 	r = radeon_fence_create(rdev, &fence);
+ 	if (r) {
+-		DRM_ERROR("failed to create fence for new IB\n");
++		dev_err(rdev->dev, "failed to create fence for new IB\n");
+ 		return r;
+ 	}
+ 	mutex_lock(&rdev->ib_pool.mutex);
+-	i = find_first_zero_bit(rdev->ib_pool.alloc_bm, RADEON_IB_POOL_SIZE);
+-	if (i < RADEON_IB_POOL_SIZE) {
+-		set_bit(i, rdev->ib_pool.alloc_bm);
+-		rdev->ib_pool.ibs[i].length_dw = 0;
+-		*ib = &rdev->ib_pool.ibs[i];
+-		mutex_unlock(&rdev->ib_pool.mutex);
+-		goto out;
++	for (i = rdev->ib_pool.head_id, c = 0, nib = NULL; c < RADEON_IB_POOL_SIZE; c++, i++) {
++		i &= (RADEON_IB_POOL_SIZE - 1);
++		if (rdev->ib_pool.ibs[i].free) {
++			nib = &rdev->ib_pool.ibs[i];
++			break;
++		}
+ 	}
+-	if (list_empty(&rdev->ib_pool.scheduled_ibs)) {
+-		/* we go do nothings here */
+-		mutex_unlock(&rdev->ib_pool.mutex);
+-		DRM_ERROR("all IB allocated none scheduled.\n");
+-		r = -EINVAL;
+-		goto out;
+-	}
+-	/* get the first ib on the scheduled list */
+-	nib = list_entry(rdev->ib_pool.scheduled_ibs.next,
+-			 struct radeon_ib, list);
+-	if (nib->fence == NULL) {
+-		/* we go do nothings here */
++	if (nib == NULL) {
++		/* This should never happen, it means we allocated all
++		 * IB and haven't scheduled one yet, return EBUSY to
++		 * userspace hoping that on ioctl recall we get better
++		 * luck
++		 */
++		dev_err(rdev->dev, "no free indirect buffer !\n");
+ 		mutex_unlock(&rdev->ib_pool.mutex);
+-		DRM_ERROR("IB %lu scheduled without a fence.\n", nib->idx);
+-		r = -EINVAL;
+-		goto out;
++		radeon_fence_unref(&fence);
++		return -EBUSY;
+ 	}
+-	mutex_unlock(&rdev->ib_pool.mutex);
+-
+-	r = radeon_fence_wait(nib->fence, false);
+-	if (r) {
+-		DRM_ERROR("radeon: IB(%lu:0x%016lX:%u)\n", nib->idx,
+-			  (unsigned long)nib->gpu_addr, nib->length_dw);
+-		DRM_ERROR("radeon: GPU lockup detected, fail to get a IB\n");
+-		goto out;
++	rdev->ib_pool.head_id = (nib->idx + 1) & (RADEON_IB_POOL_SIZE - 1);
++	nib->free = false;
++	if (nib->fence) {
++		mutex_unlock(&rdev->ib_pool.mutex);
++		r = radeon_fence_wait(nib->fence, false);
++		if (r) {
++			dev_err(rdev->dev, "error waiting fence of IB(%u:0x%016lX:%u)\n",
++				nib->idx, (unsigned long)nib->gpu_addr, nib->length_dw);
++			mutex_lock(&rdev->ib_pool.mutex);
++			nib->free = true;
++			mutex_unlock(&rdev->ib_pool.mutex);
++			radeon_fence_unref(&fence);
++			return r;
++		}
++		mutex_lock(&rdev->ib_pool.mutex);
+ 	}
+ 	radeon_fence_unref(&nib->fence);
+-
++	nib->fence = fence;
+ 	nib->length_dw = 0;
+-
+-	/* scheduled list is accessed here */
+-	mutex_lock(&rdev->ib_pool.mutex);
+-	list_del(&nib->list);
+-	INIT_LIST_HEAD(&nib->list);
+ 	mutex_unlock(&rdev->ib_pool.mutex);
+-
+ 	*ib = nib;
+-out:
+-	if (r) {
+-		radeon_fence_unref(&fence);
+-	} else {
+-		(*ib)->fence = fence;
+-	}
+-	return r;
++	return 0;
+ }
+ 
+ void radeon_ib_free(struct radeon_device *rdev, struct radeon_ib **ib)
+@@ -114,18 +101,7 @@ void radeon_ib_free(struct radeon_device
+ 		return;
+ 	}
+ 	mutex_lock(&rdev->ib_pool.mutex);
+-	if (!list_empty(&tmp->list) && !radeon_fence_signaled(tmp->fence)) {
+-		/* IB is scheduled & not signaled don't do anythings */
+-		mutex_unlock(&rdev->ib_pool.mutex);
+-		return;
+-	}
+-	list_del(&tmp->list);
+-	INIT_LIST_HEAD(&tmp->list);
+-	if (tmp->fence)
+-		radeon_fence_unref(&tmp->fence);
+-
+-	tmp->length_dw = 0;
+-	clear_bit(tmp->idx, rdev->ib_pool.alloc_bm);
++	tmp->free = true;
+ 	mutex_unlock(&rdev->ib_pool.mutex);
+ }
+ 
+@@ -135,7 +111,7 @@ int radeon_ib_schedule(struct radeon_dev
+ 
+ 	if (!ib->length_dw || !rdev->cp.ready) {
+ 		/* TODO: Nothings in the ib we should report. */
+-		DRM_ERROR("radeon: couldn't schedule IB(%lu).\n", ib->idx);
++		DRM_ERROR("radeon: couldn't schedule IB(%u).\n", ib->idx);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -148,7 +124,8 @@ int radeon_ib_schedule(struct radeon_dev
+ 	radeon_ring_ib_execute(rdev, ib);
+ 	radeon_fence_emit(rdev, ib->fence);
+ 	mutex_lock(&rdev->ib_pool.mutex);
+-	list_add_tail(&ib->list, &rdev->ib_pool.scheduled_ibs);
++	/* once scheduled IB is considered free and protected by the fence */
++	ib->free = true;
+ 	mutex_unlock(&rdev->ib_pool.mutex);
+ 	radeon_ring_unlock_commit(rdev);
+ 	return 0;
+@@ -164,7 +141,6 @@ int radeon_ib_pool_init(struct radeon_de
+ 	if (rdev->ib_pool.robj)
+ 		return 0;
+ 	/* Allocate 1M object buffer */
+-	INIT_LIST_HEAD(&rdev->ib_pool.scheduled_ibs);
+ 	r = radeon_bo_create(rdev, NULL,  RADEON_IB_POOL_SIZE*64*1024,
+ 				true, RADEON_GEM_DOMAIN_GTT,
+ 				&rdev->ib_pool.robj);
+@@ -195,9 +171,9 @@ int radeon_ib_pool_init(struct radeon_de
+ 		rdev->ib_pool.ibs[i].ptr = ptr + offset;
+ 		rdev->ib_pool.ibs[i].idx = i;
+ 		rdev->ib_pool.ibs[i].length_dw = 0;
+-		INIT_LIST_HEAD(&rdev->ib_pool.ibs[i].list);
++		rdev->ib_pool.ibs[i].free = true;
+ 	}
+-	bitmap_zero(rdev->ib_pool.alloc_bm, RADEON_IB_POOL_SIZE);
++	rdev->ib_pool.head_id = 0;
+ 	rdev->ib_pool.ready = true;
+ 	DRM_INFO("radeon: ib pool ready.\n");
+ 	if (radeon_debugfs_ib_init(rdev)) {
+@@ -214,7 +190,6 @@ void radeon_ib_pool_fini(struct radeon_d
+ 		return;
+ 	}
+ 	mutex_lock(&rdev->ib_pool.mutex);
+-	bitmap_zero(rdev->ib_pool.alloc_bm, RADEON_IB_POOL_SIZE);
+ 	if (rdev->ib_pool.robj) {
+ 		r = radeon_bo_reserve(rdev->ib_pool.robj, false);
+ 		if (likely(r == 0)) {
+@@ -363,7 +338,7 @@ static int radeon_debugfs_ib_info(struct
+ 	if (ib == NULL) {
+ 		return 0;
+ 	}
+-	seq_printf(m, "IB %04lu\n", ib->idx);
++	seq_printf(m, "IB %04u\n", ib->idx);
+ 	seq_printf(m, "IB fence %p\n", ib->fence);
+ 	seq_printf(m, "IB size %05u dwords\n", ib->length_dw);
+ 	for (i = 0; i < ib->length_dw; i++) {
 --- a/drivers/gpu/drm/ttm/ttm_bo.c
 +++ b/drivers/gpu/drm/ttm/ttm_bo.c
 @@ -1020,6 +1020,12 @@ static int ttm_bo_mem_compat(struct ttm_
@@ -312,6 +1040,128 @@
  
  	for (i = 0; i < placement->num_placement; i++) {
  		if ((placement->placement[i] & mem->placement &
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -348,22 +348,19 @@ static int vmw_driver_load(struct drm_de
+ 		 */
+ 
+ 		DRM_INFO("It appears like vesafb is loaded. "
+-			 "Ignore above error if any. Entering stealth mode.\n");
++			 "Ignore above error if any.\n");
+ 		ret = pci_request_region(dev->pdev, 2, "vmwgfx stealth probe");
+ 		if (unlikely(ret != 0)) {
+ 			DRM_ERROR("Failed reserving the SVGA MMIO resource.\n");
+ 			goto out_no_device;
+ 		}
+-		vmw_kms_init(dev_priv);
+-		vmw_overlay_init(dev_priv);
+-	} else {
+-		ret = vmw_request_device(dev_priv);
+-		if (unlikely(ret != 0))
+-			goto out_no_device;
+-		vmw_kms_init(dev_priv);
+-		vmw_overlay_init(dev_priv);
+-		vmw_fb_init(dev_priv);
+ 	}
++	ret = vmw_request_device(dev_priv);
++	if (unlikely(ret != 0))
++		goto out_no_device;
++	vmw_kms_init(dev_priv);
++	vmw_overlay_init(dev_priv);
++	vmw_fb_init(dev_priv);
+ 
+ 	dev_priv->pm_nb.notifier_call = vmwgfx_pm_notifier;
+ 	register_pm_notifier(&dev_priv->pm_nb);
+@@ -406,17 +403,15 @@ static int vmw_driver_unload(struct drm_
+ 
+ 	unregister_pm_notifier(&dev_priv->pm_nb);
+ 
+-	if (!dev_priv->stealth) {
+-		vmw_fb_close(dev_priv);
+-		vmw_kms_close(dev_priv);
+-		vmw_overlay_close(dev_priv);
+-		vmw_release_device(dev_priv);
+-		pci_release_regions(dev->pdev);
+-	} else {
+-		vmw_kms_close(dev_priv);
+-		vmw_overlay_close(dev_priv);
++	vmw_fb_close(dev_priv);
++	vmw_kms_close(dev_priv);
++	vmw_overlay_close(dev_priv);
++	vmw_release_device(dev_priv);
++	if (dev_priv->stealth)
+ 		pci_release_region(dev->pdev, 2);
+-	}
++	else
++		pci_release_regions(dev->pdev);
++
+ 	if (dev_priv->capabilities & SVGA_CAP_IRQMASK)
+ 		drm_irq_uninstall(dev_priv->dev);
+ 	if (dev->devname == vmw_devname)
+@@ -585,11 +580,6 @@ static int vmw_master_set(struct drm_dev
+ 	int ret = 0;
+ 
+ 	DRM_INFO("Master set.\n");
+-	if (dev_priv->stealth) {
+-		ret = vmw_request_device(dev_priv);
+-		if (unlikely(ret != 0))
+-			return ret;
+-	}
+ 
+ 	if (active) {
+ 		BUG_ON(active != &dev_priv->fbdev_master);
+@@ -649,18 +639,11 @@ static void vmw_master_drop(struct drm_d
+ 
+ 	ttm_lock_set_kill(&vmaster->lock, true, SIGTERM);
+ 
+-	if (dev_priv->stealth) {
+-		ret = ttm_bo_evict_mm(&dev_priv->bdev, TTM_PL_VRAM);
+-		if (unlikely(ret != 0))
+-			DRM_ERROR("Unable to clean VRAM on master drop.\n");
+-		vmw_release_device(dev_priv);
+-	}
+ 	dev_priv->active_master = &dev_priv->fbdev_master;
+ 	ttm_lock_set_kill(&dev_priv->fbdev_master.lock, false, SIGTERM);
+ 	ttm_vt_unlock(&dev_priv->fbdev_master.lock);
+ 
+-	if (!dev_priv->stealth)
+-		vmw_fb_on(dev_priv);
++	vmw_fb_on(dev_priv);
+ }
+ 
+ 
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
+@@ -559,6 +559,9 @@ int vmw_fb_init(struct vmw_private *vmw_
+ 	info->pixmap.scan_align = 1;
+ #endif
+ 
++	info->aperture_base = vmw_priv->vram_start;
++	info->aperture_size = vmw_priv->vram_size;
++
+ 	/*
+ 	 * Dirty & Deferred IO
+ 	 */
+--- a/drivers/input/serio/i8042.c
++++ b/drivers/input/serio/i8042.c
+@@ -1161,9 +1161,17 @@ static int i8042_pm_restore(struct devic
+ 	return 0;
+ }
+ 
++static int i8042_pm_thaw(struct device *dev)
++{
++	i8042_interrupt(0, NULL);
++
++	return 0;
++}
++
+ static const struct dev_pm_ops i8042_pm_ops = {
+ 	.suspend	= i8042_pm_reset,
+ 	.resume		= i8042_pm_restore,
++	.thaw		= i8042_pm_thaw,
+ 	.poweroff	= i8042_pm_reset,
+ 	.restore	= i8042_pm_restore,
+ };
 --- a/drivers/md/dm-log-userspace-transfer.c
 +++ b/drivers/md/dm-log-userspace-transfer.c
 @@ -172,11 +172,15 @@ int dm_consult_userspace(const char *uui
@@ -772,6 +1622,32 @@
  	/* Sphairon Access Systems GmbH */
  	{USB_DEVICE(0x114B, 0x0150), .driver_info = DEVICE_RTL8187},
  	/* Dick Smith Electronics */
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -720,12 +720,6 @@ static int acpiphp_bus_add(struct acpiph
+ 			-ret_val);
+ 		goto acpiphp_bus_add_out;
+ 	}
+-	/*
+-	 * try to start anyway.  We could have failed to add
+-	 * simply because this bus had previously been added
+-	 * on another add.  Don't bother with the return value
+-	 * we just keep going.
+-	 */
+ 	ret_val = acpi_bus_start(device);
+ 
+ acpiphp_bus_add_out:
+--- a/drivers/platform/x86/thinkpad_acpi.c
++++ b/drivers/platform/x86/thinkpad_acpi.c
+@@ -5771,7 +5771,7 @@ static void thermal_exit(void)
+ 	case TPACPI_THERMAL_ACPI_TMP07:
+ 	case TPACPI_THERMAL_ACPI_UPDT:
+ 		sysfs_remove_group(&tpacpi_sensors_pdev->dev.kobj,
+-				   &thermal_temp_input16_group);
++				   &thermal_temp_input8_group);
+ 		break;
+ 	case TPACPI_THERMAL_NONE:
+ 	default:
 --- a/drivers/serial/8250.c
 +++ b/drivers/serial/8250.c
 @@ -83,6 +83,9 @@ static unsigned int skip_txen_test; /* f
@@ -1330,6 +2206,16 @@
  {
  	return bp->attr.bp_len;
  }
+--- a/include/linux/input.h
++++ b/include/linux/input.h
+@@ -376,6 +376,7 @@ struct input_absinfo {
+ #define KEY_DISPLAY_OFF		245	/* display device to off state */
+ 
+ #define KEY_WIMAX		246
++#define KEY_RFKILL		247	/* Key that controls all radios */
+ 
+ /* Range 248 - 255 is reserved for special needs of AT keyboard driver */
+ 
 --- a/include/linux/kfifo.h
 +++ b/include/linux/kfifo.h
 @@ -124,7 +124,7 @@ extern __must_check unsigned int kfifo_o
