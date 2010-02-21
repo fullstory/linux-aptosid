@@ -11,8 +11,45 @@
  	acpi_irq_balance [HW,ACPI]
  			ACPI will balance active IRQs
  			default in APIC mode
+@@ -311,6 +315,11 @@ and is between 256 and 4096 characters.
+ 	aic79xx=	[HW,SCSI]
+ 			See Documentation/scsi/aic79xx.txt.
+ 
++	alignment=	[KNL,ARM]
++			Allow the default userspace alignment fault handler
++			behaviour to be specified.  Bit 0 enables warnings,
++			bit 1 enables fixups, and bit 2 sends a segfault.
++
+ 	amd_iommu=	[HW,X86-84]
+ 			Pass parameters to the AMD IOMMU driver in the system.
+ 			Possible values are:
 --- a/MAINTAINERS
 +++ b/MAINTAINERS
+@@ -616,10 +616,10 @@ M:	Richard Purdie <rpurdie@rpsys.net>
+ S:	Maintained
+ 
+ ARM/CORTINA SYSTEMS GEMINI ARM ARCHITECTURE
+-M:	Paulius Zaleckas <paulius.zaleckas@teltonika.lt>
++M:	Paulius Zaleckas <paulius.zaleckas@gmail.com>
+ L:	linux-arm-kernel@lists.infradead.org (moderated for non-subscribers)
+ T:	git git://gitorious.org/linux-gemini/mainline.git
+-S:	Maintained
++S:	Odd Fixes
+ F:	arch/arm/mach-gemini/
+ 
+ ARM/EBSA110 MACHINE SUPPORT
+@@ -641,9 +641,9 @@ T:	topgit git://git.openezx.org/openezx.
+ F:	arch/arm/mach-pxa/ezx.c
+ 
+ ARM/FARADAY FA526 PORT
+-M:	Paulius Zaleckas <paulius.zaleckas@teltonika.lt>
++M:	Paulius Zaleckas <paulius.zaleckas@gmail.com>
+ L:	linux-arm-kernel@lists.infradead.org (moderated for non-subscribers)
+-S:	Maintained
++S:	Odd Fixes
+ F:	arch/arm/mm/*-fa*
+ 
+ ARM/FOOTBRIDGE ARCHITECTURE
 @@ -1733,10 +1733,9 @@ F:	include/linux/tfrc.h
  F:	net/dccp/
  
@@ -32,10 +69,161 @@
  PATCHLEVEL = 6
  SUBLEVEL = 33
 -EXTRAVERSION = -rc8
-+EXTRAVERSION = -rc8-git4
++EXTRAVERSION = -rc8-git6
  NAME = Man-Eating Seals of Antiquity
  
  # *DOCUMENTATION*
+--- a/arch/arm/include/asm/cacheflush.h
++++ b/arch/arm/include/asm/cacheflush.h
+@@ -42,7 +42,8 @@
+ #endif
+ 
+ #if defined(CONFIG_CPU_ARM920T) || defined(CONFIG_CPU_ARM922T) || \
+-    defined(CONFIG_CPU_ARM925T) || defined(CONFIG_CPU_ARM1020)
++    defined(CONFIG_CPU_ARM925T) || defined(CONFIG_CPU_ARM1020) || \
++    defined(CONFIG_CPU_ARM1026)
+ # define MULTI_CACHE 1
+ #endif
+ 
+--- a/arch/arm/kernel/setup.c
++++ b/arch/arm/kernel/setup.c
+@@ -102,6 +102,7 @@ struct cpu_cache_fns cpu_cache;
+ #endif
+ #ifdef CONFIG_OUTER_CACHE
+ struct outer_cache_fns outer_cache;
++EXPORT_SYMBOL(outer_cache);
+ #endif
+ 
+ struct stack {
+--- a/arch/arm/mach-gemini/gpio.c
++++ b/arch/arm/mach-gemini/gpio.c
+@@ -86,7 +86,7 @@ static int gpio_set_irq_type(unsigned in
+ 	unsigned int reg_both, reg_level, reg_type;
+ 
+ 	reg_type = __raw_readl(base + GPIO_INT_TYPE);
+-	reg_level = __raw_readl(base + GPIO_INT_BOTH_EDGE);
++	reg_level = __raw_readl(base + GPIO_INT_LEVEL);
+ 	reg_both = __raw_readl(base + GPIO_INT_BOTH_EDGE);
+ 
+ 	switch (type) {
+@@ -117,7 +117,7 @@ static int gpio_set_irq_type(unsigned in
+ 	}
+ 
+ 	__raw_writel(reg_type, base + GPIO_INT_TYPE);
+-	__raw_writel(reg_level, base + GPIO_INT_BOTH_EDGE);
++	__raw_writel(reg_level, base + GPIO_INT_LEVEL);
+ 	__raw_writel(reg_both, base + GPIO_INT_BOTH_EDGE);
+ 
+ 	gpio_ack_irq(irq);
+--- a/arch/arm/mach-omap2/mux.c
++++ b/arch/arm/mach-omap2/mux.c
+@@ -961,16 +961,14 @@ static void __init omap_mux_init_list(st
+ 	while (superset->reg_offset !=  OMAP_MUX_TERMINATOR) {
+ 		struct omap_mux *entry;
+ 
+-#ifndef CONFIG_OMAP_MUX
+-		/* Skip pins that are not muxed as GPIO by bootloader */
+-		if (!OMAP_MODE_GPIO(omap_mux_read(superset->reg_offset))) {
++#ifdef CONFIG_OMAP_MUX
++		if (!superset->muxnames || !superset->muxnames[0]) {
+ 			superset++;
+ 			continue;
+ 		}
+-#endif
+-
+-#if defined(CONFIG_OMAP_MUX) && defined(CONFIG_DEBUG_FS)
+-		if (!superset->muxnames || !superset->muxnames[0]) {
++#else
++		/* Skip pins that are not muxed as GPIO by bootloader */
++		if (!OMAP_MODE_GPIO(omap_mux_read(superset->reg_offset))) {
+ 			superset++;
+ 			continue;
+ 		}
+--- a/arch/arm/mm/alignment.c
++++ b/arch/arm/mm/alignment.c
+@@ -11,6 +11,7 @@
+  * it under the terms of the GNU General Public License version 2 as
+  * published by the Free Software Foundation.
+  */
++#include <linux/moduleparam.h>
+ #include <linux/compiler.h>
+ #include <linux/kernel.h>
+ #include <linux/errno.h>
+@@ -77,6 +78,8 @@ static unsigned long ai_dword;
+ static unsigned long ai_multi;
+ static int ai_usermode;
+ 
++core_param(alignment, ai_usermode, int, 0600);
++
+ #define UM_WARN		(1 << 0)
+ #define UM_FIXUP	(1 << 1)
+ #define UM_SIGNAL	(1 << 2)
+--- a/arch/arm/tools/mach-types
++++ b/arch/arm/tools/mach-types
+@@ -12,7 +12,7 @@
+ #
+ #   http://www.arm.linux.org.uk/developer/machines/?action=new
+ #
+-# Last update: Thu Jan 28 22:15:54 2010
++# Last update: Sat Feb 20 14:16:15 2010
+ #
+ # machine_is_xxx	CONFIG_xxxx		MACH_TYPE_xxx		number
+ #
+@@ -2257,7 +2257,7 @@ oratisalog		MACH_ORATISALOG		ORATISALOG
+ oratismadi		MACH_ORATISMADI		ORATISMADI		2269
+ oratisot16		MACH_ORATISOT16		ORATISOT16		2270
+ oratisdesk		MACH_ORATISDESK		ORATISDESK		2271
+-v2_ca9			MACH_V2P_CA9		V2P_CA9			2272
++vexpress		MACH_VEXPRESS		VEXPRESS		2272
+ sintexo			MACH_SINTEXO		SINTEXO			2273
+ cm3389			MACH_CM3389		CM3389			2274
+ omap3_cio		MACH_OMAP3_CIO		OMAP3_CIO		2275
+@@ -2636,3 +2636,45 @@ hw90240			MACH_HW90240		HW90240			2648
+ dm365_leopard		MACH_DM365_LEOPARD	DM365_LEOPARD		2649
+ mityomapl138		MACH_MITYOMAPL138	MITYOMAPL138		2650
+ scat110			MACH_SCAT110		SCAT110			2651
++acer_a1			MACH_ACER_A1		ACER_A1			2652
++cmcontrol		MACH_CMCONTROL		CMCONTROL		2653
++pelco_lamar		MACH_PELCO_LAMAR	PELCO_LAMAR		2654
++rfp43			MACH_RFP43		RFP43			2655
++sk86r0301		MACH_SK86R0301		SK86R0301		2656
++ctpxa			MACH_CTPXA		CTPXA			2657
++epb_arm9_a		MACH_EPB_ARM9_A		EPB_ARM9_A		2658
++guruplug		MACH_GURUPLUG		GURUPLUG		2659
++spear310		MACH_SPEAR310		SPEAR310		2660
++spear320		MACH_SPEAR320		SPEAR320		2661
++robotx			MACH_ROBOTX		ROBOTX			2662
++lsxhl			MACH_LSXHL		LSXHL			2663
++smartlite		MACH_SMARTLITE		SMARTLITE		2664
++cws2			MACH_CWS2		CWS2			2665
++m619			MACH_M619		M619			2666
++smartview		MACH_SMARTVIEW		SMARTVIEW		2667
++lsa_salsa		MACH_LSA_SALSA		LSA_SALSA		2668
++kizbox			MACH_KIZBOX		KIZBOX			2669
++htccharmer		MACH_HTCCHARMER		HTCCHARMER		2670
++guf_neso_lt		MACH_GUF_NESO_LT	GUF_NESO_LT		2671
++pm9g45			MACH_PM9G45		PM9G45			2672
++htcpanther		MACH_HTCPANTHER		HTCPANTHER		2673
++htcpanther_cdma		MACH_HTCPANTHER_CDMA	HTCPANTHER_CDMA		2674
++reb01			MACH_REB01		REB01			2675
++aquila			MACH_AQUILA		AQUILA			2676
++spark_sls_hw2		MACH_SPARK_SLS_HW2	SPARK_SLS_HW2		2677
++sheeva_esata		MACH_ESATA_SHEEVAPLUG	ESATA_SHEEVAPLUG	2678
++surf7x30		MACH_SURF7X30		SURF7X30		2679
++micro2440		MACH_MICRO2440		MICRO2440		2680
++am2440			MACH_AM2440		AM2440			2681
++tq2440			MACH_TQ2440		TQ2440			2682
++lpc2478oem		MACH_LPC2478OEM		LPC2478OEM		2683
++ak880x			MACH_AK880X		AK880X			2684
++cobra3530		MACH_COBRA3530		COBRA3530		2685
++pmppb			MACH_PMPPB		PMPPB			2686
++u6715			MACH_U6715		U6715			2687
++axar1500_sender		MACH_AXAR1500_SENDER	AXAR1500_SENDER		2688
++g30_dvb			MACH_G30_DVB		G30_DVB			2689
++vc088x			MACH_VC088X		VC088X			2690
++mioa702			MACH_MIOA702		MIOA702			2691
++hpmin			MACH_HPMIN		HPMIN			2692
++ak880xak		MACH_AK880XAK		AK880XAK		2693
 --- a/arch/ia64/include/asm/acpi.h
 +++ b/arch/ia64/include/asm/acpi.h
 @@ -94,6 +94,7 @@ ia64_acpi_release_global_lock (unsigned
@@ -175,6 +363,77 @@
  			return 1;
  		}
  	}
+--- a/arch/sparc/kernel/kstack.h
++++ b/arch/sparc/kernel/kstack.h
+@@ -11,6 +11,10 @@ static inline bool kstack_valid(struct t
+ {
+ 	unsigned long base = (unsigned long) tp;
+ 
++	/* Stack pointer must be 16-byte aligned.  */
++	if (sp & (16UL - 1))
++		return false;
++
+ 	if (sp >= (base + sizeof(struct thread_info)) &&
+ 	    sp <= (base + THREAD_SIZE - sizeof(struct sparc_stackf)))
+ 		return true;
+--- a/arch/sparc/kernel/of_device_32.c
++++ b/arch/sparc/kernel/of_device_32.c
+@@ -105,7 +105,7 @@ static unsigned long of_bus_sbus_get_fla
+ 
+ static int of_bus_ambapp_match(struct device_node *np)
+ {
+-	return !strcmp(np->name, "ambapp");
++	return !strcmp(np->type, "ambapp");
+ }
+ 
+ static void of_bus_ambapp_count_cells(struct device_node *child,
+--- a/arch/sparc/kernel/pci.c
++++ b/arch/sparc/kernel/pci.c
+@@ -247,6 +247,7 @@ static struct pci_dev *of_create_pci_dev
+ 					 struct pci_bus *bus, int devfn)
+ {
+ 	struct dev_archdata *sd;
++	struct pci_slot *slot;
+ 	struct of_device *op;
+ 	struct pci_dev *dev;
+ 	const char *type;
+@@ -286,6 +287,11 @@ static struct pci_dev *of_create_pci_dev
+ 	dev->dev.bus = &pci_bus_type;
+ 	dev->devfn = devfn;
+ 	dev->multifunction = 0;		/* maybe a lie? */
++	set_pcie_port_type(dev);
++
++	list_for_each_entry(slot, &dev->bus->slots, list)
++		if (PCI_SLOT(dev->devfn) == slot->number)
++			dev->slot = slot;
+ 
+ 	dev->vendor = of_getintprop_default(node, "vendor-id", 0xffff);
+ 	dev->device = of_getintprop_default(node, "device-id", 0xffff);
+@@ -322,6 +328,7 @@ static struct pci_dev *of_create_pci_dev
+ 
+ 	dev->current_state = 4;		/* unknown power state */
+ 	dev->error_state = pci_channel_io_normal;
++	dev->dma_mask = 0xffffffff;
+ 
+ 	if (!strcmp(node->name, "pci")) {
+ 		/* a PCI-PCI bridge */
+--- a/arch/sparc/kernel/tsb.S
++++ b/arch/sparc/kernel/tsb.S
+@@ -191,10 +191,12 @@ tsb_dtlb_load:
+ 
+ tsb_itlb_load:
+ 	/* Executable bit must be set.  */
+-661:	andcc		%g5, _PAGE_EXEC_4U, %g0
+-	.section	.sun4v_1insn_patch, "ax"
++661:	sethi		%hi(_PAGE_EXEC_4U), %g4
++	andcc		%g5, %g4, %g0
++	.section	.sun4v_2insn_patch, "ax"
+ 	.word		661b
+ 	andcc		%g5, _PAGE_EXEC_4V, %g0
++	nop
+ 	.previous
+ 
+ 	be,pn		%xcc, tsb_do_fault
 --- a/arch/x86/include/asm/elf.h
 +++ b/arch/x86/include/asm/elf.h
 @@ -170,10 +170,7 @@ static inline void elf_common_init(struc
@@ -706,6 +965,24 @@
  	radeon_ib_free(rdev, &rdev->r600_blit.vb_ib);
  }
  
+--- a/drivers/gpu/drm/radeon/r600_cp.c
++++ b/drivers/gpu/drm/radeon/r600_cp.c
+@@ -1428,9 +1428,12 @@ static void r700_gfx_init(struct drm_dev
+ 
+ 	gb_tiling_config |= R600_BANK_SWAPS(1);
+ 
+-	backend_map = r700_get_tile_pipe_to_backend_map(dev_priv->r600_max_tile_pipes,
+-							dev_priv->r600_max_backends,
+-							(0xff << dev_priv->r600_max_backends) & 0xff);
++	if ((dev_priv->flags & RADEON_FAMILY_MASK) == CHIP_RV740)
++		backend_map = 0x28;
++	else
++		backend_map = r700_get_tile_pipe_to_backend_map(dev_priv->r600_max_tile_pipes,
++								dev_priv->r600_max_backends,
++								(0xff << dev_priv->r600_max_backends) & 0xff);
+ 	gb_tiling_config |= R600_BACKEND_MAP(backend_map);
+ 
+ 	cc_gc_shader_pipe_config =
 --- a/drivers/gpu/drm/radeon/radeon.h
 +++ b/drivers/gpu/drm/radeon/radeon.h
 @@ -96,6 +96,7 @@ extern int radeon_audio;
@@ -743,6 +1020,45 @@
  };
  
  struct radeon_cp {
+--- a/drivers/gpu/drm/radeon/radeon_atombios.c
++++ b/drivers/gpu/drm/radeon/radeon_atombios.c
+@@ -206,6 +206,15 @@ static bool radeon_atom_apply_quirks(str
+ 			*connector_type = DRM_MODE_CONNECTOR_DVID;
+ 	}
+ 
++	/* Asrock RS600 board lists the DVI port as HDMI */
++	if ((dev->pdev->device == 0x7941) &&
++	    (dev->pdev->subsystem_vendor == 0x1849) &&
++	    (dev->pdev->subsystem_device == 0x7941)) {
++		if ((*connector_type == DRM_MODE_CONNECTOR_HDMIA) &&
++		    (supported_device == ATOM_DEVICE_DFP3_SUPPORT))
++			*connector_type = DRM_MODE_CONNECTOR_DVID;
++	}
++
+ 	/* a-bit f-i90hd - ciaranm on #radeonhd - this board has no DVI */
+ 	if ((dev->pdev->device == 0x7941) &&
+ 	    (dev->pdev->subsystem_vendor == 0x147b) &&
+--- a/drivers/gpu/drm/radeon/radeon_connectors.c
++++ b/drivers/gpu/drm/radeon/radeon_connectors.c
+@@ -780,7 +780,7 @@ static enum drm_connector_status radeon_
+ 			 * connected and the DVI port disconnected.  If the edid doesn't
+ 			 * say HDMI, vice versa.
+ 			 */
+-			if (radeon_connector->shared_ddc && connector_status_connected) {
++			if (radeon_connector->shared_ddc && (ret == connector_status_connected)) {
+ 				struct drm_device *dev = connector->dev;
+ 				struct drm_connector *list_connector;
+ 				struct radeon_connector *list_radeon_connector;
+@@ -1060,8 +1060,7 @@ radeon_add_atom_connector(struct drm_dev
+ 			return;
+ 		}
+ 		if (radeon_connector->ddc_bus && i2c_bus->valid) {
+-			if (memcmp(&radeon_connector->ddc_bus->rec, i2c_bus,
+-				    sizeof(struct radeon_i2c_bus_rec)) == 0) {
++			if (radeon_connector->ddc_bus->rec.i2c_id == i2c_bus->i2c_id) {
+ 				radeon_connector->shared_ddc = true;
+ 				shared_ddc = true;
+ 			}
 --- a/drivers/gpu/drm/radeon/radeon_cs.c
 +++ b/drivers/gpu/drm/radeon/radeon_cs.c
 @@ -86,7 +86,7 @@ int radeon_cs_parser_relocs(struct radeo
@@ -770,6 +1086,20 @@
  	for (i = 0; i < parser->nrelocs; i++) {
  		if (parser->relocs[i].gobj) {
  			mutex_lock(&parser->rdev->ddev->struct_mutex);
+--- a/drivers/gpu/drm/radeon/radeon_drv.h
++++ b/drivers/gpu/drm/radeon/radeon_drv.h
+@@ -106,9 +106,10 @@
+  * 1.29- R500 3D cmd buffer support
+  * 1.30- Add support for occlusion queries
+  * 1.31- Add support for num Z pipes from GET_PARAM
++ * 1.32- fixes for rv740 setup
+  */
+ #define DRIVER_MAJOR		1
+-#define DRIVER_MINOR		31
++#define DRIVER_MINOR		32
+ #define DRIVER_PATCHLEVEL	0
+ 
+ enum radeon_cp_microcode_version {
 --- a/drivers/gpu/drm/radeon/radeon_object.c
 +++ b/drivers/gpu/drm/radeon/radeon_object.c
 @@ -306,11 +306,10 @@ void radeon_bo_list_unreserve(struct lis
@@ -949,10 +1279,11 @@
  }
  
  void radeon_ib_free(struct radeon_device *rdev, struct radeon_ib **ib)
-@@ -114,18 +101,7 @@ void radeon_ib_free(struct radeon_device
+@@ -113,19 +100,10 @@ void radeon_ib_free(struct radeon_device
+ 	if (tmp == NULL) {
  		return;
  	}
- 	mutex_lock(&rdev->ib_pool.mutex);
+-	mutex_lock(&rdev->ib_pool.mutex);
 -	if (!list_empty(&tmp->list) && !radeon_fence_signaled(tmp->fence)) {
 -		/* IB is scheduled & not signaled don't do anythings */
 -		mutex_unlock(&rdev->ib_pool.mutex);
@@ -961,15 +1292,17 @@
 -	list_del(&tmp->list);
 -	INIT_LIST_HEAD(&tmp->list);
 -	if (tmp->fence)
--		radeon_fence_unref(&tmp->fence);
++	if (!tmp->fence->emited)
+ 		radeon_fence_unref(&tmp->fence);
 -
 -	tmp->length_dw = 0;
 -	clear_bit(tmp->idx, rdev->ib_pool.alloc_bm);
++	mutex_lock(&rdev->ib_pool.mutex);
 +	tmp->free = true;
  	mutex_unlock(&rdev->ib_pool.mutex);
  }
  
-@@ -135,7 +111,7 @@ int radeon_ib_schedule(struct radeon_dev
+@@ -135,7 +113,7 @@ int radeon_ib_schedule(struct radeon_dev
  
  	if (!ib->length_dw || !rdev->cp.ready) {
  		/* TODO: Nothings in the ib we should report. */
@@ -978,7 +1311,7 @@
  		return -EINVAL;
  	}
  
-@@ -148,7 +124,8 @@ int radeon_ib_schedule(struct radeon_dev
+@@ -148,7 +126,8 @@ int radeon_ib_schedule(struct radeon_dev
  	radeon_ring_ib_execute(rdev, ib);
  	radeon_fence_emit(rdev, ib->fence);
  	mutex_lock(&rdev->ib_pool.mutex);
@@ -988,7 +1321,7 @@
  	mutex_unlock(&rdev->ib_pool.mutex);
  	radeon_ring_unlock_commit(rdev);
  	return 0;
-@@ -164,7 +141,6 @@ int radeon_ib_pool_init(struct radeon_de
+@@ -164,7 +143,6 @@ int radeon_ib_pool_init(struct radeon_de
  	if (rdev->ib_pool.robj)
  		return 0;
  	/* Allocate 1M object buffer */
@@ -996,7 +1329,7 @@
  	r = radeon_bo_create(rdev, NULL,  RADEON_IB_POOL_SIZE*64*1024,
  				true, RADEON_GEM_DOMAIN_GTT,
  				&rdev->ib_pool.robj);
-@@ -195,9 +171,9 @@ int radeon_ib_pool_init(struct radeon_de
+@@ -195,9 +173,9 @@ int radeon_ib_pool_init(struct radeon_de
  		rdev->ib_pool.ibs[i].ptr = ptr + offset;
  		rdev->ib_pool.ibs[i].idx = i;
  		rdev->ib_pool.ibs[i].length_dw = 0;
@@ -1008,7 +1341,7 @@
  	rdev->ib_pool.ready = true;
  	DRM_INFO("radeon: ib pool ready.\n");
  	if (radeon_debugfs_ib_init(rdev)) {
-@@ -214,7 +190,6 @@ void radeon_ib_pool_fini(struct radeon_d
+@@ -214,7 +192,6 @@ void radeon_ib_pool_fini(struct radeon_d
  		return;
  	}
  	mutex_lock(&rdev->ib_pool.mutex);
@@ -1016,7 +1349,7 @@
  	if (rdev->ib_pool.robj) {
  		r = radeon_bo_reserve(rdev->ib_pool.robj, false);
  		if (likely(r == 0)) {
-@@ -363,7 +338,7 @@ static int radeon_debugfs_ib_info(struct
+@@ -363,7 +340,7 @@ static int radeon_debugfs_ib_info(struct
  	if (ib == NULL) {
  		return 0;
  	}
@@ -1025,6 +1358,24 @@
  	seq_printf(m, "IB fence %p\n", ib->fence);
  	seq_printf(m, "IB size %05u dwords\n", ib->length_dw);
  	for (i = 0; i < ib->length_dw; i++) {
+--- a/drivers/gpu/drm/radeon/rv770.c
++++ b/drivers/gpu/drm/radeon/rv770.c
+@@ -549,9 +549,12 @@ static void rv770_gpu_init(struct radeon
+ 
+ 	gb_tiling_config |= BANK_SWAPS(1);
+ 
+-	backend_map = r700_get_tile_pipe_to_backend_map(rdev->config.rv770.max_tile_pipes,
+-							rdev->config.rv770.max_backends,
+-							(0xff << rdev->config.rv770.max_backends) & 0xff);
++	if (rdev->family == CHIP_RV740)
++		backend_map = 0x28;
++	else
++		backend_map = r700_get_tile_pipe_to_backend_map(rdev->config.rv770.max_tile_pipes,
++								rdev->config.rv770.max_backends,
++								(0xff << rdev->config.rv770.max_backends) & 0xff);
+ 	gb_tiling_config |= BACKEND_MAP(backend_map);
+ 
+ 	cc_gc_shader_pipe_config =
 --- a/drivers/gpu/drm/ttm/ttm_bo.c
 +++ b/drivers/gpu/drm/ttm/ttm_bo.c
 @@ -1020,6 +1020,12 @@ static int ttm_bo_mem_compat(struct ttm_
@@ -1040,6 +1391,67 @@
  
  	for (i = 0; i < placement->num_placement; i++) {
  		if ((placement->placement[i] & mem->placement &
+--- a/drivers/gpu/drm/ttm/ttm_tt.c
++++ b/drivers/gpu/drm/ttm/ttm_tt.c
+@@ -196,14 +196,15 @@ EXPORT_SYMBOL(ttm_tt_populate);
+ 
+ #ifdef CONFIG_X86
+ static inline int ttm_tt_set_page_caching(struct page *p,
+-					  enum ttm_caching_state c_state)
++					  enum ttm_caching_state c_old,
++					  enum ttm_caching_state c_new)
+ {
+ 	int ret = 0;
+ 
+ 	if (PageHighMem(p))
+ 		return 0;
+ 
+-	if (get_page_memtype(p) != -1) {
++	if (c_old != tt_cached) {
+ 		/* p isn't in the default caching state, set it to
+ 		 * writeback first to free its current memtype. */
+ 
+@@ -212,16 +213,17 @@ static inline int ttm_tt_set_page_cachin
+ 			return ret;
+ 	}
+ 
+-	if (c_state == tt_wc)
++	if (c_new == tt_wc)
+ 		ret = set_memory_wc((unsigned long) page_address(p), 1);
+-	else if (c_state == tt_uncached)
++	else if (c_new == tt_uncached)
+ 		ret = set_pages_uc(p, 1);
+ 
+ 	return ret;
+ }
+ #else /* CONFIG_X86 */
+ static inline int ttm_tt_set_page_caching(struct page *p,
+-					  enum ttm_caching_state c_state)
++					  enum ttm_caching_state c_old,
++					  enum ttm_caching_state c_new)
+ {
+ 	return 0;
+ }
+@@ -254,7 +256,9 @@ static int ttm_tt_set_caching(struct ttm
+ 	for (i = 0; i < ttm->num_pages; ++i) {
+ 		cur_page = ttm->pages[i];
+ 		if (likely(cur_page != NULL)) {
+-			ret = ttm_tt_set_page_caching(cur_page, c_state);
++			ret = ttm_tt_set_page_caching(cur_page,
++						      ttm->caching_state,
++						      c_state);
+ 			if (unlikely(ret != 0))
+ 				goto out_err;
+ 		}
+@@ -268,7 +272,7 @@ out_err:
+ 	for (j = 0; j < i; ++j) {
+ 		cur_page = ttm->pages[j];
+ 		if (likely(cur_page != NULL)) {
+-			(void)ttm_tt_set_page_caching(cur_page,
++			(void)ttm_tt_set_page_caching(cur_page, c_state,
+ 						      ttm->caching_state);
+ 		}
+ 	}
 --- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
 +++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
 @@ -348,22 +348,19 @@ static int vmw_driver_load(struct drm_de
@@ -1142,6 +1554,17 @@
  	/*
  	 * Dirty & Deferred IO
  	 */
+--- a/drivers/gpu/vga/vgaarb.c
++++ b/drivers/gpu/vga/vgaarb.c
+@@ -961,7 +961,7 @@ static ssize_t vga_arb_write(struct file
+ 		remaining -= 7;
+ 		pr_devel("client 0x%p called 'target'\n", priv);
+ 		/* if target is default */
+-		if (!strncmp(kbuf, "default", 7))
++		if (!strncmp(curr_pos, "default", 7))
+ 			pdev = pci_dev_get(vga_default_device());
+ 		else {
+ 			if (!vga_pci_str_to_vars(curr_pos, remaining,
 --- a/drivers/input/serio/i8042.c
 +++ b/drivers/input/serio/i8042.c
 @@ -1161,9 +1161,17 @@ static int i8042_pm_restore(struct devic
@@ -1319,6 +1742,102 @@
  plug_and_out:
  	if (!elv_queue_empty(q))
  		/* Some requests still remain, retry later */
+--- a/drivers/media/dvb/dvb-usb/Kconfig
++++ b/drivers/media/dvb/dvb-usb/Kconfig
+@@ -112,11 +112,13 @@ config DVB_USB_CXUSB
+ 	select DVB_MT352 if !DVB_FE_CUSTOMISE
+ 	select DVB_ZL10353 if !DVB_FE_CUSTOMISE
+ 	select DVB_DIB7000P if !DVB_FE_CUSTOMISE
+-	select DVB_LGS8GL5 if !DVB_FE_CUSTOMISE
+ 	select DVB_TUNER_DIB0070 if !DVB_FE_CUSTOMISE
++	select DVB_ATBM8830 if !DVB_FE_CUSTOMISE
++	select DVB_LGS8GXX if !DVB_FE_CUSTOMISE
+ 	select MEDIA_TUNER_SIMPLE if !MEDIA_TUNER_CUSTOMISE
+ 	select MEDIA_TUNER_XC2028 if !MEDIA_TUNER_CUSTOMISE
+ 	select MEDIA_TUNER_MXL5005S if !MEDIA_TUNER_CUSTOMISE
++	select MEDIA_TUNER_MAX2165 if !MEDIA_TUNER_CUSTOMISE
+ 	help
+ 	  Say Y here to support the Conexant USB2.0 hybrid reference design.
+ 	  Currently, only DVB and ATSC modes are supported, analog mode
+--- a/drivers/media/dvb/frontends/l64781.c
++++ b/drivers/media/dvb/frontends/l64781.c
+@@ -192,8 +192,8 @@ static int apply_frontend_param (struct
+ 	spi_bias *= qam_tab[p->constellation];
+ 	spi_bias /= p->code_rate_HP + 1;
+ 	spi_bias /= (guard_tab[p->guard_interval] + 32);
+-	spi_bias *= 1000ULL;
+-	spi_bias /= 1000ULL + ppm/1000;
++	spi_bias *= 1000;
++	spi_bias /= 1000 + ppm/1000;
+ 	spi_bias *= p->code_rate_HP;
+ 
+ 	val0x04 = (p->transmission_mode << 2) | p->guard_interval;
+--- a/drivers/media/video/bt8xx/bttv-driver.c
++++ b/drivers/media/video/bt8xx/bttv-driver.c
+@@ -4461,6 +4461,7 @@ static int __devinit bttv_probe(struct p
+ 		request_modules(btv);
+ 	}
+ 
++	init_bttv_i2c_ir(btv);
+ 	bttv_input_init(btv);
+ 
+ 	/* everything is fine */
+--- a/drivers/media/video/bt8xx/bttv-i2c.c
++++ b/drivers/media/video/bt8xx/bttv-i2c.c
+@@ -388,7 +388,12 @@ int __devinit init_bttv_i2c(struct bttv
+ 	if (0 == btv->i2c_rc && i2c_scan)
+ 		do_i2c_scan(btv->c.v4l2_dev.name, &btv->i2c_client);
+ 
+-	/* Instantiate the IR receiver device, if present */
++	return btv->i2c_rc;
++}
++
++/* Instantiate the I2C IR receiver device, if present */
++void __devinit init_bttv_i2c_ir(struct bttv *btv)
++{
+ 	if (0 == btv->i2c_rc) {
+ 		struct i2c_board_info info;
+ 		/* The external IR receiver is at i2c address 0x34 (0x35 for
+@@ -408,7 +413,6 @@ int __devinit init_bttv_i2c(struct bttv
+ 		strlcpy(info.type, "ir_video", I2C_NAME_SIZE);
+ 		i2c_new_probed_device(&btv->c.i2c_adap, &info, addr_list);
+ 	}
+-	return btv->i2c_rc;
+ }
+ 
+ int __devexit fini_bttv_i2c(struct bttv *btv)
+--- a/drivers/media/video/bt8xx/bttvp.h
++++ b/drivers/media/video/bt8xx/bttvp.h
+@@ -279,6 +279,7 @@ extern unsigned int bttv_debug;
+ extern unsigned int bttv_gpio;
+ extern void bttv_gpio_tracking(struct bttv *btv, char *comment);
+ extern int init_bttv_i2c(struct bttv *btv);
++extern void init_bttv_i2c_ir(struct bttv *btv);
+ extern int fini_bttv_i2c(struct bttv *btv);
+ 
+ #define bttv_printk if (bttv_verbose) printk
+--- a/drivers/media/video/mt9t112.c
++++ b/drivers/media/video/mt9t112.c
+@@ -514,7 +514,7 @@ static int mt9t112_init_pll(const struct
+ 	/* poll to verify out of standby. Must Poll this bit */
+ 	for (i = 0; i < 100; i++) {
+ 		mt9t112_reg_read(data, client, 0x0018);
+-		if (0x4000 & data)
++		if (!(0x4000 & data))
+ 			break;
+ 
+ 		mdelay(10);
+--- a/drivers/media/video/pwc/pwc-ctrl.c
++++ b/drivers/media/video/pwc/pwc-ctrl.c
+@@ -753,7 +753,7 @@ int pwc_set_shutter_speed(struct pwc_dev
+ 		buf[0] = 0xff; /* fixed */
+ 
+ 	ret = send_control_msg(pdev,
+-		SET_LUM_CTL, SHUTTER_MODE_FORMATTER, &buf, sizeof(buf));
++		SET_LUM_CTL, SHUTTER_MODE_FORMATTER, &buf, 1);
+ 
+ 	if (!mode && ret >= 0) {
+ 		if (value < 0)
 --- a/drivers/net/benet/be_cmds.c
 +++ b/drivers/net/benet/be_cmds.c
 @@ -296,6 +296,7 @@ static void be_cmd_hdr_prepare(struct be
@@ -1389,6 +1908,85 @@
  	EFX_LOG(efx, "initialisation failed. rc=%d\n", rc);
  	free_netdev(net_dev);
  	return rc;
+--- a/drivers/net/sfc/falcon_boards.c
++++ b/drivers/net/sfc/falcon_boards.c
+@@ -29,6 +29,15 @@
+ #define FALCON_BOARD_SFN4111T 0x51
+ #define FALCON_BOARD_SFN4112F 0x52
+ 
++/* Board temperature is about 15°C above ambient when air flow is
++ * limited. */
++#define FALCON_BOARD_TEMP_BIAS	15
++
++/* SFC4000 datasheet says: 'The maximum permitted junction temperature
++ * is 125°C; the thermal design of the environment for the SFC4000
++ * should aim to keep this well below 100°C.' */
++#define FALCON_JUNC_TEMP_MAX	90
++
+ /*****************************************************************************
+  * Support for LM87 sensor chip used on several boards
+  */
+@@ -548,16 +557,16 @@ fail_hwmon:
+ static u8 sfe4002_lm87_channel = 0x03; /* use AIN not FAN inputs */
+ 
+ static const u8 sfe4002_lm87_regs[] = {
+-	LM87_IN_LIMITS(0, 0x83, 0x91),		/* 2.5V:  1.8V +/- 5% */
+-	LM87_IN_LIMITS(1, 0x51, 0x5a),		/* Vccp1: 1.2V +/- 5% */
+-	LM87_IN_LIMITS(2, 0xb6, 0xca),		/* 3.3V:  3.3V +/- 5% */
+-	LM87_IN_LIMITS(3, 0xb0, 0xc9),		/* 5V:    4.6-5.2V */
+-	LM87_IN_LIMITS(4, 0xb0, 0xe0),		/* 12V:   11-14V */
+-	LM87_IN_LIMITS(5, 0x44, 0x4b),		/* Vccp2: 1.0V +/- 5% */
+-	LM87_AIN_LIMITS(0, 0xa0, 0xb2),		/* AIN1:  1.66V +/- 5% */
+-	LM87_AIN_LIMITS(1, 0x91, 0xa1),		/* AIN2:  1.5V +/- 5% */
+-	LM87_TEMP_INT_LIMITS(10, 60),		/* board */
+-	LM87_TEMP_EXT1_LIMITS(10, 70),		/* Falcon */
++	LM87_IN_LIMITS(0, 0x7c, 0x99),		/* 2.5V:  1.8V +/- 10% */
++	LM87_IN_LIMITS(1, 0x4c, 0x5e),		/* Vccp1: 1.2V +/- 10% */
++	LM87_IN_LIMITS(2, 0xac, 0xd4),		/* 3.3V:  3.3V +/- 10% */
++	LM87_IN_LIMITS(3, 0xac, 0xd4),		/* 5V:    5.0V +/- 10% */
++	LM87_IN_LIMITS(4, 0xac, 0xe0),		/* 12V:   10.8-14V */
++	LM87_IN_LIMITS(5, 0x3f, 0x4f),		/* Vccp2: 1.0V +/- 10% */
++	LM87_AIN_LIMITS(0, 0x98, 0xbb),		/* AIN1:  1.66V +/- 10% */
++	LM87_AIN_LIMITS(1, 0x8a, 0xa9),		/* AIN2:  1.5V +/- 10% */
++	LM87_TEMP_INT_LIMITS(0, 80 + FALCON_BOARD_TEMP_BIAS),
++	LM87_TEMP_EXT1_LIMITS(0, FALCON_JUNC_TEMP_MAX),
+ 	0
+ };
+ 
+@@ -619,14 +628,14 @@ static int sfe4002_init(struct efx_nic *
+ static u8 sfn4112f_lm87_channel = 0x03; /* use AIN not FAN inputs */
+ 
+ static const u8 sfn4112f_lm87_regs[] = {
+-	LM87_IN_LIMITS(0, 0x83, 0x91),		/* 2.5V:  1.8V +/- 5% */
+-	LM87_IN_LIMITS(1, 0x51, 0x5a),		/* Vccp1: 1.2V +/- 5% */
+-	LM87_IN_LIMITS(2, 0xb6, 0xca),		/* 3.3V:  3.3V +/- 5% */
+-	LM87_IN_LIMITS(4, 0xb0, 0xe0),		/* 12V:   11-14V */
+-	LM87_IN_LIMITS(5, 0x44, 0x4b),		/* Vccp2: 1.0V +/- 5% */
+-	LM87_AIN_LIMITS(1, 0x91, 0xa1),		/* AIN2:  1.5V +/- 5% */
+-	LM87_TEMP_INT_LIMITS(10, 60),		/* board */
+-	LM87_TEMP_EXT1_LIMITS(10, 70),		/* Falcon */
++	LM87_IN_LIMITS(0, 0x7c, 0x99),		/* 2.5V:  1.8V +/- 10% */
++	LM87_IN_LIMITS(1, 0x4c, 0x5e),		/* Vccp1: 1.2V +/- 10% */
++	LM87_IN_LIMITS(2, 0xac, 0xd4),		/* 3.3V:  3.3V +/- 10% */
++	LM87_IN_LIMITS(4, 0xac, 0xe0),		/* 12V:   10.8-14V */
++	LM87_IN_LIMITS(5, 0x3f, 0x4f),		/* Vccp2: 1.0V +/- 10% */
++	LM87_AIN_LIMITS(1, 0x8a, 0xa9),		/* AIN2:  1.5V +/- 10% */
++	LM87_TEMP_INT_LIMITS(0, 60 + FALCON_BOARD_TEMP_BIAS),
++	LM87_TEMP_EXT1_LIMITS(0, FALCON_JUNC_TEMP_MAX),
+ 	0
+ };
+ 
+--- a/drivers/net/sfc/mcdi.c
++++ b/drivers/net/sfc/mcdi.c
+@@ -127,7 +127,7 @@ static int efx_mcdi_poll(struct efx_nic
+ 	efx_dword_t reg;
+ 
+ 	/* Check for a reboot atomically with respect to efx_mcdi_copyout() */
+-	rc = efx_mcdi_poll_reboot(efx);
++	rc = -efx_mcdi_poll_reboot(efx);
+ 	if (rc)
+ 		goto out;
+ 
 --- a/drivers/net/sfc/qt202x_phy.c
 +++ b/drivers/net/sfc/qt202x_phy.c
 @@ -320,7 +320,7 @@ static int qt202x_reset_phy(struct efx_n
@@ -1648,6 +2246,177 @@
  		break;
  	case TPACPI_THERMAL_NONE:
  	default:
+--- a/drivers/scsi/arm/fas216.c
++++ b/drivers/scsi/arm/fas216.c
+@@ -2516,7 +2516,7 @@ int fas216_eh_device_reset(struct scsi_c
+ 		if (info->scsi.phase == PHASE_IDLE)
+ 			fas216_kick(info);
+ 
+-		mod_timer(&info->eh_timer, 30 * HZ);
++		mod_timer(&info->eh_timer, jiffies + 30 * HZ);
+ 		spin_unlock_irqrestore(&info->host_lock, flags);
+ 
+ 		/*
+--- a/drivers/scsi/fcoe/fcoe.c
++++ b/drivers/scsi/fcoe/fcoe.c
+@@ -2009,6 +2009,8 @@ static int fcoe_destroy(const char *buff
+ 	fcoe_interface_cleanup(fcoe);
+ 	rtnl_unlock();
+ 	fcoe_if_destroy(fcoe->ctlr.lp);
++	module_put(THIS_MODULE);
++
+ out_putdev:
+ 	dev_put(netdev);
+ out_nodev:
+@@ -2059,6 +2061,11 @@ static int fcoe_create(const char *buffe
+ 	}
+ #endif
+ 
++	if (!try_module_get(THIS_MODULE)) {
++		rc = -EINVAL;
++		goto out_nomod;
++	}
++
+ 	rtnl_lock();
+ 	netdev = fcoe_if_to_netdev(buffer);
+ 	if (!netdev) {
+@@ -2099,17 +2106,24 @@ static int fcoe_create(const char *buffe
+ 	if (!fcoe_link_ok(lport))
+ 		fcoe_ctlr_link_up(&fcoe->ctlr);
+ 
+-	rc = 0;
+-out_free:
+ 	/*
+ 	 * Release from init in fcoe_interface_create(), on success lport
+ 	 * should be holding a reference taken in fcoe_if_create().
+ 	 */
+ 	fcoe_interface_put(fcoe);
++	dev_put(netdev);
++	rtnl_unlock();
++	mutex_unlock(&fcoe_config_mutex);
++
++	return 0;
++out_free:
++	fcoe_interface_put(fcoe);
+ out_putdev:
+ 	dev_put(netdev);
+ out_nodev:
+ 	rtnl_unlock();
++	module_put(THIS_MODULE);
++out_nomod:
+ 	mutex_unlock(&fcoe_config_mutex);
+ 	return rc;
+ }
+--- a/drivers/scsi/fcoe/libfcoe.c
++++ b/drivers/scsi/fcoe/libfcoe.c
+@@ -1187,7 +1187,7 @@ static void fcoe_ctlr_timeout(unsigned l
+ 			next_timer = fip->ctlr_ka_time;
+ 
+ 		if (time_after_eq(jiffies, fip->port_ka_time)) {
+-			fip->port_ka_time += jiffies +
++			fip->port_ka_time = jiffies +
+ 				msecs_to_jiffies(FIP_VN_KA_PERIOD);
+ 			fip->send_port_ka = 1;
+ 		}
+--- a/drivers/scsi/libfc/fc_exch.c
++++ b/drivers/scsi/libfc/fc_exch.c
+@@ -1890,7 +1890,7 @@ static struct fc_seq *fc_exch_seq_send(s
+ 	fc_exch_setup_hdr(ep, fp, ep->f_ctl);
+ 	sp->cnt++;
+ 
+-	if (ep->xid <= lport->lro_xid)
++	if (ep->xid <= lport->lro_xid && fh->fh_r_ctl == FC_RCTL_DD_UNSOL_CMD)
+ 		fc_fcp_ddp_setup(fr_fsp(fp), ep->xid);
+ 
+ 	if (unlikely(lport->tt.frame_send(lport, fp)))
+--- a/drivers/scsi/libfc/fc_fcp.c
++++ b/drivers/scsi/libfc/fc_fcp.c
+@@ -298,9 +298,6 @@ void fc_fcp_ddp_setup(struct fc_fcp_pkt
+ {
+ 	struct fc_lport *lport;
+ 
+-	if (!fsp)
+-		return;
+-
+ 	lport = fsp->lp;
+ 	if ((fsp->req_flags & FC_SRB_READ) &&
+ 	    (lport->lro_enabled) && (lport->tt.ddp_setup)) {
+--- a/drivers/scsi/libfc/fc_lport.c
++++ b/drivers/scsi/libfc/fc_lport.c
+@@ -1800,7 +1800,8 @@ int fc_lport_bsg_request(struct fc_bsg_j
+ 	u32 did;
+ 
+ 	job->reply->reply_payload_rcv_len = 0;
+-	rsp->resid_len = job->reply_payload.payload_len;
++	if (rsp)
++		rsp->resid_len = job->reply_payload.payload_len;
+ 
+ 	mutex_lock(&lport->lp_mutex);
+ 
+--- a/drivers/scsi/libfc/fc_rport.c
++++ b/drivers/scsi/libfc/fc_rport.c
+@@ -623,7 +623,7 @@ static void fc_rport_plogi_resp(struct f
+ 
+ 		tov = ntohl(plp->fl_csp.sp_e_d_tov);
+ 		if (ntohs(plp->fl_csp.sp_features) & FC_SP_FT_EDTR)
+-			tov /= 1000;
++			tov /= 1000000;
+ 		if (tov > rdata->e_d_tov)
+ 			rdata->e_d_tov = tov;
+ 		csp_seq = ntohs(plp->fl_csp.sp_tot_seq);
+--- a/drivers/scsi/libiscsi_tcp.c
++++ b/drivers/scsi/libiscsi_tcp.c
+@@ -992,12 +992,10 @@ static struct iscsi_r2t_info *iscsi_tcp_
+ 		if (r2t == NULL) {
+ 			if (kfifo_out(&tcp_task->r2tqueue,
+ 			    (void *)&tcp_task->r2t, sizeof(void *)) !=
+-			    sizeof(void *)) {
+-				WARN_ONCE(1, "unexpected fifo state");
++			    sizeof(void *))
+ 				r2t = NULL;
+-			}
+-
+-			r2t = tcp_task->r2t;
++			else
++				r2t = tcp_task->r2t;
+ 		}
+ 		spin_unlock_bh(&session->lock);
+ 	}
+--- a/drivers/scsi/megaraid/megaraid_sas.c
++++ b/drivers/scsi/megaraid/megaraid_sas.c
+@@ -3781,6 +3781,7 @@ static int megasas_mgmt_compat_ioctl_fw(
+ 	    compat_alloc_user_space(sizeof(struct megasas_iocpacket));
+ 	int i;
+ 	int error = 0;
++	compat_uptr_t ptr;
+ 
+ 	if (clear_user(ioc, sizeof(*ioc)))
+ 		return -EFAULT;
+@@ -3793,9 +3794,22 @@ static int megasas_mgmt_compat_ioctl_fw(
+ 	    copy_in_user(&ioc->sge_count, &cioc->sge_count, sizeof(u32)))
+ 		return -EFAULT;
+ 
+-	for (i = 0; i < MAX_IOCTL_SGE; i++) {
+-		compat_uptr_t ptr;
++	/*
++	 * The sense_ptr is used in megasas_mgmt_fw_ioctl only when
++	 * sense_len is not null, so prepare the 64bit value under
++	 * the same condition.
++	 */
++	if (ioc->sense_len) {
++		void __user **sense_ioc_ptr =
++			(void __user **)(ioc->frame.raw + ioc->sense_off);
++		compat_uptr_t *sense_cioc_ptr =
++			(compat_uptr_t *)(cioc->frame.raw + cioc->sense_off);
++		if (get_user(ptr, sense_cioc_ptr) ||
++		    put_user(compat_ptr(ptr), sense_ioc_ptr))
++			return -EFAULT;
++	}
+ 
++	for (i = 0; i < MAX_IOCTL_SGE; i++) {
+ 		if (get_user(ptr, &cioc->sgl[i].iov_base) ||
+ 		    put_user(compat_ptr(ptr), &ioc->sgl[i].iov_base) ||
+ 		    copy_in_user(&ioc->sgl[i].iov_len,
 --- a/drivers/serial/8250.c
 +++ b/drivers/serial/8250.c
 @@ -83,6 +83,9 @@ static unsigned int skip_txen_test; /* f
@@ -2112,6 +2881,57 @@
  		btrfs_set_file_extent_type(leaf, fi,
  					   BTRFS_FILE_EXTENT_REG);
  		btrfs_set_file_extent_num_bytes(leaf, fi,
+--- a/fs/cachefiles/namei.c
++++ b/fs/cachefiles/namei.c
+@@ -348,7 +348,17 @@ int cachefiles_delete_object(struct cach
+ 	dir = dget_parent(object->dentry);
+ 
+ 	mutex_lock_nested(&dir->d_inode->i_mutex, I_MUTEX_PARENT);
+-	ret = cachefiles_bury_object(cache, dir, object->dentry);
++
++	/* we need to check that our parent is _still_ our parent - it may have
++	 * been renamed */
++	if (dir == object->dentry->d_parent) {
++		ret = cachefiles_bury_object(cache, dir, object->dentry);
++	} else {
++		/* it got moved, presumably by cachefilesd culling it, so it's
++		 * no longer in the key path and we can ignore it */
++		mutex_unlock(&dir->d_inode->i_mutex);
++		ret = 0;
++	}
+ 
+ 	dput(dir);
+ 	_leave(" = %d", ret);
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -823,6 +823,17 @@ fail:
+ }
+ 
+ /*
++ * This is a temporary kludge to deal with "automount" symlinks; proper
++ * solution is to trigger them on follow_mount(), so that do_lookup()
++ * would DTRT.  To be killed before 2.6.34-final.
++ */
++static inline int follow_on_final(struct inode *inode, unsigned lookup_flags)
++{
++	return inode && unlikely(inode->i_op->follow_link) &&
++		((lookup_flags & LOOKUP_FOLLOW) || S_ISDIR(inode->i_mode));
++}
++
++/*
+  * Name resolution.
+  * This is the basic name resolution function, turning a pathname into
+  * the final dentry. We expect 'base' to be positive and a directory.
+@@ -942,8 +953,7 @@ last_component:
+ 		if (err)
+ 			break;
+ 		inode = next.dentry->d_inode;
+-		if ((lookup_flags & LOOKUP_FOLLOW)
+-		    && inode && inode->i_op->follow_link) {
++		if (follow_on_final(inode, lookup_flags)) {
+ 			err = do_follow_link(&next, nd);
+ 			if (err)
+ 				goto return_err;
 --- a/fs/nfs/direct.c
 +++ b/fs/nfs/direct.c
 @@ -342,6 +342,7 @@ static ssize_t nfs_direct_read_schedule_
@@ -2138,6 +2958,56 @@
  
  		task_setup_data.task = &data->task;
  		task_setup_data.callback_data = data;
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -752,7 +752,8 @@ nfsd_open(struct svc_rqst *rqstp, struct
+ 			    flags, current_cred());
+ 	if (IS_ERR(*filp))
+ 		host_err = PTR_ERR(*filp);
+-	host_err = ima_file_check(*filp, access);
++	else
++		host_err = ima_file_check(*filp, access);
+ out_nfserr:
+ 	err = nfserrno(host_err);
+ out:
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -2369,16 +2369,30 @@ static void *proc_self_follow_link(struc
+ {
+ 	struct pid_namespace *ns = dentry->d_sb->s_fs_info;
+ 	pid_t tgid = task_tgid_nr_ns(current, ns);
+-	char tmp[PROC_NUMBUF];
+-	if (!tgid)
+-		return ERR_PTR(-ENOENT);
+-	sprintf(tmp, "%d", task_tgid_nr_ns(current, ns));
+-	return ERR_PTR(vfs_follow_link(nd,tmp));
++	char *name = ERR_PTR(-ENOENT);
++	if (tgid) {
++		name = __getname();
++		if (!name)
++			name = ERR_PTR(-ENOMEM);
++		else
++			sprintf(name, "%d", tgid);
++	}
++	nd_set_link(nd, name);
++	return NULL;
++}
++
++static void proc_self_put_link(struct dentry *dentry, struct nameidata *nd,
++				void *cookie)
++{
++	char *s = nd_get_link(nd);
++	if (!IS_ERR(s))
++		__putname(s);
+ }
+ 
+ static const struct inode_operations proc_self_inode_operations = {
+ 	.readlink	= proc_self_readlink,
+ 	.follow_link	= proc_self_follow_link,
++	.put_link	= proc_self_put_link,
+ };
+ 
+ /*
 --- a/fs/reiserfs/inode.c
 +++ b/fs/reiserfs/inode.c
 @@ -1497,9 +1497,11 @@ struct inode *reiserfs_iget(struct super
@@ -2195,6 +3065,37 @@
  	}
  	return 0;
  }
+--- a/include/linux/amba/bus.h
++++ b/include/linux/amba/bus.h
+@@ -1,5 +1,9 @@
+ /*
+- *  linux/include/asm-arm/hardware/amba.h
++ *  linux/include/amba/bus.h
++ *
++ *  This device type deals with ARM PrimeCells and anything else that
++ *  presents a proper CID (0xB105F00D) at the end of the I/O register
++ *  region or that is derived from a PrimeCell.
+  *
+  *  Copyright (C) 2003 Deep Blue Solutions Ltd, All Rights Reserved.
+  *
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -729,6 +729,7 @@ struct inode {
+ 	uid_t			i_uid;
+ 	gid_t			i_gid;
+ 	dev_t			i_rdev;
++	unsigned int		i_blkbits;
+ 	u64			i_version;
+ 	loff_t			i_size;
+ #ifdef __NEED_I_SIZE_ORDERED
+@@ -738,7 +739,6 @@ struct inode {
+ 	struct timespec		i_mtime;
+ 	struct timespec		i_ctime;
+ 	blkcnt_t		i_blocks;
+-	unsigned int		i_blkbits;
+ 	unsigned short          i_bytes;
+ 	umode_t			i_mode;
+ 	spinlock_t		i_lock;	/* i_blocks, i_bytes, maybe i_size */
 --- a/include/linux/hw_breakpoint.h
 +++ b/include/linux/hw_breakpoint.h
 @@ -44,7 +44,7 @@ static inline int hw_breakpoint_type(str
@@ -2395,6 +3296,41 @@
  	case ETHTOOL_GFLAGS:
  	case ETHTOOL_GPFLAGS:
  	case ETHTOOL_GRXFH:
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@ -410,7 +410,8 @@ static ssize_t wireless_show(struct devi
+ 	const struct iw_statistics *iw;
+ 	ssize_t ret = -EINVAL;
+ 
+-	rtnl_lock();
++	if (!rtnl_trylock())
++		return restart_syscall();
+ 	if (dev_isalive(dev)) {
+ 		iw = get_wireless_stats(dev);
+ 		if (iw)
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@ -1317,14 +1317,19 @@ static int devinet_sysctl_forward(ctl_ta
+ {
+ 	int *valp = ctl->data;
+ 	int val = *valp;
++	loff_t pos = *ppos;
+ 	int ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 
+ 	if (write && *valp != val) {
+ 		struct net *net = ctl->extra2;
+ 
+ 		if (valp != &IPV4_DEVCONF_DFLT(net, FORWARDING)) {
+-			if (!rtnl_trylock())
++			if (!rtnl_trylock()) {
++				/* Restore the original values before restarting */
++				*valp = val;
++				*ppos = pos;
+ 				return restart_syscall();
++			}
+ 			if (valp == &IPV4_DEVCONF_ALL(net, FORWARDING)) {
+ 				inet_forward_change(net);
+ 			} else if (*valp) {
 --- a/net/ipv4/igmp.c
 +++ b/net/ipv4/igmp.c
 @@ -946,7 +946,6 @@ int igmp_rcv(struct sk_buff *skb)
@@ -2449,6 +3385,66 @@
  
  				if (tp->rx_opt.tstamp_ok)
  					tp->advmss -= TCPOLEN_TSTAMP_ALIGNED;
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -502,8 +502,11 @@ static int addrconf_fixup_forwarding(str
+ 	if (p == &net->ipv6.devconf_dflt->forwarding)
+ 		return 0;
+ 
+-	if (!rtnl_trylock())
++	if (!rtnl_trylock()) {
++		/* Restore the original values before restarting */
++		*p = old;
+ 		return restart_syscall();
++	}
+ 
+ 	if (p == &net->ipv6.devconf_all->forwarding) {
+ 		__s32 newf = net->ipv6.devconf_all->forwarding;
+@@ -4028,12 +4031,15 @@ int addrconf_sysctl_forward(ctl_table *c
+ {
+ 	int *valp = ctl->data;
+ 	int val = *valp;
++	loff_t pos = *ppos;
+ 	int ret;
+ 
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 
+ 	if (write)
+ 		ret = addrconf_fixup_forwarding(ctl, valp, val);
++	if (ret)
++		*ppos = pos;
+ 	return ret;
+ }
+ 
+@@ -4075,8 +4081,11 @@ static int addrconf_disable_ipv6(struct
+ 	if (p == &net->ipv6.devconf_dflt->disable_ipv6)
+ 		return 0;
+ 
+-	if (!rtnl_trylock())
++	if (!rtnl_trylock()) {
++		/* Restore the original values before restarting */
++		*p = old;
+ 		return restart_syscall();
++	}
+ 
+ 	if (p == &net->ipv6.devconf_all->disable_ipv6) {
+ 		__s32 newf = net->ipv6.devconf_all->disable_ipv6;
+@@ -4095,12 +4104,15 @@ int addrconf_sysctl_disable(ctl_table *c
+ {
+ 	int *valp = ctl->data;
+ 	int val = *valp;
++	loff_t pos = *ppos;
+ 	int ret;
+ 
+ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+ 
+ 	if (write)
+ 		ret = addrconf_disable_ipv6(ctl, valp, val);
++	if (ret)
++		*ppos = pos;
+ 	return ret;
+ }
+ 
 --- a/net/ipv6/ipcomp6.c
 +++ b/net/ipv6/ipcomp6.c
 @@ -154,16 +154,12 @@ static int ipcomp6_init_state(struct xfr
