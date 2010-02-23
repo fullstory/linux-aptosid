@@ -69,7 +69,7 @@
  PATCHLEVEL = 6
  SUBLEVEL = 33
 -EXTRAVERSION = -rc8
-+EXTRAVERSION = -rc8-git6
++EXTRAVERSION = -rc8-git7
  NAME = Man-Eating Seals of Antiquity
  
  # *DOCUMENTATION*
@@ -363,6 +363,19 @@
  			return 1;
  		}
  	}
+--- a/arch/sparc/include/asm/stat.h
++++ b/arch/sparc/include/asm/stat.h
+@@ -53,8 +53,8 @@ struct stat {
+ 	ino_t		st_ino;
+ 	mode_t		st_mode;
+ 	short		st_nlink;
+-	uid_t		st_uid;
+-	gid_t		st_gid;
++	uid16_t		st_uid;
++	gid16_t		st_gid;
+ 	unsigned short	st_rdev;
+ 	off_t		st_size;
+ 	time_t		st_atime;
 --- a/arch/sparc/kernel/kstack.h
 +++ b/arch/sparc/kernel/kstack.h
 @@ -11,6 +11,10 @@ static inline bool kstack_valid(struct t
@@ -448,6 +461,17 @@
  
  #define	COMPAT_ELF_PLAT_INIT(regs, load_addr)		\
  	elf_common_init(&current->thread, regs, __USER_DS)
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -450,6 +450,8 @@ struct thread_struct {
+ 	struct perf_event	*ptrace_bps[HBP_NUM];
+ 	/* Debug status used for traps, single steps, etc... */
+ 	unsigned long           debugreg6;
++	/* Keep track of the exact dr7 value set by the user */
++	unsigned long           ptrace_dr7;
+ 	/* Fault info: */
+ 	unsigned long		cr2;
+ 	unsigned long		trap_no;
 --- a/arch/x86/kernel/acpi/boot.c
 +++ b/arch/x86/kernel/acpi/boot.c
 @@ -1344,14 +1344,6 @@ static struct dmi_system_id __initdata a
@@ -465,6 +489,52 @@
  	 .ident = "ASUS CUR-DLS",
  	 .matches = {
  		     DMI_MATCH(DMI_BOARD_VENDOR, "ASUSTeK Computer INC."),
+--- a/arch/x86/kernel/hw_breakpoint.c
++++ b/arch/x86/kernel/hw_breakpoint.c
+@@ -212,25 +212,6 @@ static int arch_check_va_in_kernelspace(
+ 	return (va >= TASK_SIZE) && ((va + len - 1) >= TASK_SIZE);
+ }
+ 
+-/*
+- * Store a breakpoint's encoded address, length, and type.
+- */
+-static int arch_store_info(struct perf_event *bp)
+-{
+-	struct arch_hw_breakpoint *info = counter_arch_bp(bp);
+-	/*
+-	 * For kernel-addresses, either the address or symbol name can be
+-	 * specified.
+-	 */
+-	if (info->name)
+-		info->address = (unsigned long)
+-				kallsyms_lookup_name(info->name);
+-	if (info->address)
+-		return 0;
+-
+-	return -EINVAL;
+-}
+-
+ int arch_bp_generic_fields(int x86_len, int x86_type,
+ 			   int *gen_len, int *gen_type)
+ {
+@@ -362,10 +343,13 @@ int arch_validate_hwbkpt_settings(struct
+ 		return ret;
+ 	}
+ 
+-	ret = arch_store_info(bp);
+-
+-	if (ret < 0)
+-		return ret;
++	/*
++	 * For kernel-addresses, either the address or symbol name can be
++	 * specified.
++	 */
++	if (info->name)
++		info->address = (unsigned long)
++				kallsyms_lookup_name(info->name);
+ 	/*
+ 	 * Check that the low-order bits of the address are appropriate
+ 	 * for the alignment implied by len.
 --- a/arch/x86/kernel/process_64.c
 +++ b/arch/x86/kernel/process_64.c
 @@ -527,6 +527,7 @@ void set_personality_ia32(void)
@@ -475,6 +545,30 @@
  
  	/* Prepare the first "return" to user space */
  	current_thread_info()->status |= TS_COMPAT;
+--- a/arch/x86/kernel/ptrace.c
++++ b/arch/x86/kernel/ptrace.c
+@@ -702,7 +702,7 @@ static unsigned long ptrace_get_debugreg
+ 	} else if (n == 6) {
+ 		val = thread->debugreg6;
+ 	 } else if (n == 7) {
+-		val = ptrace_get_dr7(thread->ptrace_bps);
++		val = thread->ptrace_dr7;
+ 	}
+ 	return val;
+ }
+@@ -778,8 +778,11 @@ int ptrace_set_debugreg(struct task_stru
+ 			return rc;
+ 	}
+ 	/* All that's left is DR7 */
+-	if (n == 7)
++	if (n == 7) {
+ 		rc = ptrace_write_dr7(tsk, val);
++		if (!rc)
++			thread->ptrace_dr7 = val;
++	}
+ 
+ ret_path:
+ 	return rc;
 --- a/drivers/acpi/dock.c
 +++ b/drivers/acpi/dock.c
 @@ -935,6 +935,7 @@ static int dock_add(acpi_handle handle)
@@ -847,6 +941,92 @@
  			if (!best_match)
  				return entry;
  			if (entry->size < best_size) {
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -176,6 +176,8 @@ MODULE_DEVICE_TABLE(pci, pciidlist);
+ 
+ static int i915_drm_freeze(struct drm_device *dev)
+ {
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
+ 	pci_save_state(dev->pdev);
+ 
+ 	/* If KMS is active, we do the leavevt stuff here */
+@@ -191,17 +193,12 @@ static int i915_drm_freeze(struct drm_de
+ 
+ 	i915_save_state(dev);
+ 
+-	return 0;
+-}
+-
+-static void i915_drm_suspend(struct drm_device *dev)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-
+ 	intel_opregion_free(dev, 1);
+ 
+ 	/* Modeset on resume, not lid events */
+ 	dev_priv->modeset_on_lid = 0;
++
++	return 0;
+ }
+ 
+ static int i915_suspend(struct drm_device *dev, pm_message_t state)
+@@ -221,8 +218,6 @@ static int i915_suspend(struct drm_devic
+ 	if (error)
+ 		return error;
+ 
+-	i915_drm_suspend(dev);
+-
+ 	if (state.event == PM_EVENT_SUSPEND) {
+ 		/* Shut down the device */
+ 		pci_disable_device(dev->pdev);
+@@ -237,6 +232,10 @@ static int i915_drm_thaw(struct drm_devi
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	int error = 0;
+ 
++	i915_restore_state(dev);
++
++	intel_opregion_init(dev, 1);
++
+ 	/* KMS EnterVT equivalent */
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET)) {
+ 		mutex_lock(&dev->struct_mutex);
+@@ -263,10 +262,6 @@ static int i915_resume(struct drm_device
+ 
+ 	pci_set_master(dev->pdev);
+ 
+-	i915_restore_state(dev);
+-
+-	intel_opregion_init(dev, 1);
+-
+ 	return i915_drm_thaw(dev);
+ }
+ 
+@@ -423,8 +418,6 @@ static int i915_pm_suspend(struct device
+ 	if (error)
+ 		return error;
+ 
+-	i915_drm_suspend(drm_dev);
+-
+ 	pci_disable_device(pdev);
+ 	pci_set_power_state(pdev, PCI_D3hot);
+ 
+@@ -464,13 +457,8 @@ static int i915_pm_poweroff(struct devic
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+ 	struct drm_device *drm_dev = pci_get_drvdata(pdev);
+-	int error;
+-
+-	error = i915_drm_freeze(drm_dev);
+-	if (!error)
+-		i915_drm_suspend(drm_dev);
+ 
+-	return error;
++	return i915_drm_freeze(drm_dev);
+ }
+ 
+ const struct dev_pm_ops i915_pm_ops = {
 --- a/drivers/gpu/drm/i915/intel_lvds.c
 +++ b/drivers/gpu/drm/i915/intel_lvds.c
 @@ -636,6 +636,13 @@ static const struct dmi_system_id bad_li
@@ -1565,6 +1745,21 @@
  			pdev = pci_dev_get(vga_default_device());
  		else {
  			if (!vga_pci_str_to_vars(curr_pos, remaining,
+--- a/drivers/input/input-polldev.c
++++ b/drivers/input/input-polldev.c
+@@ -100,6 +100,12 @@ static void input_close_polled_device(st
+ 	struct input_polled_dev *dev = input_get_drvdata(input);
+ 
+ 	cancel_delayed_work_sync(&dev->work);
++	/*
++	 * Clean up work struct to remove references to the workqueue.
++	 * It may be destroyed by the next call. This causes problems
++	 * at next device open-close in case of poll_interval == 0.
++	 */
++	INIT_DELAYED_WORK(&dev->work, dev->work.work.func);
+ 	input_polldev_stop_workqueue();
+ 
+ 	if (dev->close)
 --- a/drivers/input/serio/i8042.c
 +++ b/drivers/input/serio/i8042.c
 @@ -1161,9 +1161,17 @@ static int i8042_pm_restore(struct devic
@@ -1585,6 +1780,31 @@
  	.poweroff	= i8042_pm_reset,
  	.restore	= i8042_pm_restore,
  };
+--- a/drivers/input/touchscreen/usbtouchscreen.c
++++ b/drivers/input/touchscreen/usbtouchscreen.c
+@@ -618,8 +618,8 @@ static int idealtek_read_data(struct usb
+ #ifdef CONFIG_TOUCHSCREEN_USB_GENERAL_TOUCH
+ static int general_touch_read_data(struct usbtouch_usb *dev, unsigned char *pkt)
+ {
+-	dev->x = ((pkt[2] & 0x0F) << 8) | pkt[1] ;
+-	dev->y = ((pkt[4] & 0x0F) << 8) | pkt[3] ;
++	dev->x = (pkt[2] << 8) | pkt[1];
++	dev->y = (pkt[4] << 8) | pkt[3];
+ 	dev->press = pkt[5] & 0xff;
+ 	dev->touch = pkt[0] & 0x01;
+ 
+@@ -809,9 +809,9 @@ static struct usbtouch_device_info usbto
+ #ifdef CONFIG_TOUCHSCREEN_USB_GENERAL_TOUCH
+ 	[DEVTYPE_GENERAL_TOUCH] = {
+ 		.min_xc		= 0x0,
+-		.max_xc		= 0x0500,
++		.max_xc		= 0x7fff,
+ 		.min_yc		= 0x0,
+-		.max_yc		= 0x0500,
++		.max_yc		= 0x7fff,
+ 		.rept_size	= 7,
+ 		.read_data	= general_touch_read_data,
+ 	},
 --- a/drivers/md/dm-log-userspace-transfer.c
 +++ b/drivers/md/dm-log-userspace-transfer.c
 @@ -172,11 +172,15 @@ int dm_consult_userspace(const char *uui
@@ -2861,6 +3081,39 @@
  		US_FL_SCM_MULT_TARG ), 
  
  UNUSUAL_DEV(  0x07af, 0x0005, 0x0100, 0x0100,
+--- a/drivers/watchdog/bfin_wdt.c
++++ b/drivers/watchdog/bfin_wdt.c
+@@ -1,9 +1,8 @@
+ /*
+  * Blackfin On-Chip Watchdog Driver
+- *  Supports BF53[123]/BF53[467]/BF54[2489]/BF561
+  *
+  * Originally based on softdog.c
+- * Copyright 2006-2007 Analog Devices Inc.
++ * Copyright 2006-2010 Analog Devices Inc.
+  * Copyright 2006-2007 Michele d'Amico
+  * Copyright 1996 Alan Cox <alan@lxorguk.ukuu.org.uk>
+  *
+@@ -137,13 +136,15 @@ static int bfin_wdt_running(void)
+  */
+ static int bfin_wdt_set_timeout(unsigned long t)
+ {
+-	u32 cnt;
++	u32 cnt, max_t, sclk;
+ 	unsigned long flags;
+ 
+-	stampit();
++	sclk = get_sclk();
++	max_t = -1 / sclk;
++	cnt = t * sclk;
++	stamp("maxtimeout=%us newtimeout=%lus (cnt=%#x)", max_t, t, cnt);
+ 
+-	cnt = t * get_sclk();
+-	if (cnt < get_sclk()) {
++	if (t > max_t) {
+ 		printk(KERN_WARNING PFX "timeout value is too large\n");
+ 		return -EINVAL;
+ 	}
 --- a/fs/btrfs/file.c
 +++ b/fs/btrfs/file.c
 @@ -720,13 +720,15 @@ again:
@@ -3177,7 +3430,60 @@
  
 --- a/kernel/perf_event.c
 +++ b/kernel/perf_event.c
-@@ -4580,7 +4580,7 @@ static int perf_copy_attr(struct perf_ev
+@@ -3259,8 +3259,6 @@ static void perf_event_task_output(struc
+ 	task_event->event_id.tid = perf_event_tid(event, task);
+ 	task_event->event_id.ptid = perf_event_tid(event, current);
+ 
+-	task_event->event_id.time = perf_clock();
+-
+ 	perf_output_put(&handle, task_event->event_id);
+ 
+ 	perf_output_end(&handle);
+@@ -3268,7 +3266,7 @@ static void perf_event_task_output(struc
+ 
+ static int perf_event_task_match(struct perf_event *event)
+ {
+-	if (event->state != PERF_EVENT_STATE_ACTIVE)
++	if (event->state < PERF_EVENT_STATE_INACTIVE)
+ 		return 0;
+ 
+ 	if (event->cpu != -1 && event->cpu != smp_processor_id())
+@@ -3300,7 +3298,7 @@ static void perf_event_task_event(struct
+ 	cpuctx = &get_cpu_var(perf_cpu_context);
+ 	perf_event_task_ctx(&cpuctx->ctx, task_event);
+ 	if (!ctx)
+-		ctx = rcu_dereference(task_event->task->perf_event_ctxp);
++		ctx = rcu_dereference(current->perf_event_ctxp);
+ 	if (ctx)
+ 		perf_event_task_ctx(ctx, task_event);
+ 	put_cpu_var(perf_cpu_context);
+@@ -3331,6 +3329,7 @@ static void perf_event_task(struct task_
+ 			/* .ppid */
+ 			/* .tid  */
+ 			/* .ptid */
++			.time = perf_clock(),
+ 		},
+ 	};
+ 
+@@ -3380,7 +3379,7 @@ static void perf_event_comm_output(struc
+ 
+ static int perf_event_comm_match(struct perf_event *event)
+ {
+-	if (event->state != PERF_EVENT_STATE_ACTIVE)
++	if (event->state < PERF_EVENT_STATE_INACTIVE)
+ 		return 0;
+ 
+ 	if (event->cpu != -1 && event->cpu != smp_processor_id())
+@@ -3500,7 +3499,7 @@ static void perf_event_mmap_output(struc
+ static int perf_event_mmap_match(struct perf_event *event,
+ 				   struct perf_mmap_event *mmap_event)
+ {
+-	if (event->state != PERF_EVENT_STATE_ACTIVE)
++	if (event->state < PERF_EVENT_STATE_INACTIVE)
+ 		return 0;
+ 
+ 	if (event->cpu != -1 && event->cpu != smp_processor_id())
+@@ -4580,7 +4579,7 @@ static int perf_copy_attr(struct perf_ev
  	if (attr->type >= PERF_TYPE_MAX)
  		return -EINVAL;
  
@@ -3286,6 +3592,58 @@
  	local_irq_enable();
  }
  
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1002,33 +1002,27 @@ static int do_pages_stat(struct mm_struc
+ #define DO_PAGES_STAT_CHUNK_NR 16
+ 	const void __user *chunk_pages[DO_PAGES_STAT_CHUNK_NR];
+ 	int chunk_status[DO_PAGES_STAT_CHUNK_NR];
+-	unsigned long i, chunk_nr = DO_PAGES_STAT_CHUNK_NR;
+-	int err;
+ 
+-	for (i = 0; i < nr_pages; i += chunk_nr) {
+-		if (chunk_nr > nr_pages - i)
+-			chunk_nr = nr_pages - i;
+-
+-		err = copy_from_user(chunk_pages, &pages[i],
+-				     chunk_nr * sizeof(*chunk_pages));
+-		if (err) {
+-			err = -EFAULT;
+-			goto out;
+-		}
++	while (nr_pages) {
++		unsigned long chunk_nr;
++
++		chunk_nr = nr_pages;
++		if (chunk_nr > DO_PAGES_STAT_CHUNK_NR)
++			chunk_nr = DO_PAGES_STAT_CHUNK_NR;
++
++		if (copy_from_user(chunk_pages, pages, chunk_nr * sizeof(*chunk_pages)))
++			break;
+ 
+ 		do_pages_stat_array(mm, chunk_nr, chunk_pages, chunk_status);
+ 
+-		err = copy_to_user(&status[i], chunk_status,
+-				   chunk_nr * sizeof(*chunk_status));
+-		if (err) {
+-			err = -EFAULT;
+-			goto out;
+-		}
+-	}
+-	err = 0;
++		if (copy_to_user(status, chunk_status, chunk_nr * sizeof(*status)))
++			break;
+ 
+-out:
+-	return err;
++		pages += chunk_nr;
++		status += chunk_nr;
++		nr_pages -= chunk_nr;
++	}
++	return nr_pages ? -EFAULT : 0;
+ }
+ 
+ /*
 --- a/net/core/ethtool.c
 +++ b/net/core/ethtool.c
 @@ -927,6 +927,7 @@ int dev_ethtool(struct net *net, struct
@@ -3589,3 +3947,29 @@
  		al->level = '.';
  	else {
  		al->level = 'H';
+--- a/tools/perf/util/probe-event.c
++++ b/tools/perf/util/probe-event.c
+@@ -272,6 +272,7 @@ int synthesize_perf_probe_point(struct p
+ 	int ret;
+ 
+ 	pp->probes[0] = buf = zalloc(MAX_CMDLEN);
++	pp->found = 1;
+ 	if (!buf)
+ 		die("Failed to allocate memory by zalloc.");
+ 	if (pp->offset) {
+@@ -294,6 +295,7 @@ int synthesize_perf_probe_point(struct p
+ error:
+ 		free(pp->probes[0]);
+ 		pp->probes[0] = NULL;
++		pp->found = 0;
+ 	}
+ 	return ret;
+ }
+@@ -455,6 +457,7 @@ void show_perf_probe_events(void)
+ 	struct strlist *rawlist;
+ 	struct str_node *ent;
+ 
++	memset(&pp, 0, sizeof(pp));
+ 	fd = open_kprobe_events(O_RDONLY, 0);
+ 	rawlist = get_trace_kprobe_event_rawlist(fd);
+ 	close(fd);
