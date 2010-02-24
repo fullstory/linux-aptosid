@@ -23,6 +23,23 @@
  	amd_iommu=	[HW,X86-84]
  			Pass parameters to the AMD IOMMU driver in the system.
  			Possible values are:
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -1074,10 +1074,10 @@ regen_max_retry - INTEGER
+ 	Default: 5
+ 
+ max_addresses - INTEGER
+-	Number of maximum addresses per interface.  0 disables limitation.
+-	It is recommended not set too large value (or 0) because it would
+-	be too easy way to crash kernel to allow to create too much of
+-	autoconfigured addresses.
++	Maximum number of autoconfigured addresses per interface.  Setting
++	to zero disables the limitation.  It is not recommended to set this
++	value too large (or to zero) because it would be an easy way to
++	crash the kernel by allowing too many addresses to be created.
+ 	Default: 16
+ 
+ disable_ipv6 - BOOLEAN
 --- a/MAINTAINERS
 +++ b/MAINTAINERS
 @@ -616,10 +616,10 @@ M:	Richard Purdie <rpurdie@rpsys.net>
@@ -62,6 +79,18 @@
  F:	Documentation/networking/decnet.txt
  F:	net/decnet/
  
+@@ -3490,9 +3489,9 @@ S:	Maintained
+ F:	drivers/net/wireless/libertas/
+ 
+ MARVELL MV643XX ETHERNET DRIVER
+-M:	Lennert Buytenhek <buytenh@marvell.com>
++M:	Lennert Buytenhek <buytenh@wantstofly.org>
+ L:	netdev@vger.kernel.org
+-S:	Supported
++S:	Maintained
+ F:	drivers/net/mv643xx_eth.*
+ F:	include/linux/mv643xx.h
+ 
 --- a/Makefile
 +++ b/Makefile
 @@ -1,7 +1,7 @@
@@ -69,7 +98,7 @@
  PATCHLEVEL = 6
  SUBLEVEL = 33
 -EXTRAVERSION = -rc8
-+EXTRAVERSION = -rc8-git7
++EXTRAVERSION = -rc8-git9
  NAME = Man-Eating Seals of Antiquity
  
  # *DOCUMENTATION*
@@ -247,6 +276,42 @@
  #define elf_read_implies_exec(ex, executable_stack)					\
  	((executable_stack!=EXSTACK_DISABLE_X) && ((ex).e_flags & EF_IA_64_LINUX_EXECUTABLE_STACK) != 0)
  
+--- a/arch/mips/bcm47xx/prom.c
++++ b/arch/mips/bcm47xx/prom.c
+@@ -141,6 +141,14 @@ static __init void prom_init_mem(void)
+ 			break;
+ 	}
+ 
++	/* Ignoring the last page when ddr size is 128M. Cached
++	 * accesses to last page is causing the processor to prefetch
++	 * using address above 128M stepping out of the ddr address
++	 * space.
++	 */
++	if (mem == 0x8000000)
++		mem -= 0x1000;
++
+ 	add_memory_region(0, mem, BOOT_MEM_RAM);
+ }
+ 
+--- a/arch/mips/mm/highmem.c
++++ b/arch/mips/mm/highmem.c
+@@ -1,5 +1,6 @@
+ #include <linux/module.h>
+ #include <linux/highmem.h>
++#include <linux/sched.h>
+ #include <linux/smp.h>
+ #include <asm/fixmap.h>
+ #include <asm/tlbflush.h>
+--- a/arch/parisc/Kconfig
++++ b/arch/parisc/Kconfig
+@@ -18,7 +18,6 @@ config PARISC
+ 	select BUG
+ 	select HAVE_PERF_EVENTS
+ 	select GENERIC_ATOMIC64 if !64BIT
+-	select HAVE_ARCH_TRACEHOOK
+ 	help
+ 	  The PA-RISC microprocessor is designed by Hewlett-Packard and used
+ 	  in many of their workstations & servers (HP9000 700 and 800 series,
 --- a/arch/powerpc/platforms/85xx/mpc85xx_mds.c
 +++ b/arch/powerpc/platforms/85xx/mpc85xx_mds.c
 @@ -338,7 +338,8 @@ static void __init mpc85xx_mds_pic_init(
@@ -596,6 +661,48 @@
  	{},
  };
  
+@@ -872,12 +880,14 @@ static int acpi_idle_enter_simple(struct
+ 		return(acpi_idle_enter_c1(dev, state));
+ 
+ 	local_irq_disable();
+-	current_thread_info()->status &= ~TS_POLLING;
+-	/*
+-	 * TS_POLLING-cleared state must be visible before we test
+-	 * NEED_RESCHED:
+-	 */
+-	smp_mb();
++	if (cx->entry_method != ACPI_CSTATE_FFH) {
++		current_thread_info()->status &= ~TS_POLLING;
++		/*
++		 * TS_POLLING-cleared state must be visible before we test
++		 * NEED_RESCHED:
++		 */
++		smp_mb();
++	}
+ 
+ 	if (unlikely(need_resched())) {
+ 		current_thread_info()->status |= TS_POLLING;
+@@ -957,12 +967,14 @@ static int acpi_idle_enter_bm(struct cpu
+ 	}
+ 
+ 	local_irq_disable();
+-	current_thread_info()->status &= ~TS_POLLING;
+-	/*
+-	 * TS_POLLING-cleared state must be visible before we test
+-	 * NEED_RESCHED:
+-	 */
+-	smp_mb();
++	if (cx->entry_method != ACPI_CSTATE_FFH) {
++		current_thread_info()->status &= ~TS_POLLING;
++		/*
++		 * TS_POLLING-cleared state must be visible before we test
++		 * NEED_RESCHED:
++		 */
++		smp_mb();
++	}
+ 
+ 	if (unlikely(need_resched())) {
+ 		current_thread_info()->status |= TS_POLLING;
 --- a/drivers/acpi/processor_pdc.c
 +++ b/drivers/acpi/processor_pdc.c
 @@ -125,6 +125,8 @@ acpi_processor_eval_pdc(acpi_handle hand
@@ -638,6 +745,21 @@
 +
 +	early_pdc_done = 1;
  }
+--- a/drivers/acpi/processor_perflib.c
++++ b/drivers/acpi/processor_perflib.c
+@@ -413,7 +413,11 @@ static int acpi_processor_get_performanc
+ 	if (result)
+ 		goto update_bios;
+ 
+-	return 0;
++	/* We need to call _PPC once when cpufreq starts */
++	if (ignore_ppc != 1)
++		result = acpi_processor_get_platform_limit(pr);
++
++	return result;
+ 
+ 	/*
+ 	 * Having _PPC but missing frequencies (_PSS, _PCT) is a very good hint that
 --- a/drivers/acpi/scan.c
 +++ b/drivers/acpi/scan.c
 @@ -1336,9 +1336,25 @@ static int acpi_bus_scan(acpi_handle han
@@ -724,6 +846,17 @@
  }
  
  static struct sysfs_ops class_sysfs_ops = {
+--- a/drivers/clocksource/cs5535-clockevt.c
++++ b/drivers/clocksource/cs5535-clockevt.c
+@@ -21,7 +21,7 @@
+ 
+ #define DRV_NAME "cs5535-clockevt"
+ 
+-static int timer_irq = CONFIG_CS5535_MFGPT_DEFAULT_IRQ;
++static int timer_irq;
+ module_param_named(irq, timer_irq, int, 0644);
+ MODULE_PARM_DESC(irq, "Which IRQ to use for the clock source MFGPT ticks.");
+ 
 --- a/drivers/firewire/net.c
 +++ b/drivers/firewire/net.c
 @@ -893,20 +893,31 @@ static void fwnet_receive_broadcast(stru
@@ -1081,6 +1214,182 @@
  
  	uint8_t data[NV_PROM_SIZE];
  	unsigned int length;
+--- a/drivers/gpu/drm/nouveau/nouveau_drv.h
++++ b/drivers/gpu/drm/nouveau/nouveau_drv.h
+@@ -583,6 +583,7 @@ struct drm_nouveau_private {
+ 	uint64_t vm_end;
+ 	struct nouveau_gpuobj *vm_vram_pt[NV50_VM_VRAM_NR];
+ 	int vm_vram_pt_nr;
++	uint64_t vram_sys_base;
+ 
+ 	/* the mtrr covering the FB */
+ 	int fb_mtrr;
+--- a/drivers/gpu/drm/nouveau/nouveau_mem.c
++++ b/drivers/gpu/drm/nouveau/nouveau_mem.c
+@@ -285,53 +285,50 @@ nv50_mem_vm_bind_linear(struct drm_devic
+ 			uint32_t flags, uint64_t phys)
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpuobj **pgt;
+-	unsigned psz, pfl, pages;
+-
+-	if (virt >= dev_priv->vm_gart_base &&
+-	    (virt + size) < (dev_priv->vm_gart_base + dev_priv->vm_gart_size)) {
+-		psz = 12;
+-		pgt = &dev_priv->gart_info.sg_ctxdma;
+-		pfl = 0x21;
+-		virt -= dev_priv->vm_gart_base;
+-	} else
+-	if (virt >= dev_priv->vm_vram_base &&
+-	    (virt + size) < (dev_priv->vm_vram_base + dev_priv->vm_vram_size)) {
+-		psz = 16;
+-		pgt = dev_priv->vm_vram_pt;
+-		pfl = 0x01;
+-		virt -= dev_priv->vm_vram_base;
+-	} else {
+-		NV_ERROR(dev, "Invalid address: 0x%16llx-0x%16llx\n",
+-			 virt, virt + size - 1);
+-		return -EINVAL;
++	struct nouveau_gpuobj *pgt;
++	unsigned block;
++	int i;
++
++	virt = ((virt - dev_priv->vm_vram_base) >> 16) << 1;
++	size = (size >> 16) << 1;
++
++	phys |= ((uint64_t)flags << 32);
++	phys |= 1;
++	if (dev_priv->vram_sys_base) {
++		phys += dev_priv->vram_sys_base;
++		phys |= 0x30;
+ 	}
+ 
+-	pages = size >> psz;
+-
+ 	dev_priv->engine.instmem.prepare_access(dev, true);
+-	if (flags & 0x80000000) {
+-		while (pages--) {
+-			struct nouveau_gpuobj *pt = pgt[virt >> 29];
+-			unsigned pte = ((virt & 0x1fffffffULL) >> psz) << 1;
+-
+-			nv_wo32(dev, pt, pte++, 0x00000000);
+-			nv_wo32(dev, pt, pte++, 0x00000000);
+-
+-			virt += (1 << psz);
++	while (size) {
++		unsigned offset_h = upper_32_bits(phys);
++		unsigned offset_l = lower_32_bits(phys);
++		unsigned pte, end;
++
++		for (i = 7; i >= 0; i--) {
++			block = 1 << (i + 1);
++			if (size >= block && !(virt & (block - 1)))
++				break;
+ 		}
+-	} else {
+-		while (pages--) {
+-			struct nouveau_gpuobj *pt = pgt[virt >> 29];
+-			unsigned pte = ((virt & 0x1fffffffULL) >> psz) << 1;
+-			unsigned offset_h = upper_32_bits(phys) & 0xff;
+-			unsigned offset_l = lower_32_bits(phys);
++		offset_l |= (i << 7);
+ 
+-			nv_wo32(dev, pt, pte++, offset_l | pfl);
+-			nv_wo32(dev, pt, pte++, offset_h | flags);
++		phys += block << 15;
++		size -= block;
+ 
+-			phys += (1 << psz);
+-			virt += (1 << psz);
++		while (block) {
++			pgt = dev_priv->vm_vram_pt[virt >> 14];
++			pte = virt & 0x3ffe;
++
++			end = pte + block;
++			if (end > 16384)
++				end = 16384;
++			block -= (end - pte);
++			virt  += (end - pte);
++
++			while (pte < end) {
++				nv_wo32(dev, pgt, pte++, offset_l);
++				nv_wo32(dev, pgt, pte++, offset_h);
++			}
+ 		}
+ 	}
+ 	dev_priv->engine.instmem.finish_access(dev);
+@@ -356,7 +353,41 @@ nv50_mem_vm_bind_linear(struct drm_devic
+ void
+ nv50_mem_vm_unbind(struct drm_device *dev, uint64_t virt, uint32_t size)
+ {
+-	nv50_mem_vm_bind_linear(dev, virt, size, 0x80000000, 0);
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_gpuobj *pgt;
++	unsigned pages, pte, end;
++
++	virt -= dev_priv->vm_vram_base;
++	pages = (size >> 16) << 1;
++
++	dev_priv->engine.instmem.prepare_access(dev, true);
++	while (pages) {
++		pgt = dev_priv->vm_vram_pt[virt >> 29];
++		pte = (virt & 0x1ffe0000ULL) >> 15;
++
++		end = pte + pages;
++		if (end > 16384)
++			end = 16384;
++		pages -= (end - pte);
++		virt  += (end - pte) << 15;
++
++		while (pte < end)
++			nv_wo32(dev, pgt, pte++, 0);
++	}
++	dev_priv->engine.instmem.finish_access(dev);
++
++	nv_wr32(dev, 0x100c80, 0x00050001);
++	if (!nv_wait(0x100c80, 0x00000001, 0x00000000)) {
++		NV_ERROR(dev, "timeout: (0x100c80 & 1) == 0 (2)\n");
++		NV_ERROR(dev, "0x100c80 = 0x%08x\n", nv_rd32(dev, 0x100c80));
++		return;
++	}
++
++	nv_wr32(dev, 0x100c80, 0x00000001);
++	if (!nv_wait(0x100c80, 0x00000001, 0x00000000)) {
++		NV_ERROR(dev, "timeout: (0x100c80 & 1) == 0 (2)\n");
++		NV_ERROR(dev, "0x100c80 = 0x%08x\n", nv_rd32(dev, 0x100c80));
++	}
+ }
+ 
+ /*
+--- a/drivers/gpu/drm/nouveau/nv04_dac.c
++++ b/drivers/gpu/drm/nouveau/nv04_dac.c
+@@ -119,7 +119,7 @@ static enum drm_connector_status nv04_da
+ 						 struct drm_connector *connector)
+ {
+ 	struct drm_device *dev = encoder->dev;
+-	uint8_t saved_seq1, saved_pi, saved_rpc1;
++	uint8_t saved_seq1, saved_pi, saved_rpc1, saved_cr_mode;
+ 	uint8_t saved_palette0[3], saved_palette_mask;
+ 	uint32_t saved_rtest_ctrl, saved_rgen_ctrl;
+ 	int i;
+@@ -135,6 +135,9 @@ static enum drm_connector_status nv04_da
+ 		/* only implemented for head A for now */
+ 		NVSetOwner(dev, 0);
+ 
++	saved_cr_mode = NVReadVgaCrtc(dev, 0, NV_CIO_CR_MODE_INDEX);
++	NVWriteVgaCrtc(dev, 0, NV_CIO_CR_MODE_INDEX, saved_cr_mode | 0x80);
++
+ 	saved_seq1 = NVReadVgaSeq(dev, 0, NV_VIO_SR_CLOCK_INDEX);
+ 	NVWriteVgaSeq(dev, 0, NV_VIO_SR_CLOCK_INDEX, saved_seq1 & ~0x20);
+ 
+@@ -203,6 +206,7 @@ out:
+ 	NVWriteVgaCrtc(dev, 0, NV_CIO_CRE_PIXEL_INDEX, saved_pi);
+ 	NVWriteVgaCrtc(dev, 0, NV_CIO_CRE_RPC1_INDEX, saved_rpc1);
+ 	NVWriteVgaSeq(dev, 0, NV_VIO_SR_CLOCK_INDEX, saved_seq1);
++	NVWriteVgaCrtc(dev, 0, NV_CIO_CR_MODE_INDEX, saved_cr_mode);
+ 
+ 	if (blue == 0x18) {
+ 		NV_INFO(dev, "Load detected on head A\n");
 --- a/drivers/gpu/drm/nouveau/nv17_tv.c
 +++ b/drivers/gpu/drm/nouveau/nv17_tv.c
 @@ -579,6 +579,8 @@ static void nv17_tv_restore(struct drm_e
@@ -1092,6 +1401,116 @@
  }
  
  static int nv17_tv_create_resources(struct drm_encoder *encoder,
+--- a/drivers/gpu/drm/nouveau/nv50_instmem.c
++++ b/drivers/gpu/drm/nouveau/nv50_instmem.c
+@@ -76,6 +76,11 @@ nv50_instmem_init(struct drm_device *dev
+ 	for (i = 0x1700; i <= 0x1710; i += 4)
+ 		priv->save1700[(i-0x1700)/4] = nv_rd32(dev, i);
+ 
++	if (dev_priv->chipset == 0xaa || dev_priv->chipset == 0xac)
++		dev_priv->vram_sys_base = nv_rd32(dev, 0x100e10) << 12;
++	else
++		dev_priv->vram_sys_base = 0;
++
+ 	/* Reserve the last MiB of VRAM, we should probably try to avoid
+ 	 * setting up the below tables over the top of the VBIOS image at
+ 	 * some point.
+@@ -172,16 +177,28 @@ nv50_instmem_init(struct drm_device *dev
+ 	 * We map the entire fake channel into the start of the PRAMIN BAR
+ 	 */
+ 	ret = nouveau_gpuobj_new_ref(dev, chan, NULL, 0, pt_size, 0x1000,
+-							0, &priv->pramin_pt);
++				     0, &priv->pramin_pt);
+ 	if (ret)
+ 		return ret;
+ 
+-	for (i = 0, v = c_offset; i < pt_size; i += 8, v += 0x1000) {
+-		if (v < (c_offset + c_size))
+-			BAR0_WI32(priv->pramin_pt->gpuobj, i + 0, v | 1);
+-		else
+-			BAR0_WI32(priv->pramin_pt->gpuobj, i + 0, 0x00000009);
++	v = c_offset | 1;
++	if (dev_priv->vram_sys_base) {
++		v += dev_priv->vram_sys_base;
++		v |= 0x30;
++	}
++
++	i = 0;
++	while (v < dev_priv->vram_sys_base + c_offset + c_size) {
++		BAR0_WI32(priv->pramin_pt->gpuobj, i + 0, v);
++		BAR0_WI32(priv->pramin_pt->gpuobj, i + 4, 0x00000000);
++		v += 0x1000;
++		i += 8;
++	}
++
++	while (i < pt_size) {
++		BAR0_WI32(priv->pramin_pt->gpuobj, i + 0, 0x00000000);
+ 		BAR0_WI32(priv->pramin_pt->gpuobj, i + 4, 0x00000000);
++		i += 8;
+ 	}
+ 
+ 	BAR0_WI32(chan->vm_pd, 0x00, priv->pramin_pt->instance | 0x63);
+@@ -416,7 +433,9 @@ nv50_instmem_bind(struct drm_device *dev
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+ 	struct nv50_instmem_priv *priv = dev_priv->engine.instmem.priv;
+-	uint32_t pte, pte_end, vram;
++	struct nouveau_gpuobj *pramin_pt = priv->pramin_pt->gpuobj;
++	uint32_t pte, pte_end;
++	uint64_t vram;
+ 
+ 	if (!gpuobj->im_backing || !gpuobj->im_pramin || gpuobj->im_bound)
+ 		return -EINVAL;
+@@ -424,20 +443,24 @@ nv50_instmem_bind(struct drm_device *dev
+ 	NV_DEBUG(dev, "st=0x%0llx sz=0x%0llx\n",
+ 		 gpuobj->im_pramin->start, gpuobj->im_pramin->size);
+ 
+-	pte     = (gpuobj->im_pramin->start >> 12) << 3;
+-	pte_end = ((gpuobj->im_pramin->size >> 12) << 3) + pte;
++	pte     = (gpuobj->im_pramin->start >> 12) << 1;
++	pte_end = ((gpuobj->im_pramin->size >> 12) << 1) + pte;
+ 	vram    = gpuobj->im_backing_start;
+ 
+ 	NV_DEBUG(dev, "pramin=0x%llx, pte=%d, pte_end=%d\n",
+ 		 gpuobj->im_pramin->start, pte, pte_end);
+ 	NV_DEBUG(dev, "first vram page: 0x%08x\n", gpuobj->im_backing_start);
+ 
++	vram |= 1;
++	if (dev_priv->vram_sys_base) {
++		vram += dev_priv->vram_sys_base;
++		vram |= 0x30;
++	}
++
+ 	dev_priv->engine.instmem.prepare_access(dev, true);
+ 	while (pte < pte_end) {
+-		nv_wo32(dev, priv->pramin_pt->gpuobj, (pte + 0)/4, vram | 1);
+-		nv_wo32(dev, priv->pramin_pt->gpuobj, (pte + 4)/4, 0x00000000);
+-
+-		pte += 8;
++		nv_wo32(dev, pramin_pt, pte++, lower_32_bits(vram));
++		nv_wo32(dev, pramin_pt, pte++, upper_32_bits(vram));
+ 		vram += NV50_INSTMEM_PAGE_SIZE;
+ 	}
+ 	dev_priv->engine.instmem.finish_access(dev);
+@@ -470,14 +493,13 @@ nv50_instmem_unbind(struct drm_device *d
+ 	if (gpuobj->im_bound == 0)
+ 		return -EINVAL;
+ 
+-	pte     = (gpuobj->im_pramin->start >> 12) << 3;
+-	pte_end = ((gpuobj->im_pramin->size >> 12) << 3) + pte;
++	pte     = (gpuobj->im_pramin->start >> 12) << 1;
++	pte_end = ((gpuobj->im_pramin->size >> 12) << 1) + pte;
+ 
+ 	dev_priv->engine.instmem.prepare_access(dev, true);
+ 	while (pte < pte_end) {
+-		nv_wo32(dev, priv->pramin_pt->gpuobj, (pte + 0)/4, 0x00000009);
+-		nv_wo32(dev, priv->pramin_pt->gpuobj, (pte + 4)/4, 0x00000000);
+-		pte += 8;
++		nv_wo32(dev, priv->pramin_pt->gpuobj, pte++, 0x00000000);
++		nv_wo32(dev, priv->pramin_pt->gpuobj, pte++, 0x00000000);
+ 	}
+ 	dev_priv->engine.instmem.finish_access(dev);
+ 
 --- a/drivers/gpu/drm/radeon/atom.c
 +++ b/drivers/gpu/drm/radeon/atom.c
 @@ -24,6 +24,7 @@
@@ -1722,6 +2141,158 @@
  }
  
  
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+@@ -182,25 +182,19 @@ static int vmw_cmd_present_check(struct
+ 	return vmw_cmd_sid_check(dev_priv, sw_context, &cmd->body.sid);
+ }
+ 
+-static int vmw_cmd_dma(struct vmw_private *dev_priv,
+-		       struct vmw_sw_context *sw_context,
+-		       SVGA3dCmdHeader *header)
++static int vmw_translate_guest_ptr(struct vmw_private *dev_priv,
++				   struct vmw_sw_context *sw_context,
++				   SVGAGuestPtr *ptr,
++				   struct vmw_dma_buffer **vmw_bo_p)
+ {
+-	uint32_t handle;
+ 	struct vmw_dma_buffer *vmw_bo = NULL;
+ 	struct ttm_buffer_object *bo;
+-	struct vmw_surface *srf = NULL;
+-	struct vmw_dma_cmd {
+-		SVGA3dCmdHeader header;
+-		SVGA3dCmdSurfaceDMA dma;
+-	} *cmd;
++	uint32_t handle = ptr->gmrId;
+ 	struct vmw_relocation *reloc;
+-	int ret;
+ 	uint32_t cur_validate_node;
+ 	struct ttm_validate_buffer *val_buf;
++	int ret;
+ 
+-	cmd = container_of(header, struct vmw_dma_cmd, header);
+-	handle = cmd->dma.guest.ptr.gmrId;
+ 	ret = vmw_user_dmabuf_lookup(sw_context->tfile, handle, &vmw_bo);
+ 	if (unlikely(ret != 0)) {
+ 		DRM_ERROR("Could not find or use GMR region.\n");
+@@ -209,14 +203,14 @@ static int vmw_cmd_dma(struct vmw_privat
+ 	bo = &vmw_bo->base;
+ 
+ 	if (unlikely(sw_context->cur_reloc >= VMWGFX_MAX_RELOCATIONS)) {
+-		DRM_ERROR("Max number of DMA commands per submission"
++		DRM_ERROR("Max number relocations per submission"
+ 			  " exceeded\n");
+ 		ret = -EINVAL;
+ 		goto out_no_reloc;
+ 	}
+ 
+ 	reloc = &sw_context->relocs[sw_context->cur_reloc++];
+-	reloc->location = &cmd->dma.guest.ptr;
++	reloc->location = ptr;
+ 
+ 	cur_validate_node = vmw_dmabuf_validate_node(bo, sw_context->cur_val_buf);
+ 	if (unlikely(cur_validate_node >= VMWGFX_MAX_GMRS)) {
+@@ -234,7 +228,89 @@ static int vmw_cmd_dma(struct vmw_privat
+ 		list_add_tail(&val_buf->head, &sw_context->validate_nodes);
+ 		++sw_context->cur_val_buf;
+ 	}
++	*vmw_bo_p = vmw_bo;
++	return 0;
++
++out_no_reloc:
++	vmw_dmabuf_unreference(&vmw_bo);
++	vmw_bo_p = NULL;
++	return ret;
++}
++
++static int vmw_cmd_end_query(struct vmw_private *dev_priv,
++			     struct vmw_sw_context *sw_context,
++			     SVGA3dCmdHeader *header)
++{
++	struct vmw_dma_buffer *vmw_bo;
++	struct vmw_query_cmd {
++		SVGA3dCmdHeader header;
++		SVGA3dCmdEndQuery q;
++	} *cmd;
++	int ret;
++
++	cmd = container_of(header, struct vmw_query_cmd, header);
++	ret = vmw_cmd_cid_check(dev_priv, sw_context, header);
++	if (unlikely(ret != 0))
++		return ret;
++
++	ret = vmw_translate_guest_ptr(dev_priv, sw_context,
++				      &cmd->q.guestResult,
++				      &vmw_bo);
++	if (unlikely(ret != 0))
++		return ret;
++
++	vmw_dmabuf_unreference(&vmw_bo);
++	return 0;
++}
+ 
++static int vmw_cmd_wait_query(struct vmw_private *dev_priv,
++			      struct vmw_sw_context *sw_context,
++			      SVGA3dCmdHeader *header)
++{
++	struct vmw_dma_buffer *vmw_bo;
++	struct vmw_query_cmd {
++		SVGA3dCmdHeader header;
++		SVGA3dCmdWaitForQuery q;
++	} *cmd;
++	int ret;
++
++	cmd = container_of(header, struct vmw_query_cmd, header);
++	ret = vmw_cmd_cid_check(dev_priv, sw_context, header);
++	if (unlikely(ret != 0))
++		return ret;
++
++	ret = vmw_translate_guest_ptr(dev_priv, sw_context,
++				      &cmd->q.guestResult,
++				      &vmw_bo);
++	if (unlikely(ret != 0))
++		return ret;
++
++	vmw_dmabuf_unreference(&vmw_bo);
++	return 0;
++}
++
++
++static int vmw_cmd_dma(struct vmw_private *dev_priv,
++		       struct vmw_sw_context *sw_context,
++		       SVGA3dCmdHeader *header)
++{
++	struct vmw_dma_buffer *vmw_bo = NULL;
++	struct ttm_buffer_object *bo;
++	struct vmw_surface *srf = NULL;
++	struct vmw_dma_cmd {
++		SVGA3dCmdHeader header;
++		SVGA3dCmdSurfaceDMA dma;
++	} *cmd;
++	int ret;
++
++	cmd = container_of(header, struct vmw_dma_cmd, header);
++	ret = vmw_translate_guest_ptr(dev_priv, sw_context,
++				      &cmd->dma.guest.ptr,
++				      &vmw_bo);
++	if (unlikely(ret != 0))
++		return ret;
++
++	bo = &vmw_bo->base;
+ 	ret = vmw_user_surface_lookup_handle(dev_priv, sw_context->tfile,
+ 					     cmd->dma.host.sid, &srf);
+ 	if (ret) {
+@@ -379,8 +455,8 @@ static vmw_cmd_func vmw_cmd_funcs[SVGA_3
+ 	VMW_CMD_DEF(SVGA_3D_CMD_DRAW_PRIMITIVES, &vmw_cmd_draw),
+ 	VMW_CMD_DEF(SVGA_3D_CMD_SETSCISSORRECT, &vmw_cmd_cid_check),
+ 	VMW_CMD_DEF(SVGA_3D_CMD_BEGIN_QUERY, &vmw_cmd_cid_check),
+-	VMW_CMD_DEF(SVGA_3D_CMD_END_QUERY, &vmw_cmd_cid_check),
+-	VMW_CMD_DEF(SVGA_3D_CMD_WAIT_FOR_QUERY, &vmw_cmd_cid_check),
++	VMW_CMD_DEF(SVGA_3D_CMD_END_QUERY, &vmw_cmd_end_query),
++	VMW_CMD_DEF(SVGA_3D_CMD_WAIT_FOR_QUERY, &vmw_cmd_wait_query),
+ 	VMW_CMD_DEF(SVGA_3D_CMD_PRESENT_READBACK, &vmw_cmd_ok),
+ 	VMW_CMD_DEF(SVGA_3D_CMD_BLIT_SURFACE_TO_SCREEN,
+ 		    &vmw_cmd_blt_surf_screen_check)
 --- a/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
 +++ b/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
 @@ -559,6 +559,9 @@ int vmw_fb_init(struct vmw_private *vmw_
@@ -2068,6 +2639,45 @@
  }
  
  static void be_cmd_page_addrs_prepare(struct phys_addr *pages, u32 max_pages,
+--- a/drivers/net/e1000/e1000_main.c
++++ b/drivers/net/e1000/e1000_main.c
+@@ -4006,11 +4006,21 @@ check_page:
+ 			}
+ 		}
+ 
+-		if (!buffer_info->dma)
++		if (!buffer_info->dma) {
+ 			buffer_info->dma = pci_map_page(pdev,
+ 			                                buffer_info->page, 0,
+ 			                                buffer_info->length,
+ 			                                PCI_DMA_FROMDEVICE);
++			if (pci_dma_mapping_error(pdev, buffer_info->dma)) {
++				put_page(buffer_info->page);
++				dev_kfree_skb(skb);
++				buffer_info->page = NULL;
++				buffer_info->skb = NULL;
++				buffer_info->dma = 0;
++				adapter->alloc_rx_buff_failed++;
++				break; /* while !buffer_info->skb */
++			}
++		}
+ 
+ 		rx_desc = E1000_RX_DESC(*rx_ring, i);
+ 		rx_desc->buffer_addr = cpu_to_le64(buffer_info->dma);
+@@ -4101,6 +4111,13 @@ map_skb:
+ 						  skb->data,
+ 						  buffer_info->length,
+ 						  PCI_DMA_FROMDEVICE);
++		if (pci_dma_mapping_error(pdev, buffer_info->dma)) {
++			dev_kfree_skb(skb);
++			buffer_info->skb = NULL;
++			buffer_info->dma = 0;
++			adapter->alloc_rx_buff_failed++;
++			break; /* while !buffer_info->skb */
++		}
+ 
+ 		/*
+ 		 * XXX if it was allocated cleanly it will never map to a
 --- a/drivers/net/ixgbe/ixgbe_82598.c
 +++ b/drivers/net/ixgbe/ixgbe_82598.c
 @@ -357,12 +357,34 @@ static s32 ixgbe_fc_enable_82598(struct
@@ -2218,6 +2828,30 @@
  
   fail:
  	EFX_ERR(efx, "PHY reset timed out\n");
+--- a/drivers/net/tc35815.c
++++ b/drivers/net/tc35815.c
+@@ -1437,7 +1437,6 @@ static int tc35815_do_interrupt(struct n
+ 		/* Transmit complete. */
+ 		lp->lstats.tx_ints++;
+ 		tc35815_txdone(dev);
+-		netif_wake_queue(dev);
+ 		if (ret < 0)
+ 			ret = 0;
+ 	}
+--- a/drivers/net/usb/cdc_ether.c
++++ b/drivers/net/usb/cdc_ether.c
+@@ -584,6 +584,11 @@ static const struct usb_device_id	produc
+ 			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+ 	.driver_info = (unsigned long) &mbm_info,
+ }, {
++	/* Ericsson C3607w ver 2 */
++	USB_DEVICE_AND_INTERFACE_INFO(0x0bdb, 0x190b, USB_CLASS_COMM,
++			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
++	.driver_info = (unsigned long) &mbm_info,
++}, {
+ 	/* Toshiba F3507g */
+ 	USB_DEVICE_AND_INTERFACE_INFO(0x0930, 0x130b, USB_CLASS_COMM,
+ 			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
 --- a/drivers/net/via-velocity.c
 +++ b/drivers/net/via-velocity.c
 @@ -1877,13 +1877,12 @@ static void velocity_error(struct veloci
@@ -2395,16 +3029,68 @@
  }
  
  static void b43_short_slot_timing_enable(struct b43_wldev *dev)
+--- a/drivers/net/wireless/iwlwifi/iwl-4965.c
++++ b/drivers/net/wireless/iwlwifi/iwl-4965.c
+@@ -2008,7 +2008,7 @@ static void iwl4965_rx_reply_tx(struct i
+ 			IWL_DEBUG_TX_REPLY(priv, "Retry scheduler reclaim scd_ssn "
+ 					   "%d index %d\n", scd_ssn , index);
+ 			freed = iwl_tx_queue_reclaim(priv, txq_id, index);
+-			priv->stations[sta_id].tid[tid].tfds_in_queue -= freed;
++			iwl_free_tfds_in_queue(priv, sta_id, tid, freed);
+ 
+ 			if (priv->mac80211_registered &&
+ 			    (iwl_queue_space(&txq->q) > txq->q.low_mark) &&
+--- a/drivers/net/wireless/iwlwifi/iwl-5000.c
++++ b/drivers/net/wireless/iwlwifi/iwl-5000.c
+@@ -1125,7 +1125,7 @@ static void iwl5000_rx_reply_tx(struct i
+ 					scd_ssn , index, txq_id, txq->swq_id);
+ 
+ 			freed = iwl_tx_queue_reclaim(priv, txq_id, index);
+-			priv->stations[sta_id].tid[tid].tfds_in_queue -= freed;
++			iwl_free_tfds_in_queue(priv, sta_id, tid, freed);
+ 
+ 			if (priv->mac80211_registered &&
+ 			    (iwl_queue_space(&txq->q) > txq->q.low_mark) &&
+@@ -1153,16 +1153,14 @@ static void iwl5000_rx_reply_tx(struct i
+ 				   tx_resp->failure_frame);
+ 
+ 		freed = iwl_tx_queue_reclaim(priv, txq_id, index);
+-		if (ieee80211_is_data_qos(tx_resp->frame_ctrl))
+-			priv->stations[sta_id].tid[tid].tfds_in_queue -= freed;
++		iwl_free_tfds_in_queue(priv, sta_id, tid, freed);
+ 
+ 		if (priv->mac80211_registered &&
+ 		    (iwl_queue_space(&txq->q) > txq->q.low_mark))
+ 			iwl_wake_queue(priv, txq_id);
+ 	}
+ 
+-	if (ieee80211_is_data_qos(tx_resp->frame_ctrl))
+-		iwl_txq_check_empty(priv, sta_id, tid, txq_id);
++	iwl_txq_check_empty(priv, sta_id, tid, txq_id);
+ 
+ 	if (iwl_check_bits(status, TX_ABORT_REQUIRED_MSK))
+ 		IWL_ERR(priv, "TODO:  Implement Tx ABORT REQUIRED!!!\n");
 --- a/drivers/net/wireless/iwlwifi/iwl-core.c
 +++ b/drivers/net/wireless/iwlwifi/iwl-core.c
-@@ -2744,6 +2744,7 @@ int iwl_mac_config(struct ieee80211_hw *
- 		if ((le16_to_cpu(priv->staging_rxon.channel) != ch))
+@@ -2745,6 +2745,7 @@ int iwl_mac_config(struct ieee80211_hw *
  			priv->staging_rxon.flags = 0;
  
-+		iwl_set_rxon_ht(priv, ht_conf);
  		iwl_set_rxon_channel(priv, conf->channel);
++		iwl_set_rxon_ht(priv, ht_conf);
  
  		iwl_set_flags_for_band(priv, conf->channel->band);
+ 		spin_unlock_irqrestore(&priv->lock, flags);
+--- a/drivers/net/wireless/iwlwifi/iwl-core.h
++++ b/drivers/net/wireless/iwlwifi/iwl-core.h
+@@ -446,6 +446,8 @@ void iwl_hw_txq_ctx_free(struct iwl_priv
+ int iwl_hw_tx_queue_init(struct iwl_priv *priv,
+ 			 struct iwl_tx_queue *txq);
+ int iwl_txq_update_write_ptr(struct iwl_priv *priv, struct iwl_tx_queue *txq);
++void iwl_free_tfds_in_queue(struct iwl_priv *priv,
++			    int sta_id, int tid, int freed);
+ int iwl_tx_queue_init(struct iwl_priv *priv, struct iwl_tx_queue *txq,
+ 		      int slots_num, u32 txq_id);
+ void iwl_tx_queue_free(struct iwl_priv *priv, int txq_id);
 --- a/drivers/net/wireless/iwlwifi/iwl-rx.c
 +++ b/drivers/net/wireless/iwlwifi/iwl-rx.c
 @@ -928,7 +928,10 @@ static void iwl_pass_packet_to_mac80211(
@@ -2419,6 +3105,64 @@
  		ret = skb_linearize(skb);
  	else
  		ret = __pskb_pull_tail(skb, min_t(u16, IWL_LINK_HDR_MAX, len)) ?
+--- a/drivers/net/wireless/iwlwifi/iwl-tx.c
++++ b/drivers/net/wireless/iwlwifi/iwl-tx.c
+@@ -120,6 +120,20 @@ int iwl_txq_update_write_ptr(struct iwl_
+ EXPORT_SYMBOL(iwl_txq_update_write_ptr);
+ 
+ 
++void iwl_free_tfds_in_queue(struct iwl_priv *priv,
++			    int sta_id, int tid, int freed)
++{
++	if (priv->stations[sta_id].tid[tid].tfds_in_queue >= freed)
++		priv->stations[sta_id].tid[tid].tfds_in_queue -= freed;
++	else {
++		IWL_ERR(priv, "free more than tfds_in_queue (%u:%d)\n",
++			priv->stations[sta_id].tid[tid].tfds_in_queue,
++			freed);
++		priv->stations[sta_id].tid[tid].tfds_in_queue = 0;
++	}
++}
++EXPORT_SYMBOL(iwl_free_tfds_in_queue);
++
+ /**
+  * iwl_tx_queue_free - Deallocate DMA queue.
+  * @txq: Transmit queue to deallocate.
+@@ -1131,6 +1145,7 @@ int iwl_tx_queue_reclaim(struct iwl_priv
+ 	struct iwl_queue *q = &txq->q;
+ 	struct iwl_tx_info *tx_info;
+ 	int nfreed = 0;
++	struct ieee80211_hdr *hdr;
+ 
+ 	if ((index >= q->n_bd) || (iwl_queue_used(q, index) == 0)) {
+ 		IWL_ERR(priv, "Read index for DMA queue txq id (%d), index %d, "
+@@ -1145,13 +1160,16 @@ int iwl_tx_queue_reclaim(struct iwl_priv
+ 
+ 		tx_info = &txq->txb[txq->q.read_ptr];
+ 		iwl_tx_status(priv, tx_info->skb[0]);
++
++		hdr = (struct ieee80211_hdr *)tx_info->skb[0]->data;
++		if (hdr && ieee80211_is_data_qos(hdr->frame_control))
++			nfreed++;
+ 		tx_info->skb[0] = NULL;
+ 
+ 		if (priv->cfg->ops->lib->txq_inval_byte_cnt_tbl)
+ 			priv->cfg->ops->lib->txq_inval_byte_cnt_tbl(priv, txq);
+ 
+ 		priv->cfg->ops->lib->txq_free_tfd(priv, txq);
+-		nfreed++;
+ 	}
+ 	return nfreed;
+ }
+@@ -1559,7 +1577,7 @@ void iwl_rx_reply_compressed_ba(struct i
+ 	if (txq->q.read_ptr != (ba_resp_scd_ssn & 0xff)) {
+ 		/* calculate mac80211 ampdu sw queue to wake */
+ 		int freed = iwl_tx_queue_reclaim(priv, scd_flow, index);
+-		priv->stations[sta_id].tid[tid].tfds_in_queue -= freed;
++		iwl_free_tfds_in_queue(priv, sta_id, tid, freed);
+ 
+ 		if ((iwl_queue_space(&txq->q) > txq->q.low_mark) &&
+ 		    priv->mac80211_registered &&
 --- a/drivers/net/wireless/iwmc3200wifi/rx.c
 +++ b/drivers/net/wireless/iwmc3200wifi/rx.c
 @@ -794,7 +794,7 @@ static int iwm_mlme_update_bss_table(str
@@ -2455,6 +3199,17 @@
  	ret_val = acpi_bus_start(device);
  
  acpiphp_bus_add_out:
+--- a/drivers/platform/x86/acer-wmi.c
++++ b/drivers/platform/x86/acer-wmi.c
+@@ -934,7 +934,7 @@ static int __devinit acer_backlight_init
+ 	acer_backlight_device = bd;
+ 
+ 	bd->props.power = FB_BLANK_UNBLANK;
+-	bd->props.brightness = max_brightness;
++	bd->props.brightness = read_brightness(bd);
+ 	bd->props.max_brightness = max_brightness;
+ 	backlight_update_status(bd);
+ 	return 0;
 --- a/drivers/platform/x86/thinkpad_acpi.c
 +++ b/drivers/platform/x86/thinkpad_acpi.c
 @@ -5771,7 +5771,7 @@ static void thermal_exit(void)
@@ -3081,6 +3836,35 @@
  		US_FL_SCM_MULT_TARG ), 
  
  UNUSUAL_DEV(  0x07af, 0x0005, 0x0100, 0x0100,
+--- a/drivers/video/efifb.c
++++ b/drivers/video/efifb.c
+@@ -161,8 +161,17 @@ static int efifb_setcolreg(unsigned regn
+ 	return 0;
+ }
+ 
++static void efifb_destroy(struct fb_info *info)
++{
++	if (info->screen_base)
++		iounmap(info->screen_base);
++	release_mem_region(info->aperture_base, info->aperture_size);
++	framebuffer_release(info);
++}
++
+ static struct fb_ops efifb_ops = {
+ 	.owner		= THIS_MODULE,
++	.fb_destroy	= efifb_destroy,
+ 	.fb_setcolreg	= efifb_setcolreg,
+ 	.fb_fillrect	= cfb_fillrect,
+ 	.fb_copyarea	= cfb_copyarea,
+@@ -281,7 +290,7 @@ static int __init efifb_probe(struct pla
+ 	info->par = NULL;
+ 
+ 	info->aperture_base = efifb_fix.smem_start;
+-	info->aperture_size = size_total;
++	info->aperture_size = size_remap;
+ 
+ 	info->screen_base = ioremap(efifb_fix.smem_start, efifb_fix.smem_len);
+ 	if (!info->screen_base) {
 --- a/drivers/watchdog/bfin_wdt.c
 +++ b/drivers/watchdog/bfin_wdt.c
 @@ -1,9 +1,8 @@
@@ -3155,6 +3939,16 @@
  
  	dput(dir);
  	_leave(" = %d", ret);
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -637,7 +637,6 @@ int setup_arg_pages(struct linux_binprm
+ 	 * will align it up.
+ 	 */
+ 	rlim_stack = rlimit(RLIMIT_STACK) & PAGE_MASK;
+-	rlim_stack = min(rlim_stack, stack_size);
+ #ifdef CONFIG_STACK_GROWSUP
+ 	if (stack_size + stack_expand > rlim_stack)
+ 		stack_base = vma->vm_start + rlim_stack;
 --- a/fs/namei.c
 +++ b/fs/namei.c
 @@ -823,6 +823,17 @@ fail:
@@ -3522,6 +4316,24 @@
  }
  
  /*
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -222,6 +222,7 @@ SYSCALL_DEFINE2(getpriority, int, which,
+ 	if (which > PRIO_USER || which < PRIO_PROCESS)
+ 		return -EINVAL;
+ 
++	rcu_read_lock();
+ 	read_lock(&tasklist_lock);
+ 	switch (which) {
+ 		case PRIO_PROCESS:
+@@ -267,6 +268,7 @@ SYSCALL_DEFINE2(getpriority, int, which,
+ 	}
+ out_unlock:
+ 	read_unlock(&tasklist_lock);
++	rcu_read_unlock();
+ 
+ 	return retval;
+ }
 --- a/kernel/trace/trace_kprobe.c
 +++ b/kernel/trace/trace_kprobe.c
 @@ -689,7 +689,7 @@ static int create_trace_probe(int argc,
@@ -3592,6 +4404,22 @@
  	local_irq_enable();
  }
  
+--- a/lib/idr.c
++++ b/lib/idr.c
+@@ -156,10 +156,12 @@ static int sub_alloc(struct idr *idp, in
+ 			id = (id | ((1 << (IDR_BITS * l)) - 1)) + 1;
+ 
+ 			/* if already at the top layer, we need to grow */
+-			if (!(p = pa[l])) {
++			if (id >= 1 << (idp->layers * IDR_BITS)) {
+ 				*starting_id = id;
+ 				return IDR_NEED_TO_GROW;
+ 			}
++			p = pa[l];
++			BUG_ON(!p);
+ 
+ 			/* If we need to go up one layer, continue the
+ 			 * loop; otherwise, restart from the top.
 --- a/mm/migrate.c
 +++ b/mm/migrate.c
 @@ -1002,33 +1002,27 @@ static int do_pages_stat(struct mm_struc
@@ -3644,6 +4472,28 @@
  }
  
  /*
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@ -459,6 +459,8 @@ static int oom_kill_process(struct task_
+ 	list_for_each_entry(c, &p->children, sibling) {
+ 		if (c->mm == p->mm)
+ 			continue;
++		if (mem && !task_in_mem_cgroup(c, mem))
++			continue;
+ 		if (!oom_kill_task(c))
+ 			return 0;
+ 	}
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2761,7 +2761,7 @@ gro_result_t napi_frags_finish(struct na
+ 	switch (ret) {
+ 	case GRO_NORMAL:
+ 	case GRO_HELD:
+-		skb->protocol = eth_type_trans(skb, napi->dev);
++		skb->protocol = eth_type_trans(skb, skb->dev);
+ 
+ 		if (ret == GRO_HELD)
+ 			skb_gro_pull(skb, -ETH_HLEN);
 --- a/net/core/ethtool.c
 +++ b/net/core/ethtool.c
 @@ -927,6 +927,7 @@ int dev_ethtool(struct net *net, struct
