@@ -157,6 +157,7 @@ class Gencontrol(Base):
         packages_dummy = []
         packages_own = []
 
+        """
         if config_entry_image['type'] == 'plain-s390-tape':
             image = self.templates["control.image.type-standalone"]
             build_modules = False
@@ -176,6 +177,8 @@ class Gencontrol(Base):
                 p[0]['Depends'].append(l)
                 packages_dummy.extend(p)
         else:
+	"""
+	if True: #sidux
             build_modules = True
             image = self.templates["control.image.type-%s" % config_entry_image['type']]
             #image = self.templates["control.image.type-modulesinline"]
