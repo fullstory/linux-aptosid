@@ -177,8 +177,8 @@ class Gencontrol(Base):
                 p[0]['Depends'].append(l)
                 packages_dummy.extend(p)
         else:
-	"""
-	if True: #sidux
+        """
+        if True: #sidux
             build_modules = True
             image = self.templates["control.image.type-%s" % config_entry_image['type']]
             #image = self.templates["control.image.type-modulesinline"]
