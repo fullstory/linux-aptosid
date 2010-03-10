@@ -1354,7 +1354,7 @@
 +#endif /* __AUFS_BRANCH_H__ */
 --- /dev/null
 +++ b/fs/aufs/conf.mk
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,33 @@
 +
 +AuConfStr = CONFIG_AUFS_FS=${CONFIG_AUFS_FS}
 +
@@ -1372,6 +1372,7 @@
 +	SHWH \
 +	BR_RAMFS \
 +	BR_FUSE POLL \
++	BR_HFSPLUS \
 +	BDEV_LOOP \
 +	DEBUG MAGIC_SYSRQ, \
 +	$(eval $(call AuConf,CONFIG_AUFS_${i})))
@@ -1389,7 +1390,7 @@
 +${obj}/sysfs.o: ${AuConfName}
 --- /dev/null
 +++ b/fs/aufs/cpup.c
-@@ -0,0 +1,1048 @@
+@@ -0,0 +1,1050 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -2304,6 +2305,7 @@
 +		mutex_unlock(&h_inode->i_mutex);
 +		mutex_lock_nested(&h_tmpdir->i_mutex, AuLsc_I_PARENT3);
 +		mutex_lock_nested(&h_inode->i_mutex, AuLsc_I_CHILD);
++		/* todo: au_h_open_pre()? */
 +	}
 +
 +	if (!au_test_h_perm_sio(h_tmpdir, MAY_EXEC | MAY_WRITE))
@@ -2323,6 +2325,7 @@
 +
 +	if (h_orph) {
 +		mutex_unlock(&h_tmpdir->i_mutex);
++		/* todo: au_h_open_post()? */
 +		au_set_h_iptr(dir, bdst, NULL, 0);
 +		au_set_h_iptr(dir, bdst, au_igrab(h_dir), /*flags*/0);
 +		au_set_h_dptr(parent, bdst, NULL);
@@ -6801,7 +6804,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/file.c
-@@ -0,0 +1,600 @@
+@@ -0,0 +1,606 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -7039,6 +7042,7 @@
 +	struct dentry *dentry, *parent, *h_dentry;
 +	struct inode *h_inode, *inode;
 +	struct super_block *sb;
++	struct file *h_file;
 +
 +	dentry = file->f_dentry;
 +	sb = dentry->d_sb;
@@ -7074,7 +7078,11 @@
 +	h_dentry = au_h_fptr(file, bstart)->f_dentry;
 +	h_inode = h_dentry->d_inode;
 +	mutex_lock_nested(&h_inode->i_mutex, AuLsc_I_CHILD);
-+	if (d_unhashed(dentry) /* || d_unhashed(h_dentry) */
++	h_file = au_h_open_pre(dentry, bstart);
++	if (IS_ERR(h_file)) {
++		err = PTR_ERR(h_file);
++		h_file = NULL;
++	} else if (d_unhashed(dentry) /* || d_unhashed(h_dentry) */
 +	    /* || !h_inode->i_nlink */) {
 +		err = au_ready_to_write_wh(file, len, bcpup);
 +		di_downgrade_lock(parent, AuLock_IR);
@@ -7087,6 +7095,7 @@
 +			err = au_reopen_nondir(file);
 +	}
 +	mutex_unlock(&h_inode->i_mutex);
++	au_h_open_post(dentry, bstart, h_file);
 +
 +	if (!err) {
 +		au_pin_set_parent_lflag(pin, /*lflag*/0);
@@ -7404,7 +7413,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/file.h
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,208 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -7483,6 +7492,22 @@
 +/* poll.c */
 +#ifdef CONFIG_AUFS_POLL
 +unsigned int aufs_poll(struct file *file, poll_table *wait);
++#endif
++
++#ifdef CONFIG_AUFS_BR_HFSPLUS
++/* hfsplus.c */
++struct file *au_h_open_pre(struct dentry *dentry, aufs_bindex_t bindex);
++void au_h_open_post(struct dentry *dentry, aufs_bindex_t bindex,
++		    struct file *h_file);
++#else
++static inline
++struct file *au_h_open_pre(struct dentry *dentry, aufs_bindex_t bindex)
++{
++	return NULL;
++}
++
++AuStubVoid(au_h_open_post, struct dentry *dentry, aufs_bindex_t bindex,
++	   struct file *h_file);
 +#endif
 +
 +/* f_op.c */
@@ -7731,7 +7756,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/f_op.c
-@@ -0,0 +1,876 @@
+@@ -0,0 +1,855 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -7759,7 +7784,6 @@
 +#include <linux/mman.h>
 +#include <linux/mm.h>
 +#include <linux/security.h>
-+#include <linux/smp_lock.h>
 +#include "aufs.h"
 +
 +/* common function to regular file and dir */
@@ -8317,25 +8341,10 @@
 +	dentry = file->f_dentry;
 +	wlock = !!(file->f_mode & FMODE_WRITE) && (vma->vm_flags & VM_SHARED);
 +	sb = dentry->d_sb;
-+	/*
-+	 * Very ugly BKL approach to keep the order of locks.
-+	 * Here mm->mmap_sem is acquired by our caller.
-+	 *
-+	 * native readdir, i_mutex, copy_to_user, mmap_sem
-+	 * aufs readdir, i_mutex, rwsem, nested-i_mutex, copy_to_user, mmap_sem
-+	 * aufs mmap, mmap_sem, rwsem
-+	 *
-+	 * Unlock it temporary.
-+	 */
-+	lock_kernel();
-+	up_write(&current->mm->mmap_sem);
 +	si_read_lock(sb, AuLock_FLUSH);
 +	err = au_reval_and_lock_fdi(file, au_reopen_nondir, /*wlock*/1);
-+	if (unlikely(err)) {
-+		down_write(&current->mm->mmap_sem);
-+		unlock_kernel();
++	if (unlikely(err))
 +		goto out;
-+	}
 +
 +	mmapped = !!au_test_mmapped(file);
 +	if (wlock) {
@@ -8343,16 +8352,11 @@
 +
 +		err = au_ready_to_write(file, -1, &pin);
 +		di_downgrade_lock(dentry, AuLock_IR);
-+		if (unlikely(err)) {
-+			down_write(&current->mm->mmap_sem);
-+			unlock_kernel();
++		if (unlikely(err))
 +			goto out_unlock;
-+		}
 +		au_unpin(&pin);
 +	} else
 +		di_downgrade_lock(dentry, AuLock_IR);
-+	down_write(&current->mm->mmap_sem);
-+	unlock_kernel();
 +
 +	h_file = au_h_fptr(file, au_fbstart(file));
 +	if (!mmapped && au_test_fs_bad_mapping(h_file->f_dentry->d_sb)) {
@@ -8903,7 +8907,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/fstype.h
-@@ -0,0 +1,486 @@
+@@ -0,0 +1,497 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -9216,6 +9220,15 @@
 +#endif
 +}
 +
++static inline int au_test_hfsplus(struct super_block *sb __maybe_unused)
++{
++#if defined(CONFIG_HFSPLUS_FS) || defined(CONFIG_HFSPLUS_FS_MODULE)
++	return sb->s_magic == HFSPLUS_SUPER_MAGIC;
++#else
++	return 0;
++#endif
++}
++
 +/* ---------------------------------------------------------------------- */
 +/*
 + * they can't be an aufs branch.
@@ -9288,11 +9301,12 @@
 +{
 +	return au_test_xfs(sb)
 +		|| au_test_btrfs(sb)
++		|| au_test_ubifs(sb)
++		|| au_test_hfsplus(sb)	/* maintained, but incorrect */
 +		/* || au_test_ext4(sb) */	/* untested */
 +		/* || au_test_ocfs2(sb) */	/* untested */
 +		/* || au_test_ocfs2_dlmfs(sb) */ /* untested */
 +		/* || au_test_sysv(sb) */	/* untested */
-+		/* || au_test_ubifs(sb) */	/* untested */
 +		/* || au_test_minix(sb) */	/* untested */
 +		;
 +}
@@ -9318,7 +9332,8 @@
 +		|| au_test_ramfs(sb)
 +#endif
 +		|| au_test_ubifs(sb)
-+		|| au_test_btrfs(sb);
++		|| au_test_btrfs(sb)
++		|| au_test_hfsplus(sb);
 +}
 +
 +/*
@@ -9391,8 +9406,69 @@
 +#endif /* __KERNEL__ */
 +#endif /* __AUFS_FSTYPE_H__ */
 --- /dev/null
++++ b/fs/aufs/hfsplus.c
+@@ -0,0 +1,58 @@
++/*
++ * Copyright (C) 2010 Junjiro R. Okajima
++ *
++ * This program, aufs is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ */
++
++/*
++ * special support for filesystems which aqucires an inode mutex
++ * at final closing a file, eg, hfsplus.
++ *
++ * This trick is very simple and stupid, just to open the file before really
++ * neceeary open to tell hfsplus that this is not the final closing.
++ * The caller should call au_h_open_pre() after acquiring the inode mutex,
++ * and au_h_open_post() after releasing it.
++ */
++
++#include <linux/file.h>
++#include "aufs.h"
++
++struct file *au_h_open_pre(struct dentry *dentry, aufs_bindex_t bindex)
++{
++	struct file *h_file;
++	struct dentry *h_dentry;
++
++	h_dentry = au_h_dptr(dentry, bindex);
++	AuDebugOn(!h_dentry);
++	AuDebugOn(!h_dentry->d_inode);
++	IMustLock(h_dentry->d_inode);
++
++	h_file = NULL;
++	if (au_test_hfsplus(h_dentry->d_sb)
++	    && S_ISREG(h_dentry->d_inode->i_mode))
++		h_file = au_h_open(dentry, bindex,
++				   O_RDONLY | O_NOATIME | O_LARGEFILE,
++				   /*file*/NULL);
++	return h_file;
++}
++
++void au_h_open_post(struct dentry *dentry, aufs_bindex_t bindex,
++		    struct file *h_file)
++{
++	if (h_file) {
++		fput(h_file);
++		au_sbr_put(dentry->d_sb, bindex);
++	}
++}
+--- /dev/null
 +++ b/fs/aufs/hinotify.c
-@@ -0,0 +1,756 @@
+@@ -0,0 +1,749 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -9546,12 +9622,11 @@
 +		goto out;
 +	}
 +#endif
-+	for (bindex = bstart; bindex <= bend; bindex++) {
++	for (bindex = bstart; bindex <= bend; bindex++)
 +		if (au_h_iptr(inode, bindex) == h_inode) {
 +			bfound = bindex;
 +			break;
 +		}
-+	}
 +	if (bfound < 0)
 +		goto out;
 +
@@ -10035,20 +10110,16 @@
 +	flags[CHILD] = 0;
 +	if (isdir)
 +		flags[CHILD] = AuHinJob_ISDIR;
++	au_fset_hinjob(flags[PARENT], DIRENT);
++	au_fset_hinjob(flags[CHILD], GEN);
 +	switch (mask & IN_ALL_EVENTS) {
 +	case IN_MOVED_FROM:
 +	case IN_MOVED_TO:
-+		AuDebugOn(!h_child_name || !h_child_inode);
-+		au_fset_hinjob(flags[CHILD], GEN);
 +		au_fset_hinjob(flags[CHILD], XINO0);
 +		au_fset_hinjob(flags[CHILD], MNTPNT);
-+		au_fset_hinjob(flags[PARENT], DIRENT);
-+		break;
-+
++		/*FALLTHROUGH*/
 +	case IN_CREATE:
 +		AuDebugOn(!h_child_name || !h_child_inode);
-+		au_fset_hinjob(flags[PARENT], DIRENT);
-+		au_fset_hinjob(flags[CHILD], GEN);
 +		break;
 +
 +	case IN_DELETE:
@@ -10058,8 +10129,6 @@
 +		 * by checking i_nlink, i_generation or d_unhashed().
 +		 */
 +		AuDebugOn(!h_child_name);
-+		au_fset_hinjob(flags[PARENT], DIRENT);
-+		au_fset_hinjob(flags[CHILD], GEN);
 +		au_fset_hinjob(flags[CHILD], TRYXINO0);
 +		au_fset_hinjob(flags[CHILD], MNTPNT);
 +		break;
@@ -11461,7 +11530,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/i_op_add.c
-@@ -0,0 +1,657 @@
+@@ -0,0 +1,672 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -11804,6 +11873,7 @@
 +	int err;
 +	struct dentry *h_src_dentry;
 +	struct mutex *h_mtx;
++	struct file *h_file;
 +
 +	di_read_lock_parent(a->src_parent, AuLock_IR);
 +	err = au_test_and_cpup_dirs(src_dentry, a->bdst);
@@ -11818,9 +11888,15 @@
 +	if (unlikely(err))
 +		goto out;
 +	mutex_lock_nested(h_mtx, AuLsc_I_CHILD);
-+	err = au_sio_cpup_simple(src_dentry, a->bdst, -1,
-+				 AuCpup_DTIME /* | AuCpup_KEEPLINO */);
++	h_file = au_h_open_pre(src_dentry, a->bsrc);
++	if (IS_ERR(h_file)) {
++		err = PTR_ERR(h_file);
++		h_file = NULL;
++	} else
++		err = au_sio_cpup_simple(src_dentry, a->bdst, a->bsrc,
++					 AuCpup_DTIME /* | AuCpup_KEEPLINO */);
 +	mutex_unlock(h_mtx);
++	au_h_open_post(src_dentry, a->bsrc, h_file);
 +	au_unpin(&a->pin);
 +
 + out:
@@ -11835,6 +11911,7 @@
 +	struct inode *h_inode, *inode;
 +	struct dentry *h_src_dentry;
 +	struct super_block *sb;
++	struct file *h_file;
 +
 +	plink = 0;
 +	h_inode = NULL;
@@ -11848,9 +11925,16 @@
 +		au_set_h_dptr(src_dentry, a->bdst, dget(a->h_path.dentry));
 +		h_inode = au_h_dptr(src_dentry, a->bsrc)->d_inode;
 +		mutex_lock_nested(&h_inode->i_mutex, AuLsc_I_CHILD);
-+		err = au_sio_cpup_single(src_dentry, a->bdst, a->bsrc, -1,
-+					 AuCpup_KEEPLINO, a->parent);
++		h_file = au_h_open_pre(src_dentry, a->bsrc);
++		if (IS_ERR(h_file)) {
++			err = PTR_ERR(h_file);
++			h_file = NULL;
++		} else
++			err = au_sio_cpup_single(src_dentry, a->bdst, a->bsrc,
++						 -1, AuCpup_KEEPLINO,
++						 a->parent);
 +		mutex_unlock(&h_inode->i_mutex);
++		au_h_open_post(src_dentry, a->bsrc, h_file);
 +		au_set_h_dptr(src_dentry, a->bdst, NULL);
 +		au_set_dbstart(src_dentry, a->bsrc);
 +	} else {
@@ -12121,7 +12205,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/i_op.c
-@@ -0,0 +1,898 @@
+@@ -0,0 +1,907 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -12599,6 +12683,7 @@
 +	aufs_bindex_t bstart;
 +	struct dentry *hi_wh, *parent;
 +	struct inode *inode;
++	struct file *h_file;
 +	struct au_wr_dir_args wr_dir_args = {
 +		.force_btgt	= -1,
 +		.flags		= 0
@@ -12646,6 +12731,7 @@
 +	if ((ia->ia_valid & ATTR_SIZE) && ia->ia_size < i_size_read(a->h_inode))
 +		sz = ia->ia_size;
 +
++	h_file = NULL;
 +	hi_wh = NULL;
 +	if (au_ftest_icpup(a->flags, DID_CPUP) && d_unhashed(dentry)) {
 +		hi_wh = au_hi_wh(inode, a->btgt);
@@ -12667,7 +12753,13 @@
 +		goto out; /* success */
 +
 +	if (!d_unhashed(dentry)) {
-+		err = au_sio_cpup_simple(dentry, a->btgt, sz, AuCpup_DTIME);
++		h_file = au_h_open_pre(dentry, bstart);
++		if (IS_ERR(h_file)) {
++			err = PTR_ERR(h_file);
++			h_file = NULL;
++		} else
++			err = au_sio_cpup_simple(dentry, a->btgt, sz,
++						 AuCpup_DTIME);
 +		if (!err)
 +			a->h_path.dentry = au_h_dptr(dentry, a->btgt);
 +	} else if (!hi_wh)
@@ -12677,6 +12769,7 @@
 +
 + out_unlock:
 +	mutex_unlock(&a->h_inode->i_mutex);
++	au_h_open_post(dentry, bstart, h_file);
 +	a->h_inode = a->h_path.dentry->d_inode;
 +	if (!err) {
 +		mutex_lock_nested(&a->h_inode->i_mutex, AuLsc_I_CHILD);
@@ -13022,7 +13115,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/i_op_del.c
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,472 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -13220,9 +13313,11 @@
 +		goto out; /* success, no need to create whiteout */
 +
 +	wh_dentry = au_wh_create(dentry, bcpup, h_path.dentry);
-+	if (!IS_ERR(wh_dentry))
-+		goto out; /* success */
++	if (IS_ERR(wh_dentry))
++		goto out_unpin;
++
 +	/* returns with the parent is locked and wh_dentry is dget-ed */
++	goto out; /* success */
 +
 + out_unpin:
 +	au_unpin(pin);
@@ -13495,7 +13590,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/i_op_ren.c
-@@ -0,0 +1,965 @@
+@@ -0,0 +1,978 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -13610,7 +13705,6 @@
 +		RevertFailure("remove diropq %.*s", AuDLNPair(a->src_dentry));
 +}
 +
-+
 +static void au_ren_rev_rename(int err, struct au_ren_args *a)
 +{
 +	int rerr;
@@ -13644,7 +13738,6 @@
 +	if (rerr)
 +		RevertFailure("unlink %.*s", AuDLNPair(a->dst_h_dentry));
 +}
-+
 +
 +static void au_ren_rev_whtmp(int err, struct au_ren_args *a)
 +{
@@ -13729,14 +13822,21 @@
 +				   a->dst_h_dir, &a->h_path);
 +	} else {
 +		struct mutex *h_mtx = &a->src_h_dentry->d_inode->i_mutex;
++		struct file *h_file;
 +
 +		au_fset_ren(a->flags, CPUP);
 +		mutex_lock_nested(h_mtx, AuLsc_I_CHILD);
 +		au_set_dbstart(d, a->btgt);
 +		au_set_h_dptr(d, a->btgt, dget(a->dst_h_dentry));
-+		err = au_sio_cpup_single(d, a->btgt, a->src_bstart, -1,
-+					 !AuCpup_DTIME, a->dst_parent);
++		h_file = au_h_open_pre(d, a->src_bstart);
++		if (IS_ERR(h_file)) {
++			err = PTR_ERR(h_file);
++			h_file = NULL;
++		} else
++			err = au_sio_cpup_single(d, a->btgt, a->src_bstart, -1,
++						 !AuCpup_DTIME, a->dst_parent);
 +		mutex_unlock(h_mtx);
++		au_h_open_post(d, a->src_bstart, h_file);
 +		if (!err) {
 +			d = a->dst_dentry;
 +			au_set_h_dptr(d, a->btgt, NULL);
@@ -13849,11 +13949,19 @@
 +	/* cpup src */
 +	if (a->dst_h_dentry->d_inode && a->src_bstart != a->btgt) {
 +		struct mutex *h_mtx = &a->src_h_dentry->d_inode->i_mutex;
++		struct file *h_file;
 +
 +		mutex_lock_nested(h_mtx, AuLsc_I_CHILD);
-+		err = au_sio_cpup_simple(a->src_dentry, a->btgt, -1,
-+					 !AuCpup_DTIME);
++		AuDebugOn(au_dbstart(a->src_dentry) != a->src_bstart);
++		h_file = au_h_open_pre(a->src_dentry, a->src_bstart);
++		if (IS_ERR(h_file)) {
++			err = PTR_ERR(h_file);
++			h_file = NULL;
++		} else
++			err = au_sio_cpup_simple(a->src_dentry, a->btgt, -1,
++						 !AuCpup_DTIME);
 +		mutex_unlock(h_mtx);
++		au_h_open_post(a->src_dentry, a->src_bstart, h_file);
 +		if (unlikely(err))
 +			goto out_whtmp;
 +	}
@@ -14463,7 +14571,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/Kconfig
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,160 @@
 +config AUFS_FS
 +	tristate "Aufs (Advanced multi layered unification filesystem) support"
 +	depends on EXPERIMENTAL
@@ -14593,6 +14701,15 @@
 +	help
 +	Automatic configuration for internal use.
 +
++config AUFS_BR_HFSPLUS
++	bool "Hfsplus as an aufs branch"
++	depends on HFSPLUS_FS
++	default y
++	help
++	If you want to use hfsplus fs as an aufs branch fs, then enable
++	this option. This option introduces a small overhead at
++	copying-up a file on hfsplus.
++
 +config AUFS_BDEV_LOOP
 +	bool
 +	depends on BLK_DEV_LOOP
@@ -14721,7 +14838,7 @@
 +#endif /* __AUFS_LOOP_H__ */
 --- /dev/null
 +++ b/fs/aufs/magic.mk
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,54 @@
 +
 +# defined in ${srctree}/fs/fuse/inode.c
 +# tristate
@@ -14770,9 +14887,15 @@
 +ifdef CONFIG_UBIFS_FS
 +ccflags-y += -DUBIFS_SUPER_MAGIC=0x24051905
 +endif
++
++# defined in ${srctree}/fs/hfsplus/hfsplus_raw.h
++# tristate
++ifdef CONFIG_HFSPLUS_FS
++ccflags-y += -DHFSPLUS_SUPER_MAGIC=0x482b
++endif
 --- /dev/null
 +++ b/fs/aufs/Makefile
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,35 @@
 +
 +include ${src}/magic.mk
 +ifeq (${CONFIG_AUFS_FS},m)
@@ -14805,6 +14928,7 @@
 +aufs-$(CONFIG_AUFS_POLL) += poll.o
 +aufs-$(CONFIG_AUFS_RDU) += rdu.o
 +aufs-$(CONFIG_AUFS_SP_IATTR) += f_op_sp.o
++aufs-$(CONFIG_AUFS_BR_HFSPLUS) += hfsplus.o
 +aufs-$(CONFIG_AUFS_DEBUG) += debug.o
 +aufs-$(CONFIG_AUFS_MAGIC_SYSRQ) += sysrq.o
 --- /dev/null
@@ -17301,7 +17425,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/rdu.c
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,330 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -17536,14 +17660,9 @@
 +	sb = file->f_dentry->d_sb;
 +	si_read_lock(sb, AuLock_FLUSH);
 +	while (nent-- > 0) {
-+		err = !access_ok(VERIFY_WRITE, u->e, sizeof(ent));
-+		if (unlikely(err)) {
-+			err = -EFAULT;
-+			AuTraceErr(err);
-+			break;
-+		}
-+
 +		err = copy_from_user(&ent, u->e, sizeof(ent));
++		if (!err)
++			err = !access_ok(VERIFY_WRITE, &u->e->ino, sizeof(ino));
 +		if (unlikely(err)) {
 +			err = -EFAULT;
 +			AuTraceErr(err);
@@ -25062,7 +25181,7 @@
 +#include <linux/limits.h>
 +#include <linux/types.h>
 +
-+#define AUFS_VERSION	"2-standalone.tree-20100222"
++#define AUFS_VERSION	"2-standalone.tree-33-20100308"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
