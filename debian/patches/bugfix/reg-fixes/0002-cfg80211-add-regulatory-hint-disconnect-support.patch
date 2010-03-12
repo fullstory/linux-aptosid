@@ -1,0 +1,331 @@
+From 12b51bd71f1c9656a16105010cd643fd00aeb779 Mon Sep 17 00:00:00 2001
+From: Luis R. Rodriguez <lrodriguez@atheros.com>
+Date: Thu, 11 Mar 2010 16:24:16 -0800
+Subject: [PATCH 2/2] cfg80211: add regulatory hint disconnect support
+
+commit 09d989d179d0c679043556dda77c51b41a2dae7e upstream.
+
+This adds a new regulatory hint to be used when we know all
+devices have been disconnected and idle. This can happen
+when we suspend, for instance. When we disconnect we can
+no longer assume the same regulatory rules learned from
+a country IE or beacon hints are applicable so restore
+regulatory settings to an initial state.
+
+Since driver hints are cached on the wiphy that called
+the hint, those hints are not reproduced onto cfg80211
+as the wiphy will respect its own wiphy->regd regardless.
+
+Signed-off-by: Luis R. Rodriguez <lrodriguez@atheros.com>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+---
+ include/net/regulatory.h |    1 +
+ net/wireless/reg.c       |  158 +++++++++++++++++++++++++++++++++++++++++++++-
+ net/wireless/reg.h       |   18 +++++
+ net/wireless/sme.c       |   40 ++++++++++++
+ 4 files changed, 214 insertions(+), 3 deletions(-)
+
+--- a/include/net/regulatory.h
++++ b/include/net/regulatory.h
+@@ -39,6 +39,7 @@ enum environment_cap {
+  * 	00 - World regulatory domain
+  * 	99 - built by driver but a specific alpha2 cannot be determined
+  * 	98 - result of an intersection between two regulatory domains
++ *	97 - regulatory domain has not yet been configured
+  * @intersect: indicates whether the wireless core should intersect
+  * 	the requested regulatory domain with the presently set regulatory
+  * 	domain.
+--- a/net/wireless/reg.c
++++ b/net/wireless/reg.c
+@@ -133,6 +133,7 @@ static const struct ieee80211_regdomain
+ 	&world_regdom;
+ 
+ static char *ieee80211_regdom = "00";
++static char user_alpha2[2];
+ 
+ module_param(ieee80211_regdom, charp, 0444);
+ MODULE_PARM_DESC(ieee80211_regdom, "IEEE 802.11 regulatory domain code");
+@@ -325,6 +326,27 @@ static bool regdom_changes(const char *a
+ 	return true;
+ }
+ 
++/*
++ * The NL80211_REGDOM_SET_BY_USER regdom alpha2 is cached, this lets
++ * you know if a valid regulatory hint with NL80211_REGDOM_SET_BY_USER
++ * has ever been issued.
++ */
++static bool is_user_regdom_saved(void)
++{
++	if (user_alpha2[0] == '9' && user_alpha2[1] == '7')
++		return false;
++
++	/* This would indicate a mistake on the design */
++	if (WARN((!is_world_regdom(user_alpha2) &&
++		  !is_an_alpha2(user_alpha2)),
++		 "Unexpected user alpha2: %c%c\n",
++		 user_alpha2[0],
++	         user_alpha2[1]))
++		return false;
++
++	return true;
++}
++
+ /**
+  * country_ie_integrity_changes - tells us if the country IE has changed
+  * @checksum: checksum of country IE of fields we are interested in
+@@ -1648,7 +1670,7 @@ static int ignore_request(struct wiphy *
+ 
+ 	switch (pending_request->initiator) {
+ 	case NL80211_REGDOM_SET_BY_CORE:
+-		return -EINVAL;
++		return 0;
+ 	case NL80211_REGDOM_SET_BY_COUNTRY_IE:
+ 
+ 		last_wiphy = wiphy_idx_to_wiphy(last_request->wiphy_idx);
+@@ -1790,6 +1812,11 @@ new_request:
+ 
+ 	pending_request = NULL;
+ 
++	if (last_request->initiator == NL80211_REGDOM_SET_BY_USER) {
++		user_alpha2[0] = last_request->alpha2[0];
++		user_alpha2[1] = last_request->alpha2[1];
++	}
++
+ 	/* When r == REG_INTERSECT we do need to call CRDA */
+ 	if (r < 0) {
+ 		/*
+@@ -1909,12 +1936,16 @@ static void queue_regulatory_request(str
+ 	schedule_work(&reg_work);
+ }
+ 
+-/* Core regulatory hint -- happens once during cfg80211_init() */
++/*
++ * Core regulatory hint -- happens during cfg80211_init()
++ * and when we restore regulatory settings.
++ */
+ static int regulatory_hint_core(const char *alpha2)
+ {
+ 	struct regulatory_request *request;
+ 
+-	BUG_ON(last_request);
++	kfree(last_request);
++	last_request = NULL;
+ 
+ 	request = kzalloc(sizeof(struct regulatory_request),
+ 			  GFP_KERNEL);
+@@ -2114,6 +2145,123 @@ out:
+ 	mutex_unlock(&reg_mutex);
+ }
+ 
++static void restore_alpha2(char *alpha2, bool reset_user)
++{
++	/* indicates there is no alpha2 to consider for restoration */
++	alpha2[0] = '9';
++	alpha2[1] = '7';
++
++	/* The user setting has precedence over the module parameter */
++	if (is_user_regdom_saved()) {
++		/* Unless we're asked to ignore it and reset it */
++		if (reset_user) {
++			REG_DBG_PRINT("cfg80211: Restoring regulatory settings "
++			       "including user preference\n");
++			user_alpha2[0] = '9';
++			user_alpha2[1] = '7';
++
++			/*
++			 * If we're ignoring user settings, we still need to
++			 * check the module parameter to ensure we put things
++			 * back as they were for a full restore.
++			 */
++			if (!is_world_regdom(ieee80211_regdom)) {
++				REG_DBG_PRINT("cfg80211: Keeping preference on "
++				       "module parameter ieee80211_regdom: %c%c\n",
++				       ieee80211_regdom[0],
++				       ieee80211_regdom[1]);
++				alpha2[0] = ieee80211_regdom[0];
++				alpha2[1] = ieee80211_regdom[1];
++			}
++		} else {
++			REG_DBG_PRINT("cfg80211: Restoring regulatory settings "
++			       "while preserving user preference for: %c%c\n",
++			       user_alpha2[0],
++			       user_alpha2[1]);
++			alpha2[0] = user_alpha2[0];
++			alpha2[1] = user_alpha2[1];
++		}
++	} else if (!is_world_regdom(ieee80211_regdom)) {
++		REG_DBG_PRINT("cfg80211: Keeping preference on "
++		       "module parameter ieee80211_regdom: %c%c\n",
++		       ieee80211_regdom[0],
++		       ieee80211_regdom[1]);
++		alpha2[0] = ieee80211_regdom[0];
++		alpha2[1] = ieee80211_regdom[1];
++	} else
++		REG_DBG_PRINT("cfg80211: Restoring regulatory settings\n");
++}
++
++/*
++ * Restoring regulatory settings involves ingoring any
++ * possibly stale country IE information and user regulatory
++ * settings if so desired, this includes any beacon hints
++ * learned as we could have traveled outside to another country
++ * after disconnection. To restore regulatory settings we do
++ * exactly what we did at bootup:
++ *
++ *   - send a core regulatory hint
++ *   - send a user regulatory hint if applicable
++ *
++ * Device drivers that send a regulatory hint for a specific country
++ * keep their own regulatory domain on wiphy->regd so that does does
++ * not need to be remembered.
++ */
++static void restore_regulatory_settings(bool reset_user)
++{
++	char alpha2[2];
++	struct reg_beacon *reg_beacon, *btmp;
++
++	mutex_lock(&cfg80211_mutex);
++	mutex_lock(&reg_mutex);
++
++	reset_regdomains();
++	restore_alpha2(alpha2, reset_user);
++
++	/* Clear beacon hints */
++	spin_lock_bh(&reg_pending_beacons_lock);
++	if (!list_empty(&reg_pending_beacons)) {
++		list_for_each_entry_safe(reg_beacon, btmp,
++					 &reg_pending_beacons, list) {
++			list_del(&reg_beacon->list);
++			kfree(reg_beacon);
++		}
++	}
++	spin_unlock_bh(&reg_pending_beacons_lock);
++
++	if (!list_empty(&reg_beacon_list)) {
++		list_for_each_entry_safe(reg_beacon, btmp,
++					 &reg_beacon_list, list) {
++			list_del(&reg_beacon->list);
++			kfree(reg_beacon);
++		}
++	}
++
++	/* First restore to the basic regulatory settings */
++	cfg80211_regdomain = cfg80211_world_regdom;
++
++	mutex_unlock(&reg_mutex);
++	mutex_unlock(&cfg80211_mutex);
++
++	regulatory_hint_core(cfg80211_regdomain->alpha2);
++
++	/*
++	 * This restores the ieee80211_regdom module parameter
++	 * preference or the last user requested regulatory
++	 * settings, user regulatory settings takes precedence.
++	 */
++	if (is_an_alpha2(alpha2))
++		regulatory_hint_user(user_alpha2);
++}
++
++
++void regulatory_hint_disconnect(void)
++{
++	REG_DBG_PRINT("cfg80211: All devices are disconnected, going to "
++		      "restore regulatory settings\n");
++	restore_regulatory_settings(false);
++}
++
+ static bool freq_is_chan_12_13_14(u16 freq)
+ {
+ 	if (freq == ieee80211_channel_to_frequency(12) ||
+@@ -2511,6 +2659,10 @@ int regulatory_init(void)
+ 	cfg80211_regdomain = cfg80211_world_regdom;
+ 
+ #endif
++
++	user_alpha2[0] = '9';
++	user_alpha2[1] = '7';
++
+ 	/* We always try to get an update for the static regdomain */
+ 	err = regulatory_hint_core(cfg80211_regdomain->alpha2);
+ 	if (err) {
+--- a/net/wireless/reg.h
++++ b/net/wireless/reg.h
+@@ -63,4 +63,22 @@ void regulatory_hint_11d(struct wiphy *w
+ 			 u8 *country_ie,
+ 			 u8 country_ie_len);
+ 
++/**
++ * regulatory_hint_disconnect - informs all devices have been disconneted
++ *
++ * Regulotory rules can be enhanced further upon scanning and upon
++ * connection to an AP. These rules become stale if we disconnect
++ * and go to another country, whether or not we suspend and resume.
++ * If we suspend, go to another country and resume we'll automatically
++ * get disconnected shortly after resuming and things will be reset as well.
++ * This routine is a helper to restore regulatory settings to how they were
++ * prior to our first connect attempt. This includes ignoring country IE and
++ * beacon regulatory hints. The ieee80211_regdom module parameter will always
++ * be respected but if a user had set the regulatory domain that will take
++ * precedence.
++ *
++ * Must be called from process context.
++ */
++void regulatory_hint_disconnect(void);
++
+ #endif  /* __NET_WIRELESS_REG_H */
+--- a/net/wireless/sme.c
++++ b/net/wireless/sme.c
+@@ -34,6 +34,44 @@ struct cfg80211_conn {
+ 	bool auto_auth, prev_bssid_valid;
+ };
+ 
++bool cfg80211_is_all_idle(void)
++{
++	struct cfg80211_registered_device *rdev;
++	struct wireless_dev *wdev;
++	bool is_all_idle = true;
++
++	mutex_lock(&cfg80211_mutex);
++
++	/*
++	 * All devices must be idle as otherwise if you are actively
++	 * scanning some new beacon hints could be learned and would
++	 * count as new regulatory hints.
++	 */
++	list_for_each_entry(rdev, &cfg80211_rdev_list, list) {
++		cfg80211_lock_rdev(rdev);
++		list_for_each_entry(wdev, &rdev->netdev_list, list) {
++			wdev_lock(wdev);
++			if (wdev->sme_state != CFG80211_SME_IDLE)
++				is_all_idle = false;
++			wdev_unlock(wdev);
++		}
++		cfg80211_unlock_rdev(rdev);
++	}
++
++	mutex_unlock(&cfg80211_mutex);
++
++	return is_all_idle;
++}
++
++static void disconnect_work(struct work_struct *work)
++{
++	if (!cfg80211_is_all_idle())
++		return;
++
++	regulatory_hint_disconnect();
++}
++
++static DECLARE_WORK(cfg80211_disconnect_work, disconnect_work);
+ 
+ static int cfg80211_conn_scan(struct wireless_dev *wdev)
+ {
+@@ -658,6 +696,8 @@ void __cfg80211_disconnected(struct net_
+ 	wireless_send_event(dev, SIOCGIWAP, &wrqu, NULL);
+ 	wdev->wext.connect.ssid_len = 0;
+ #endif
++
++	schedule_work(&cfg80211_disconnect_work);
+ }
+ 
+ void cfg80211_disconnected(struct net_device *dev, u16 reason,
