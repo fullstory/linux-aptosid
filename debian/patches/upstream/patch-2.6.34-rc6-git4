@@ -30,7 +30,7 @@
  PATCHLEVEL = 6
  SUBLEVEL = 34
 -EXTRAVERSION = -rc6
-+EXTRAVERSION = -rc6-git3
++EXTRAVERSION = -rc6-git4
  NAME = Sheep on Meth
  
  # *DOCUMENTATION*
@@ -1578,6 +1578,40 @@
         };
         /* XXXKW for CFE, get lines/cols from environment */
  #endif
+--- a/arch/x86/include/asm/io.h
++++ b/arch/x86/include/asm/io.h
+@@ -347,6 +347,7 @@ extern void __iomem *early_ioremap(resou
+ extern void __iomem *early_memremap(resource_size_t phys_addr,
+ 				    unsigned long size);
+ extern void early_iounmap(void __iomem *addr, unsigned long size);
++extern void fixup_early_ioremap(void);
+ 
+ #define IO_SPACE_LIMIT 0xffff
+ 
+--- a/arch/x86/kernel/apic/io_apic.c
++++ b/arch/x86/kernel/apic/io_apic.c
+@@ -2545,6 +2545,9 @@ void irq_force_complete_move(int irq)
+ 	struct irq_desc *desc = irq_to_desc(irq);
+ 	struct irq_cfg *cfg = desc->chip_data;
+ 
++	if (!cfg)
++		return;
++
+ 	__irq_complete_move(&desc, cfg->vector);
+ }
+ #else
+--- a/arch/x86/kernel/cpu/cpufreq/powernow-k8.c
++++ b/arch/x86/kernel/cpu/cpufreq/powernow-k8.c
+@@ -929,7 +929,8 @@ static int fill_powernow_table_pstate(st
+ 		powernow_table[i].index = index;
+ 
+ 		/* Frequency may be rounded for these */
+-		if (boot_cpu_data.x86 == 0x10 || boot_cpu_data.x86 == 0x11) {
++		if ((boot_cpu_data.x86 == 0x10 && boot_cpu_data.x86_model < 10)
++				 || boot_cpu_data.x86 == 0x11) {
+ 			powernow_table[i].frequency =
+ 				freq_from_fid_did(lo & 0x3f, (lo >> 6) & 7);
+ 		} else
 --- a/arch/x86/lib/rwsem_64.S
 +++ b/arch/x86/lib/rwsem_64.S
 @@ -60,7 +60,7 @@ ENTRY(call_rwsem_down_write_failed)
@@ -1589,6 +1623,47 @@
  	jnz 1f
  	save_common_regs
  	movq %rax,%rdi
+--- a/arch/x86/mm/ioremap.c
++++ b/arch/x86/mm/ioremap.c
+@@ -448,6 +448,20 @@ static inline void __init early_clear_fi
+ static void __iomem *prev_map[FIX_BTMAPS_SLOTS] __initdata;
+ static unsigned long prev_size[FIX_BTMAPS_SLOTS] __initdata;
+ 
++void __init fixup_early_ioremap(void)
++{
++	int i;
++
++	for (i = 0; i < FIX_BTMAPS_SLOTS; i++) {
++		if (prev_map[i]) {
++			WARN_ON(1);
++			break;
++		}
++	}
++
++	early_ioremap_init();
++}
++
+ static int __init check_early_ioremap_leak(void)
+ {
+ 	int count = 0;
+--- a/arch/x86/mm/pgtable_32.c
++++ b/arch/x86/mm/pgtable_32.c
+@@ -18,6 +18,7 @@
+ #include <asm/e820.h>
+ #include <asm/tlb.h>
+ #include <asm/tlbflush.h>
++#include <asm/io.h>
+ 
+ unsigned int __VMALLOC_RESERVE = 128 << 20;
+ 
+@@ -128,6 +129,7 @@ static int __init parse_reservetop(char
+ 
+ 	address = memparse(arg, &arg);
+ 	reserve_top_address(address);
++	fixup_early_ioremap();
+ 	return 0;
+ }
+ early_param("reservetop", parse_reservetop);
 --- a/drivers/char/isicom.c
 +++ b/drivers/char/isicom.c
 @@ -879,8 +879,8 @@ static int isicom_open(struct tty_struct
@@ -1733,6 +1808,297 @@
  free_id:
  	idr_remove(&pdesc_idr, id);
  	desc->flags &= GPIO_FLAGS_MASK;
+--- a/drivers/gpu/drm/drm_memory.c
++++ b/drivers/gpu/drm/drm_memory.c
+@@ -77,7 +77,7 @@ static void *agp_remap(unsigned long off
+ 		    && (agpmem->bound + (agpmem->pages << PAGE_SHIFT)) >=
+ 		    (offset + size))
+ 			break;
+-	if (!agpmem)
++	if (&agpmem->head == &dev->agp->memory)
+ 		return NULL;
+ 
+ 	/*
+--- a/drivers/gpu/drm/drm_sysfs.c
++++ b/drivers/gpu/drm/drm_sysfs.c
+@@ -354,7 +354,10 @@ static struct bin_attribute edid_attr =
+ int drm_sysfs_connector_add(struct drm_connector *connector)
+ {
+ 	struct drm_device *dev = connector->dev;
+-	int ret = 0, i, j;
++	int attr_cnt = 0;
++	int opt_cnt = 0;
++	int i;
++	int ret = 0;
+ 
+ 	/* We shouldn't get called more than once for the same connector */
+ 	BUG_ON(device_is_registered(&connector->kdev));
+@@ -377,8 +380,8 @@ int drm_sysfs_connector_add(struct drm_c
+ 
+ 	/* Standard attributes */
+ 
+-	for (i = 0; i < ARRAY_SIZE(connector_attrs); i++) {
+-		ret = device_create_file(&connector->kdev, &connector_attrs[i]);
++	for (attr_cnt = 0; attr_cnt < ARRAY_SIZE(connector_attrs); attr_cnt++) {
++		ret = device_create_file(&connector->kdev, &connector_attrs[attr_cnt]);
+ 		if (ret)
+ 			goto err_out_files;
+ 	}
+@@ -394,8 +397,8 @@ int drm_sysfs_connector_add(struct drm_c
+ 		case DRM_MODE_CONNECTOR_SVIDEO:
+ 		case DRM_MODE_CONNECTOR_Component:
+ 		case DRM_MODE_CONNECTOR_TV:
+-			for (i = 0; i < ARRAY_SIZE(connector_attrs_opt1); i++) {
+-				ret = device_create_file(&connector->kdev, &connector_attrs_opt1[i]);
++			for (opt_cnt = 0; opt_cnt < ARRAY_SIZE(connector_attrs_opt1); opt_cnt++) {
++				ret = device_create_file(&connector->kdev, &connector_attrs_opt1[opt_cnt]);
+ 				if (ret)
+ 					goto err_out_files;
+ 			}
+@@ -414,10 +417,10 @@ int drm_sysfs_connector_add(struct drm_c
+ 	return 0;
+ 
+ err_out_files:
+-	if (i > 0)
+-		for (j = 0; j < i; j++)
+-			device_remove_file(&connector->kdev,
+-					   &connector_attrs[i]);
++	for (i = 0; i < opt_cnt; i++)
++		device_remove_file(&connector->kdev, &connector_attrs_opt1[i]);
++	for (i = 0; i < attr_cnt; i++)
++		device_remove_file(&connector->kdev, &connector_attrs[i]);
+ 	device_unregister(&connector->kdev);
+ 
+ out:
+--- a/drivers/gpu/drm/radeon/atombios.h
++++ b/drivers/gpu/drm/radeon/atombios.h
+@@ -2912,7 +2912,7 @@ typedef struct _ATOM_ANALOG_TV_INFO_V1_2
+   UCHAR                    ucTV_BootUpDefaultStandard; 
+   UCHAR                    ucExt_TV_ASIC_ID;
+   UCHAR                    ucExt_TV_ASIC_SlaveAddr;
+-  ATOM_DTD_FORMAT          aModeTimings[MAX_SUPPORTED_TV_TIMING];
++  ATOM_DTD_FORMAT          aModeTimings[MAX_SUPPORTED_TV_TIMING_V1_2];
+ }ATOM_ANALOG_TV_INFO_V1_2;
+ 
+ typedef struct _ATOM_DPCD_INFO
+--- a/drivers/gpu/drm/radeon/r100.c
++++ b/drivers/gpu/drm/radeon/r100.c
+@@ -2975,7 +2975,7 @@ int r100_cs_track_check(struct radeon_de
+ 
+ 	for (i = 0; i < track->num_cb; i++) {
+ 		if (track->cb[i].robj == NULL) {
+-			if (!(track->fastfill || track->color_channel_mask ||
++			if (!(track->zb_cb_clear || track->color_channel_mask ||
+ 			      track->blend_read_enable)) {
+ 				continue;
+ 			}
+--- a/drivers/gpu/drm/radeon/r100_track.h
++++ b/drivers/gpu/drm/radeon/r100_track.h
+@@ -75,7 +75,7 @@ struct r100_cs_track {
+ 	struct r100_cs_track_texture	textures[R300_TRACK_MAX_TEXTURE];
+ 	bool				z_enabled;
+ 	bool                            separate_cube;
+-	bool				fastfill;
++	bool				zb_cb_clear;
+ 	bool				blend_read_enable;
+ };
+ 
+--- a/drivers/gpu/drm/radeon/r300.c
++++ b/drivers/gpu/drm/radeon/r300.c
+@@ -1044,7 +1044,7 @@ static int r300_packet0_check(struct rad
+ 		break;
+ 	case 0x4d1c:
+ 		/* ZB_BW_CNTL */
+-		track->fastfill = !!(idx_value & (1 << 2));
++		track->zb_cb_clear = !!(idx_value & (1 << 5));
+ 		break;
+ 	case 0x4e04:
+ 		/* RB3D_BLENDCNTL */
+--- a/drivers/gpu/drm/radeon/radeon_agp.c
++++ b/drivers/gpu/drm/radeon/radeon_agp.c
+@@ -134,12 +134,10 @@ int radeon_agp_init(struct radeon_device
+ 	int ret;
+ 
+ 	/* Acquire AGP. */
+-	if (!rdev->ddev->agp->acquired) {
+-		ret = drm_agp_acquire(rdev->ddev);
+-		if (ret) {
+-			DRM_ERROR("Unable to acquire AGP: %d\n", ret);
+-			return ret;
+-		}
++	ret = drm_agp_acquire(rdev->ddev);
++	if (ret) {
++		DRM_ERROR("Unable to acquire AGP: %d\n", ret);
++		return ret;
+ 	}
+ 
+ 	ret = drm_agp_info(rdev->ddev, &info);
+--- a/drivers/gpu/drm/radeon/radeon_atombios.c
++++ b/drivers/gpu/drm/radeon/radeon_atombios.c
+@@ -1264,7 +1264,7 @@ bool radeon_atom_get_tv_timings(struct r
+ 	switch (crev) {
+ 	case 1:
+ 		tv_info = (ATOM_ANALOG_TV_INFO *)(mode_info->atom_context->bios + data_offset);
+-		if (index > MAX_SUPPORTED_TV_TIMING)
++		if (index >= MAX_SUPPORTED_TV_TIMING)
+ 			return false;
+ 
+ 		mode->crtc_htotal = le16_to_cpu(tv_info->aModeTimings[index].usCRTC_H_Total);
+@@ -1302,7 +1302,7 @@ bool radeon_atom_get_tv_timings(struct r
+ 		break;
+ 	case 2:
+ 		tv_info_v1_2 = (ATOM_ANALOG_TV_INFO_V1_2 *)(mode_info->atom_context->bios + data_offset);
+-		if (index > MAX_SUPPORTED_TV_TIMING_V1_2)
++		if (index >= MAX_SUPPORTED_TV_TIMING_V1_2)
+ 			return false;
+ 
+ 		dtd_timings = &tv_info_v1_2->aModeTimings[index];
+--- a/drivers/gpu/drm/radeon/radeon_connectors.c
++++ b/drivers/gpu/drm/radeon/radeon_connectors.c
+@@ -1316,6 +1316,8 @@ radeon_add_legacy_connector(struct drm_d
+ 			radeon_connector->ddc_bus = radeon_i2c_create(dev, i2c_bus, "DVI");
+ 			if (!radeon_connector->ddc_bus)
+ 				goto failed;
++		}
++		if (connector_type == DRM_MODE_CONNECTOR_DVII) {
+ 			radeon_connector->dac_load_detect = true;
+ 			drm_connector_attach_property(&radeon_connector->base,
+ 						      rdev->mode_info.load_detect_property,
+--- a/drivers/gpu/drm/radeon/radeon_encoders.c
++++ b/drivers/gpu/drm/radeon/radeon_encoders.c
+@@ -254,6 +254,53 @@ radeon_get_atom_connector_priv_from_enco
+ 	return dig_connector;
+ }
+ 
++void radeon_panel_mode_fixup(struct drm_encoder *encoder,
++			     struct drm_display_mode *adjusted_mode)
++{
++	struct radeon_encoder *radeon_encoder = to_radeon_encoder(encoder);
++	struct drm_device *dev = encoder->dev;
++	struct radeon_device *rdev = dev->dev_private;
++	struct drm_display_mode *native_mode = &radeon_encoder->native_mode;
++	unsigned hblank = native_mode->htotal - native_mode->hdisplay;
++	unsigned vblank = native_mode->vtotal - native_mode->vdisplay;
++	unsigned hover = native_mode->hsync_start - native_mode->hdisplay;
++	unsigned vover = native_mode->vsync_start - native_mode->vdisplay;
++	unsigned hsync_width = native_mode->hsync_end - native_mode->hsync_start;
++	unsigned vsync_width = native_mode->vsync_end - native_mode->vsync_start;
++
++	adjusted_mode->clock = native_mode->clock;
++	adjusted_mode->flags = native_mode->flags;
++
++	if (ASIC_IS_AVIVO(rdev)) {
++		adjusted_mode->hdisplay = native_mode->hdisplay;
++		adjusted_mode->vdisplay = native_mode->vdisplay;
++	}
++
++	adjusted_mode->htotal = native_mode->hdisplay + hblank;
++	adjusted_mode->hsync_start = native_mode->hdisplay + hover;
++	adjusted_mode->hsync_end = adjusted_mode->hsync_start + hsync_width;
++
++	adjusted_mode->vtotal = native_mode->vdisplay + vblank;
++	adjusted_mode->vsync_start = native_mode->vdisplay + vover;
++	adjusted_mode->vsync_end = adjusted_mode->vsync_start + vsync_width;
++
++	drm_mode_set_crtcinfo(adjusted_mode, CRTC_INTERLACE_HALVE_V);
++
++	if (ASIC_IS_AVIVO(rdev)) {
++		adjusted_mode->crtc_hdisplay = native_mode->hdisplay;
++		adjusted_mode->crtc_vdisplay = native_mode->vdisplay;
++	}
++
++	adjusted_mode->crtc_htotal = adjusted_mode->crtc_hdisplay + hblank;
++	adjusted_mode->crtc_hsync_start = adjusted_mode->crtc_hdisplay + hover;
++	adjusted_mode->crtc_hsync_end = adjusted_mode->crtc_hsync_start + hsync_width;
++
++	adjusted_mode->crtc_vtotal = adjusted_mode->crtc_vdisplay + vblank;
++	adjusted_mode->crtc_vsync_start = adjusted_mode->crtc_vdisplay + vover;
++	adjusted_mode->crtc_vsync_end = adjusted_mode->crtc_vsync_start + vsync_width;
++
++}
++
+ static bool radeon_atom_mode_fixup(struct drm_encoder *encoder,
+ 				   struct drm_display_mode *mode,
+ 				   struct drm_display_mode *adjusted_mode)
+@@ -275,18 +322,8 @@ static bool radeon_atom_mode_fixup(struc
+ 		adjusted_mode->crtc_vsync_start = adjusted_mode->crtc_vdisplay + 2;
+ 
+ 	/* get the native mode for LVDS */
+-	if (radeon_encoder->active_device & (ATOM_DEVICE_LCD_SUPPORT)) {
+-		struct drm_display_mode *native_mode = &radeon_encoder->native_mode;
+-		int mode_id = adjusted_mode->base.id;
+-		*adjusted_mode = *native_mode;
+-		if (!ASIC_IS_AVIVO(rdev)) {
+-			adjusted_mode->hdisplay = mode->hdisplay;
+-			adjusted_mode->vdisplay = mode->vdisplay;
+-			adjusted_mode->crtc_hdisplay = mode->hdisplay;
+-			adjusted_mode->crtc_vdisplay = mode->vdisplay;
+-		}
+-		adjusted_mode->base.id = mode_id;
+-	}
++	if (radeon_encoder->active_device & (ATOM_DEVICE_LCD_SUPPORT))
++		radeon_panel_mode_fixup(encoder, adjusted_mode);
+ 
+ 	/* get the native mode for TV */
+ 	if (radeon_encoder->active_device & (ATOM_DEVICE_TV_SUPPORT)) {
+--- a/drivers/gpu/drm/radeon/radeon_legacy_encoders.c
++++ b/drivers/gpu/drm/radeon/radeon_legacy_encoders.c
+@@ -228,16 +228,8 @@ static bool radeon_legacy_mode_fixup(str
+ 	drm_mode_set_crtcinfo(adjusted_mode, 0);
+ 
+ 	/* get the native mode for LVDS */
+-	if (radeon_encoder->active_device & (ATOM_DEVICE_LCD_SUPPORT)) {
+-		struct drm_display_mode *native_mode = &radeon_encoder->native_mode;
+-		int mode_id = adjusted_mode->base.id;
+-		*adjusted_mode = *native_mode;
+-		adjusted_mode->hdisplay = mode->hdisplay;
+-		adjusted_mode->vdisplay = mode->vdisplay;
+-		adjusted_mode->crtc_hdisplay = mode->hdisplay;
+-		adjusted_mode->crtc_vdisplay = mode->vdisplay;
+-		adjusted_mode->base.id = mode_id;
+-	}
++	if (radeon_encoder->active_device & (ATOM_DEVICE_LCD_SUPPORT))
++		radeon_panel_mode_fixup(encoder, adjusted_mode);
+ 
+ 	return true;
+ }
+--- a/drivers/gpu/drm/radeon/radeon_mode.h
++++ b/drivers/gpu/drm/radeon/radeon_mode.h
+@@ -558,6 +558,8 @@ extern int radeon_static_clocks_init(str
+ bool radeon_crtc_scaling_mode_fixup(struct drm_crtc *crtc,
+ 					struct drm_display_mode *mode,
+ 					struct drm_display_mode *adjusted_mode);
++void radeon_panel_mode_fixup(struct drm_encoder *encoder,
++			     struct drm_display_mode *adjusted_mode);
+ void atom_rv515_force_tv_scaler(struct radeon_device *rdev, struct radeon_crtc *radeon_crtc);
+ 
+ /* legacy tv */
+--- a/drivers/gpu/drm/via/via_video.c
++++ b/drivers/gpu/drm/via/via_video.c
+@@ -75,7 +75,7 @@ int via_decoder_futex(struct drm_device
+ 
+ 	DRM_DEBUG("\n");
+ 
+-	if (fx->lock > VIA_NR_XVMC_LOCKS)
++	if (fx->lock >= VIA_NR_XVMC_LOCKS)
+ 		return -EFAULT;
+ 
+ 	lock = (volatile int *)XVMCLOCKPTR(sAPriv, fx->lock);
+--- a/drivers/gpu/vga/vga_switcheroo.c
++++ b/drivers/gpu/vga/vga_switcheroo.c
+@@ -276,8 +276,10 @@ vga_switcheroo_debugfs_write(struct file
+ 
+ 	mutex_lock(&vgasr_mutex);
+ 
+-	if (!vgasr_priv.active)
+-		return -EINVAL;
++	if (!vgasr_priv.active) {
++		cnt = -EINVAL;
++		goto out;
++	}
+ 
+ 	/* pwr off the device not in use */
+ 	if (strncmp(usercmd, "OFF", 3) == 0) {
 --- a/drivers/i2c/busses/i2c-octeon.c
 +++ b/drivers/i2c/busses/i2c-octeon.c
 @@ -447,7 +447,7 @@ static struct i2c_adapter octeon_i2c_ops
@@ -3417,6 +3783,422 @@
  	select FSNOTIFY
  	default y
  	---help---
+--- a/fs/ocfs2/buffer_head_io.c
++++ b/fs/ocfs2/buffer_head_io.c
+@@ -406,6 +406,7 @@ int ocfs2_write_super_or_backup(struct o
+ 				struct buffer_head *bh)
+ {
+ 	int ret = 0;
++	struct ocfs2_dinode *di = (struct ocfs2_dinode *)bh->b_data;
+ 
+ 	mlog_entry_void();
+ 
+@@ -425,6 +426,7 @@ int ocfs2_write_super_or_backup(struct o
+ 
+ 	get_bh(bh); /* for end_buffer_write_sync() */
+ 	bh->b_end_io = end_buffer_write_sync;
++	ocfs2_compute_meta_ecc(osb->sb, bh->b_data, &di->i_check);
+ 	submit_bh(WRITE, bh);
+ 
+ 	wait_on_buffer(bh);
+--- a/fs/ocfs2/dlm/dlmast.c
++++ b/fs/ocfs2/dlm/dlmast.c
+@@ -184,9 +184,8 @@ static void dlm_update_lvb(struct dlm_ct
+ 	BUG_ON(!lksb);
+ 
+ 	/* only updates if this node masters the lockres */
++	spin_lock(&res->spinlock);
+ 	if (res->owner == dlm->node_num) {
+-
+-		spin_lock(&res->spinlock);
+ 		/* check the lksb flags for the direction */
+ 		if (lksb->flags & DLM_LKSB_GET_LVB) {
+ 			mlog(0, "getting lvb from lockres for %s node\n",
+@@ -201,8 +200,8 @@ static void dlm_update_lvb(struct dlm_ct
+  		 * here. In the future we might want to clear it at the time
+  		 * the put is actually done.
+ 		 */
+-		spin_unlock(&res->spinlock);
+ 	}
++	spin_unlock(&res->spinlock);
+ 
+ 	/* reset any lvb flags on the lksb */
+ 	lksb->flags &= ~(DLM_LKSB_PUT_LVB|DLM_LKSB_GET_LVB);
+--- a/fs/ocfs2/dlmfs/dlmfs.c
++++ b/fs/ocfs2/dlmfs/dlmfs.c
+@@ -112,20 +112,20 @@ MODULE_PARM_DESC(capabilities, DLMFS_CAP
+  * O_RDONLY -> PRMODE level
+  * O_WRONLY -> EXMODE level
+  *
+- * O_NONBLOCK -> LKM_NOQUEUE
++ * O_NONBLOCK -> NOQUEUE
+  */
+ static int dlmfs_decode_open_flags(int open_flags,
+ 				   int *level,
+ 				   int *flags)
+ {
+ 	if (open_flags & (O_WRONLY|O_RDWR))
+-		*level = LKM_EXMODE;
++		*level = DLM_LOCK_EX;
+ 	else
+-		*level = LKM_PRMODE;
++		*level = DLM_LOCK_PR;
+ 
+ 	*flags = 0;
+ 	if (open_flags & O_NONBLOCK)
+-		*flags |= LKM_NOQUEUE;
++		*flags |= DLM_LKF_NOQUEUE;
+ 
+ 	return 0;
+ }
+@@ -166,7 +166,7 @@ static int dlmfs_file_open(struct inode
+ 		 * to be able userspace to be able to distinguish a
+ 		 * valid lock request from one that simply couldn't be
+ 		 * granted. */
+-		if (flags & LKM_NOQUEUE && status == -EAGAIN)
++		if (flags & DLM_LKF_NOQUEUE && status == -EAGAIN)
+ 			status = -ETXTBSY;
+ 		kfree(fp);
+ 		goto bail;
+@@ -193,7 +193,7 @@ static int dlmfs_file_release(struct ino
+ 	status = 0;
+ 	if (fp) {
+ 		level = fp->fp_lock_level;
+-		if (level != LKM_IVMODE)
++		if (level != DLM_LOCK_IV)
+ 			user_dlm_cluster_unlock(&ip->ip_lockres, level);
+ 
+ 		kfree(fp);
+@@ -262,7 +262,7 @@ static ssize_t dlmfs_file_read(struct fi
+ 	if ((count + *ppos) > i_size_read(inode))
+ 		readlen = i_size_read(inode) - *ppos;
+ 	else
+-		readlen = count - *ppos;
++		readlen = count;
+ 
+ 	lvb_buf = kmalloc(readlen, GFP_NOFS);
+ 	if (!lvb_buf)
+--- a/fs/ocfs2/file.c
++++ b/fs/ocfs2/file.c
+@@ -684,6 +684,7 @@ restarted_transaction:
+ 		if (why == RESTART_META) {
+ 			mlog(0, "restarting function.\n");
+ 			restart_func = 1;
++			status = 0;
+ 		} else {
+ 			BUG_ON(why != RESTART_TRANS);
+ 
+@@ -1981,18 +1982,18 @@ relock:
+ 	/* communicate with ocfs2_dio_end_io */
+ 	ocfs2_iocb_set_rw_locked(iocb, rw_level);
+ 
+-	if (direct_io) {
+-		ret = generic_segment_checks(iov, &nr_segs, &ocount,
+-					     VERIFY_READ);
+-		if (ret)
+-			goto out_dio;
++	ret = generic_segment_checks(iov, &nr_segs, &ocount,
++				     VERIFY_READ);
++	if (ret)
++		goto out_dio;
+ 
+-		count = ocount;
+-		ret = generic_write_checks(file, ppos, &count,
+-					   S_ISBLK(inode->i_mode));
+-		if (ret)
+-			goto out_dio;
++	count = ocount;
++	ret = generic_write_checks(file, ppos, &count,
++				   S_ISBLK(inode->i_mode));
++	if (ret)
++		goto out_dio;
+ 
++	if (direct_io) {
+ 		written = generic_file_direct_write(iocb, iov, &nr_segs, *ppos,
+ 						    ppos, count, ocount);
+ 		if (written < 0) {
+@@ -2007,7 +2008,10 @@ relock:
+ 			goto out_dio;
+ 		}
+ 	} else {
+-		written = __generic_file_aio_write(iocb, iov, nr_segs, ppos);
++		current->backing_dev_info = file->f_mapping->backing_dev_info;
++		written = generic_file_buffered_write(iocb, iov, nr_segs, *ppos,
++						      ppos, count, 0);
++		current->backing_dev_info = NULL;
+ 	}
+ 
+ out_dio:
+@@ -2021,9 +2025,9 @@ out_dio:
+ 		if (ret < 0)
+ 			written = ret;
+ 
+-		if (!ret && (old_size != i_size_read(inode) ||
+-		    old_clusters != OCFS2_I(inode)->ip_clusters ||
+-		    has_refcount)) {
++		if (!ret && ((old_size != i_size_read(inode)) ||
++			     (old_clusters != OCFS2_I(inode)->ip_clusters) ||
++			     has_refcount)) {
+ 			ret = jbd2_journal_force_commit(osb->journal->j_journal);
+ 			if (ret < 0)
+ 				written = ret;
+--- a/fs/ocfs2/inode.c
++++ b/fs/ocfs2/inode.c
+@@ -558,6 +558,7 @@ static int ocfs2_truncate_for_delete(str
+ 		handle = ocfs2_start_trans(osb, OCFS2_INODE_UPDATE_CREDITS);
+ 		if (IS_ERR(handle)) {
+ 			status = PTR_ERR(handle);
++			handle = NULL;
+ 			mlog_errno(status);
+ 			goto out;
+ 		}
+@@ -639,11 +640,13 @@ static int ocfs2_remove_inode(struct ino
+ 		goto bail_unlock;
+ 	}
+ 
+-	status = ocfs2_orphan_del(osb, handle, orphan_dir_inode, inode,
+-				  orphan_dir_bh);
+-	if (status < 0) {
+-		mlog_errno(status);
+-		goto bail_commit;
++	if (!(OCFS2_I(inode)->ip_flags & OCFS2_INODE_SKIP_ORPHAN_DIR)) {
++		status = ocfs2_orphan_del(osb, handle, orphan_dir_inode, inode,
++					  orphan_dir_bh);
++		if (status < 0) {
++			mlog_errno(status);
++			goto bail_commit;
++		}
+ 	}
+ 
+ 	/* set the inodes dtime */
+@@ -722,38 +725,39 @@ static void ocfs2_signal_wipe_completion
+ static int ocfs2_wipe_inode(struct inode *inode,
+ 			    struct buffer_head *di_bh)
+ {
+-	int status, orphaned_slot;
++	int status, orphaned_slot = -1;
+ 	struct inode *orphan_dir_inode = NULL;
+ 	struct buffer_head *orphan_dir_bh = NULL;
+ 	struct ocfs2_super *osb = OCFS2_SB(inode->i_sb);
+-	struct ocfs2_dinode *di;
+-
+-	di = (struct ocfs2_dinode *) di_bh->b_data;
+-	orphaned_slot = le16_to_cpu(di->i_orphaned_slot);
++	struct ocfs2_dinode *di = (struct ocfs2_dinode *) di_bh->b_data;
+ 
+-	status = ocfs2_check_orphan_recovery_state(osb, orphaned_slot);
+-	if (status)
+-		return status;
++	if (!(OCFS2_I(inode)->ip_flags & OCFS2_INODE_SKIP_ORPHAN_DIR)) {
++		orphaned_slot = le16_to_cpu(di->i_orphaned_slot);
+ 
+-	orphan_dir_inode = ocfs2_get_system_file_inode(osb,
+-						       ORPHAN_DIR_SYSTEM_INODE,
+-						       orphaned_slot);
+-	if (!orphan_dir_inode) {
+-		status = -EEXIST;
+-		mlog_errno(status);
+-		goto bail;
+-	}
++		status = ocfs2_check_orphan_recovery_state(osb, orphaned_slot);
++		if (status)
++			return status;
++
++		orphan_dir_inode = ocfs2_get_system_file_inode(osb,
++							       ORPHAN_DIR_SYSTEM_INODE,
++							       orphaned_slot);
++		if (!orphan_dir_inode) {
++			status = -EEXIST;
++			mlog_errno(status);
++			goto bail;
++		}
+ 
+-	/* Lock the orphan dir. The lock will be held for the entire
+-	 * delete_inode operation. We do this now to avoid races with
+-	 * recovery completion on other nodes. */
+-	mutex_lock(&orphan_dir_inode->i_mutex);
+-	status = ocfs2_inode_lock(orphan_dir_inode, &orphan_dir_bh, 1);
+-	if (status < 0) {
+-		mutex_unlock(&orphan_dir_inode->i_mutex);
++		/* Lock the orphan dir. The lock will be held for the entire
++		 * delete_inode operation. We do this now to avoid races with
++		 * recovery completion on other nodes. */
++		mutex_lock(&orphan_dir_inode->i_mutex);
++		status = ocfs2_inode_lock(orphan_dir_inode, &orphan_dir_bh, 1);
++		if (status < 0) {
++			mutex_unlock(&orphan_dir_inode->i_mutex);
+ 
+-		mlog_errno(status);
+-		goto bail;
++			mlog_errno(status);
++			goto bail;
++		}
+ 	}
+ 
+ 	/* we do this while holding the orphan dir lock because we
+@@ -794,6 +798,9 @@ static int ocfs2_wipe_inode(struct inode
+ 		mlog_errno(status);
+ 
+ bail_unlock_dir:
++	if (OCFS2_I(inode)->ip_flags & OCFS2_INODE_SKIP_ORPHAN_DIR)
++		return status;
++
+ 	ocfs2_inode_unlock(orphan_dir_inode, 1);
+ 	mutex_unlock(&orphan_dir_inode->i_mutex);
+ 	brelse(orphan_dir_bh);
+@@ -889,7 +896,8 @@ static int ocfs2_query_inode_wipe(struct
+ 
+ 	/* Do some basic inode verification... */
+ 	di = (struct ocfs2_dinode *) di_bh->b_data;
+-	if (!(di->i_flags & cpu_to_le32(OCFS2_ORPHANED_FL))) {
++	if (!(di->i_flags & cpu_to_le32(OCFS2_ORPHANED_FL)) &&
++	    !(oi->ip_flags & OCFS2_INODE_SKIP_ORPHAN_DIR)) {
+ 		/*
+ 		 * Inodes in the orphan dir must have ORPHANED_FL.  The only
+ 		 * inodes that come back out of the orphan dir are reflink
+--- a/fs/ocfs2/inode.h
++++ b/fs/ocfs2/inode.h
+@@ -100,6 +100,8 @@ struct ocfs2_inode_info
+ #define OCFS2_INODE_MAYBE_ORPHANED	0x00000020
+ /* Does someone have the file open O_DIRECT */
+ #define OCFS2_INODE_OPEN_DIRECT		0x00000040
++/* Tell the inode wipe code it's not in orphan dir */
++#define OCFS2_INODE_SKIP_ORPHAN_DIR     0x00000080
+ 
+ static inline struct ocfs2_inode_info *OCFS2_I(struct inode *inode)
+ {
+--- a/fs/ocfs2/namei.c
++++ b/fs/ocfs2/namei.c
+@@ -408,23 +408,28 @@ static int ocfs2_mknod(struct inode *dir
+ 		}
+ 	}
+ 
+-	status = ocfs2_add_entry(handle, dentry, inode,
+-				 OCFS2_I(inode)->ip_blkno, parent_fe_bh,
+-				 &lookup);
+-	if (status < 0) {
++	/*
++	 * Do this before adding the entry to the directory. We add
++	 * also set d_op after success so that ->d_iput() will cleanup
++	 * the dentry lock even if ocfs2_add_entry() fails below.
++	 */
++	status = ocfs2_dentry_attach_lock(dentry, inode,
++					  OCFS2_I(dir)->ip_blkno);
++	if (status) {
+ 		mlog_errno(status);
+ 		goto leave;
+ 	}
++	dentry->d_op = &ocfs2_dentry_ops;
+ 
+-	status = ocfs2_dentry_attach_lock(dentry, inode,
+-					  OCFS2_I(dir)->ip_blkno);
+-	if (status) {
++	status = ocfs2_add_entry(handle, dentry, inode,
++				 OCFS2_I(inode)->ip_blkno, parent_fe_bh,
++				 &lookup);
++	if (status < 0) {
+ 		mlog_errno(status);
+ 		goto leave;
+ 	}
+ 
+ 	insert_inode_hash(inode);
+-	dentry->d_op = &ocfs2_dentry_ops;
+ 	d_instantiate(dentry, inode);
+ 	status = 0;
+ leave:
+@@ -445,11 +450,6 @@ leave:
+ 
+ 	ocfs2_free_dir_lookup_result(&lookup);
+ 
+-	if ((status < 0) && inode) {
+-		clear_nlink(inode);
+-		iput(inode);
+-	}
+-
+ 	if (inode_ac)
+ 		ocfs2_free_alloc_context(inode_ac);
+ 
+@@ -459,6 +459,17 @@ leave:
+ 	if (meta_ac)
+ 		ocfs2_free_alloc_context(meta_ac);
+ 
++	/*
++	 * We should call iput after the i_mutex of the bitmap been
++	 * unlocked in ocfs2_free_alloc_context, or the
++	 * ocfs2_delete_inode will mutex_lock again.
++	 */
++	if ((status < 0) && inode) {
++		OCFS2_I(inode)->ip_flags |= OCFS2_INODE_SKIP_ORPHAN_DIR;
++		clear_nlink(inode);
++		iput(inode);
++	}
++
+ 	mlog_exit(status);
+ 
+ 	return status;
+@@ -1771,22 +1782,27 @@ static int ocfs2_symlink(struct inode *d
+ 		}
+ 	}
+ 
+-	status = ocfs2_add_entry(handle, dentry, inode,
+-				 le64_to_cpu(fe->i_blkno), parent_fe_bh,
+-				 &lookup);
+-	if (status < 0) {
++	/*
++	 * Do this before adding the entry to the directory. We add
++	 * also set d_op after success so that ->d_iput() will cleanup
++	 * the dentry lock even if ocfs2_add_entry() fails below.
++	 */
++	status = ocfs2_dentry_attach_lock(dentry, inode, OCFS2_I(dir)->ip_blkno);
++	if (status) {
+ 		mlog_errno(status);
+ 		goto bail;
+ 	}
++	dentry->d_op = &ocfs2_dentry_ops;
+ 
+-	status = ocfs2_dentry_attach_lock(dentry, inode, OCFS2_I(dir)->ip_blkno);
+-	if (status) {
++	status = ocfs2_add_entry(handle, dentry, inode,
++				 le64_to_cpu(fe->i_blkno), parent_fe_bh,
++				 &lookup);
++	if (status < 0) {
+ 		mlog_errno(status);
+ 		goto bail;
+ 	}
+ 
+ 	insert_inode_hash(inode);
+-	dentry->d_op = &ocfs2_dentry_ops;
+ 	d_instantiate(dentry, inode);
+ bail:
+ 	if (status < 0 && did_quota)
+@@ -1811,6 +1827,7 @@ bail:
+ 	if (xattr_ac)
+ 		ocfs2_free_alloc_context(xattr_ac);
+ 	if ((status < 0) && inode) {
++		OCFS2_I(inode)->ip_flags |= OCFS2_INODE_SKIP_ORPHAN_DIR;
+ 		clear_nlink(inode);
+ 		iput(inode);
+ 	}
+@@ -1976,6 +1993,7 @@ static int ocfs2_orphan_add(struct ocfs2
+ 	}
+ 
+ 	le32_add_cpu(&fe->i_flags, OCFS2_ORPHANED_FL);
++	OCFS2_I(inode)->ip_flags &= ~OCFS2_INODE_SKIP_ORPHAN_DIR;
+ 
+ 	/* Record which orphan dir our inode now resides
+ 	 * in. delete_inode will use this to determine which orphan
+--- a/fs/ocfs2/refcounttree.c
++++ b/fs/ocfs2/refcounttree.c
+@@ -4083,6 +4083,9 @@ static int ocfs2_complete_reflink(struct
+ 	di->i_attr = s_di->i_attr;
+ 
+ 	if (preserve) {
++		t_inode->i_uid = s_inode->i_uid;
++		t_inode->i_gid = s_inode->i_gid;
++		t_inode->i_mode = s_inode->i_mode;
+ 		di->i_uid = s_di->i_uid;
+ 		di->i_gid = s_di->i_gid;
+ 		di->i_mode = s_di->i_mode;
 --- a/include/linux/i2c.h
 +++ b/include/linux/i2c.h
 @@ -355,6 +355,8 @@ struct i2c_adapter {
@@ -3553,6 +4335,49 @@
  	return 1;
  }
  #endif
+--- a/security/keys/gc.c
++++ b/security/keys/gc.c
+@@ -77,10 +77,10 @@ static bool key_gc_keyring(struct key *k
+ 		goto dont_gc;
+ 
+ 	/* scan the keyring looking for dead keys */
+-	klist = rcu_dereference_check(keyring->payload.subscriptions,
+-				      lockdep_is_held(&key_serial_lock));
++	rcu_read_lock();
++	klist = rcu_dereference(keyring->payload.subscriptions);
+ 	if (!klist)
+-		goto dont_gc;
++		goto unlock_dont_gc;
+ 
+ 	for (loop = klist->nkeys - 1; loop >= 0; loop--) {
+ 		key = klist->keys[loop];
+@@ -89,11 +89,14 @@ static bool key_gc_keyring(struct key *k
+ 			goto do_gc;
+ 	}
+ 
++unlock_dont_gc:
++	rcu_read_unlock();
+ dont_gc:
+ 	kleave(" = false");
+ 	return false;
+ 
+ do_gc:
++	rcu_read_unlock();
+ 	key_gc_cursor = keyring->serial;
+ 	key_get(keyring);
+ 	spin_unlock(&key_serial_lock);
+--- a/security/keys/user_defined.c
++++ b/security/keys/user_defined.c
+@@ -199,7 +199,8 @@ long user_read(const struct key *key, ch
+ 	struct user_key_payload *upayload;
+ 	long ret;
+ 
+-	upayload = rcu_dereference(key->payload.data);
++	upayload = rcu_dereference_protected(
++		key->payload.data, rwsem_is_locked(&((struct key *)key)->sem));
+ 	ret = upayload->datalen;
+ 
+ 	/* we can return the data as is */
 --- a/sound/soc/txx9/txx9aclc-ac97.c
 +++ b/sound/soc/txx9/txx9aclc-ac97.c
 @@ -254,3 +254,4 @@ module_exit(txx9aclc_ac97_exit);
