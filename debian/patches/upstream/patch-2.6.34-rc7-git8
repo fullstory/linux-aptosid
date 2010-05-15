@@ -17,6 +17,17 @@
  
   or if empty, the mapping is anonymous.
  
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -5492,7 +5492,7 @@ S:	Maintained
+ F:	drivers/mmc/host/tmio_mmc.*
+ 
+ TMPFS (SHMEM FILESYSTEM)
+-M:	Hugh Dickins <hugh.dickins@tiscali.co.uk>
++M:	Hugh Dickins <hughd@google.com>
+ L:	linux-mm@kvack.org
+ S:	Maintained
+ F:	include/linux/shmem_fs.h
 --- a/Makefile
 +++ b/Makefile
 @@ -1,7 +1,7 @@
@@ -24,10 +35,509 @@
  PATCHLEVEL = 6
  SUBLEVEL = 34
 -EXTRAVERSION = -rc7
-+EXTRAVERSION = -rc7-git6
++EXTRAVERSION = -rc7-git8
  NAME = Sheep on Meth
  
  # *DOCUMENTATION*
+--- a/arch/arm/include/asm/cacheflush.h
++++ b/arch/arm/include/asm/cacheflush.h
+@@ -371,6 +371,10 @@ static inline void __flush_icache_all(vo
+ #ifdef CONFIG_ARM_ERRATA_411920
+ 	extern void v6_icache_inval_all(void);
+ 	v6_icache_inval_all();
++#elif defined(CONFIG_SMP) && __LINUX_ARM_ARCH__ >= 7
++	asm("mcr	p15, 0, %0, c7, c1, 0	@ invalidate I-cache inner shareable\n"
++	    :
++	    : "r" (0));
+ #else
+ 	asm("mcr	p15, 0, %0, c7, c5, 0	@ invalidate I-cache\n"
+ 	    :
+--- a/arch/arm/include/asm/smp_twd.h
++++ b/arch/arm/include/asm/smp_twd.h
+@@ -1,6 +1,23 @@
+ #ifndef __ASMARM_SMP_TWD_H
+ #define __ASMARM_SMP_TWD_H
+ 
++#define TWD_TIMER_LOAD			0x00
++#define TWD_TIMER_COUNTER		0x04
++#define TWD_TIMER_CONTROL		0x08
++#define TWD_TIMER_INTSTAT		0x0C
++
++#define TWD_WDOG_LOAD			0x20
++#define TWD_WDOG_COUNTER		0x24
++#define TWD_WDOG_CONTROL		0x28
++#define TWD_WDOG_INTSTAT		0x2C
++#define TWD_WDOG_RESETSTAT		0x30
++#define TWD_WDOG_DISABLE		0x34
++
++#define TWD_TIMER_CONTROL_ENABLE	(1 << 0)
++#define TWD_TIMER_CONTROL_ONESHOT	(0 << 1)
++#define TWD_TIMER_CONTROL_PERIODIC	(1 << 1)
++#define TWD_TIMER_CONTROL_IT_ENABLE	(1 << 2)
++
+ struct clock_event_device;
+ 
+ extern void __iomem *twd_base;
+--- a/arch/arm/include/asm/tlbflush.h
++++ b/arch/arm/include/asm/tlbflush.h
+@@ -46,6 +46,9 @@
+ #define TLB_V7_UIS_FULL (1 << 20)
+ #define TLB_V7_UIS_ASID (1 << 21)
+ 
++/* Inner Shareable BTB operation (ARMv7 MP extensions) */
++#define TLB_V7_IS_BTB	(1 << 22)
++
+ #define TLB_L2CLEAN_FR	(1 << 29)		/* Feroceon */
+ #define TLB_DCLEAN	(1 << 30)
+ #define TLB_WB		(1 << 31)
+@@ -183,7 +186,7 @@
+ #endif
+ 
+ #ifdef CONFIG_SMP
+-#define v7wbi_tlb_flags (TLB_WB | TLB_DCLEAN | TLB_BTB | \
++#define v7wbi_tlb_flags (TLB_WB | TLB_DCLEAN | TLB_V7_IS_BTB | \
+ 			 TLB_V7_UIS_FULL | TLB_V7_UIS_PAGE | TLB_V7_UIS_ASID)
+ #else
+ #define v7wbi_tlb_flags (TLB_WB | TLB_DCLEAN | TLB_BTB | \
+@@ -339,6 +342,12 @@ static inline void local_flush_tlb_all(v
+ 		dsb();
+ 		isb();
+ 	}
++	if (tlb_flag(TLB_V7_IS_BTB)) {
++		/* flush the branch target cache */
++		asm("mcr p15, 0, %0, c7, c1, 6" : : "r" (zero) : "cc");
++		dsb();
++		isb();
++	}
+ }
+ 
+ static inline void local_flush_tlb_mm(struct mm_struct *mm)
+@@ -376,6 +385,12 @@ static inline void local_flush_tlb_mm(st
+ 		asm("mcr p15, 0, %0, c7, c5, 6" : : "r" (zero) : "cc");
+ 		dsb();
+ 	}
++	if (tlb_flag(TLB_V7_IS_BTB)) {
++		/* flush the branch target cache */
++		asm("mcr p15, 0, %0, c7, c1, 6" : : "r" (zero) : "cc");
++		dsb();
++		isb();
++	}
+ }
+ 
+ static inline void
+@@ -416,6 +431,12 @@ local_flush_tlb_page(struct vm_area_stru
+ 		asm("mcr p15, 0, %0, c7, c5, 6" : : "r" (zero) : "cc");
+ 		dsb();
+ 	}
++	if (tlb_flag(TLB_V7_IS_BTB)) {
++		/* flush the branch target cache */
++		asm("mcr p15, 0, %0, c7, c1, 6" : : "r" (zero) : "cc");
++		dsb();
++		isb();
++	}
+ }
+ 
+ static inline void local_flush_tlb_kernel_page(unsigned long kaddr)
+@@ -454,6 +475,12 @@ static inline void local_flush_tlb_kerne
+ 		dsb();
+ 		isb();
+ 	}
++	if (tlb_flag(TLB_V7_IS_BTB)) {
++		/* flush the branch target cache */
++		asm("mcr p15, 0, %0, c7, c1, 6" : : "r" (zero) : "cc");
++		dsb();
++		isb();
++	}
+ }
+ 
+ /*
+--- a/arch/arm/kernel/smp_twd.c
++++ b/arch/arm/kernel/smp_twd.c
+@@ -21,23 +21,6 @@
+ #include <asm/smp_twd.h>
+ #include <asm/hardware/gic.h>
+ 
+-#define TWD_TIMER_LOAD 			0x00
+-#define TWD_TIMER_COUNTER		0x04
+-#define TWD_TIMER_CONTROL		0x08
+-#define TWD_TIMER_INTSTAT		0x0C
+-
+-#define TWD_WDOG_LOAD			0x20
+-#define TWD_WDOG_COUNTER		0x24
+-#define TWD_WDOG_CONTROL		0x28
+-#define TWD_WDOG_INTSTAT		0x2C
+-#define TWD_WDOG_RESETSTAT		0x30
+-#define TWD_WDOG_DISABLE		0x34
+-
+-#define TWD_TIMER_CONTROL_ENABLE	(1 << 0)
+-#define TWD_TIMER_CONTROL_ONESHOT	(0 << 1)
+-#define TWD_TIMER_CONTROL_PERIODIC	(1 << 1)
+-#define TWD_TIMER_CONTROL_IT_ENABLE	(1 << 2)
+-
+ /* set up by the platform code */
+ void __iomem *twd_base;
+ 
+--- a/arch/arm/lib/clear_user.S
++++ b/arch/arm/lib/clear_user.S
+@@ -45,6 +45,7 @@ USER(		strnebt	r2, [r0])
+ 		mov	r0, #0
+ 		ldmfd	sp!, {r1, pc}
+ ENDPROC(__clear_user)
++ENDPROC(__clear_user_std)
+ 
+ 		.pushsection .fixup,"ax"
+ 		.align	0
+--- a/arch/arm/lib/copy_to_user.S
++++ b/arch/arm/lib/copy_to_user.S
+@@ -93,6 +93,7 @@ WEAK(__copy_to_user)
+ #include "copy_template.S"
+ 
+ ENDPROC(__copy_to_user)
++ENDPROC(__copy_to_user_std)
+ 
+ 	.pushsection .fixup,"ax"
+ 	.align 0
+--- a/arch/arm/mach-davinci/da830.c
++++ b/arch/arm/mach-davinci/da830.c
+@@ -410,7 +410,7 @@ static struct clk_lookup da830_clks[] =
+ 	CLK("davinci-mcasp.0",	NULL,		&mcasp0_clk),
+ 	CLK("davinci-mcasp.1",	NULL,		&mcasp1_clk),
+ 	CLK("davinci-mcasp.2",	NULL,		&mcasp2_clk),
+-	CLK("musb_hdrc",	NULL,		&usb20_clk),
++	CLK(NULL,		"usb20",	&usb20_clk),
+ 	CLK(NULL,		"aemif",	&aemif_clk),
+ 	CLK(NULL,		"aintc",	&aintc_clk),
+ 	CLK(NULL,		"secu_mgr",	&secu_mgr_clk),
+--- a/arch/arm/mm/cache-v6.S
++++ b/arch/arm/mm/cache-v6.S
+@@ -211,6 +211,9 @@ v6_dma_inv_range:
+ 	mcrne	p15, 0, r1, c7, c15, 1		@ clean & invalidate unified line
+ #endif
+ 1:
++#ifdef CONFIG_SMP
++	str	r0, [r0]			@ write for ownership
++#endif
+ #ifdef HARVARD_CACHE
+ 	mcr	p15, 0, r0, c7, c6, 1		@ invalidate D line
+ #else
+@@ -231,6 +234,9 @@ v6_dma_inv_range:
+ v6_dma_clean_range:
+ 	bic	r0, r0, #D_CACHE_LINE_SIZE - 1
+ 1:
++#ifdef CONFIG_SMP
++	ldr	r2, [r0]			@ read for ownership
++#endif
+ #ifdef HARVARD_CACHE
+ 	mcr	p15, 0, r0, c7, c10, 1		@ clean D line
+ #else
+@@ -251,6 +257,10 @@ v6_dma_clean_range:
+ ENTRY(v6_dma_flush_range)
+ 	bic	r0, r0, #D_CACHE_LINE_SIZE - 1
+ 1:
++#ifdef CONFIG_SMP
++	ldr	r2, [r0]			@ read for ownership
++	str	r2, [r0]			@ write for ownership
++#endif
+ #ifdef HARVARD_CACHE
+ 	mcr	p15, 0, r0, c7, c14, 1		@ clean & invalidate D line
+ #else
+@@ -273,7 +283,9 @@ ENTRY(v6_dma_map_area)
+ 	add	r1, r1, r0
+ 	teq	r2, #DMA_FROM_DEVICE
+ 	beq	v6_dma_inv_range
+-	b	v6_dma_clean_range
++	teq	r2, #DMA_TO_DEVICE
++	beq	v6_dma_clean_range
++	b	v6_dma_flush_range
+ ENDPROC(v6_dma_map_area)
+ 
+ /*
+@@ -283,9 +295,6 @@ ENDPROC(v6_dma_map_area)
+  *	- dir	- DMA direction
+  */
+ ENTRY(v6_dma_unmap_area)
+-	add	r1, r1, r0
+-	teq	r2, #DMA_TO_DEVICE
+-	bne	v6_dma_inv_range
+ 	mov	pc, lr
+ ENDPROC(v6_dma_unmap_area)
+ 
+--- a/arch/arm/mm/cache-v7.S
++++ b/arch/arm/mm/cache-v7.S
+@@ -167,7 +167,11 @@ ENTRY(v7_coherent_user_range)
+ 	cmp	r0, r1
+ 	blo	1b
+ 	mov	r0, #0
++#ifdef CONFIG_SMP
++	mcr	p15, 0, r0, c7, c1, 6		@ invalidate BTB Inner Shareable
++#else
+ 	mcr	p15, 0, r0, c7, c5, 6		@ invalidate BTB
++#endif
+ 	dsb
+ 	isb
+ 	mov	pc, lr
+--- a/arch/arm/mm/nommu.c
++++ b/arch/arm/mm/nommu.c
+@@ -65,6 +65,15 @@ void flush_dcache_page(struct page *page
+ }
+ EXPORT_SYMBOL(flush_dcache_page);
+ 
++void copy_to_user_page(struct vm_area_struct *vma, struct page *page,
++		       unsigned long uaddr, void *dst, const void *src,
++		       unsigned long len)
++{
++	memcpy(dst, src, len);
++	if (vma->vm_flags & VM_EXEC)
++		__cpuc_coherent_user_range(uaddr, uaddr + len);
++}
++
+ void __iomem *__arm_ioremap_pfn(unsigned long pfn, unsigned long offset,
+ 				size_t size, unsigned int mtype)
+ {
+@@ -87,8 +96,8 @@ void __iomem *__arm_ioremap(unsigned lon
+ }
+ EXPORT_SYMBOL(__arm_ioremap);
+ 
+-void __iomem *__arm_ioremap(unsigned long phys_addr, size_t size,
+-			    unsigned int mtype, void *caller)
++void __iomem *__arm_ioremap_caller(unsigned long phys_addr, size_t size,
++				   unsigned int mtype, void *caller)
+ {
+ 	return __arm_ioremap(phys_addr, size, mtype);
+ }
+--- a/arch/arm/mm/tlb-v7.S
++++ b/arch/arm/mm/tlb-v7.S
+@@ -50,7 +50,11 @@ ENTRY(v7wbi_flush_user_tlb_range)
+ 	cmp	r0, r1
+ 	blo	1b
+ 	mov	ip, #0
++#ifdef CONFIG_SMP
++	mcr	p15, 0, ip, c7, c1, 6		@ flush BTAC/BTB Inner Shareable
++#else
+ 	mcr	p15, 0, ip, c7, c5, 6		@ flush BTAC/BTB
++#endif
+ 	dsb
+ 	mov	pc, lr
+ ENDPROC(v7wbi_flush_user_tlb_range)
+@@ -79,7 +83,11 @@ ENTRY(v7wbi_flush_kern_tlb_range)
+ 	cmp	r0, r1
+ 	blo	1b
+ 	mov	r2, #0
++#ifdef CONFIG_SMP
++	mcr	p15, 0, r2, c7, c1, 6		@ flush BTAC/BTB Inner Shareable
++#else
+ 	mcr	p15, 0, r2, c7, c5, 6		@ flush BTAC/BTB
++#endif
+ 	dsb
+ 	isb
+ 	mov	pc, lr
+--- a/arch/microblaze/include/asm/uaccess.h
++++ b/arch/microblaze/include/asm/uaccess.h
+@@ -182,6 +182,39 @@ extern long __user_bad(void);
+  * Returns zero on success, or -EFAULT on error.
+  * On error, the variable @x is set to zero.
+  */
++#define get_user(x, ptr)						\
++	__get_user_check((x), (ptr), sizeof(*(ptr)))
++
++#define __get_user_check(x, ptr, size)					\
++({									\
++	unsigned long __gu_val = 0;					\
++	const typeof(*(ptr)) __user *__gu_addr = (ptr);			\
++	int __gu_err = 0;						\
++									\
++	if (access_ok(VERIFY_READ, __gu_addr, size)) {			\
++		switch (size) {						\
++		case 1:							\
++			__get_user_asm("lbu", __gu_addr, __gu_val,	\
++				       __gu_err);			\
++			break;						\
++		case 2:							\
++			__get_user_asm("lhu", __gu_addr, __gu_val,	\
++				       __gu_err);			\
++			break;						\
++		case 4:							\
++			__get_user_asm("lw", __gu_addr, __gu_val,	\
++				       __gu_err);			\
++			break;						\
++		default:						\
++			__gu_err = __user_bad();			\
++			break;						\
++		}							\
++	} else {							\
++		__gu_err = -EFAULT;					\
++	}								\
++	x = (typeof(*(ptr)))__gu_val;					\
++	__gu_err;							\
++})
+ 
+ #define __get_user(x, ptr)						\
+ ({									\
+@@ -206,12 +239,6 @@ extern long __user_bad(void);
+ })
+ 
+ 
+-#define get_user(x, ptr)						\
+-({									\
+-	access_ok(VERIFY_READ, (ptr), sizeof(*(ptr)))			\
+-		? __get_user((x), (ptr)) : -EFAULT;			\
+-})
+-
+ #define __put_user_asm(insn, __gu_ptr, __gu_val, __gu_err)	\
+ ({								\
+ 	__asm__ __volatile__ (					\
+@@ -266,6 +293,42 @@ extern long __user_bad(void);
+  *
+  * Returns zero on success, or -EFAULT on error.
+  */
++#define put_user(x, ptr)						\
++	__put_user_check((x), (ptr), sizeof(*(ptr)))
++
++#define __put_user_check(x, ptr, size)					\
++({									\
++	typeof(*(ptr)) __pu_val;					\
++	typeof(*(ptr)) __user *__pu_addr = (ptr);			\
++	int __pu_err = 0;						\
++									\
++	__pu_val = (x);							\
++	if (access_ok(VERIFY_WRITE, __pu_addr, size)) {			\
++		switch (size) {						\
++		case 1:							\
++			__put_user_asm("sb", __pu_addr, __pu_val,	\
++				       __pu_err);			\
++			break;						\
++		case 2:							\
++			__put_user_asm("sh", __pu_addr, __pu_val,	\
++				       __pu_err);			\
++			break;						\
++		case 4:							\
++			__put_user_asm("sw", __pu_addr, __pu_val,	\
++				       __pu_err);			\
++			break;						\
++		case 8:							\
++			__put_user_asm_8(__pu_addr, __pu_val, __pu_err);\
++			break;						\
++		default:						\
++			__pu_err = __user_bad();			\
++			break;						\
++		}							\
++	} else {							\
++		__pu_err = -EFAULT;					\
++	}								\
++	__pu_err;							\
++})
+ 
+ #define __put_user(x, ptr)						\
+ ({									\
+@@ -290,18 +353,6 @@ extern long __user_bad(void);
+ 	__gu_err;							\
+ })
+ 
+-#ifndef CONFIG_MMU
+-
+-#define put_user(x, ptr)	__put_user((x), (ptr))
+-
+-#else /* CONFIG_MMU */
+-
+-#define put_user(x, ptr)						\
+-({									\
+-	access_ok(VERIFY_WRITE, (ptr), sizeof(*(ptr)))			\
+-		? __put_user((x), (ptr)) : -EFAULT;			\
+-})
+-#endif /* CONFIG_MMU */
+ 
+ /* copy_to_from_user */
+ #define __copy_from_user(to, from, n)	\
+--- a/arch/microblaze/kernel/cpu/cache.c
++++ b/arch/microblaze/kernel/cpu/cache.c
+@@ -137,8 +137,9 @@ do {									\
+ do {									\
+ 	int step = -line_length;					\
+ 	int align = ~(line_length - 1);					\
++	int count;							\
+ 	end = ((end & align) == end) ? end - line_length : end & align;	\
+-	int count = end - start;					\
++	count = end - start;						\
+ 	WARN_ON(count < 0);						\
+ 									\
+ 	__asm__ __volatile__ (" 1:	" #op "	%0, %1;			\
+--- a/arch/microblaze/kernel/entry-nommu.S
++++ b/arch/microblaze/kernel/entry-nommu.S
+@@ -476,6 +476,8 @@ ENTRY(ret_from_fork)
+ 	nop
+ 
+ work_pending:
++	enable_irq
++
+ 	andi	r11, r19, _TIF_NEED_RESCHED
+ 	beqi	r11, 1f
+ 	bralid	r15, schedule
+--- a/arch/microblaze/kernel/microblaze_ksyms.c
++++ b/arch/microblaze/kernel/microblaze_ksyms.c
+@@ -52,3 +52,14 @@ EXPORT_SYMBOL_GPL(_ebss);
+ extern void _mcount(void);
+ EXPORT_SYMBOL(_mcount);
+ #endif
++
++/*
++ * Assembly functions that may be used (directly or indirectly) by modules
++ */
++EXPORT_SYMBOL(__copy_tofrom_user);
++EXPORT_SYMBOL(__strncpy_user);
++
++#ifdef CONFIG_OPT_LIB_ASM
++EXPORT_SYMBOL(memcpy);
++EXPORT_SYMBOL(memmove);
++#endif
+--- a/arch/microblaze/kernel/module.c
++++ b/arch/microblaze/kernel/module.c
+@@ -16,6 +16,7 @@
+ #include <linux/string.h>
+ 
+ #include <asm/pgtable.h>
++#include <asm/cacheflush.h>
+ 
+ void *module_alloc(unsigned long size)
+ {
+@@ -151,6 +152,7 @@ int apply_relocate_add(Elf32_Shdr *sechd
+ int module_finalize(const Elf32_Ehdr *hdr, const Elf_Shdr *sechdrs,
+ 		struct module *module)
+ {
++	flush_dcache();
+ 	return 0;
+ }
+ 
+--- a/arch/microblaze/mm/init.c
++++ b/arch/microblaze/mm/init.c
+@@ -47,6 +47,7 @@ unsigned long memory_start;
+ EXPORT_SYMBOL(memory_start);
+ unsigned long memory_end; /* due to mm/nommu.c */
+ unsigned long memory_size;
++EXPORT_SYMBOL(memory_size);
+ 
+ /*
+  * paging_init() sets up the page tables - in fact we've already done this.
+--- a/arch/microblaze/mm/pgtable.c
++++ b/arch/microblaze/mm/pgtable.c
+@@ -42,6 +42,7 @@
+ 
+ unsigned long ioremap_base;
+ unsigned long ioremap_bot;
++EXPORT_SYMBOL(ioremap_bot);
+ 
+ /* The maximum lowmem defaults to 768Mb, but this can be configured to
+  * another value.
+--- a/arch/microblaze/pci/pci-common.c
++++ b/arch/microblaze/pci/pci-common.c
+@@ -1507,7 +1507,7 @@ void pcibios_finish_adding_to_bus(struct
+ 	pci_bus_add_devices(bus);
+ 
+ 	/* Fixup EEH */
+-	eeh_add_device_tree_late(bus);
++	/* eeh_add_device_tree_late(bus); */
+ }
+ EXPORT_SYMBOL_GPL(pcibios_finish_adding_to_bus);
+ 
 --- a/arch/powerpc/include/asm/hw_irq.h
 +++ b/arch/powerpc/include/asm/hw_irq.h
 @@ -130,43 +130,5 @@ static inline int irqs_disabled_flags(un
@@ -300,6 +810,38 @@
  }
  
  asmlinkage void do_syscall_trace_exit(struct pt_regs *regs)
+--- a/arch/x86/include/asm/k8.h
++++ b/arch/x86/include/asm/k8.h
+@@ -16,11 +16,16 @@ extern int k8_numa_init(unsigned long st
+ extern int k8_scan_nodes(void);
+ 
+ #ifdef CONFIG_K8_NB
++extern int num_k8_northbridges;
++
+ static inline struct pci_dev *node_to_k8_nb_misc(int node)
+ {
+ 	return (node < num_k8_northbridges) ? k8_northbridges[node] : NULL;
+ }
++
+ #else
++#define num_k8_northbridges 0
++
+ static inline struct pci_dev *node_to_k8_nb_misc(int node)
+ {
+ 	return NULL;
+--- a/arch/x86/kernel/cpu/intel_cacheinfo.c
++++ b/arch/x86/kernel/cpu/intel_cacheinfo.c
+@@ -340,6 +340,10 @@ amd_check_l3_disable(int index, struct _
+ 	     (boot_cpu_data.x86_mask  < 0x1)))
+ 		return;
+ 
++	/* not in virtualized environments */
++	if (num_k8_northbridges == 0)
++		return;
++
+ 	this_leaf->can_disable = true;
+ 	this_leaf->l3_indices  = amd_calc_l3_indices();
+ }
 --- a/arch/x86/kernel/kprobes.c
 +++ b/arch/x86/kernel/kprobes.c
 @@ -534,20 +534,6 @@ static int __kprobes kprobe_handler(stru
@@ -343,6 +885,27 @@
  	} else if (kprobe_running()) {
  		p = __get_cpu_var(current_kprobe);
  		if (p->break_handler && p->break_handler(p, regs)) {
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -546,11 +546,13 @@ static int __cpuinit check_c1e_idle(cons
+ 		 * check OSVW bit for CPUs that are not affected
+ 		 * by erratum #400
+ 		 */
+-		rdmsrl(MSR_AMD64_OSVW_ID_LENGTH, val);
+-		if (val >= 2) {
+-			rdmsrl(MSR_AMD64_OSVW_STATUS, val);
+-			if (!(val & BIT(1)))
+-				goto no_c1e_idle;
++		if (cpu_has(c, X86_FEATURE_OSVW)) {
++			rdmsrl(MSR_AMD64_OSVW_ID_LENGTH, val);
++			if (val >= 2) {
++				rdmsrl(MSR_AMD64_OSVW_STATUS, val);
++				if (!(val & BIT(1)))
++					goto no_c1e_idle;
++			}
+ 		}
+ 		return 1;
+ 	}
 --- a/arch/x86/kvm/svm.c
 +++ b/arch/x86/kvm/svm.c
 @@ -2067,7 +2067,7 @@ static int cpuid_interception(struct vcp
@@ -418,6 +981,31 @@
  	return 0;
  
  out:
+--- a/arch/x86/mm/srat_64.c
++++ b/arch/x86/mm/srat_64.c
+@@ -461,7 +461,8 @@ void __init acpi_fake_nodes(const struct
+ 		 * node, it must now point to the fake node ID.
+ 		 */
+ 		for (j = 0; j < MAX_LOCAL_APIC; j++)
+-			if (apicid_to_node[j] == nid)
++			if (apicid_to_node[j] == nid &&
++			    fake_apicid_to_node[j] == NUMA_NO_NODE)
+ 				fake_apicid_to_node[j] = i;
+ 	}
+ 	for (i = 0; i < num_nodes; i++)
+--- a/arch/x86/pci/mrst.c
++++ b/arch/x86/pci/mrst.c
+@@ -247,6 +247,10 @@ static void __devinit pci_fixed_bar_fixu
+ 	u32 size;
+ 	int i;
+ 
++	/* Must have extended configuration space */
++	if (dev->cfg_size < PCIE_CAP_OFFSET + 4)
++		return;
++
+ 	/* Fixup the BAR sizes for fixed BAR devices and make them unmoveable */
+ 	offset = fixed_bar_cap(dev->bus, dev->devfn);
+ 	if (!offset || PCI_DEVFN(2, 0) == dev->devfn ||
 --- a/drivers/acpi/sleep.c
 +++ b/drivers/acpi/sleep.c
 @@ -475,101 +475,13 @@ static struct dmi_system_id __initdata a
@@ -1851,6 +2439,22 @@
  		ret = psc_ops->fifoc_init();
  		if (ret)
  			return ret;
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@ -1035,7 +1035,12 @@ int vhost_add_used(struct vhost_virtqueu
+ /* This actually signals the guest, using eventfd. */
+ void vhost_signal(struct vhost_dev *dev, struct vhost_virtqueue *vq)
+ {
+-	__u16 flags = 0;
++	__u16 flags;
++	/* Flush out used index updates. This is paired
++	 * with the barrier that the Guest executes when enabling
++	 * interrupts. */
++	smp_mb();
++
+ 	if (get_user(flags, &vq->avail->flags)) {
+ 		vq_err(vq, "Failed to get flags");
+ 		return;
 --- a/drivers/video/bfin-t350mcqb-fb.c
 +++ b/drivers/video/bfin-t350mcqb-fb.c
 @@ -488,9 +488,9 @@ static int __devinit bfin_t350mcqb_probe
@@ -1889,6 +2493,99 @@
  
  	fb_dealloc_cmap(&fbinfo->cmap);
  
+--- a/drivers/watchdog/Kconfig
++++ b/drivers/watchdog/Kconfig
+@@ -175,7 +175,7 @@ config SA1100_WATCHDOG
+ 
+ config MPCORE_WATCHDOG
+ 	tristate "MPcore watchdog"
+-	depends on ARM_MPCORE_PLATFORM && LOCAL_TIMERS
++	depends on HAVE_ARM_TWD
+ 	help
+ 	  Watchdog timer embedded into the MPcore system.
+ 
+--- a/drivers/watchdog/mpcore_wdt.c
++++ b/drivers/watchdog/mpcore_wdt.c
+@@ -31,8 +31,9 @@
+ #include <linux/platform_device.h>
+ #include <linux/uaccess.h>
+ #include <linux/slab.h>
++#include <linux/io.h>
+ 
+-#include <asm/hardware/arm_twd.h>
++#include <asm/smp_twd.h>
+ 
+ struct mpcore_wdt {
+ 	unsigned long	timer_alive;
+@@ -44,7 +45,7 @@ struct mpcore_wdt {
+ };
+ 
+ static struct platform_device *mpcore_wdt_dev;
+-extern unsigned int mpcore_timer_rate;
++static DEFINE_SPINLOCK(wdt_lock);
+ 
+ #define TIMER_MARGIN	60
+ static int mpcore_margin = TIMER_MARGIN;
+@@ -94,13 +95,15 @@ static irqreturn_t mpcore_wdt_fire(int i
+  */
+ static void mpcore_wdt_keepalive(struct mpcore_wdt *wdt)
+ {
+-	unsigned int count;
++	unsigned long count;
+ 
++	spin_lock(&wdt_lock);
+ 	/* Assume prescale is set to 256 */
+-	count = (mpcore_timer_rate / 256) * mpcore_margin;
++	count =  __raw_readl(wdt->base + TWD_WDOG_COUNTER);
++	count = (0xFFFFFFFFU - count) * (HZ / 5);
++	count = (count / 256) * mpcore_margin;
+ 
+ 	/* Reload the counter */
+-	spin_lock(&wdt_lock);
+ 	writel(count + wdt->perturb, wdt->base + TWD_WDOG_LOAD);
+ 	wdt->perturb = wdt->perturb ? 0 : 1;
+ 	spin_unlock(&wdt_lock);
+@@ -119,7 +122,6 @@ static void mpcore_wdt_start(struct mpco
+ {
+ 	dev_printk(KERN_INFO, wdt->dev, "enabling watchdog.\n");
+ 
+-	spin_lock(&wdt_lock);
+ 	/* This loads the count register but does NOT start the count yet */
+ 	mpcore_wdt_keepalive(wdt);
+ 
+@@ -130,7 +132,6 @@ static void mpcore_wdt_start(struct mpco
+ 		/* Enable watchdog - prescale=256, watchdog mode=1, enable=1 */
+ 		writel(0x0000FF09, wdt->base + TWD_WDOG_CONTROL);
+ 	}
+-	spin_unlock(&wdt_lock);
+ }
+ 
+ static int mpcore_wdt_set_heartbeat(int t)
+@@ -360,7 +361,7 @@ static int __devinit mpcore_wdt_probe(st
+ 	mpcore_wdt_miscdev.parent = &dev->dev;
+ 	ret = misc_register(&mpcore_wdt_miscdev);
+ 	if (ret) {
+-		dev_printk(KERN_ERR, _dev,
++		dev_printk(KERN_ERR, wdt->dev,
+ 			"cannot register miscdev on minor=%d (err=%d)\n",
+ 							WATCHDOG_MINOR, ret);
+ 		goto err_misc;
+@@ -369,13 +370,13 @@ static int __devinit mpcore_wdt_probe(st
+ 	ret = request_irq(wdt->irq, mpcore_wdt_fire, IRQF_DISABLED,
+ 							"mpcore_wdt", wdt);
+ 	if (ret) {
+-		dev_printk(KERN_ERR, _dev,
++		dev_printk(KERN_ERR, wdt->dev,
+ 			"cannot register IRQ%d for watchdog\n", wdt->irq);
+ 		goto err_irq;
+ 	}
+ 
+ 	mpcore_wdt_stop(wdt);
+-	platform_set_drvdata(&dev->dev, wdt);
++	platform_set_drvdata(dev, wdt);
+ 	mpcore_wdt_dev = dev;
+ 
+ 	return 0;
 --- a/fs/autofs4/root.c
 +++ b/fs/autofs4/root.c
 @@ -177,8 +177,7 @@ static int try_to_fill_dentry(struct den
@@ -2670,6 +3367,73 @@
  			goto exit_dput;
  		if (count++ == 32)
  			goto exit_dput;
+--- a/fs/notify/inotify/inotify_fsnotify.c
++++ b/fs/notify/inotify/inotify_fsnotify.c
+@@ -28,6 +28,7 @@
+ #include <linux/path.h> /* struct path */
+ #include <linux/slab.h> /* kmem_* */
+ #include <linux/types.h>
++#include <linux/sched.h>
+ 
+ #include "inotify.h"
+ 
+@@ -146,6 +147,7 @@ static void inotify_free_group_priv(stru
+ 	idr_for_each(&group->inotify_data.idr, idr_callback, group);
+ 	idr_remove_all(&group->inotify_data.idr);
+ 	idr_destroy(&group->inotify_data.idr);
++	free_uid(group->inotify_data.user);
+ }
+ 
+ void inotify_free_event_priv(struct fsnotify_event_private_data *fsn_event_priv)
+--- a/fs/notify/inotify/inotify_user.c
++++ b/fs/notify/inotify/inotify_user.c
+@@ -546,21 +546,24 @@ retry:
+ 	if (unlikely(!idr_pre_get(&group->inotify_data.idr, GFP_KERNEL)))
+ 		goto out_err;
+ 
++	/* we are putting the mark on the idr, take a reference */
++	fsnotify_get_mark(&tmp_ientry->fsn_entry);
++
+ 	spin_lock(&group->inotify_data.idr_lock);
+ 	ret = idr_get_new_above(&group->inotify_data.idr, &tmp_ientry->fsn_entry,
+ 				group->inotify_data.last_wd+1,
+ 				&tmp_ientry->wd);
+ 	spin_unlock(&group->inotify_data.idr_lock);
+ 	if (ret) {
++		/* we didn't get on the idr, drop the idr reference */
++		fsnotify_put_mark(&tmp_ientry->fsn_entry);
++
+ 		/* idr was out of memory allocate and try again */
+ 		if (ret == -EAGAIN)
+ 			goto retry;
+ 		goto out_err;
+ 	}
+ 
+-	/* we put the mark on the idr, take a reference */
+-	fsnotify_get_mark(&tmp_ientry->fsn_entry);
+-
+ 	/* we are on the idr, now get on the inode */
+ 	ret = fsnotify_add_mark(&tmp_ientry->fsn_entry, group, inode);
+ 	if (ret) {
+@@ -578,16 +581,13 @@ retry:
+ 	/* return the watch descriptor for this new entry */
+ 	ret = tmp_ientry->wd;
+ 
+-	/* match the ref from fsnotify_init_markentry() */
+-	fsnotify_put_mark(&tmp_ientry->fsn_entry);
+-
+ 	/* if this mark added a new event update the group mask */
+ 	if (mask & ~group->mask)
+ 		fsnotify_recalc_group_mask(group);
+ 
+ out_err:
+-	if (ret < 0)
+-		kmem_cache_free(inotify_inode_mark_cachep, tmp_ientry);
++	/* match the ref from fsnotify_init_markentry() */
++	fsnotify_put_mark(&tmp_ientry->fsn_entry);
+ 
+ 	return ret;
+ }
 --- a/fs/proc/array.c
 +++ b/fs/proc/array.c
 @@ -81,7 +81,6 @@
@@ -2910,6 +3674,20 @@
  
  unlock:
  	mutex_unlock(&kexec_mutex);
+--- a/kernel/profile.c
++++ b/kernel/profile.c
+@@ -127,8 +127,10 @@ int __ref profile_init(void)
+ 		return 0;
+ 
+ 	prof_buffer = vmalloc(buffer_bytes);
+-	if (prof_buffer)
++	if (prof_buffer) {
++		memset(prof_buffer, 0, buffer_bytes);
+ 		return 0;
++	}
+ 
+ 	free_cpumask_var(prof_cpu_mask);
+ 	return -ENOMEM;
 --- a/lib/rwsem.c
 +++ b/lib/rwsem.c
 @@ -136,9 +136,10 @@ __rwsem_do_wake(struct rw_semaphore *sem
@@ -3268,6 +4046,17 @@
  
  	/* Initialize the 64-bit random nonce sent with heartbeat. */
  	get_random_bytes(&peer->hb_nonce, sizeof(peer->hb_nonce));
+--- a/security/min_addr.c
++++ b/security/min_addr.c
+@@ -33,7 +33,7 @@ int mmap_min_addr_handler(struct ctl_tab
+ {
+ 	int ret;
+ 
+-	if (!capable(CAP_SYS_RAWIO))
++	if (write && !capable(CAP_SYS_RAWIO))
+ 		return -EPERM;
+ 
+ 	ret = proc_doulongvec_minmax(table, write, buffer, lenp, ppos);
 --- a/sound/core/pcm_native.c
 +++ b/sound/core/pcm_native.c
 @@ -36,6 +36,9 @@
