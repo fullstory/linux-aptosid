@@ -35,7 +35,7 @@
  PATCHLEVEL = 6
  SUBLEVEL = 34
 -EXTRAVERSION = -rc7
-+EXTRAVERSION = -rc7-git8
++EXTRAVERSION = -rc7-git9
  NAME = Sheep on Meth
  
  # *DOCUMENTATION*
@@ -1973,6 +1973,18 @@
  	/* We ignore the result of the completion and just check for a
  	 * conversion result, allowing us to soldier on if the IRQ
  	 * infrastructure is not set up for the chip. */
+--- a/drivers/mmc/host/at91_mci.c
++++ b/drivers/mmc/host/at91_mci.c
+@@ -314,8 +314,8 @@ static void at91_mci_post_dma_read(struc
+ 			dmabuf = (unsigned *)tmpv;
+ 		}
+ 
++		flush_kernel_dcache_page(sg_page(sg));
+ 		kunmap_atomic(sgbuffer, KM_BIO_SRC_IRQ);
+-		dmac_flush_range((void *)sgbuffer, ((void *)sgbuffer) + amount);
+ 		data->bytes_xfered += amount;
+ 		if (size == 0)
+ 			break;
 --- a/drivers/mmc/host/atmel-mci.c
 +++ b/drivers/mmc/host/atmel-mci.c
 @@ -266,7 +266,7 @@ static int atmci_req_show(struct seq_fil
@@ -2439,6 +2451,16 @@
  		ret = psc_ops->fifoc_init();
  		if (ret)
  			return ret;
+--- a/drivers/usb/core/inode.c
++++ b/drivers/usb/core/inode.c
+@@ -380,6 +380,7 @@ static int usbfs_rmdir(struct inode *dir
+ 	mutex_lock(&inode->i_mutex);
+ 	dentry_unhash(dentry);
+ 	if (usbfs_empty(dentry)) {
++		dont_mount(dentry);
+ 		drop_nlink(dentry->d_inode);
+ 		drop_nlink(dentry->d_inode);
+ 		dput(dentry);
 --- a/drivers/vhost/vhost.c
 +++ b/drivers/vhost/vhost.c
 @@ -1035,7 +1035,12 @@ int vhost_add_used(struct vhost_virtqueu
@@ -2607,6 +2629,26 @@
  		if (status)
  			goto out_error;
  
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -1481,12 +1481,17 @@ static noinline long btrfs_ioctl_clone(s
+ 		ret = -EBADF;
+ 		goto out_drop_write;
+ 	}
++
+ 	src = src_file->f_dentry->d_inode;
+ 
+ 	ret = -EINVAL;
+ 	if (src == inode)
+ 		goto out_fput;
+ 
++	/* the src must be open for reading */
++	if (!(src_file->f_mode & FMODE_READ))
++		goto out_fput;
++
+ 	ret = -EISDIR;
+ 	if (S_ISDIR(src->i_mode) || S_ISDIR(inode->i_mode))
+ 		goto out_fput;
 --- a/fs/cachefiles/internal.h
 +++ b/fs/cachefiles/internal.h
 @@ -34,6 +34,7 @@ struct cachefiles_object {
@@ -3327,6 +3369,40 @@
  	/* execve succeeded */
  	current->fs->in_exec = 0;
  	current->in_execve = 0;
+--- a/fs/configfs/dir.c
++++ b/fs/configfs/dir.c
+@@ -645,6 +645,7 @@ static void detach_groups(struct config_
+ 
+ 		configfs_detach_group(sd->s_element);
+ 		child->d_inode->i_flags |= S_DEAD;
++		dont_mount(child);
+ 
+ 		mutex_unlock(&child->d_inode->i_mutex);
+ 
+@@ -840,6 +841,7 @@ static int configfs_attach_item(struct c
+ 			mutex_lock(&dentry->d_inode->i_mutex);
+ 			configfs_remove_dir(item);
+ 			dentry->d_inode->i_flags |= S_DEAD;
++			dont_mount(dentry);
+ 			mutex_unlock(&dentry->d_inode->i_mutex);
+ 			d_delete(dentry);
+ 		}
+@@ -882,6 +884,7 @@ static int configfs_attach_group(struct
+ 		if (ret) {
+ 			configfs_detach_item(item);
+ 			dentry->d_inode->i_flags |= S_DEAD;
++			dont_mount(dentry);
+ 		}
+ 		configfs_adjust_dir_dirent_depth_after_populate(sd);
+ 		mutex_unlock(&dentry->d_inode->i_mutex);
+@@ -1725,6 +1728,7 @@ void configfs_unregister_subsystem(struc
+ 	mutex_unlock(&configfs_symlink_mutex);
+ 	configfs_detach_group(&group->cg_item);
+ 	dentry->d_inode->i_flags |= S_DEAD;
++	dont_mount(dentry);
+ 	mutex_unlock(&dentry->d_inode->i_mutex);
+ 
+ 	d_delete(dentry);
 --- a/fs/exec.c
 +++ b/fs/exec.c
 @@ -1387,8 +1387,6 @@ int do_execve(char * filename,
@@ -3338,6 +3414,88 @@
  	/* execve succeeded */
  	current->fs->in_exec = 0;
  	current->in_execve = 0;
+--- a/fs/jfs/super.c
++++ b/fs/jfs/super.c
+@@ -446,10 +446,8 @@ static int jfs_fill_super(struct super_b
+ 	/* initialize the mount flag and determine the default error handler */
+ 	flag = JFS_ERR_REMOUNT_RO;
+ 
+-	if (!parse_options((char *) data, sb, &newLVSize, &flag)) {
+-		kfree(sbi);
+-		return -EINVAL;
+-	}
++	if (!parse_options((char *) data, sb, &newLVSize, &flag))
++		goto out_kfree;
+ 	sbi->flag = flag;
+ 
+ #ifdef CONFIG_JFS_POSIX_ACL
+@@ -458,7 +456,7 @@ static int jfs_fill_super(struct super_b
+ 
+ 	if (newLVSize) {
+ 		printk(KERN_ERR "resize option for remount only\n");
+-		return -EINVAL;
++		goto out_kfree;
+ 	}
+ 
+ 	/*
+@@ -478,7 +476,7 @@ static int jfs_fill_super(struct super_b
+ 	inode = new_inode(sb);
+ 	if (inode == NULL) {
+ 		ret = -ENOMEM;
+-		goto out_kfree;
++		goto out_unload;
+ 	}
+ 	inode->i_ino = 0;
+ 	inode->i_nlink = 1;
+@@ -550,9 +548,10 @@ out_mount_failed:
+ 	make_bad_inode(sbi->direct_inode);
+ 	iput(sbi->direct_inode);
+ 	sbi->direct_inode = NULL;
+-out_kfree:
++out_unload:
+ 	if (sbi->nls_tab)
+ 		unload_nls(sbi->nls_tab);
++out_kfree:
+ 	kfree(sbi);
+ 	return ret;
+ }
+--- a/fs/logfs/super.c
++++ b/fs/logfs/super.c
+@@ -333,27 +333,27 @@ static int logfs_get_sb_final(struct sup
+ 		goto fail;
+ 
+ 	sb->s_root = d_alloc_root(rootdir);
+-	if (!sb->s_root)
+-		goto fail2;
++	if (!sb->s_root) {
++		iput(rootdir);
++		goto fail;
++	}
+ 
+ 	super->s_erase_page = alloc_pages(GFP_KERNEL, 0);
+ 	if (!super->s_erase_page)
+-		goto fail2;
++		goto fail;
+ 	memset(page_address(super->s_erase_page), 0xFF, PAGE_SIZE);
+ 
+ 	/* FIXME: check for read-only mounts */
+ 	err = logfs_make_writeable(sb);
+ 	if (err)
+-		goto fail3;
++		goto fail1;
+ 
+ 	log_super("LogFS: Finished mounting\n");
+ 	simple_set_mnt(mnt, sb);
+ 	return 0;
+ 
+-fail3:
++fail1:
+ 	__free_page(super->s_erase_page);
+-fail2:
+-	iput(rootdir);
+ fail:
+ 	iput(logfs_super(sb)->s_master_inode);
+ 	return -EIO;
 --- a/fs/namei.c
 +++ b/fs/namei.c
 @@ -1641,7 +1641,7 @@ static struct file *do_last(struct namei
@@ -3367,6 +3525,91 @@
  			goto exit_dput;
  		if (count++ == 32)
  			goto exit_dput;
+@@ -2174,8 +2176,10 @@ int vfs_rmdir(struct inode *dir, struct
+ 		error = security_inode_rmdir(dir, dentry);
+ 		if (!error) {
+ 			error = dir->i_op->rmdir(dir, dentry);
+-			if (!error)
++			if (!error) {
+ 				dentry->d_inode->i_flags |= S_DEAD;
++				dont_mount(dentry);
++			}
+ 		}
+ 	}
+ 	mutex_unlock(&dentry->d_inode->i_mutex);
+@@ -2259,7 +2263,7 @@ int vfs_unlink(struct inode *dir, struct
+ 		if (!error) {
+ 			error = dir->i_op->unlink(dir, dentry);
+ 			if (!error)
+-				dentry->d_inode->i_flags |= S_DEAD;
++				dont_mount(dentry);
+ 		}
+ 	}
+ 	mutex_unlock(&dentry->d_inode->i_mutex);
+@@ -2570,17 +2574,20 @@ static int vfs_rename_dir(struct inode *
+ 		return error;
+ 
+ 	target = new_dentry->d_inode;
+-	if (target) {
++	if (target)
+ 		mutex_lock(&target->i_mutex);
+-		dentry_unhash(new_dentry);
+-	}
+ 	if (d_mountpoint(old_dentry)||d_mountpoint(new_dentry))
+ 		error = -EBUSY;
+-	else 
++	else {
++		if (target)
++			dentry_unhash(new_dentry);
+ 		error = old_dir->i_op->rename(old_dir, old_dentry, new_dir, new_dentry);
++	}
+ 	if (target) {
+-		if (!error)
++		if (!error) {
+ 			target->i_flags |= S_DEAD;
++			dont_mount(new_dentry);
++		}
+ 		mutex_unlock(&target->i_mutex);
+ 		if (d_unhashed(new_dentry))
+ 			d_rehash(new_dentry);
+@@ -2612,7 +2619,7 @@ static int vfs_rename_other(struct inode
+ 		error = old_dir->i_op->rename(old_dir, old_dentry, new_dir, new_dentry);
+ 	if (!error) {
+ 		if (target)
+-			target->i_flags |= S_DEAD;
++			dont_mount(new_dentry);
+ 		if (!(old_dir->i_sb->s_type->fs_flags & FS_RENAME_DOES_D_MOVE))
+ 			d_move(old_dentry, new_dentry);
+ 	}
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1432,7 +1432,7 @@ static int graft_tree(struct vfsmount *m
+ 
+ 	err = -ENOENT;
+ 	mutex_lock(&path->dentry->d_inode->i_mutex);
+-	if (IS_DEADDIR(path->dentry->d_inode))
++	if (cant_mount(path->dentry))
+ 		goto out_unlock;
+ 
+ 	err = security_sb_check_sb(mnt, path);
+@@ -1623,7 +1623,7 @@ static int do_move_mount(struct path *pa
+ 
+ 	err = -ENOENT;
+ 	mutex_lock(&path->dentry->d_inode->i_mutex);
+-	if (IS_DEADDIR(path->dentry->d_inode))
++	if (cant_mount(path->dentry))
+ 		goto out1;
+ 
+ 	if (d_unlinked(path->dentry))
+@@ -2234,7 +2234,7 @@ SYSCALL_DEFINE2(pivot_root, const char _
+ 	if (!check_mnt(root.mnt))
+ 		goto out2;
+ 	error = -ENOENT;
+-	if (IS_DEADDIR(new.dentry->d_inode))
++	if (cant_mount(old.dentry))
+ 		goto out2;
+ 	if (d_unlinked(new.dentry))
+ 		goto out2;
 --- a/fs/notify/inotify/inotify_fsnotify.c
 +++ b/fs/notify/inotify/inotify_fsnotify.c
 @@ -28,6 +28,7 @@
@@ -3481,6 +3724,18 @@
  				}
  			} else {
  				name = "[vdso]";
+--- a/fs/sysv/dir.c
++++ b/fs/sysv/dir.c
+@@ -164,8 +164,8 @@ struct sysv_dir_entry *sysv_find_entry(s
+ 							name, de->name))
+ 					goto found;
+ 			}
++			dir_put_page(page);
+ 		}
+-		dir_put_page(page);
+ 
+ 		if (++n >= npages)
+ 			n = 0;
 --- a/include/asm-generic/dma-mapping-common.h
 +++ b/include/asm-generic/dma-mapping-common.h
 @@ -131,7 +131,7 @@ static inline void dma_sync_single_range
@@ -3501,6 +3756,36 @@
  }
  
  static inline void
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -186,6 +186,8 @@ d_iput:		no		no		no       yes
+ 
+ #define DCACHE_FSNOTIFY_PARENT_WATCHED	0x0080 /* Parent inode is watched by some fsnotify listener */
+ 
++#define DCACHE_CANT_MOUNT	0x0100
++
+ extern spinlock_t dcache_lock;
+ extern seqlock_t rename_lock;
+ 
+@@ -358,6 +360,18 @@ static inline int d_unlinked(struct dent
+ 	return d_unhashed(dentry) && !IS_ROOT(dentry);
+ }
+ 
++static inline int cant_mount(struct dentry *dentry)
++{
++	return (dentry->d_flags & DCACHE_CANT_MOUNT);
++}
++
++static inline void dont_mount(struct dentry *dentry)
++{
++	spin_lock(&dentry->d_lock);
++	dentry->d_flags |= DCACHE_CANT_MOUNT;
++	spin_unlock(&dentry->d_lock);
++}
++
+ static inline struct dentry *dget_parent(struct dentry *dentry)
+ {
+ 	struct dentry *ret;
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
 @@ -1497,7 +1497,6 @@ struct task_struct {
@@ -3688,6 +3973,18 @@
  
  	free_cpumask_var(prof_cpu_mask);
  	return -ENOMEM;
+--- a/lib/btree.c
++++ b/lib/btree.c
+@@ -95,7 +95,8 @@ static unsigned long *btree_node_alloc(s
+ 	unsigned long *node;
+ 
+ 	node = mempool_alloc(head->mempool, gfp);
+-	memset(node, 0, NODESIZE);
++	if (likely(node))
++		memset(node, 0, NODESIZE);
+ 	return node;
+ }
+ 
 --- a/lib/rwsem.c
 +++ b/lib/rwsem.c
 @@ -136,9 +136,10 @@ __rwsem_do_wake(struct rw_semaphore *sem
@@ -4242,6 +4539,18 @@
  	xonar_init_cs53x1(chip);
  	xonar_enable_output(chip);
  
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -563,6 +563,9 @@ static int __cmd_record(int argc, const
+ 
+ 	err = event__synthesize_kernel_mmap(process_synthesized_event,
+ 					    session, "_text");
++	if (err < 0)
++		err = event__synthesize_kernel_mmap(process_synthesized_event,
++						    session, "_stext");
+ 	if (err < 0) {
+ 		pr_err("Couldn't record kernel reference relocation symbol.\n");
+ 		return err;
 --- a/tools/perf/util/trace-event-parse.c
 +++ b/tools/perf/util/trace-event-parse.c
 @@ -1925,7 +1925,7 @@ void *raw_field_ptr(struct event *event,
