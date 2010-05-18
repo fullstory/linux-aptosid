@@ -2015,7 +2015,7 @@
 +		} else
 +			/* todo: cpup_wh_file? */
 +			/* udba work */
-+			au_update_brange(inode, 1);
++			au_update_ibrange(inode, /*do_put_zero*/1);
 +	}
 +
 +	old_ibstart = au_ibstart(inode);
@@ -2030,7 +2030,7 @@
 +	if (!err) {
 +		if (bdst < old_ibstart) {
 +			if (S_ISREG(inode->i_mode)) {
-+				err = au_dy_ifaop(inode, bdst, dst_inode);
++				err = au_dy_iaop(inode, bdst, dst_inode);
 +				if (unlikely(err))
 +					goto out_rev;
 +			}
@@ -6085,7 +6085,7 @@
 +#endif /* __AUFS_DIR_H__ */
 --- /dev/null
 +++ b/fs/aufs/dynop.c
-@@ -0,0 +1,473 @@
+@@ -0,0 +1,404 @@
 +/*
 + * Copyright (C) 2010 Junjiro R. Okajima
 + *
@@ -6250,50 +6250,6 @@
 +	dst.func = src.func;			\
 +} while (0)
 +
-+#define DySetFop(func) \
-+	DySet(func, dyfop->df_op, aufs_file_fop, h_fop, h_sb)
-+#define DySetFopForce(func) \
-+	DySetForce(func, dyfop->df_op, aufs_file_fop)
-+
-+static void dy_fop(struct au_dykey *key, const void *h_op,
-+		   struct super_block *h_sb __maybe_unused)
-+{
-+	struct au_dyfop *dyfop = (void *)key;
-+	const struct file_operations *h_fop = h_op;
-+	DyDbgDeclare(cnt);
-+
-+	AuDbg("%s\n", au_sbtype(h_sb));
-+
-+	DySetFopForce(owner);	/* force */
-+	DySetFop(llseek);
-+	DySetFop(read);
-+	DySetFop(write);
-+	DySetFop(aio_read);
-+	DySetFop(aio_write);
-+	DySetFop(readdir);
-+	DySetFop(poll);
-+	DySetFop(ioctl);
-+	DySetFop(unlocked_ioctl);
-+	DySetFop(compat_ioctl);
-+	DySetFop(mmap);
-+	DySetFopForce(open);	/* force */
-+	DySetFop(flush);
-+	DySetFopForce(release);	/* force */
-+	DySetFop(fsync);
-+	DySetFop(aio_fsync);
-+	DySetFop(fasync);
-+	DySetFop(lock);
-+	DySetFop(sendpage);
-+	DySetFop(get_unmapped_area);
-+	DySetFop(check_flags);
-+	DySetFop(flock);
-+	DySetFop(splice_write);
-+	DySetFop(splice_read);
-+	DySetFop(setlease);
-+
-+	DyDbgSize(cnt, *h_fop);
-+}
-+
 +#define DySetAop(func) \
 +	DySet(func, dyaop->da_op, aufs_aop, h_aop, h_sb)
 +#define DySetAopForce(func) \
@@ -6375,10 +6331,6 @@
 +		void (*set_op)(struct au_dykey *key, const void *h_op,
 +			       struct super_block *h_sb __maybe_unused);
 +	} a[] = {
-+		[AuDy_FOP] = {
-+			.sz	= sizeof(struct au_dyfop),
-+			.set_op	= dy_fop
-+		},
 +		[AuDy_AOP] = {
 +			.sz	= sizeof(struct au_dyaop),
 +			.set_op	= dy_aop
@@ -6420,19 +6372,6 @@
 +}
 +
 +/* ---------------------------------------------------------------------- */
-+
-+static struct au_dyfop *dy_fget(struct au_branch *br,
-+				const struct file_operations *h_fop)
-+{
-+	struct au_dynop op = {
-+		.dy_type	= AuDy_FOP,
-+		/* .dy_hfop	= h_inode->i_fop */
-+	};
-+
-+	op.dy_hfop = h_fop;
-+	return (void *)dy_get(&op, br);
-+}
-+
 +/*
 + * Aufs prohibits O_DIRECT by defaut even if the branch supports it.
 + * This behaviour is neccessary to return an error from open(O_DIRECT) instead
@@ -6474,13 +6413,12 @@
 +	return dyaop;
 +}
 +
-+int au_dy_ifaop(struct inode *inode, aufs_bindex_t bindex,
++int au_dy_iaop(struct inode *inode, aufs_bindex_t bindex,
 +		struct inode *h_inode)
 +{
 +	int err, do_dx;
 +	struct super_block *sb;
 +	struct au_branch *br;
-+	struct au_dyfop *dyfop;
 +	struct au_dyaop *dyaop;
 +
 +	AuDebugOn(!S_ISREG(h_inode->i_mode));
@@ -6488,11 +6426,6 @@
 +
 +	sb = inode->i_sb;
 +	br = au_sbr(sb, bindex);
-+	dyfop = dy_fget(br, h_inode->i_fop);
-+	err = PTR_ERR(dyfop);
-+	if (IS_ERR(dyfop))
-+		goto out;
-+
 +	do_dx = !!au_opt_test(au_mntflags(sb), DIO);
 +	dyaop = dy_aget(br, h_inode->i_mapping->a_ops, do_dx);
 +	err = PTR_ERR(dyaop);
@@ -6501,7 +6434,6 @@
 +		goto out;
 +
 +	err = 0;
-+	inode->i_fop = &dyfop->df_op;
 +	inode->i_mapping->a_ops = &dyaop->da_op;
 +
 +out:
@@ -6544,7 +6476,6 @@
 +	int i;
 +
 +	/* make sure that 'struct au_dykey *' can be any type */
-+	BUILD_BUG_ON(offsetof(struct au_dyfop, df_key));
 +	BUILD_BUG_ON(offsetof(struct au_dyaop, da_key));
 +	BUILD_BUG_ON(offsetof(struct au_dyvmop, dv_key));
 +
@@ -6561,7 +6492,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/dynop.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,109 @@
 +/*
 + * Copyright (C) 2010 Junjiro R. Okajima
 + *
@@ -6595,13 +6526,12 @@
 +#include <linux/aufs_type.h>
 +#include "inode.h"
 +
-+enum {AuDy_FOP, AuDy_AOP, AuDy_VMOP, AuDyLast};
++enum {AuDy_AOP, AuDy_VMOP, AuDyLast};
 +
 +struct au_dynop {
 +	int						dy_type;
 +	union {
 +		const void				*dy_hop;
-+		const struct file_operations		*dy_hfop;
 +		const struct address_space_operations	*dy_haop;
 +		const struct vm_operations_struct	*dy_hvmop;
 +	};
@@ -6622,11 +6552,6 @@
 +};
 +
 +/* stop unioning since their sizes are very different from each other */
-+struct au_dyfop {
-+	struct au_dykey			df_key;
-+	struct file_operations		df_op; /* not const */
-+};
-+
 +struct au_dyaop {
 +	struct au_dykey			da_key;
 +	struct address_space_operations	da_op; /* not const */
@@ -6644,7 +6569,7 @@
 +/* dynop.c */
 +struct au_branch;
 +void au_dy_put(struct au_dykey *key);
-+int au_dy_ifaop(struct inode *inode, aufs_bindex_t bindex,
++int au_dy_iaop(struct inode *inode, aufs_bindex_t bindex,
 +		struct inode *h_inode);
 +void au_dy_arefresh(int do_dio);
 +const struct vm_operations_struct *
@@ -6657,19 +6582,9 @@
 +/* ---------------------------------------------------------------------- */
 +
 +/*
-+ * Is it safe to replace i_fop/f_op during the inode/file is in operation?
++ * Is it safe to replace a_ops during the inode/file is in operation?
 + * Yes, I hope so.
 + */
-+static inline void au_dy_frefresh(struct file *file)
-+{
-+	struct inode *inode;
-+
-+	/* fops_get/put() are unnecessary */
-+	inode = file->f_dentry->d_inode;
-+	if (S_ISREG(inode->i_mode))
-+		file->f_op = inode->i_fop;
-+}
-+
 +static inline int au_dy_irefresh(struct inode *inode)
 +{
 +	int err;
@@ -6680,7 +6595,7 @@
 +	if (S_ISREG(inode->i_mode)) {
 +		bstart = au_ibstart(inode);
 +		h_inode = au_h_iptr(inode, bstart);
-+		err = au_dy_ifaop(inode, bstart, h_inode);
++		err = au_dy_iaop(inode, bstart, h_inode);
 +	}
 +	return err;
 +}
@@ -7488,7 +7403,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/file.c
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,615 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -7652,7 +7567,6 @@
 +	au_set_fbstart(file, bstart);
 +	au_set_h_fptr(file, bstart, h_file);
 +	au_update_figen(file);
-+	au_dy_frefresh(file);
 +	/* todo: necessary? */
 +	/* file->f_ra = h_file->f_ra; */
 +
@@ -11490,7 +11404,7 @@
 +}
 +
 +/* it may be called at remount time, too */
-+void au_update_brange(struct inode *inode, int do_put_zero)
++void au_update_ibrange(struct inode *inode, int do_put_zero)
 +{
 +	struct au_iinfo *iinfo;
 +
@@ -11653,7 +11567,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/inode.c
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,416 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -11745,7 +11659,7 @@
 +			p--;
 +		}
 +	}
-+	au_update_brange(inode, /*do_put_zero*/0);
++	au_update_ibrange(inode, /*do_put_zero*/0);
 +	e = au_dy_irefresh(inode);
 +	if (unlikely(e && !err))
 +		err = e;
@@ -11799,7 +11713,7 @@
 +		au_set_h_iptr(inode, bindex, au_igrab(h_d->d_inode), flags);
 +		update = 1;
 +	}
-+	au_update_brange(inode, /*do_put_zero*/0);
++	au_update_ibrange(inode, /*do_put_zero*/0);
 +	e = au_dy_irefresh(inode);
 +	if (unlikely(e && !err))
 +		err = e;
@@ -11832,7 +11746,8 @@
 +	case S_IFREG:
 +		btail = au_dbtail(dentry);
 +		inode->i_op = &aufs_iop;
-+		err = au_dy_ifaop(inode, bstart, h_inode);
++		inode->i_fop = &aufs_file_fop;
++		err = au_dy_iaop(inode, bstart, h_inode);
 +		if (unlikely(err))
 +			goto out;
 +		break;
@@ -12274,7 +12189,7 @@
 +		   struct inode *h_inode, unsigned int flags);
 +
 +void au_update_iigen(struct inode *inode);
-+void au_update_brange(struct inode *inode, int do_put_zero);
++void au_update_ibrange(struct inode *inode, int do_put_zero);
 +
 +void au_icntnr_init_once(void *_c);
 +int au_iinfo_init(struct inode *inode);
@@ -13371,7 +13286,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/i_op.c
-@@ -0,0 +1,925 @@
+@@ -0,0 +1,924 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -13680,12 +13595,11 @@
 +		AuDebugOn(au_test_ro(sb, bcpup, dentry->d_inode));
 +	}
 +	AuDbg("bstart %d, bcpup %d\n", bstart, bcpup);
-+	if (bstart < bcpup)
-+		au_update_dbrange(dentry, /*do_put_zero*/1);
-+
 +	err = bcpup;
 +	if (bcpup == bstart)
 +		goto out; /* success */
++	else if (bstart < bcpup)
++		au_update_dbrange(dentry, /*do_put_zero*/1);
 +
 +	/* copyup the new parent into the branch we process */
 +	err = au_wr_dir_cpup(dentry, parent, add_entry, bcpup, bstart);
@@ -15754,7 +15668,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/Kconfig
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,176 @@
 +config AUFS_FS
 +	tristate "Aufs (Advanced multi layered unification filesystem) support"
 +	depends on EXPERIMENTAL
@@ -15844,9 +15758,13 @@
 +config AUFS_RDU
 +	bool "Readdir in userspace"
 +	help
-+	If you have millions of files under a single aufs directory, and
-+	meet the out of memory, then enable this option and set
-+	environment variables for your readdir(3).
++	Aufs has two methods to provide a merged view for a directory,
++	by a user-space library and by kernel-space natively. The latter
++	is always enabled but sometimes large and slow.
++	If you enable this option, install the library in aufs2-util
++	package, and set some environment variables for your readdir(3),
++	then the work will be handled in user-space which generally
++	shows better performance in most cases.
 +	See detail in aufs.5.
 +
 +config AUFS_SP_IATTR
@@ -26560,7 +26478,7 @@
 +#include <linux/limits.h>
 +#include <linux/types.h>
 +
-+#define AUFS_VERSION	"2-standalone.tree-20100510"
++#define AUFS_VERSION	"2-standalone.tree-20100517"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
