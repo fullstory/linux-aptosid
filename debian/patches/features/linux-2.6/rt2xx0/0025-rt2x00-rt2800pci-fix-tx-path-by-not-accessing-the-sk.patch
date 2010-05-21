@@ -1,0 +1,93 @@
+From 745b1ae31ba6644a943ec2b6da2d03f00d8b2dd2 Mon Sep 17 00:00:00 2001
+From: Helmut Schaa <helmut.schaa@googlemail.com>
+Date: Thu, 15 Apr 2010 09:13:35 +0200
+Subject: [PATCH 25/62] rt2x00: rt2800pci: fix tx path by not accessing the skb after it was DMA mapped
+
+rt2800pci used the callback write_tx_desc to write the tx descriptor but
+also to update the txwi which is part of the dma mapped skb. Since the
+memory was already DMA mapped _before_ the call to write_tx_desc the
+device didn't get the txwi data at all or only sporadically.
+
+The call order is basically as follows (from rt2x00queue.c):
+1) write_tx_data
+2) rt2x00queue_map_txskb
+3) write_tx_desc
+
+Hence, we shouldn't touch the skb in write_tx_desc anymore.
+
+To fix this issue create a new rt2800pci_write_tx_data callback and use it
+for updating the txwi _before_ the memory gets DMA mapped.
+
+The tx descriptor is still written (as before) in write_tx_desc.
+
+This patch allows basic TX on an rt305x soc device but I'm pretty sure
+that it will fix pci based cards as well. I can associate just fine with
+an AP now but I wasn't able to get a wpa secured connection working yet.
+
+Signed-off-by: Helmut Schaa <helmut.schaa@googlemail.com>
+Acked-by: Gertjan van Wingerde <gwingerde@gmail.com>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+---
+ drivers/net/wireless/rt2x00/rt2800pci.c |   34 ++++++++++++++++++++++++------
+ 1 files changed, 27 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/wireless/rt2x00/rt2800pci.c
++++ b/drivers/net/wireless/rt2x00/rt2800pci.c
+@@ -613,15 +613,23 @@ static int rt2800pci_set_device_state(st
+ /*
+  * TX descriptor initialization
+  */
+-static void rt2800pci_write_tx_desc(struct rt2x00_dev *rt2x00dev,
+-				    struct sk_buff *skb,
+-				    struct txentry_desc *txdesc)
++static int rt2800pci_write_tx_data(struct queue_entry* entry,
++				   struct txentry_desc *txdesc)
+ {
+-	struct skb_frame_desc *skbdesc = get_skb_frame_desc(skb);
+-	__le32 *txd = skbdesc->desc;
+-	__le32 *txwi = (__le32 *)(skb->data - rt2x00dev->ops->extra_tx_headroom);
++	struct rt2x00_dev *rt2x00dev = entry->queue->rt2x00dev;
++	struct sk_buff *skb = entry->skb;
++	struct skb_frame_desc *skbdesc;
++	int ret;
++	__le32 *txwi;
+ 	u32 word;
+ 
++	ret = rt2x00pci_write_tx_data(entry, txdesc);
++	if (ret)
++		return ret;
++
++	skbdesc = get_skb_frame_desc(skb);
++	txwi = (__le32 *)(skb->data - rt2x00dev->ops->extra_tx_headroom);
++
+ 	/*
+ 	 * Initialize TX Info descriptor
+ 	 */
+@@ -670,6 +678,18 @@ static void rt2800pci_write_tx_desc(stru
+ 	_rt2x00_desc_write(txwi, 2, 0 /* skbdesc->iv[0] */);
+ 	_rt2x00_desc_write(txwi, 3, 0 /* skbdesc->iv[1] */);
+ 
++	return 0;
++}
++
++
++static void rt2800pci_write_tx_desc(struct rt2x00_dev *rt2x00dev,
++				    struct sk_buff *skb,
++				    struct txentry_desc *txdesc)
++{
++	struct skb_frame_desc *skbdesc = get_skb_frame_desc(skb);
++	__le32 *txd = skbdesc->desc;
++	u32 word;
++
+ 	/*
+ 	 * The buffers pointed by SD_PTR0/SD_LEN0 and SD_PTR1/SD_LEN1
+ 	 * must contains a TXWI structure + 802.11 header + padding + 802.11
+@@ -1135,7 +1155,7 @@ static const struct rt2x00lib_ops rt2800
+ 	.reset_tuner		= rt2800_reset_tuner,
+ 	.link_tuner		= rt2800_link_tuner,
+ 	.write_tx_desc		= rt2800pci_write_tx_desc,
+-	.write_tx_data		= rt2x00pci_write_tx_data,
++	.write_tx_data		= rt2800pci_write_tx_data,
+ 	.write_beacon		= rt2800pci_write_beacon,
+ 	.kick_tx_queue		= rt2800pci_kick_tx_queue,
+ 	.kill_tx_queue		= rt2800pci_kill_tx_queue,
