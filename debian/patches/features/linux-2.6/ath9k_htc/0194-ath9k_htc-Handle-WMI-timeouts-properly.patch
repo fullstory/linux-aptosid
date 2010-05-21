@@ -1,0 +1,66 @@
+From 6ce34ec11c6297562e70e27c57a24cd27d4cd2b1 Mon Sep 17 00:00:00 2001
+From: Sujith <Sujith.Manoharan@atheros.com>
+Date: Fri, 16 Apr 2010 11:54:01 +0530
+Subject: [PATCH 194/270] ath9k_htc: Handle WMI timeouts properly
+
+If a WMI command has timed out for some reason,
+a late WMI response would end up updating the
+response region of a new WMI request that has been
+issued in the meantime.
+
+Fix this race condition by dropping a WMI response
+if a new WMI command has been issued.
+
+Signed-off-by: Sujith <Sujith.Manoharan@atheros.com>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+---
+ drivers/net/wireless/ath/ath9k/wmi.c |   13 +++++++++++++
+ drivers/net/wireless/ath/ath9k/wmi.h |    1 +
+ 2 files changed, 14 insertions(+), 0 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath9k/wmi.c
++++ b/drivers/net/wireless/ath/ath9k/wmi.c
+@@ -204,6 +204,14 @@ static void ath9k_wmi_ctrl_rx(void *priv
+ 		return;
+ 	}
+ 
++	/* Check if there has been a timeout. */
++	spin_lock(&wmi->wmi_lock);
++	if (cmd_id != wmi->last_cmd_id) {
++		spin_unlock(&wmi->wmi_lock);
++		goto free_skb;
++	}
++	spin_unlock(&wmi->wmi_lock);
++
+ 	/* WMI command response */
+ 	ath9k_wmi_rsp_callback(wmi, skb);
+ 
+@@ -266,6 +274,7 @@ int ath9k_wmi_cmd(struct wmi *wmi, enum
+ 	struct sk_buff *skb;
+ 	u8 *data;
+ 	int time_left, ret = 0;
++	unsigned long flags;
+ 
+ 	if (!wmi)
+ 		return -EINVAL;
+@@ -297,6 +306,10 @@ int ath9k_wmi_cmd(struct wmi *wmi, enum
+ 	if (ret)
+ 		goto out;
+ 
++	spin_lock_irqsave(&wmi->wmi_lock, flags);
++	wmi->last_cmd_id = cmd_id;
++	spin_unlock_irqrestore(&wmi->wmi_lock, flags);
++
+ 	time_left = wait_for_completion_timeout(&wmi->cmd_wait, timeout);
+ 	if (!time_left) {
+ 		ath_print(common, ATH_DBG_WMI,
+--- a/drivers/net/wireless/ath/ath9k/wmi.h
++++ b/drivers/net/wireless/ath/ath9k/wmi.h
+@@ -97,6 +97,7 @@ struct wmi {
+ 	enum htc_endpoint_id ctrl_epid;
+ 	struct mutex op_mutex;
+ 	struct completion cmd_wait;
++	enum wmi_cmd_id last_cmd_id;
+ 	u16 tx_seq_id;
+ 	u8 *cmd_rsp_buf;
+ 	u32 cmd_rsp_len;
