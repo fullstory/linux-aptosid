@@ -1405,7 +1405,7 @@
 +${obj}/sysfs.o: ${AuConfName}
 --- /dev/null
 +++ b/fs/aufs/cpup.c
-@@ -0,0 +1,1057 @@
+@@ -0,0 +1,1059 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -1817,29 +1817,31 @@
 +{
 +	int err, symlen;
 +	mm_segment_t old_fs;
-+	char *sym;
++	union {
++		char *k;
++		char __user *u;
++	} sym;
 +
 +	err = -ENOSYS;
 +	if (unlikely(!h_src->d_inode->i_op->readlink))
 +		goto out;
 +
 +	err = -ENOMEM;
-+	sym = __getname_gfp(GFP_NOFS);
-+	if (unlikely(!sym))
++	sym.k = __getname_gfp(GFP_NOFS);
++	if (unlikely(!sym.k))
 +		goto out;
 +
 +	old_fs = get_fs();
 +	set_fs(KERNEL_DS);
-+	symlen = h_src->d_inode->i_op->readlink(h_src, (char __user *)sym,
-+						PATH_MAX);
++	symlen = h_src->d_inode->i_op->readlink(h_src, sym.u, PATH_MAX);
 +	err = symlen;
 +	set_fs(old_fs);
 +
 +	if (symlen > 0) {
-+		sym[symlen] = 0;
-+		err = vfsub_symlink(h_dir, h_path, sym);
++		sym.k[symlen] = 0;
++		err = vfsub_symlink(h_dir, h_path, sym.k);
 +	}
-+	__putname(sym);
++	__putname(sym.k);
 +
 + out:
 +	return err;
@@ -11682,7 +11684,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/inode.c
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,443 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -11956,11 +11958,10 @@
 +{
 +	int err;
 +	struct mutex *mtx;
-+	const int isdir = (d_type == DT_DIR);
 +
-+	/* prevent hardlinks from race condition */
++	/* prevent hardlinked inode number from race condition */
 +	mtx = NULL;
-+	if (!isdir) {
++	if (d_type != DT_DIR) {
 +		mtx = &au_sbr(sb, bindex)->br_xino.xi_nondir_mtx;
 +		mutex_lock(mtx);
 +	}
@@ -11979,7 +11980,7 @@
 +	}
 +
 + out:
-+	if (!isdir)
++	if (mtx)
 +		mutex_unlock(mtx);
 +	return err;
 +}
@@ -11988,9 +11989,10 @@
 +/* todo: return with unlocked? */
 +struct inode *au_new_inode(struct dentry *dentry, int must_new)
 +{
-+	struct inode *inode;
++	struct inode *inode, *h_inode;
 +	struct dentry *h_dentry;
 +	struct super_block *sb;
++	struct mutex *mtx;
 +	ino_t h_ino, ino;
 +	int err, match;
 +	aufs_bindex_t bstart;
@@ -11998,12 +12000,25 @@
 +	sb = dentry->d_sb;
 +	bstart = au_dbstart(dentry);
 +	h_dentry = au_h_dptr(dentry, bstart);
-+	h_ino = h_dentry->d_inode->i_ino;
++	h_inode = h_dentry->d_inode;
++	h_ino = h_inode->i_ino;
++
++	/*
++	 * stop 'race'-ing between hardlinks under different
++	 * parents.
++	 */
++	mtx = NULL;
++	if (!S_ISDIR(h_inode->i_mode))
++		mtx = &au_sbr(sb, bstart)->br_xino.xi_nondir_mtx;
++
++ new_ino:
++	if (mtx)
++		mutex_lock(mtx);
 +	err = au_xino_read(sb, bstart, h_ino, &ino);
 +	inode = ERR_PTR(err);
 +	if (unlikely(err))
 +		goto out;
-+ new_ino:
++
 +	if (!ino) {
 +		ino = au_xino_new_ino(sb);
 +		if (unlikely(!ino)) {
@@ -12031,11 +12046,21 @@
 +		iget_failed(inode);
 +		goto out_err;
 +	} else if (!must_new) {
++		/*
++		 * horrible race condition between lookup, readdir and copyup
++		 * (or something).
++		 */
++		if (mtx)
++			mutex_unlock(mtx);
 +		err = reval_inode(inode, dentry, &match);
-+		if (!err)
++		if (!err) {
++			mtx = NULL;
 +			goto out; /* success */
-+		else if (match)
++		} else if (match) {
++			mtx = NULL;
 +			goto out_iput;
++		} else if (mtx)
++			mutex_lock(mtx);
 +	}
 +
 +	if (unlikely(au_test_fs_unique_ino(h_dentry->d_inode)))
@@ -12047,6 +12072,8 @@
 +	err = au_xino_write(sb, bstart, h_ino, /*ino*/0);
 +	if (!err) {
 +		iput(inode);
++		if (mtx)
++			mutex_unlock(mtx);
 +		goto new_ino;
 +	}
 +
@@ -12055,6 +12082,8 @@
 + out_err:
 +	inode = ERR_PTR(err);
 + out:
++	if (mtx)
++		mutex_unlock(mtx);
 +	return inode;
 +}
 +
@@ -13406,7 +13435,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/i_op.c
-@@ -0,0 +1,924 @@
+@@ -0,0 +1,912 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -13561,11 +13590,9 @@
 +				  struct nameidata *nd)
 +{
 +	struct dentry *ret, *parent;
-+	struct inode *inode, *h_inode;
-+	struct mutex *mtx;
++	struct inode *inode;
 +	struct super_block *sb;
 +	int err, npositive;
-+	aufs_bindex_t bstart;
 +
 +	IMustLock(dir);
 +
@@ -13590,19 +13617,7 @@
 +
 +	inode = NULL;
 +	if (npositive) {
-+		bstart = au_dbstart(dentry);
-+		h_inode = au_h_dptr(dentry, bstart)->d_inode;
-+		if (!S_ISDIR(h_inode->i_mode)) {
-+			/*
-+			 * stop 'race'-ing between hardlinks under different
-+			 * parents.
-+			 */
-+			mtx = &au_sbr(sb, bstart)->br_xino.xi_nondir_mtx;
-+			mutex_lock(mtx);
-+			inode = au_new_inode(dentry, /*must_new*/0);
-+			mutex_unlock(mtx);
-+		} else
-+			inode = au_new_inode(dentry, /*must_new*/0);
++		inode = au_new_inode(dentry, /*must_new*/0);
 +		ret = (void *)inode;
 +	}
 +	if (IS_ERR(inode))
@@ -14253,29 +14268,31 @@
 +static void *aufs_follow_link(struct dentry *dentry, struct nameidata *nd)
 +{
 +	int err;
-+	char *buf;
 +	mm_segment_t old_fs;
++	union {
++		char *k;
++		char __user *u;
++	} buf;
 +
 +	err = -ENOMEM;
-+	buf = __getname_gfp(GFP_NOFS);
-+	if (unlikely(!buf))
++	buf.k = __getname_gfp(GFP_NOFS);
++	if (unlikely(!buf.k))
 +		goto out;
 +
 +	aufs_read_lock(dentry, AuLock_IR);
 +	old_fs = get_fs();
 +	set_fs(KERNEL_DS);
-+	err = h_readlink(dentry, au_dbstart(dentry), (char __user *)buf,
-+			 PATH_MAX);
++	err = h_readlink(dentry, au_dbstart(dentry), buf.u, PATH_MAX);
 +	set_fs(old_fs);
 +	aufs_read_unlock(dentry, AuLock_IR);
 +
 +	if (err >= 0) {
-+		buf[err] = 0;
++		buf.k[err] = 0;
 +		/* will be freed by put_link */
-+		nd_set_link(nd, buf);
++		nd_set_link(nd, buf.k);
 +		return NULL; /* success */
 +	}
-+	__putname(buf);
++	__putname(buf.k);
 +
 + out:
 +	path_put(&nd->path);
@@ -22274,7 +22291,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/vfsub.c
-@@ -0,0 +1,805 @@
+@@ -0,0 +1,815 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -22479,7 +22496,7 @@
 +
 +	d = path->dentry;
 +	path->dentry = d->d_parent;
-+	err = security_path_mknod(path, path->dentry, mode, 0);
++	err = security_path_mknod(path, d, mode, 0);
 +	path->dentry = d;
 +	if (unlikely(err))
 +		goto out;
@@ -22526,7 +22543,7 @@
 +
 +	d = path->dentry;
 +	path->dentry = d->d_parent;
-+	err = security_path_symlink(path, path->dentry, symname);
++	err = security_path_symlink(path, d, symname);
 +	path->dentry = d;
 +	if (unlikely(err))
 +		goto out;
@@ -22557,7 +22574,7 @@
 +
 +	d = path->dentry;
 +	path->dentry = d->d_parent;
-+	err = security_path_mknod(path, path->dentry, mode, dev);
++	err = security_path_mknod(path, d, mode, dev);
 +	path->dentry = d;
 +	if (unlikely(err))
 +		goto out;
@@ -22602,7 +22619,7 @@
 +
 +	d = path->dentry;
 +	path->dentry = d->d_parent;
-+	err = security_path_link(src_dentry, path, path->dentry);
++	err = security_path_link(src_dentry, path, d);
 +	path->dentry = d;
 +	if (unlikely(err))
 +		goto out;
@@ -22644,7 +22661,7 @@
 +	d = path->dentry;
 +	path->dentry = d->d_parent;
 +	tmp.dentry = src_dentry->d_parent;
-+	err = security_path_rename(&tmp, src_dentry, path, path->dentry);
++	err = security_path_rename(&tmp, src_dentry, path, d);
 +	path->dentry = d;
 +	if (unlikely(err))
 +		goto out;
@@ -22679,7 +22696,7 @@
 +
 +	d = path->dentry;
 +	path->dentry = d->d_parent;
-+	err = security_path_mkdir(path, path->dentry, mode);
++	err = security_path_mkdir(path, d, mode);
 +	path->dentry = d;
 +	if (unlikely(err))
 +		goto out;
@@ -22710,7 +22727,7 @@
 +
 +	d = path->dentry;
 +	path->dentry = d->d_parent;
-+	err = security_path_rmdir(path, path->dentry);
++	err = security_path_rmdir(path, d);
 +	path->dentry = d;
 +	if (unlikely(err))
 +		goto out;
@@ -22750,10 +22767,15 @@
 +{
 +	ssize_t err;
 +	mm_segment_t oldfs;
++	union {
++		void *k;
++		char __user *u;
++	} buf;
 +
++	buf.k = kbuf;
 +	oldfs = get_fs();
 +	set_fs(KERNEL_DS);
-+	err = vfsub_read_u(file, (char __user *)kbuf, count, ppos);
++	err = vfsub_read_u(file, buf.u, count, ppos);
 +	set_fs(oldfs);
 +	return err;
 +}
@@ -22775,10 +22797,15 @@
 +{
 +	ssize_t err;
 +	mm_segment_t oldfs;
++	union {
++		void *k;
++		const char __user *u;
++	} buf;
 +
++	buf.k = kbuf;
 +	oldfs = get_fs();
 +	set_fs(KERNEL_DS);
-+	err = vfsub_write_u(file, (const char __user *)kbuf, count, ppos);
++	err = vfsub_write_u(file, buf.u, count, ppos);
 +	set_fs(oldfs);
 +	return err;
 +}
@@ -25378,7 +25405,7 @@
 +#endif /* __AUFS_WKQ_H__ */
 --- /dev/null
 +++ b/fs/aufs/xino.c
-@@ -0,0 +1,1202 @@
+@@ -0,0 +1,1212 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -25406,17 +25433,22 @@
 +#include <linux/uaccess.h>
 +#include "aufs.h"
 +
-+ssize_t xino_fread(au_readf_t func, struct file *file, void *buf, size_t size,
++ssize_t xino_fread(au_readf_t func, struct file *file, void *kbuf, size_t size,
 +		   loff_t *pos)
 +{
 +	ssize_t err;
 +	mm_segment_t oldfs;
++	union {
++		void *k;
++		char __user *u;
++	} buf;
 +
++	buf.k = kbuf;
 +	oldfs = get_fs();
 +	set_fs(KERNEL_DS);
 +	do {
 +		/* todo: signal_pending? */
-+		err = func(file, (char __user *)buf, size, pos);
++		err = func(file, buf.u, size, pos);
 +	} while (err == -EAGAIN || err == -EINTR);
 +	set_fs(oldfs);
 +
@@ -25430,18 +25462,23 @@
 +
 +/* ---------------------------------------------------------------------- */
 +
-+static ssize_t do_xino_fwrite(au_writef_t func, struct file *file, void *buf,
++static ssize_t do_xino_fwrite(au_writef_t func, struct file *file, void *kbuf,
 +			      size_t size, loff_t *pos)
 +{
 +	ssize_t err;
 +	mm_segment_t oldfs;
++	union {
++		void *k;
++		const char __user *u;
++	} buf;
 +
++	buf.k = kbuf;
 +	oldfs = get_fs();
 +	set_fs(KERNEL_DS);
 +	/* lockdep_off(); */
 +	do {
 +		/* todo: signal_pending? */
-+		err = func(file, (const char __user *)buf, size, pos);
++		err = func(file, buf.u, size, pos);
 +	} while (err == -EAGAIN || err == -EINTR);
 +	/* lockdep_on(); */
 +	set_fs(oldfs);
@@ -26613,7 +26650,7 @@
 +#include <linux/limits.h>
 +#include <linux/types.h>
 +
-+#define AUFS_VERSION	"2-standalone.tree-34-20100531"
++#define AUFS_VERSION	"2-standalone.tree-34-20100607"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
