@@ -131,7 +131,7 @@
 +#endif /* __AUFS_H__ */
 --- /dev/null
 +++ b/fs/aufs/branch.c
-@@ -0,0 +1,1007 @@
+@@ -0,0 +1,1000 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -188,11 +188,7 @@
 +		else
 +			break;
 +
-+	/* some filesystems acquire extra lock */
-+	/* lockdep_off(); */
 +	mntput(br->br_mnt);
-+	/* lockdep_on(); */
-+
 +	kfree(wbr);
 +	kfree(br);
 +}
@@ -660,11 +656,10 @@
 + * test if the branch is deletable or not.
 + */
 +static int test_dentry_busy(struct dentry *root, aufs_bindex_t bindex,
-+			    unsigned int sigen)
++			    unsigned int sigen, const unsigned int verbose)
 +{
 +	int err, i, j, ndentry;
 +	aufs_bindex_t bstart, bend;
-+	unsigned char verbose;
 +	struct au_dcsub_pages dpages;
 +	struct au_dpage *dpage;
 +	struct dentry *d;
@@ -677,7 +672,6 @@
 +	if (unlikely(err))
 +		goto out_dpages;
 +
-+	verbose = !!au_opt_test(au_mntflags(root->d_sb), VERBOSE);
 +	for (i = 0; !err && i < dpages.ndpage; i++) {
 +		dpage = dpages.dpages + i;
 +		ndentry = dpage->ndentry;
@@ -718,15 +712,13 @@
 +}
 +
 +static int test_inode_busy(struct super_block *sb, aufs_bindex_t bindex,
-+			   unsigned int sigen)
++			   unsigned int sigen, const unsigned int verbose)
 +{
 +	int err;
 +	struct inode *i;
 +	aufs_bindex_t bstart, bend;
-+	unsigned char verbose;
 +
 +	err = 0;
-+	verbose = !!au_opt_test(au_mntflags(sb), VERBOSE);
 +	list_for_each_entry(i, &sb->s_inodes, i_sb_list) {
 +		AuDebugOn(!atomic_read(&i->i_count));
 +		if (!list_empty(&i->i_dentry))
@@ -762,7 +754,8 @@
 +	return err;
 +}
 +
-+static int test_children_busy(struct dentry *root, aufs_bindex_t bindex)
++static int test_children_busy(struct dentry *root, aufs_bindex_t bindex,
++			      const unsigned int verbose)
 +{
 +	int err;
 +	unsigned int sigen;
@@ -771,9 +764,9 @@
 +	DiMustNoWaiters(root);
 +	IiMustNoWaiters(root->d_inode);
 +	di_write_unlock(root);
-+	err = test_dentry_busy(root, bindex, sigen);
++	err = test_dentry_busy(root, bindex, sigen, verbose);
 +	if (!err)
-+		err = test_inode_busy(root->d_sb, bindex, sigen);
++		err = test_inode_busy(root->d_sb, bindex, sigen, verbose);
 +	di_write_lock_child(root); /* aufs_write_lock() calls ..._child() */
 +
 +	return err;
@@ -910,7 +903,7 @@
 +		}
 +	}
 +
-+	err = test_children_busy(sb->s_root, bindex);
++	err = test_children_busy(sb->s_root, bindex, verbose);
 +	if (unlikely(err)) {
 +		if (do_wh)
 +			goto out_wh;
@@ -1141,7 +1134,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/branch.h
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,224 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -1301,8 +1294,7 @@
 +struct file *au_xino_create2(struct file *base_file, struct file *copy_src);
 +struct file *au_xino_create(struct super_block *sb, char *fname, int silent);
 +ino_t au_xino_new_ino(struct super_block *sb);
-+int au_xino_write0(struct super_block *sb, aufs_bindex_t bindex, ino_t h_ino,
-+		   ino_t ino);
++void au_xino_delete_inode(struct inode *inode, const int unlinked);
 +int au_xino_write(struct super_block *sb, aufs_bindex_t bindex, ino_t h_ino,
 +		  ino_t ino);
 +int au_xino_read(struct super_block *sb, aufs_bindex_t bindex, ino_t h_ino,
@@ -5362,7 +5354,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/dir.c
-@@ -0,0 +1,637 @@
+@@ -0,0 +1,635 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -5769,9 +5761,7 @@
 +
 +		di_read_unlock(dentry, AuLock_IR);
 +		si_read_unlock(sb);
-+		/* lockdep_off(); */
 +		err = au_vdir_fill_de(file, dirent, filldir);
-+		/* lockdep_on(); */
 +		fsstack_copy_attr_atime(inode, h_inode);
 +		fi_write_unlock(file);
 +
@@ -6651,7 +6641,7 @@
 +#endif /* __AUFS_DYNOP_H__ */
 --- /dev/null
 +++ b/fs/aufs/export.c
-@@ -0,0 +1,801 @@
+@@ -0,0 +1,788 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -6745,41 +6735,28 @@
 +/* ---------------------------------------------------------------------- */
 +/* inode generation external table */
 +
-+int au_xigen_inc(struct inode *inode)
++void au_xigen_inc(struct inode *inode)
 +{
-+	int err;
 +	loff_t pos;
 +	ssize_t sz;
 +	__u32 igen;
 +	struct super_block *sb;
 +	struct au_sbinfo *sbinfo;
 +
-+	err = 0;
 +	sb = inode->i_sb;
-+	sbinfo = au_sbi(sb);
-+	/*
-+	 * temporary workaround for escaping from SiMustAnyLock() in
-+	 * au_mntflags(), since this function is called from au_iinfo_fin().
-+	 */
-+	if (unlikely(!au_opt_test(sbinfo->si_mntflags, XINO)))
-+		goto out;
++	AuDebugOn(!au_opt_test(au_mntflags(sb), XINO));
 +
++	sbinfo = au_sbi(sb);
 +	pos = inode->i_ino;
 +	pos *= sizeof(igen);
 +	igen = inode->i_generation + 1;
 +	sz = xino_fwrite(sbinfo->si_xwrite, sbinfo->si_xigen, &igen,
 +			 sizeof(igen), &pos);
 +	if (sz == sizeof(igen))
-+		goto out; /* success */
++		return; /* success */
 +
-+	err = sz;
-+	if (unlikely(sz >= 0)) {
-+		err = -EIO;
++	if (unlikely(sz >= 0))
 +		AuIOErr("xigen error (%zd)\n", sz);
-+	}
-+
-+ out:
-+	return err;
 +}
 +
 +int au_xigen_new(struct inode *inode)
@@ -7776,12 +7753,12 @@
 +	inode = dentry->d_inode;
 +	si_noflush_read_lock(sb);
 +	fi_read_lock(file);
-+	di_read_lock_child(dentry, AuLock_IW);
++	ii_read_lock_child(inode);
 +
 +	err = flush(file, id);
 +	au_cpup_attr_timesizes(inode);
 +
-+	di_read_unlock(dentry, AuLock_IW);
++	ii_read_unlock(inode);
 +	fi_read_unlock(file);
 +	si_read_unlock(sb);
 +	return err;
@@ -10730,7 +10707,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/hnotify.c
-@@ -0,0 +1,671 @@
+@@ -0,0 +1,663 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -11331,13 +11308,7 @@
 +
 +	err = -ENOMEM;
 +	/* iput() and kfree() will be called in au_hnotify() */
-+	/*
-+	 * inotify_mutex is already acquired and kmalloc/prune_icache may lock
-+	 * iprune_mutex. strange.
-+	 */
-+	/* lockdep_off(); */
 +	args = kmalloc(sizeof(*args) + len + 1, GFP_NOFS);
-+	/* lockdep_on(); */
 +	if (unlikely(!args)) {
 +		AuErr1("no memory\n");
 +		iput(dir);
@@ -11359,9 +11330,7 @@
 +		p[len] = 0;
 +	}
 +
-+	/* lockdep_off(); */
 +	err = au_wkq_nowait(au_hn_bh, args, dir->i_sb);
-+	/* lockdep_on(); */
 +	if (unlikely(err)) {
 +		pr_err("wkq %d\n", err);
 +		iput(args->h_child_inode);
@@ -11404,7 +11373,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/iinfo.c
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,257 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -11618,67 +11587,47 @@
 +	return err;
 +}
 +
-+static int au_iinfo_write0(struct super_block *sb, struct au_hinode *hinode,
-+			   ino_t ino)
-+{
-+	int err;
-+	aufs_bindex_t bindex;
-+	unsigned char locked;
-+
-+	err = 0;
-+	locked = !!si_noflush_read_trylock(sb);
-+	bindex = au_br_index(sb, hinode->hi_id);
-+	if (bindex >= 0)
-+		err = au_xino_write0(sb, bindex, hinode->hi_inode->i_ino, ino);
-+	/* error action? */
-+	if (locked)
-+		si_read_unlock(sb);
-+	return err;
-+}
-+
 +void au_iinfo_fin(struct inode *inode)
 +{
-+	ino_t ino;
-+	aufs_bindex_t bend;
-+	unsigned char unlinked = !inode->i_nlink;
 +	struct au_iinfo *iinfo;
 +	struct au_hinode *hi;
 +	struct super_block *sb;
-+
-+	if (unlinked) {
-+		int err = au_xigen_inc(inode);
-+		if (unlikely(err))
-+			AuWarn1("failed resetting i_generation, %d\n", err);
-+	}
++	aufs_bindex_t bindex, bend;
++	const unsigned char unlinked = !inode->i_nlink;
 +
 +	iinfo = au_ii(inode);
 +	/* bad_inode case */
 +	if (!iinfo)
 +		return;
 +
++	sb = inode->i_sb;
++	if (si_pid_test(sb))
++		au_xino_delete_inode(inode, unlinked);
++	else {
++		/*
++		 * it is safe to hide the dependency between sbinfo and
++		 * sb->s_umount.
++		 */
++		lockdep_off();
++		si_noflush_read_lock(sb);
++		au_xino_delete_inode(inode, unlinked);
++		si_read_unlock(sb);
++		lockdep_on();
++	}
++
 +	if (iinfo->ii_vdir)
 +		au_vdir_free(iinfo->ii_vdir);
 +
-+	if (iinfo->ii_bstart >= 0) {
-+		sb = inode->i_sb;
-+		ino = 0;
-+		if (unlinked)
-+			ino = inode->i_ino;
-+		hi = iinfo->ii_hinode + iinfo->ii_bstart;
++	bindex = iinfo->ii_bstart;
++	if (bindex >= 0) {
++		hi = iinfo->ii_hinode + bindex;
 +		bend = iinfo->ii_bend;
-+		while (iinfo->ii_bstart++ <= bend) {
-+			if (hi->hi_inode) {
-+				if (unlinked || !hi->hi_inode->i_nlink) {
-+					au_iinfo_write0(sb, hi, ino);
-+					/* ignore this error */
-+					ino = 0;
-+				}
++		while (bindex++ <= bend) {
++			if (hi->hi_inode)
 +				au_hiput(hi);
-+			}
 +			hi++;
 +		}
 +	}
-+
 +	kfree(iinfo->ii_hinode);
 +	AuRwDestroy(&iinfo->ii_rwsem);
 +}
@@ -15983,7 +15932,7 @@
 +endif
 --- /dev/null
 +++ b/fs/aufs/loop.c
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,60 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -16033,11 +15982,16 @@
 +/* true if a kernel thread named 'loop[0-9].*' accesses a file */
 +int au_test_loopback_kthread(void)
 +{
-+	const char c = current->comm[4];
++	int ret;
 +
-+	return current->mm == NULL
-+	       && '0' <= c && c <= '9'
-+	       && strncmp(current->comm, "loop", 4) == 0;
++	ret = 0;
++	if (current->flags & PF_KTHREAD) {
++		const char c = current->comm[4];
++		ret = ('0' <= c && c <= '9'
++		       && !strncmp(current->comm, "loop", 4));
++	}
++
++	return ret;
 +}
 --- /dev/null
 +++ b/fs/aufs/loop.h
@@ -18284,7 +18238,7 @@
 +#endif /* __AUFS_OPTS_H__ */
 --- /dev/null
 +++ b/fs/aufs/plink.c
-@@ -0,0 +1,453 @@
+@@ -0,0 +1,451 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -18708,7 +18662,6 @@
 +{
 +	long err;
 +	struct super_block *sb;
-+	struct au_sbinfo *sbinfo;
 +
 +	err = -EACCES;
 +	if (!capable(CAP_SYS_ADMIN))
@@ -18716,7 +18669,6 @@
 +
 +	err = 0;
 +	sb = file->f_dentry->d_sb;
-+	sbinfo = au_sbi(sb);
 +	switch (cmd) {
 +	case AUFS_CTL_PLINK_MAINT:
 +		/*
@@ -18727,7 +18679,7 @@
 +		break;
 +	case AUFS_CTL_PLINK_CLEAN:
 +		aufs_write_lock(sb->s_root);
-+		if (au_opt_test(sbinfo->si_mntflags, PLINK))
++		if (au_opt_test(au_mntflags(sb), PLINK))
 +			au_plink_put(sb);
 +		aufs_write_unlock(sb->s_root);
 +		break;
@@ -19322,7 +19274,7 @@
 +#endif /* __AUFS_RWSEM_H__ */
 --- /dev/null
 +++ b/fs/aufs/sbinfo.c
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,269 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -19354,6 +19306,7 @@
 +{
 +	struct au_sbinfo *sbinfo;
 +	struct super_block *sb;
++	char *locked __maybe_unused; /* debug only */
 +
 +	sbinfo = container_of(kobj, struct au_sbinfo, si_kobj);
 +	AuDebugOn(!list_empty(&sbinfo->si_plink.head));
@@ -19363,9 +19316,16 @@
 +	si_write_lock(sb);
 +	au_xino_clr(sb);
 +	au_br_free(sbinfo);
-+	kfree(sbinfo->si_branch);
-+	mutex_destroy(&sbinfo->si_xib_mtx);
 +	si_write_unlock(sb);
++
++	AuDebugOn(radix_tree_gang_lookup
++		  (&sbinfo->au_si_pid.tree, (void **)&locked,
++		   /*first_index*/PID_MAX_DEFAULT - 1,
++		   /*max_items*/sizeof(locked)/sizeof(*locked)));
++
++	kfree(sbinfo->si_branch);
++	kfree(sbinfo->au_si_pid.bitmap);
++	mutex_destroy(&sbinfo->si_xib_mtx);
 +	AuRwDestroy(&sbinfo->si_rwsem);
 +
 +	kfree(sbinfo);
@@ -19381,10 +19341,18 @@
 +	if (unlikely(!sbinfo))
 +		goto out;
 +
++	BUILD_BUG_ON(sizeof(unsigned long) !=
++		     sizeof(*sbinfo->au_si_pid.bitmap));
++	sbinfo->au_si_pid.bitmap = kcalloc(BITS_TO_LONGS(PID_MAX_DEFAULT),
++					sizeof(*sbinfo->au_si_pid.bitmap),
++					GFP_NOFS);
++	if (unlikely(!sbinfo->au_si_pid.bitmap))
++		goto out_sbinfo;
++
 +	/* will be reallocated separately */
 +	sbinfo->si_branch = kzalloc(sizeof(*sbinfo->si_branch), GFP_NOFS);
 +	if (unlikely(!sbinfo->si_branch))
-+		goto out_sbinfo;
++		goto out_pidmap;
 +
 +	err = sysaufs_si_init(sbinfo);
 +	if (unlikely(err))
@@ -19392,6 +19360,9 @@
 +
 +	au_nwt_init(&sbinfo->si_nowait);
 +	au_rw_init_wlock(&sbinfo->si_rwsem);
++	spin_lock_init(&sbinfo->au_si_pid.tree_lock);
++	INIT_RADIX_TREE(&sbinfo->au_si_pid.tree, GFP_ATOMIC | __GFP_NOFAIL);
++
 +	sbinfo->si_bend = -1;
 +
 +	sbinfo->si_wbr_copyup = AuWbrCopyup_Def;
@@ -19417,11 +19388,14 @@
 +	/* leave other members for sysaufs and si_mnt. */
 +	sbinfo->si_sb = sb;
 +	sb->s_fs_info = sbinfo;
++	si_pid_set(sb);
 +	au_debug_sbinfo_init(sbinfo);
 +	return 0; /* success */
 +
 + out_br:
 +	kfree(sbinfo->si_branch);
++ out_pidmap:
++	kfree(sbinfo->au_si_pid.bitmap);
 + out_sbinfo:
 +	kfree(sbinfo);
 + out:
@@ -19525,6 +19499,51 @@
 +	di_write_unlock2(d1, d2);
 +	si_read_unlock(d1->d_sb);
 +}
++
++/* ---------------------------------------------------------------------- */
++
++int si_pid_test_slow(struct super_block *sb)
++{
++	void *p;
++
++	rcu_read_lock();
++	p = radix_tree_lookup(&au_sbi(sb)->au_si_pid.tree, current->pid);
++	rcu_read_unlock();
++
++	return (long)p;
++}
++
++void si_pid_set_slow(struct super_block *sb)
++{
++	int err;
++	struct au_sbinfo *sbinfo;
++
++	AuDebugOn(si_pid_test_slow(sb));
++
++	sbinfo = au_sbi(sb);
++	err = radix_tree_preload(GFP_NOFS | __GFP_NOFAIL);
++	AuDebugOn(err);
++	spin_lock(&sbinfo->au_si_pid.tree_lock);
++	err = radix_tree_insert(&sbinfo->au_si_pid.tree, current->pid,
++				(void *)1);
++	spin_unlock(&sbinfo->au_si_pid.tree_lock);
++	AuDebugOn(err);
++	radix_tree_preload_end();
++}
++
++void si_pid_clr_slow(struct super_block *sb)
++{
++	void *p;
++	struct au_sbinfo *sbinfo;
++
++	AuDebugOn(!si_pid_test_slow(sb));
++
++	sbinfo = au_sbi(sb);
++	spin_lock(&sbinfo->au_si_pid.tree_lock);
++	p = radix_tree_delete(&sbinfo->au_si_pid.tree, current->pid);
++	spin_unlock(&sbinfo->au_si_pid.tree_lock);
++	AuDebugOn(1 != (long)p);
++}
 --- /dev/null
 +++ b/fs/aufs/spl.h
 @@ -0,0 +1,66 @@
@@ -19596,7 +19615,7 @@
 +#endif /* __AUFS_SPL_H__ */
 --- /dev/null
 +++ b/fs/aufs/super.c
-@@ -0,0 +1,847 @@
+@@ -0,0 +1,848 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -20285,6 +20304,7 @@
 +static const struct super_operations aufs_sop = {
 +	.alloc_inode	= aufs_alloc_inode,
 +	.destroy_inode	= aufs_destroy_inode,
++	/* always deleting, no clearing */
 +	.drop_inode	= generic_delete_inode,
 +	.show_options	= aufs_show_options,
 +	.statfs		= aufs_statfs,
@@ -20446,7 +20466,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/super.h
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,463 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -20510,7 +20530,18 @@
 +	/* nowait tasks in the system-wide workqueue */
 +	struct au_nowait_tasks	si_nowait;
 +
++	/*
++	 * tried sb->s_umount, but failed due to the dependecy between i_mutex.
++	 * rwsem for au_sbinfo is necessary.
++	 */
 +	struct au_rwsem		si_rwsem;
++
++	/* prevent recursive locking in deleting inode */
++	struct {
++		unsigned long		*bitmap;
++		spinlock_t		tree_lock;
++		struct radix_tree_root	tree;
++	} au_si_pid;
 +
 +	/* branch management */
 +	unsigned int		si_generation;
@@ -20661,6 +20692,10 @@
 +void aufs_read_and_write_lock2(struct dentry *d1, struct dentry *d2, int isdir);
 +void aufs_read_and_write_unlock2(struct dentry *d1, struct dentry *d2);
 +
++int si_pid_test_slow(struct super_block *sb);
++void si_pid_set_slow(struct super_block *sb);
++void si_pid_clr_slow(struct super_block *sb);
++
 +/* wbr_policy.c */
 +extern struct au_wbr_copyup_operations au_wbr_copyup_ops[];
 +extern struct au_wbr_create_operations au_wbr_create_ops[];
@@ -20680,10 +20715,11 @@
 +
 +static inline int au_test_nfsd(struct task_struct *tsk)
 +{
-+	return !tsk->mm && !strcmp(tsk->comm, "nfsd");
++	return (current->flags & PF_KTHREAD)
++		&& !strcmp(tsk->comm, "nfsd");
 +}
 +
-+int au_xigen_inc(struct inode *inode);
++void au_xigen_inc(struct inode *inode);
 +int au_xigen_new(struct inode *inode);
 +int au_xigen_set(struct super_block *sb, struct file *base);
 +void au_xigen_clr(struct super_block *sb);
@@ -20697,7 +20733,7 @@
 +#else
 +AuStubVoid(au_export_init, struct super_block *sb)
 +AuStubInt0(au_test_nfsd, struct task_struct *tsk)
-+AuStubInt0(au_xigen_inc, struct inode *inode)
++AuStubVoid(au_xigen_inc, struct inode *inode)
 +AuStubInt0(au_xigen_new, struct inode *inode)
 +AuStubInt0(au_xigen_set, struct super_block *sb, struct file *base)
 +AuStubVoid(au_xigen_clr, struct super_block *sb)
@@ -20727,30 +20763,89 @@
 +
 +/* ---------------------------------------------------------------------- */
 +
++static inline pid_t si_pid_bit(void)
++{
++	/* the origin of pid is 1, but the bitmap's is 0 */
++	return current->pid - 1;
++}
++
++static inline int si_pid_test(struct super_block *sb)
++{
++	pid_t bit = si_pid_bit();
++	if (bit < PID_MAX_DEFAULT)
++		return test_bit(bit, au_sbi(sb)->au_si_pid.bitmap);
++	else
++		return si_pid_test_slow(sb);
++}
++
++static inline void si_pid_set(struct super_block *sb)
++{
++	pid_t bit = si_pid_bit();
++	if (bit < PID_MAX_DEFAULT) {
++		AuDebugOn(test_bit(bit, au_sbi(sb)->au_si_pid.bitmap));
++		set_bit(bit, au_sbi(sb)->au_si_pid.bitmap);
++		/* smp_mb(); */
++	} else
++		si_pid_set_slow(sb);
++}
++
++static inline void si_pid_clr(struct super_block *sb)
++{
++	pid_t bit = si_pid_bit();
++	if (bit < PID_MAX_DEFAULT) {
++		AuDebugOn(!test_bit(bit, au_sbi(sb)->au_si_pid.bitmap));
++		clear_bit(bit, au_sbi(sb)->au_si_pid.bitmap);
++		/* smp_mb(); */
++	} else
++		si_pid_clr_slow(sb);
++}
++
++/* ---------------------------------------------------------------------- */
++
 +/* lock superblock. mainly for entry point functions */
 +/*
-+ * si_noflush_read_lock, si_noflush_write_lock,
-+ * si_read_unlock, si_write_unlock, si_downgrade_lock
++ * __si_read_lock, __si_write_lock,
++ * __si_read_unlock, __si_write_unlock, __si_downgrade_lock
 + */
-+AuSimpleLockRwsemFuncs(si_noflush, struct super_block *sb,
-+		       &au_sbi(sb)->si_rwsem);
-+AuSimpleUnlockRwsemFuncs(si, struct super_block *sb, &au_sbi(sb)->si_rwsem);
++AuSimpleRwsemFuncs(__si, struct super_block *sb, &au_sbi(sb)->si_rwsem);
 +
 +#define SiMustNoWaiters(sb)	AuRwMustNoWaiters(&au_sbi(sb)->si_rwsem)
 +#define SiMustAnyLock(sb)	AuRwMustAnyLock(&au_sbi(sb)->si_rwsem)
 +#define SiMustWriteLock(sb)	AuRwMustWriteLock(&au_sbi(sb)->si_rwsem)
++
++static inline void si_noflush_read_lock(struct super_block *sb)
++{
++	__si_read_lock(sb);
++	si_pid_set(sb);
++}
++
++static inline int si_noflush_read_trylock(struct super_block *sb)
++{
++	int locked = __si_read_trylock(sb);
++	if (locked)
++		si_pid_set(sb);
++	return locked;
++}
++
++static inline void si_noflush_write_lock(struct super_block *sb)
++{
++	__si_write_lock(sb);
++	si_pid_set(sb);
++}
++
++static inline int si_noflush_write_trylock(struct super_block *sb)
++{
++	int locked = __si_write_trylock(sb);
++	if (locked)
++		si_pid_set(sb);
++	return locked;
++}
 +
 +static inline void si_read_lock(struct super_block *sb, int flags)
 +{
 +	if (au_ftest_lock(flags, FLUSH))
 +		au_nwt_flush(&au_sbi(sb)->si_nowait);
 +	si_noflush_read_lock(sb);
-+}
-+
-+static inline void si_write_lock(struct super_block *sb)
-+{
-+	au_nwt_flush(&au_sbi(sb)->si_nowait);
-+	si_noflush_write_lock(sb);
 +}
 +
 +static inline int si_read_trylock(struct super_block *sb, int flags)
@@ -20760,12 +20855,39 @@
 +	return si_noflush_read_trylock(sb);
 +}
 +
++static inline void si_read_unlock(struct super_block *sb)
++{
++	si_pid_clr(sb);
++	__si_read_unlock(sb);
++}
++
++static inline void si_write_lock(struct super_block *sb)
++{
++	au_nwt_flush(&au_sbi(sb)->si_nowait);
++	si_noflush_write_lock(sb);
++}
++
++#if 0 /* unused */
 +static inline int si_write_trylock(struct super_block *sb, int flags)
 +{
 +	if (au_ftest_lock(flags, FLUSH))
 +		au_nwt_flush(&au_sbi(sb)->si_nowait);
 +	return si_noflush_write_trylock(sb);
 +}
++#endif
++
++static inline void si_write_unlock(struct super_block *sb)
++{
++	si_pid_clr(sb);
++	__si_write_unlock(sb);
++}
++
++#if 0 /* unused */
++static inline void si_downgrade_lock(struct super_block *sb)
++{
++	__si_downgrade_lock(sb);
++}
++#endif
 +
 +/* ---------------------------------------------------------------------- */
 +
@@ -22291,7 +22413,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/vfsub.c
-@@ -0,0 +1,815 @@
+@@ -0,0 +1,790 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -22394,9 +22516,7 @@
 +{
 +	struct file *file;
 +
-+	/* lockdep_off(); */
 +	file = filp_open(path, oflags, mode);
-+	/* lockdep_on(); */
 +	if (IS_ERR(file))
 +		goto out;
 +	vfsub_update_h_iattr(&file->f_path, /*did*/NULL); /*ignore*/
@@ -22409,9 +22529,7 @@
 +{
 +	int err;
 +
-+	/* lockdep_off(); */
 +	err = kern_path(name, flags, path);
-+	/* lockdep_on(); */
 +	if (!err && path->dentry->d_inode)
 +		vfsub_update_h_iattr(path, /*did*/NULL); /*ignore*/
 +	return err;
@@ -22624,9 +22742,7 @@
 +	if (unlikely(err))
 +		goto out;
 +
-+	/* lockdep_off(); */
 +	err = vfs_link(src_dentry, dir, path->dentry);
-+	/* lockdep_on(); */
 +	if (!err) {
 +		struct path tmp = *path;
 +		int did;
@@ -22666,9 +22782,7 @@
 +	if (unlikely(err))
 +		goto out;
 +
-+	/* lockdep_off(); */
 +	err = vfs_rename(src_dir, src_dentry, dir, path->dentry);
-+	/* lockdep_on(); */
 +	if (!err) {
 +		int did;
 +
@@ -22732,9 +22846,7 @@
 +	if (unlikely(err))
 +		goto out;
 +
-+	/* lockdep_off(); */
 +	err = vfs_rmdir(dir, path->dentry);
-+	/* lockdep_on(); */
 +	if (!err) {
 +		struct path tmp = {
 +			.dentry	= path->dentry->d_parent,
@@ -22785,9 +22897,7 @@
 +{
 +	ssize_t err;
 +
-+	/* lockdep_off(); */
 +	err = vfs_write(file, ubuf, count, ppos);
-+	/* lockdep_on(); */
 +	if (err >= 0)
 +		vfsub_update_h_iattr(&file->f_path, /*did*/NULL); /*ignore*/
 +	return err;
@@ -22828,9 +22938,7 @@
 +{
 +	int err;
 +
-+	/* lockdep_off(); */
 +	err = vfs_readdir(file, filldir, arg);
-+	/* lockdep_on(); */
 +	if (err >= 0)
 +		vfsub_update_h_iattr(&file->f_path, /*did*/NULL); /*ignore*/
 +	return err;
@@ -22842,9 +22950,7 @@
 +{
 +	long err;
 +
-+	/* lockdep_off(); */
 +	err = do_splice_to(in, ppos, pipe, len, flags);
-+	/* lockdep_on(); */
 +	file_accessed(in);
 +	if (err >= 0)
 +		vfsub_update_h_iattr(&in->f_path, /*did*/NULL); /*ignore*/
@@ -22856,9 +22962,7 @@
 +{
 +	long err;
 +
-+	/* lockdep_off(); */
 +	err = do_splice_from(pipe, out, ppos, len, flags);
-+	/* lockdep_on(); */
 +	if (err >= 0)
 +		vfsub_update_h_iattr(&out->f_path, /*did*/NULL); /*ignore*/
 +	return err;
@@ -22890,11 +22994,8 @@
 +	err = locks_verify_truncate(h_inode, h_file, length);
 +	if (!err)
 +		err = security_path_truncate(h_path, length, attr);
-+	if (!err) {
-+		/* lockdep_off(); */
++	if (!err)
 +		err = do_truncate(h_path->dentry, length, attr, h_file);
-+		/* lockdep_on(); */
-+	}
 +
 + out_inode:
 +	if (!h_file)
@@ -22994,9 +23095,7 @@
 +
 +	*a->errp = -EPERM;
 +	if (!IS_IMMUTABLE(h_inode) && !IS_APPEND(h_inode)) {
-+		/* lockdep_off(); */
 +		*a->errp = notify_change(a->path->dentry, a->ia);
-+		/* lockdep_on(); */
 +		if (!*a->errp)
 +			vfsub_update_h_iattr(a->path, /*did*/NULL); /*ignore*/
 +	}
@@ -23063,9 +23162,7 @@
 +	if (h_inode)
 +		atomic_inc(&h_inode->i_count);
 +
-+	/* lockdep_off(); */
 +	*a->errp = vfs_unlink(a->dir, d);
-+	/* lockdep_on(); */
 +	if (!*a->errp) {
 +		struct path tmp = {
 +			.dentry = d->d_parent,
@@ -23109,7 +23206,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/vfsub.h
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,174 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -23242,9 +23339,7 @@
 +{
 +	loff_t err;
 +
-+	/* lockdep_off(); */
 +	err = vfs_llseek(file, offset, origin);
-+	/* lockdep_on(); */
 +	return err;
 +}
 +
@@ -25384,7 +25479,7 @@
 +
 +static inline int au_test_wkq(struct task_struct *tsk)
 +{
-+	return !tsk->mm
++	return (current->flags & PF_KTHREAD)
 +		&& !strncmp(tsk->comm, AUFS_WKQ_NAME "/",
 +			    sizeof(AUFS_WKQ_NAME));
 +}
@@ -25405,7 +25500,7 @@
 +#endif /* __AUFS_WKQ_H__ */
 --- /dev/null
 +++ b/fs/aufs/xino.c
-@@ -0,0 +1,1212 @@
+@@ -0,0 +1,1260 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -25475,12 +25570,10 @@
 +	buf.k = kbuf;
 +	oldfs = get_fs();
 +	set_fs(KERNEL_DS);
-+	/* lockdep_off(); */
 +	do {
 +		/* todo: signal_pending? */
 +		err = func(file, buf.u, size, pos);
 +	} while (err == -EAGAIN || err == -EINTR);
-+	/* lockdep_on(); */
 +	set_fs(oldfs);
 +
 +#if 0 /* reserved for future use */
@@ -25895,33 +25988,83 @@
 +
 +/* ---------------------------------------------------------------------- */
 +
-+int au_xino_write0(struct super_block *sb, aufs_bindex_t bindex, ino_t h_ino,
-+		   ino_t ino)
++static void au_xib_clear_bit(struct inode *inode)
 +{
 +	int err, bit;
 +	unsigned long pindex;
++	struct super_block *sb;
 +	struct au_sbinfo *sbinfo;
 +
-+	if (!au_opt_test(au_mntflags(sb), XINO))
-+		return 0;
++	AuDebugOn(inode->i_nlink);
 +
-+	err = 0;
-+	if (ino) {
-+		sbinfo = au_sbi(sb);
-+		xib_calc_bit(ino, &pindex, &bit);
-+		AuDebugOn(page_bits <= bit);
-+		mutex_lock(&sbinfo->si_xib_mtx);
-+		err = xib_pindex(sb, pindex);
-+		if (!err) {
-+			clear_bit(bit, sbinfo->si_xib_buf);
-+			sbinfo->si_xib_next_bit = bit;
-+		}
-+		mutex_unlock(&sbinfo->si_xib_mtx);
++	sb = inode->i_sb;
++	xib_calc_bit(inode->i_ino, &pindex, &bit);
++	AuDebugOn(page_bits <= bit);
++	sbinfo = au_sbi(sb);
++	mutex_lock(&sbinfo->si_xib_mtx);
++	err = xib_pindex(sb, pindex);
++	if (!err) {
++		clear_bit(bit, sbinfo->si_xib_buf);
++		sbinfo->si_xib_next_bit = bit;
++	}
++	mutex_unlock(&sbinfo->si_xib_mtx);
++}
++
++/* for s_op->delete_inode() */
++void au_xino_delete_inode(struct inode *inode, const int unlinked)
++{
++	int err;
++	unsigned int mnt_flags;
++	aufs_bindex_t bindex, bend, bi;
++	unsigned char try_trunc;
++	struct au_iinfo *iinfo;
++	struct super_block *sb;
++	struct au_hinode *hi;
++	struct inode *h_inode;
++	struct au_branch *br;
++	au_writef_t xwrite;
++
++	sb = inode->i_sb;
++	mnt_flags = au_mntflags(sb);
++	if (!au_opt_test(mnt_flags, XINO)
++	    || inode->i_ino == AUFS_ROOT_INO)
++		return;
++
++	if (unlinked) {
++		au_xigen_inc(inode);
++		au_xib_clear_bit(inode);
 +	}
 +
-+	if (!err)
-+		err = au_xino_write(sb, bindex, h_ino, 0);
-+	return err;
++	iinfo = au_ii(inode);
++	if (!iinfo)
++		return;
++
++	bindex = iinfo->ii_bstart;
++	if (bindex < 0)
++		return;
++
++	xwrite = au_sbi(sb)->si_xwrite;
++	try_trunc = !!au_opt_test(mnt_flags, TRUNC_XINO);
++	hi = iinfo->ii_hinode + bindex;
++	bend = iinfo->ii_bend;
++	for (; bindex <= bend; bindex++, hi++) {
++		h_inode = hi->hi_inode;
++		if (!h_inode
++		    || (!unlinked && h_inode->i_nlink))
++			continue;
++
++		/* inode may not be revalidated */
++		bi = au_br_index(sb, hi->hi_id);
++		if (bi < 0)
++			continue;
++
++		br = au_sbr(sb, bi);
++		err = au_xino_do_write(xwrite, br->br_xino.xi_file,
++				       h_inode->i_ino, /*ino*/0);
++		if (!err && try_trunc
++		    && au_test_fs_trunc_xino(br->br_mnt->mnt_sb))
++			xino_try_trunc(sb, br);
++	}
 +}
 +
 +/* get an unused inode number from bitmap */
@@ -26650,7 +26793,7 @@
 +#include <linux/limits.h>
 +#include <linux/types.h>
 +
-+#define AUFS_VERSION	"2-standalone.tree-34-20100607"
++#define AUFS_VERSION	"2-standalone.tree-34-20100621"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
