@@ -131,7 +131,7 @@
 +#endif /* __AUFS_H__ */
 --- /dev/null
 +++ b/fs/aufs/branch.c
-@@ -0,0 +1,1002 @@
+@@ -0,0 +1,1005 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -492,7 +492,7 @@
 +	if (au_br_writable(add->perm)) {
 +		err = au_wbr_init(br, sb, add->perm, &add->path);
 +		if (unlikely(err))
-+			goto out;
++			goto out_err;
 +	}
 +
 +	if (au_opt_test(au_mntflags(sb), XINO)) {
@@ -500,13 +500,16 @@
 +				 au_sbr(sb, 0)->br_xino.xi_file, /*do_test*/1);
 +		if (unlikely(err)) {
 +			AuDebugOn(br->br_xino.xi_file);
-+			goto out;
++			goto out_err;
 +		}
 +	}
 +
 +	sysaufs_br_init(br);
 +	mntget(add->path.mnt);
++	goto out; /* success */
 +
++ out_err:
++	br->br_mnt = NULL;
 + out:
 +	return err;
 +}
@@ -3200,7 +3203,7 @@
 +#endif /* __AUFS_DCSUB_H__ */
 --- /dev/null
 +++ b/fs/aufs/debug.c
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,440 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -3578,10 +3581,24 @@
 +
 +void au_dbg_verify_kthread(void)
 +{
-+	if (au_test_wkq(current)) {
++	struct task_struct *tsk = current;
++
++	if ((tsk->flags & PF_KTHREAD)
++	    && !strncmp(tsk->comm, AUFS_WKQ_NAME "/", sizeof(AUFS_WKQ_NAME))) {
 +		au_dbg_blocked();
 +		BUG();
 +	}
++}
++
++static void au_dbg_do_verify_wkq(void *args)
++{
++	BUG_ON(current_fsuid());
++	BUG_ON(rlimit(RLIMIT_FSIZE) != RLIM_INFINITY);
++}
++
++void au_dbg_verify_wkq(void)
++{
++	au_wkq_wait(au_dbg_do_verify_wkq, NULL);
 +}
 +
 +/* ---------------------------------------------------------------------- */
@@ -3629,7 +3646,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/debug.h
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,245 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -3769,6 +3786,7 @@
 +void au_dbg_verify_nondir_parent(struct dentry *dentry, unsigned int sigen);
 +void au_dbg_verify_gen(struct dentry *parent, unsigned int sigen);
 +void au_dbg_verify_kthread(void);
++void au_dbg_verify_wkq(void);
 +
 +int __init au_debug_init(void);
 +void au_debug_sbinfo_init(struct au_sbinfo *sbinfo);
@@ -3834,6 +3852,7 @@
 +	   unsigned int sigen)
 +AuStubVoid(au_dbg_verify_gen, struct dentry *parent, unsigned int sigen)
 +AuStubVoid(au_dbg_verify_kthread, void)
++AuStubVoid(au_dbg_verify_wkq, void)
 +AuStubInt0(__init au_debug_init, void)
 +AuStubVoid(au_debug_sbinfo_init, struct au_sbinfo *sbinfo)
 +
@@ -5754,7 +5773,7 @@
 +	if (unlikely(err))
 +		goto out_unlock;
 +
-+	if (!au_test_nfsd(current)) {
++	if (!au_test_nfsd()) {
 +		err = au_vdir_fill_de(file, dirent, filldir);
 +		fsstack_copy_attr_atime(inode,
 +					au_h_iptr(inode, au_ibstart(inode)));
@@ -7505,10 +7524,10 @@
 +	/* a race condition can happen between open and unlink/rmdir */
 +	h_file = ERR_PTR(-ENOENT);
 +	h_dentry = au_h_dptr(dentry, bindex);
-+	if (au_test_nfsd(current) && !h_dentry)
++	if (au_test_nfsd() && !h_dentry)
 +		goto out;
 +	h_inode = h_dentry->d_inode;
-+	if (au_test_nfsd(current) && !h_inode)
++	if (au_test_nfsd() && !h_inode)
 +		goto out;
 +	if (unlikely((!d_unhashed(dentry) && d_unhashed(h_dentry))
 +		     || !h_inode))
@@ -13440,7 +13459,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/i_op.c
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,916 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -13812,8 +13831,12 @@
 +	if (p->hdir)
 +		h_dir = p->hdir->hi_inode;
 +
-+	/* udba case */
-+	if (unlikely(!p->hdir || !h_dir)) {
++	/*
++	 * udba case, or
++	 * if DI_LOCKED is not set, then p->parent may be different
++	 * and h_parent can be NULL.
++	 */
++	if (unlikely(!p->hdir || !h_dir || !h_parent)) {
 +		if (!au_ftest_pin(p->flags, DI_LOCKED))
 +			di_read_unlock(p->parent, AuLock_IR);
 +		dput(p->parent);
@@ -15988,7 +16011,7 @@
 +endif
 --- /dev/null
 +++ b/fs/aufs/loop.c
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,63 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -16041,12 +16064,13 @@
 +int au_test_loopback_kthread(void)
 +{
 +	int ret;
++	struct task_struct *tsk = current;
 +
 +	ret = 0;
-+	if (current->flags & PF_KTHREAD) {
-+		const char c = current->comm[4];
++	if (tsk->flags & PF_KTHREAD) {
++		const char c = tsk->comm[4];
 +		ret = ('0' <= c && c <= '9'
-+		       && !strncmp(current->comm, "loop", 4));
++		       && !strncmp(tsk->comm, "loop", 4));
 +	}
 +
 +	return ret;
@@ -18538,7 +18562,7 @@
 +
 +	/* always superio. */
 +	mutex_lock_nested(&h_dir->i_mutex, AuLsc_I_CHILD2);
-+	if (!au_test_wkq(current)) {
++	if (current_fsuid()) {
 +		struct do_whplink_args args = {
 +			.errp		= &err,
 +			.tgt		= &tgtname,
@@ -20570,7 +20594,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/super.h
-@@ -0,0 +1,463 @@
+@@ -0,0 +1,465 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -20817,9 +20841,11 @@
 +#ifdef CONFIG_AUFS_EXPORT
 +void au_export_init(struct super_block *sb);
 +
-+static inline int au_test_nfsd(struct task_struct *tsk)
++static inline int au_test_nfsd(void)
 +{
-+	return (current->flags & PF_KTHREAD)
++	struct task_struct *tsk = current;
++
++	return (tsk->flags & PF_KTHREAD)
 +		&& !strcmp(tsk->comm, "nfsd");
 +}
 +
@@ -20830,13 +20856,13 @@
 +
 +static inline int au_busy_or_stale(void)
 +{
-+	if (!au_test_nfsd(current))
++	if (!au_test_nfsd())
 +		return -EBUSY;
 +	return -ESTALE;
 +}
 +#else
 +AuStubVoid(au_export_init, struct super_block *sb)
-+AuStubInt0(au_test_nfsd, struct task_struct *tsk)
++AuStubInt0(au_test_nfsd, void)
 +AuStubVoid(au_xigen_inc, struct inode *inode)
 +AuStubInt0(au_xigen_new, struct inode *inode)
 +AuStubInt0(au_xigen_set, struct super_block *sb, struct file *base)
@@ -25327,7 +25353,7 @@
 +#endif /* __AUFS_WHOUT_H__ */
 --- /dev/null
 +++ b/fs/aufs/wkq.c
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,223 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -25544,14 +25570,16 @@
 +		if (unlikely(err))
 +			au_wkq[i].wkq = NULL;
 +	}
-+	if (unlikely(err))
++	if (!err)
++		au_dbg_verify_wkq();
++	else
 +		au_wkq_fin();
 +
 +	return err;
 +}
 --- /dev/null
 +++ b/fs/aufs/wkq.h
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,88 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -25626,13 +25654,6 @@
 +	return au_wkq_do_wait(AuWkq_WAIT, func, args);
 +}
 +
-+static inline int au_test_wkq(struct task_struct *tsk)
-+{
-+	return (current->flags & PF_KTHREAD)
-+		&& !strncmp(tsk->comm, AUFS_WKQ_NAME "/",
-+			    sizeof(AUFS_WKQ_NAME));
-+}
-+
 +static inline void au_nwt_done(struct au_nowait_tasks *nwt)
 +{
 +	if (!atomic_dec_return(&nwt->nw_len))
@@ -25649,7 +25670,7 @@
 +#endif /* __AUFS_WKQ_H__ */
 --- /dev/null
 +++ b/fs/aufs/xino.c
-@@ -0,0 +1,1260 @@
+@@ -0,0 +1,1263 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -25754,12 +25775,15 @@
 +	ssize_t err;
 +
 +	/* todo: signal block and no wkq? */
-+	/* todo: new credential scheme */
-+	/*
-+	 * it breaks RLIMIT_FSIZE and normal user's limit,
-+	 * users should care about quota and real 'filesystem full.'
-+	 */
-+	if (!au_test_wkq(current)) {
++	if (rlimit(RLIMIT_FSIZE) == RLIM_INFINITY) {
++		lockdep_off();
++		err = do_xino_fwrite(func, file, buf, size, pos);
++		lockdep_on();
++	} else {
++		/*
++		 * it breaks RLIMIT_FSIZE and normal user's limit,
++		 * users should care about quota and real 'filesystem full.'
++		 */
 +		int wkq_err;
 +		struct do_xino_fwrite_args args = {
 +			.errp	= &err,
@@ -25773,8 +25797,7 @@
 +		wkq_err = au_wkq_wait(call_do_xino_fwrite, &args);
 +		if (unlikely(wkq_err))
 +			err = wkq_err;
-+	} else
-+		err = do_xino_fwrite(func, file, buf, size, pos);
++	}
 +
 +	return err;
 +}
@@ -26446,9 +26469,10 @@
 +	ino = AUFS_ROOT_INO;
 +	err = au_xino_do_write(au_sbi(sb)->si_xwrite, br->br_xino.xi_file,
 +			       h_ino, ino);
-+	if (!err)
-+		return 0; /* success */
-+
++	if (unlikely(err)) {
++		fput(br->br_xino.xi_file);
++		br->br_xino.xi_file = NULL;
++	}
 +
 + out:
 +	return err;
@@ -26942,7 +26966,7 @@
 +#include <linux/limits.h>
 +#include <linux/types.h>
 +
-+#define AUFS_VERSION	"2-standalone.tree-35-20100809"
++#define AUFS_VERSION	"2-standalone.tree-35-20100816"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
