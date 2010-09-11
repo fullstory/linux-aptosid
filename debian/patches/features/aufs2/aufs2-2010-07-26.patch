@@ -131,7 +131,7 @@
 +#endif /* __AUFS_H__ */
 --- /dev/null
 +++ b/fs/aufs/branch.c
-@@ -0,0 +1,1000 @@
+@@ -0,0 +1,1001 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -229,15 +229,16 @@
 + * add a branch
 + */
 +
-+static int test_overlap(struct super_block *sb, struct dentry *h_d1,
-+			struct dentry *h_d2)
++static int test_overlap(struct super_block *sb, struct dentry *h_adding,
++			struct dentry *h_root)
 +{
-+	if (unlikely(h_d1 == h_d2))
++	if (unlikely(h_adding == h_root
++		     || au_test_loopback_overlap(sb, h_adding)))
 +		return 1;
-+	return au_test_subdir(h_d1, h_d2)
-+		|| au_test_subdir(h_d2, h_d1)
-+		|| au_test_loopback_overlap(sb, h_d1, h_d2)
-+		|| au_test_loopback_overlap(sb, h_d2, h_d1);
++	if (h_adding->d_sb != h_root->d_sb)
++		return 0;
++	return au_test_subdir(h_adding, h_root)
++		|| au_test_subdir(h_root, h_adding);
 +}
 +
 +/*
@@ -928,7 +929,7 @@
 +	if (au_opt_test(mnt_flags, PLINK))
 +		au_plink_half_refresh(sb, br_id);
 +
-+	if (au_xino_brid(sb) == br->br_id)
++	if (au_xino_brid(sb) == br_id)
 +		au_xino_brid_set(sb, -1);
 +	goto out; /* success */
 +
@@ -6137,7 +6138,7 @@
 +#endif /* __AUFS_DIR_H__ */
 --- /dev/null
 +++ b/fs/aufs/dynop.c
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,406 @@
 +/*
 + * Copyright (C) 2010 Junjiro R. Okajima
 + *
@@ -6378,20 +6379,22 @@
 +{
 +	struct au_dykey *key, *old;
 +	struct au_splhead *spl;
-+	static const struct {
++	struct op {
 +		unsigned int sz;
-+		void (*set_op)(struct au_dykey *key, const void *h_op,
-+			       struct super_block *h_sb __maybe_unused);
-+	} a[] = {
++		void (*set)(struct au_dykey *key, const void *h_op,
++			    struct super_block *h_sb __maybe_unused);
++	};
++	static const struct op a[] = {
 +		[AuDy_AOP] = {
 +			.sz	= sizeof(struct au_dyaop),
-+			.set_op	= dy_aop
++			.set	= dy_aop
 +		},
 +		[AuDy_VMOP] = {
 +			.sz	= sizeof(struct au_dyvmop),
-+			.set_op	= dy_vmop
++			.set	= dy_vmop
 +		}
-+	}, *p;
++	};
++	const struct op *p;
 +
 +	spl = dynop + op->dy_type;
 +	key = dy_gfind_get(spl, op->dy_hop);
@@ -6407,7 +6410,7 @@
 +
 +	key->dk_op.dy_hop = op->dy_hop;
 +	kref_init(&key->dk_kref);
-+	p->set_op(key, op->dy_hop, br->br_mnt->mnt_sb);
++	p->set(key, op->dy_hop, br->br_mnt->mnt_sb);
 +	old = dy_gadd(spl, key);
 +	if (old) {
 +		kfree(key);
@@ -15982,7 +15985,7 @@
 +endif
 --- /dev/null
 +++ b/fs/aufs/loop.c
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,62 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -16011,22 +16014,24 @@
 +/*
 + * test if two lower dentries have overlapping branches.
 + */
-+int au_test_loopback_overlap(struct super_block *sb, struct dentry *h_d1,
-+			     struct dentry *h_d2)
++int au_test_loopback_overlap(struct super_block *sb, struct dentry *h_adding)
 +{
-+	struct inode *h_inode;
++	struct super_block *h_sb;
 +	struct loop_device *l;
 +
-+	h_inode = h_d1->d_inode;
-+	if (MAJOR(h_inode->i_sb->s_dev) != LOOP_MAJOR)
++	h_sb = h_adding->d_sb;
++	if (MAJOR(h_sb->s_dev) != LOOP_MAJOR)
 +		return 0;
 +
-+	l = h_inode->i_sb->s_bdev->bd_disk->private_data;
-+	h_d1 = l->lo_backing_file->f_dentry;
-+	/* h_d1 can be local NFS. in this case aufs cannot detect the loop */
-+	if (unlikely(h_d1->d_sb == sb))
++	l = h_sb->s_bdev->bd_disk->private_data;
++	h_adding = l->lo_backing_file->f_dentry;
++	/*
++	 * h_adding can be local NFS.
++	 * in this case aufs cannot detect the loop.
++	 */
++	if (unlikely(h_adding->d_sb == sb))
 +		return 1;
-+	return au_test_subdir(h_d1, h_d2);
++	return !!au_test_subdir(h_adding, sb->s_root);
 +}
 +
 +/* true if a kernel thread named 'loop[0-9].*' accesses a file */
@@ -16045,7 +16050,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/loop.h
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,42 @@
 +/*
 + * Copyright (C) 2005-2010 Junjiro R. Okajima
 + *
@@ -16078,12 +16083,11 @@
 +
 +#ifdef CONFIG_AUFS_BDEV_LOOP
 +/* loop.c */
-+int au_test_loopback_overlap(struct super_block *sb, struct dentry *h_d1,
-+			     struct dentry *h_d2);
++int au_test_loopback_overlap(struct super_block *sb, struct dentry *h_adding);
 +int au_test_loopback_kthread(void);
 +#else
 +AuStubInt0(au_test_loopback_overlap, struct super_block *sb,
-+	   struct dentry *h_d1, struct dentry *h_d2)
++	   struct dentry *h_adding)
 +AuStubInt0(au_test_loopback_kthread, void)
 +#endif /* BLK_DEV_LOOP */
 +
@@ -24328,7 +24332,7 @@
 +
 +	qs.name = name;
 +	for (i = 0; i < 3; i++) {
-+		sprintf(p, "%.*d", AUFS_WH_TMP_LEN, cnt++);
++		sprintf(p, "%.*x", AUFS_WH_TMP_LEN, cnt++);
 +		dentry = au_sio_lkup_one(&qs, h_parent, br);
 +		if (IS_ERR(dentry) || !dentry->d_inode)
 +			goto out_name;
@@ -26935,7 +26939,7 @@
 +#include <linux/limits.h>
 +#include <linux/types.h>
 +
-+#define AUFS_VERSION	"2-standalone.tree-35-rcN-20100705"
++#define AUFS_VERSION	"2-standalone.tree-35-rcN-20100726"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
