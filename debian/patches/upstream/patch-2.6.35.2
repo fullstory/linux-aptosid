@@ -4,8 +4,8 @@
  VERSION = 2
  PATCHLEVEL = 6
  SUBLEVEL = 35
--EXTRAVERSION = .1
-+EXTRAVERSION = .2-rc1
+-EXTRAVERSION =
++EXTRAVERSION = .2
  NAME = Sheep on Meth
  
  # *DOCUMENTATION*
@@ -70,6 +70,47 @@
  
  	cm_x300_init_da9030();
  	cm_x300_init_dm9000();
+--- a/arch/arm/plat-mxc/gpio.c
++++ b/arch/arm/plat-mxc/gpio.c
+@@ -214,13 +214,16 @@ static void _set_gpio_direction(struct g
+ 	struct mxc_gpio_port *port =
+ 		container_of(chip, struct mxc_gpio_port, chip);
+ 	u32 l;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&port->lock, flags);
+ 	l = __raw_readl(port->base + GPIO_GDIR);
+ 	if (dir)
+ 		l |= 1 << offset;
+ 	else
+ 		l &= ~(1 << offset);
+ 	__raw_writel(l, port->base + GPIO_GDIR);
++	spin_unlock_irqrestore(&port->lock, flags);
+ }
+ 
+ static void mxc_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
+@@ -229,9 +232,12 @@ static void mxc_gpio_set(struct gpio_chi
+ 		container_of(chip, struct mxc_gpio_port, chip);
+ 	void __iomem *reg = port->base + GPIO_DR;
+ 	u32 l;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&port->lock, flags);
+ 	l = (__raw_readl(reg) & (~(1 << offset))) | (value << offset);
+ 	__raw_writel(l, reg);
++	spin_unlock_irqrestore(&port->lock, flags);
+ }
+ 
+ static int mxc_gpio_get(struct gpio_chip *chip, unsigned offset)
+@@ -285,6 +291,8 @@ int __init mxc_gpio_init(struct mxc_gpio
+ 		port[i].chip.base = i * 32;
+ 		port[i].chip.ngpio = 32;
+ 
++		spin_lock_init(&port[i].lock);
++
+ 		/* its a serious configuration bug when it fails */
+ 		BUG_ON( gpiochip_add(&port[i].chip) < 0 );
+ 
 --- a/arch/arm/plat-mxc/include/mach/gpio.h
 +++ b/arch/arm/plat-mxc/include/mach/gpio.h
 @@ -19,6 +19,7 @@
@@ -80,6 +121,46 @@
  #include <mach/hardware.h>
  #include <asm-generic/gpio.h>
  
+@@ -36,6 +37,7 @@ struct mxc_gpio_port {
+ 	int virtual_irq_start;
+ 	struct gpio_chip chip;
+ 	u32 both_edges;
++	spinlock_t lock;
+ };
+ 
+ int mxc_gpio_init(struct mxc_gpio_port*, int);
+--- a/arch/parisc/kernel/firmware.c
++++ b/arch/parisc/kernel/firmware.c
+@@ -1123,7 +1123,6 @@ static char __attribute__((aligned(64)))
+  */
+ int pdc_iodc_print(const unsigned char *str, unsigned count)
+ {
+-	static int posx;        /* for simple TAB-Simulation... */
+ 	unsigned int i;
+ 	unsigned long flags;
+ 
+@@ -1133,19 +1132,12 @@ int pdc_iodc_print(const unsigned char *
+ 			iodc_dbuf[i+0] = '\r';
+ 			iodc_dbuf[i+1] = '\n';
+ 			i += 2;
+-			posx = 0;
+ 			goto print;
+-		case '\t':
+-			while (posx & 7) {
+-				iodc_dbuf[i] = ' ';
+-				i++, posx++;
+-			}
+-			break;
+ 		case '\b':	/* BS */
+-			posx -= 2;
++			i--; /* overwrite last */
+ 		default:
+ 			iodc_dbuf[i] = str[i];
+-			i++, posx++;
++			i++;
+ 			break;
+ 		}
+ 	}
 --- a/arch/powerpc/Makefile
 +++ b/arch/powerpc/Makefile
 @@ -163,9 +163,11 @@ drivers-$(CONFIG_OPROFILE)	+= arch/power
@@ -514,6 +595,20 @@
  		}
  
  		if (cpumask_test_cpu(cpu, cpu_callin_mask))
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -802,8 +802,10 @@ do_sigbus(struct pt_regs *regs, unsigned
+ 	up_read(&mm->mmap_sem);
+ 
+ 	/* Kernel mode? Handle exceptions or die: */
+-	if (!(error_code & PF_USER))
++	if (!(error_code & PF_USER)) {
+ 		no_context(regs, error_code, address);
++		return;
++	}
+ 
+ 	/* User-space => ok to do another page fault: */
+ 	if (is_prefetch(regs, error_code, address))
 --- a/arch/x86/mm/kmmio.c
 +++ b/arch/x86/mm/kmmio.c
 @@ -45,6 +45,8 @@ struct kmmio_fault_page {
@@ -617,6 +712,65 @@
  	{}
  };
  
+--- a/arch/x86/xen/enlighten.c
++++ b/arch/x86/xen/enlighten.c
+@@ -927,7 +927,7 @@ static const struct pv_init_ops xen_init
+ };
+ 
+ static const struct pv_time_ops xen_time_ops __initdata = {
+-	.sched_clock = xen_sched_clock,
++	.sched_clock = xen_clocksource_read,
+ };
+ 
+ static const struct pv_cpu_ops xen_cpu_ops __initdata = {
+--- a/arch/x86/xen/time.c
++++ b/arch/x86/xen/time.c
+@@ -155,45 +155,6 @@ static void do_stolen_accounting(void)
+ 	account_idle_ticks(ticks);
+ }
+ 
+-/*
+- * Xen sched_clock implementation.  Returns the number of unstolen
+- * nanoseconds, which is nanoseconds the VCPU spent in RUNNING+BLOCKED
+- * states.
+- */
+-unsigned long long xen_sched_clock(void)
+-{
+-	struct vcpu_runstate_info state;
+-	cycle_t now;
+-	u64 ret;
+-	s64 offset;
+-
+-	/*
+-	 * Ideally sched_clock should be called on a per-cpu basis
+-	 * anyway, so preempt should already be disabled, but that's
+-	 * not current practice at the moment.
+-	 */
+-	preempt_disable();
+-
+-	now = xen_clocksource_read();
+-
+-	get_runstate_snapshot(&state);
+-
+-	WARN_ON(state.state != RUNSTATE_running);
+-
+-	offset = now - state.state_entry_time;
+-	if (offset < 0)
+-		offset = 0;
+-
+-	ret = state.time[RUNSTATE_blocked] +
+-		state.time[RUNSTATE_running] +
+-		offset;
+-
+-	preempt_enable();
+-
+-	return ret;
+-}
+-
+-
+ /* Get the TSC speed from Xen */
+ unsigned long xen_tsc_khz(void)
+ {
 --- a/crypto/Kconfig
 +++ b/crypto/Kconfig
 @@ -96,6 +96,14 @@ config CRYPTO_MANAGER2
@@ -941,6 +1095,542 @@
  		}
  
  		/* if we haven't made progress and we have already
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -178,7 +178,7 @@ static int amd64_set_scrub_rate(struct m
+ 
+ 	default:
+ 		amd64_printk(KERN_ERR, "Unsupported family!\n");
+-		break;
++		return -EINVAL;
+ 	}
+ 	return amd64_search_set_scrub_rate(pvt->misc_f3_ctl, *bandwidth,
+ 			min_scrubrate);
+@@ -1430,7 +1430,7 @@ static inline u64 f10_get_base_addr_offs
+ 	u64 chan_off;
+ 
+ 	if (hi_range_sel) {
+-		if (!(dct_sel_base_addr & 0xFFFFF800) &&
++		if (!(dct_sel_base_addr & 0xFFFF0000) &&
+ 		   hole_valid && (sys_addr >= 0x100000000ULL))
+ 			chan_off = hole_off << 16;
+ 		else
+@@ -1679,7 +1679,7 @@ static void f10_map_sysaddr_to_csrow(str
+ 	 * ganged. Otherwise @chan should already contain the channel at
+ 	 * this point.
+ 	 */
+-	if (dct_ganging_enabled(pvt) && pvt->nbcfg & K8_NBCFG_CHIPKILL)
++	if (dct_ganging_enabled(pvt) && (pvt->nbcfg & K8_NBCFG_CHIPKILL))
+ 		chan = get_channel_from_ecc_syndrome(mci, syndrome);
+ 
+ 	if (chan >= 0)
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -42,6 +42,7 @@
+ bool intel_pipe_has_type (struct drm_crtc *crtc, int type);
+ static void intel_update_watermarks(struct drm_device *dev);
+ static void intel_increase_pllclock(struct drm_crtc *crtc, bool schedule);
++static void intel_crtc_update_cursor(struct drm_crtc *crtc);
+ 
+ typedef struct {
+     /* given values */
+@@ -3403,6 +3404,9 @@ static int intel_crtc_mode_set(struct dr
+ 		return -EINVAL;
+ 	}
+ 
++	/* Ensure that the cursor is valid for the new mode before changing... */
++	intel_crtc_update_cursor(crtc);
++
+ 	if (is_lvds && dev_priv->lvds_downclock_avail) {
+ 		has_reduced_clock = limit->find_pll(limit, crtc,
+ 							    dev_priv->lvds_downclock,
+@@ -3939,6 +3943,85 @@ void intel_crtc_load_lut(struct drm_crtc
+ 	}
+ }
+ 
++/* If no-part of the cursor is visible on the framebuffer, then the GPU may hang... */
++static void intel_crtc_update_cursor(struct drm_crtc *crtc)
++{
++	struct drm_device *dev = crtc->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++	int pipe = intel_crtc->pipe;
++	int x = intel_crtc->cursor_x;
++	int y = intel_crtc->cursor_y;
++	uint32_t base, pos;
++	bool visible;
++
++	pos = 0;
++
++	if (crtc->fb) {
++		base = intel_crtc->cursor_addr;
++		if (x > (int) crtc->fb->width)
++			base = 0;
++
++		if (y > (int) crtc->fb->height)
++			base = 0;
++	} else
++		base = 0;
++
++	if (x < 0) {
++		if (x + intel_crtc->cursor_width < 0)
++			base = 0;
++
++		pos |= CURSOR_POS_SIGN << CURSOR_X_SHIFT;
++		x = -x;
++	}
++	pos |= x << CURSOR_X_SHIFT;
++
++	if (y < 0) {
++		if (y + intel_crtc->cursor_height < 0)
++			base = 0;
++
++		pos |= CURSOR_POS_SIGN << CURSOR_Y_SHIFT;
++		y = -y;
++	}
++	pos |= y << CURSOR_Y_SHIFT;
++
++	visible = base != 0;
++	if (!visible && !intel_crtc->cursor_visble)
++		return;
++
++	I915_WRITE(pipe == 0 ? CURAPOS : CURBPOS, pos);
++	if (intel_crtc->cursor_visble != visible) {
++		uint32_t cntl = I915_READ(pipe == 0 ? CURACNTR : CURBCNTR);
++		if (base) {
++			/* Hooray for CUR*CNTR differences */
++			if (IS_MOBILE(dev) || IS_I9XX(dev)) {
++				cntl &= ~(CURSOR_MODE | MCURSOR_PIPE_SELECT);
++				cntl |= CURSOR_MODE_64_ARGB_AX | MCURSOR_GAMMA_ENABLE;
++				cntl |= pipe << 28; /* Connect to correct pipe */
++			} else {
++				cntl &= ~(CURSOR_FORMAT_MASK);
++				cntl |= CURSOR_ENABLE;
++				cntl |= CURSOR_FORMAT_ARGB | CURSOR_GAMMA_ENABLE;
++			}
++		} else {
++			if (IS_MOBILE(dev) || IS_I9XX(dev)) {
++				cntl &= ~(CURSOR_MODE | MCURSOR_GAMMA_ENABLE);
++				cntl |= CURSOR_MODE_DISABLE;
++			} else {
++				cntl &= ~(CURSOR_ENABLE | CURSOR_GAMMA_ENABLE);
++			}
++		}
++		I915_WRITE(pipe == 0 ? CURACNTR : CURBCNTR, cntl);
++
++		intel_crtc->cursor_visble = visible;
++	}
++	/* and commit changes on next vblank */
++	I915_WRITE(pipe == 0 ? CURABASE : CURBBASE, base);
++
++	if (visible)
++		intel_mark_busy(dev, to_intel_framebuffer(crtc->fb)->obj);
++}
++
+ static int intel_crtc_cursor_set(struct drm_crtc *crtc,
+ 				 struct drm_file *file_priv,
+ 				 uint32_t handle,
+@@ -3949,11 +4032,7 @@ static int intel_crtc_cursor_set(struct
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ 	struct drm_gem_object *bo;
+ 	struct drm_i915_gem_object *obj_priv;
+-	int pipe = intel_crtc->pipe;
+-	uint32_t control = (pipe == 0) ? CURACNTR : CURBCNTR;
+-	uint32_t base = (pipe == 0) ? CURABASE : CURBBASE;
+-	uint32_t temp = I915_READ(control);
+-	size_t addr;
++	uint32_t addr;
+ 	int ret;
+ 
+ 	DRM_DEBUG_KMS("\n");
+@@ -3961,12 +4040,6 @@ static int intel_crtc_cursor_set(struct
+ 	/* if we want to turn off the cursor ignore width and height */
+ 	if (!handle) {
+ 		DRM_DEBUG_KMS("cursor off\n");
+-		if (IS_MOBILE(dev) || IS_I9XX(dev)) {
+-			temp &= ~(CURSOR_MODE | MCURSOR_GAMMA_ENABLE);
+-			temp |= CURSOR_MODE_DISABLE;
+-		} else {
+-			temp &= ~(CURSOR_ENABLE | CURSOR_GAMMA_ENABLE);
+-		}
+ 		addr = 0;
+ 		bo = NULL;
+ 		mutex_lock(&dev->struct_mutex);
+@@ -4008,7 +4081,8 @@ static int intel_crtc_cursor_set(struct
+ 
+ 		addr = obj_priv->gtt_offset;
+ 	} else {
+-		ret = i915_gem_attach_phys_object(dev, bo, (pipe == 0) ? I915_GEM_PHYS_CURSOR_0 : I915_GEM_PHYS_CURSOR_1);
++		ret = i915_gem_attach_phys_object(dev, bo,
++						  (intel_crtc->pipe == 0) ? I915_GEM_PHYS_CURSOR_0 : I915_GEM_PHYS_CURSOR_1);
+ 		if (ret) {
+ 			DRM_ERROR("failed to attach phys object\n");
+ 			goto fail_locked;
+@@ -4019,21 +4093,7 @@ static int intel_crtc_cursor_set(struct
+ 	if (!IS_I9XX(dev))
+ 		I915_WRITE(CURSIZE, (height << 12) | width);
+ 
+-	/* Hooray for CUR*CNTR differences */
+-	if (IS_MOBILE(dev) || IS_I9XX(dev)) {
+-		temp &= ~(CURSOR_MODE | MCURSOR_PIPE_SELECT);
+-		temp |= CURSOR_MODE_64_ARGB_AX | MCURSOR_GAMMA_ENABLE;
+-		temp |= (pipe << 28); /* Connect to correct pipe */
+-	} else {
+-		temp &= ~(CURSOR_FORMAT_MASK);
+-		temp |= CURSOR_ENABLE;
+-		temp |= CURSOR_FORMAT_ARGB | CURSOR_GAMMA_ENABLE;
+-	}
+-
+  finish:
+-	I915_WRITE(control, temp);
+-	I915_WRITE(base, addr);
+-
+ 	if (intel_crtc->cursor_bo) {
+ 		if (dev_priv->info->cursor_needs_physical) {
+ 			if (intel_crtc->cursor_bo != bo)
+@@ -4047,6 +4107,10 @@ static int intel_crtc_cursor_set(struct
+ 
+ 	intel_crtc->cursor_addr = addr;
+ 	intel_crtc->cursor_bo = bo;
++	intel_crtc->cursor_width = width;
++	intel_crtc->cursor_height = height;
++
++	intel_crtc_update_cursor(crtc);
+ 
+ 	return 0;
+ fail_unpin:
+@@ -4060,34 +4124,12 @@ fail:
+ 
+ static int intel_crtc_cursor_move(struct drm_crtc *crtc, int x, int y)
+ {
+-	struct drm_device *dev = crtc->dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+-	struct intel_framebuffer *intel_fb;
+-	int pipe = intel_crtc->pipe;
+-	uint32_t temp = 0;
+-	uint32_t adder;
+-
+-	if (crtc->fb) {
+-		intel_fb = to_intel_framebuffer(crtc->fb);
+-		intel_mark_busy(dev, intel_fb->obj);
+-	}
+-
+-	if (x < 0) {
+-		temp |= CURSOR_POS_SIGN << CURSOR_X_SHIFT;
+-		x = -x;
+-	}
+-	if (y < 0) {
+-		temp |= CURSOR_POS_SIGN << CURSOR_Y_SHIFT;
+-		y = -y;
+-	}
+ 
+-	temp |= x << CURSOR_X_SHIFT;
+-	temp |= y << CURSOR_Y_SHIFT;
++	intel_crtc->cursor_x = x;
++	intel_crtc->cursor_y = y;
+ 
+-	adder = intel_crtc->cursor_addr;
+-	I915_WRITE((pipe == 0) ? CURAPOS : CURBPOS, temp);
+-	I915_WRITE((pipe == 0) ? CURABASE : CURBBASE, adder);
++	intel_crtc_update_cursor(crtc);
+ 
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -143,8 +143,6 @@ struct intel_crtc {
+ 	struct drm_crtc base;
+ 	enum pipe pipe;
+ 	enum plane plane;
+-	struct drm_gem_object *cursor_bo;
+-	uint32_t cursor_addr;
+ 	u8 lut_r[256], lut_g[256], lut_b[256];
+ 	int dpms_mode;
+ 	bool busy; /* is scanout buffer being updated frequently? */
+@@ -153,6 +151,12 @@ struct intel_crtc {
+ 	struct intel_overlay *overlay;
+ 	struct intel_unpin_work *unpin_work;
+ 	int fdi_lanes;
++
++	struct drm_gem_object *cursor_bo;
++	uint32_t cursor_addr;
++	int16_t cursor_x, cursor_y;
++	int16_t cursor_width, cursor_height;
++	bool cursor_visble;
+ };
+ 
+ #define to_intel_crtc(x) container_of(x, struct intel_crtc, base)
+--- a/drivers/gpu/drm/i915/intel_overlay.c
++++ b/drivers/gpu/drm/i915/intel_overlay.c
+@@ -958,7 +958,7 @@ static int check_overlay_src(struct drm_
+ 	    || rec->src_width < N_HORIZ_Y_TAPS*4)
+ 		return -EINVAL;
+ 
+-	/* check alingment constrains */
++	/* check alignment constraints */
+ 	switch (rec->flags & I915_OVERLAY_TYPE_MASK) {
+ 		case I915_OVERLAY_RGB:
+ 			/* not implemented */
+@@ -990,7 +990,10 @@ static int check_overlay_src(struct drm_
+ 		return -EINVAL;
+ 
+ 	/* stride checking */
+-	stride_mask = 63;
++	if (IS_I830(dev) || IS_845G(dev))
++		stride_mask = 255;
++	else
++		stride_mask = 63;
+ 
+ 	if (rec->stride_Y & stride_mask || rec->stride_UV & stride_mask)
+ 		return -EINVAL;
+--- a/drivers/gpu/drm/radeon/r600.c
++++ b/drivers/gpu/drm/radeon/r600.c
+@@ -869,7 +869,17 @@ void r600_pcie_gart_tlb_flush(struct rad
+ 	u32 tmp;
+ 
+ 	/* flush hdp cache so updates hit vram */
+-	WREG32(R_005480_HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
++	if ((rdev->family >= CHIP_RV770) && (rdev->family <= CHIP_RV740)) {
++		void __iomem *ptr = (void *)rdev->gart.table.vram.ptr;
++		u32 tmp;
++
++		/* r7xx hw bug.  write to HDP_DEBUG1 followed by fb read
++		 * rather than write to HDP_REG_COHERENCY_FLUSH_CNTL
++		 */
++		WREG32(HDP_DEBUG1, 0);
++		tmp = readl((void __iomem *)ptr);
++	} else
++		WREG32(R_005480_HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
+ 
+ 	WREG32(VM_CONTEXT0_INVALIDATION_LOW_ADDR, rdev->mc.gtt_start >> 12);
+ 	WREG32(VM_CONTEXT0_INVALIDATION_HIGH_ADDR, (rdev->mc.gtt_end - 1) >> 12);
+@@ -3512,5 +3522,15 @@ int r600_debugfs_mc_info_init(struct rad
+  */
+ void r600_ioctl_wait_idle(struct radeon_device *rdev, struct radeon_bo *bo)
+ {
+-	WREG32(R_005480_HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
++	/* r7xx hw bug.  write to HDP_DEBUG1 followed by fb read
++	 * rather than write to HDP_REG_COHERENCY_FLUSH_CNTL
++	 */
++	if ((rdev->family >= CHIP_RV770) && (rdev->family <= CHIP_RV740)) {
++		void __iomem *ptr = (void *)rdev->gart.table.vram.ptr;
++		u32 tmp;
++
++		WREG32(HDP_DEBUG1, 0);
++		tmp = readl((void __iomem *)ptr);
++	} else
++		WREG32(R_005480_HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
+ }
+--- a/drivers/gpu/drm/radeon/r600d.h
++++ b/drivers/gpu/drm/radeon/r600d.h
+@@ -245,6 +245,7 @@
+ #define	HDP_NONSURFACE_SIZE				0x2C0C
+ #define HDP_REG_COHERENCY_FLUSH_CNTL			0x54A0
+ #define	HDP_TILING_CONFIG				0x2F3C
++#define HDP_DEBUG1                                      0x2F34
+ 
+ #define MC_VM_AGP_TOP					0x2184
+ #define MC_VM_AGP_BOT					0x2188
+--- a/drivers/gpu/drm/radeon/radeon_object.c
++++ b/drivers/gpu/drm/radeon/radeon_object.c
+@@ -110,6 +110,7 @@ int radeon_bo_create(struct radeon_devic
+ 	bo->surface_reg = -1;
+ 	INIT_LIST_HEAD(&bo->list);
+ 
++retry:
+ 	radeon_ttm_placement_from_domain(bo, domain);
+ 	/* Kernel allocation are uninterruptible */
+ 	mutex_lock(&rdev->vram_mutex);
+@@ -118,10 +119,15 @@ int radeon_bo_create(struct radeon_devic
+ 			&radeon_ttm_bo_destroy);
+ 	mutex_unlock(&rdev->vram_mutex);
+ 	if (unlikely(r != 0)) {
+-		if (r != -ERESTARTSYS)
++		if (r != -ERESTARTSYS) {
++			if (domain == RADEON_GEM_DOMAIN_VRAM) {
++				domain |= RADEON_GEM_DOMAIN_GTT;
++				goto retry;
++			}
+ 			dev_err(rdev->dev,
+ 				"object_init failed for (%lu, 0x%08X)\n",
+ 				size, domain);
++		}
+ 		return r;
+ 	}
+ 	*bo_ptr = bo;
+@@ -321,6 +327,7 @@ int radeon_bo_list_validate(struct list_
+ {
+ 	struct radeon_bo_list *lobj;
+ 	struct radeon_bo *bo;
++	u32 domain;
+ 	int r;
+ 
+ 	list_for_each_entry(lobj, head, list) {
+@@ -333,17 +340,19 @@ int radeon_bo_list_validate(struct list_
+ 	list_for_each_entry(lobj, head, list) {
+ 		bo = lobj->bo;
+ 		if (!bo->pin_count) {
+-			if (lobj->wdomain) {
+-				radeon_ttm_placement_from_domain(bo,
+-								lobj->wdomain);
+-			} else {
+-				radeon_ttm_placement_from_domain(bo,
+-								lobj->rdomain);
+-			}
++			domain = lobj->wdomain ? lobj->wdomain : lobj->rdomain;
++
++		retry:
++			radeon_ttm_placement_from_domain(bo, domain);
+ 			r = ttm_bo_validate(&bo->tbo, &bo->placement,
+ 						true, false, false);
+-			if (unlikely(r))
++			if (unlikely(r)) {
++				if (r != -ERESTARTSYS && domain == RADEON_GEM_DOMAIN_VRAM) {
++					domain |= RADEON_GEM_DOMAIN_GTT;
++					goto retry;
++				}
+ 				return r;
++			}
+ 		}
+ 		lobj->gpu_offset = radeon_bo_gpu_offset(bo);
+ 		lobj->tiling_flags = bo->tiling_flags;
+--- a/drivers/gpu/drm/radeon/rs690.c
++++ b/drivers/gpu/drm/radeon/rs690.c
+@@ -398,7 +398,9 @@ void rs690_bandwidth_update(struct radeo
+ 	struct drm_display_mode *mode1 = NULL;
+ 	struct rs690_watermark wm0;
+ 	struct rs690_watermark wm1;
+-	u32 tmp, d1mode_priority_a_cnt, d2mode_priority_a_cnt;
++	u32 tmp;
++	u32 d1mode_priority_a_cnt = S_006548_D1MODE_PRIORITY_A_OFF(1);
++	u32 d2mode_priority_a_cnt = S_006548_D1MODE_PRIORITY_A_OFF(1);
+ 	fixed20_12 priority_mark02, priority_mark12, fill_rate;
+ 	fixed20_12 a, b;
+ 
+@@ -495,10 +497,6 @@ void rs690_bandwidth_update(struct radeo
+ 			d1mode_priority_a_cnt |= S_006548_D1MODE_PRIORITY_A_ALWAYS_ON(1);
+ 			d2mode_priority_a_cnt |= S_006D48_D2MODE_PRIORITY_A_ALWAYS_ON(1);
+ 		}
+-		WREG32(R_006548_D1MODE_PRIORITY_A_CNT, d1mode_priority_a_cnt);
+-		WREG32(R_00654C_D1MODE_PRIORITY_B_CNT, d1mode_priority_a_cnt);
+-		WREG32(R_006D48_D2MODE_PRIORITY_A_CNT, d2mode_priority_a_cnt);
+-		WREG32(R_006D4C_D2MODE_PRIORITY_B_CNT, d2mode_priority_a_cnt);
+ 	} else if (mode0) {
+ 		if (dfixed_trunc(wm0.dbpp) > 64)
+ 			a.full = dfixed_mul(wm0.dbpp, wm0.num_line_pair);
+@@ -528,13 +526,7 @@ void rs690_bandwidth_update(struct radeo
+ 		d1mode_priority_a_cnt = dfixed_trunc(priority_mark02);
+ 		if (rdev->disp_priority == 2)
+ 			d1mode_priority_a_cnt |= S_006548_D1MODE_PRIORITY_A_ALWAYS_ON(1);
+-		WREG32(R_006548_D1MODE_PRIORITY_A_CNT, d1mode_priority_a_cnt);
+-		WREG32(R_00654C_D1MODE_PRIORITY_B_CNT, d1mode_priority_a_cnt);
+-		WREG32(R_006D48_D2MODE_PRIORITY_A_CNT,
+-			S_006D48_D2MODE_PRIORITY_A_OFF(1));
+-		WREG32(R_006D4C_D2MODE_PRIORITY_B_CNT,
+-			S_006D4C_D2MODE_PRIORITY_B_OFF(1));
+-	} else {
++	} else if (mode1) {
+ 		if (dfixed_trunc(wm1.dbpp) > 64)
+ 			a.full = dfixed_mul(wm1.dbpp, wm1.num_line_pair);
+ 		else
+@@ -563,13 +555,12 @@ void rs690_bandwidth_update(struct radeo
+ 		d2mode_priority_a_cnt = dfixed_trunc(priority_mark12);
+ 		if (rdev->disp_priority == 2)
+ 			d2mode_priority_a_cnt |= S_006D48_D2MODE_PRIORITY_A_ALWAYS_ON(1);
+-		WREG32(R_006548_D1MODE_PRIORITY_A_CNT,
+-			S_006548_D1MODE_PRIORITY_A_OFF(1));
+-		WREG32(R_00654C_D1MODE_PRIORITY_B_CNT,
+-			S_00654C_D1MODE_PRIORITY_B_OFF(1));
+-		WREG32(R_006D48_D2MODE_PRIORITY_A_CNT, d2mode_priority_a_cnt);
+-		WREG32(R_006D4C_D2MODE_PRIORITY_B_CNT, d2mode_priority_a_cnt);
+ 	}
++
++	WREG32(R_006548_D1MODE_PRIORITY_A_CNT, d1mode_priority_a_cnt);
++	WREG32(R_00654C_D1MODE_PRIORITY_B_CNT, d1mode_priority_a_cnt);
++	WREG32(R_006D48_D2MODE_PRIORITY_A_CNT, d2mode_priority_a_cnt);
++	WREG32(R_006D4C_D2MODE_PRIORITY_B_CNT, d2mode_priority_a_cnt);
+ }
+ 
+ uint32_t rs690_mc_rreg(struct radeon_device *rdev, uint32_t reg)
+--- a/drivers/gpu/drm/radeon/rv515.c
++++ b/drivers/gpu/drm/radeon/rv515.c
+@@ -925,7 +925,9 @@ void rv515_bandwidth_avivo_update(struct
+ 	struct drm_display_mode *mode1 = NULL;
+ 	struct rv515_watermark wm0;
+ 	struct rv515_watermark wm1;
+-	u32 tmp, d1mode_priority_a_cnt, d2mode_priority_a_cnt;
++	u32 tmp;
++	u32 d1mode_priority_a_cnt = MODE_PRIORITY_OFF;
++	u32 d2mode_priority_a_cnt = MODE_PRIORITY_OFF;
+ 	fixed20_12 priority_mark02, priority_mark12, fill_rate;
+ 	fixed20_12 a, b;
+ 
+@@ -999,10 +1001,6 @@ void rv515_bandwidth_avivo_update(struct
+ 			d1mode_priority_a_cnt |= MODE_PRIORITY_ALWAYS_ON;
+ 			d2mode_priority_a_cnt |= MODE_PRIORITY_ALWAYS_ON;
+ 		}
+-		WREG32(D1MODE_PRIORITY_A_CNT, d1mode_priority_a_cnt);
+-		WREG32(D1MODE_PRIORITY_B_CNT, d1mode_priority_a_cnt);
+-		WREG32(D2MODE_PRIORITY_A_CNT, d2mode_priority_a_cnt);
+-		WREG32(D2MODE_PRIORITY_B_CNT, d2mode_priority_a_cnt);
+ 	} else if (mode0) {
+ 		if (dfixed_trunc(wm0.dbpp) > 64)
+ 			a.full = dfixed_div(wm0.dbpp, wm0.num_line_pair);
+@@ -1032,11 +1030,7 @@ void rv515_bandwidth_avivo_update(struct
+ 		d1mode_priority_a_cnt = dfixed_trunc(priority_mark02);
+ 		if (rdev->disp_priority == 2)
+ 			d1mode_priority_a_cnt |= MODE_PRIORITY_ALWAYS_ON;
+-		WREG32(D1MODE_PRIORITY_A_CNT, d1mode_priority_a_cnt);
+-		WREG32(D1MODE_PRIORITY_B_CNT, d1mode_priority_a_cnt);
+-		WREG32(D2MODE_PRIORITY_A_CNT, MODE_PRIORITY_OFF);
+-		WREG32(D2MODE_PRIORITY_B_CNT, MODE_PRIORITY_OFF);
+-	} else {
++	} else if (mode1) {
+ 		if (dfixed_trunc(wm1.dbpp) > 64)
+ 			a.full = dfixed_div(wm1.dbpp, wm1.num_line_pair);
+ 		else
+@@ -1065,11 +1059,12 @@ void rv515_bandwidth_avivo_update(struct
+ 		d2mode_priority_a_cnt = dfixed_trunc(priority_mark12);
+ 		if (rdev->disp_priority == 2)
+ 			d2mode_priority_a_cnt |= MODE_PRIORITY_ALWAYS_ON;
+-		WREG32(D1MODE_PRIORITY_A_CNT, MODE_PRIORITY_OFF);
+-		WREG32(D1MODE_PRIORITY_B_CNT, MODE_PRIORITY_OFF);
+-		WREG32(D2MODE_PRIORITY_A_CNT, d2mode_priority_a_cnt);
+-		WREG32(D2MODE_PRIORITY_B_CNT, d2mode_priority_a_cnt);
+ 	}
++
++	WREG32(D1MODE_PRIORITY_A_CNT, d1mode_priority_a_cnt);
++	WREG32(D1MODE_PRIORITY_B_CNT, d1mode_priority_a_cnt);
++	WREG32(D2MODE_PRIORITY_A_CNT, d2mode_priority_a_cnt);
++	WREG32(D2MODE_PRIORITY_B_CNT, d2mode_priority_a_cnt);
+ }
+ 
+ void rv515_bandwidth_update(struct radeon_device *rdev)
+--- a/drivers/gpu/drm/radeon/rv770.c
++++ b/drivers/gpu/drm/radeon/rv770.c
+@@ -189,7 +189,10 @@ static void rv770_mc_program(struct rade
+ 		WREG32((0x2c20 + j), 0x00000000);
+ 		WREG32((0x2c24 + j), 0x00000000);
+ 	}
+-	WREG32(HDP_REG_COHERENCY_FLUSH_CNTL, 0);
++	/* r7xx hw bug.  Read from HDP_DEBUG1 rather
++	 * than writing to HDP_REG_COHERENCY_FLUSH_CNTL
++	 */
++	tmp = RREG32(HDP_DEBUG1);
+ 
+ 	rv515_mc_stop(rdev, &save);
+ 	if (r600_mc_wait_for_idle(rdev)) {
+--- a/drivers/gpu/drm/radeon/rv770d.h
++++ b/drivers/gpu/drm/radeon/rv770d.h
+@@ -128,6 +128,7 @@
+ #define	HDP_NONSURFACE_SIZE				0x2C0C
+ #define HDP_REG_COHERENCY_FLUSH_CNTL			0x54A0
+ #define	HDP_TILING_CONFIG				0x2F3C
++#define HDP_DEBUG1                                      0x2F34
+ 
+ #define MC_SHARED_CHMAP						0x2004
+ #define		NOOFCHAN_SHIFT					12
 --- a/drivers/ide/ide-cd.c
 +++ b/drivers/ide/ide-cd.c
 @@ -506,15 +506,22 @@ int ide_cd_queue_pc(ide_drive_t *drive,
@@ -1118,6 +1808,22 @@
  		bio_pair_release(bp);
  		return 0;
  	bad_map:
+--- a/drivers/misc/enclosure.c
++++ b/drivers/misc/enclosure.c
+@@ -285,8 +285,11 @@ enclosure_component_register(struct encl
+ 	cdev->groups = enclosure_groups;
+ 
+ 	err = device_register(cdev);
+-	if (err)
+-		ERR_PTR(err);
++	if (err) {
++		ecomp->number = -1;
++		put_device(cdev);
++		return ERR_PTR(err);
++	}
+ 
+ 	return ecomp;
+ }
 --- a/drivers/mtd/nand/mxc_nand.c
 +++ b/drivers/mtd/nand/mxc_nand.c
 @@ -604,8 +604,8 @@ static void mxc_nand_command(struct mtd_
@@ -1185,6 +1891,17 @@
  
  		status = rx_desc->status;
  		skb = buffer_info->skb;
+--- a/drivers/net/e1000e/hw.h
++++ b/drivers/net/e1000e/hw.h
+@@ -308,7 +308,7 @@ enum e1e_registers {
+ #define E1000_KMRNCTRLSTA_INBAND_PARAM	0x9    /* Kumeran InBand Parameters */
+ #define E1000_KMRNCTRLSTA_DIAG_NELPBK	0x1000 /* Nearend Loopback mode */
+ #define E1000_KMRNCTRLSTA_K1_CONFIG	0x7
+-#define E1000_KMRNCTRLSTA_K1_ENABLE	0x140E
++#define E1000_KMRNCTRLSTA_K1_ENABLE	0x0002
+ #define E1000_KMRNCTRLSTA_K1_DISABLE	0x1400
+ 
+ #define IFE_PHY_EXTENDED_STATUS_CONTROL	0x10
 --- a/drivers/net/e1000e/netdev.c
 +++ b/drivers/net/e1000e/netdev.c
 @@ -774,6 +774,7 @@ static bool e1000_clean_rx_irq(struct e1
@@ -1219,8 +1936,53 @@
  
  		status = rx_desc->status;
  		skb = buffer_info->skb;
+@@ -3419,13 +3423,18 @@ static int e1000_test_msi(struct e1000_a
+ 
+ 	/* disable SERR in case the MSI write causes a master abort */
+ 	pci_read_config_word(adapter->pdev, PCI_COMMAND, &pci_cmd);
+-	pci_write_config_word(adapter->pdev, PCI_COMMAND,
+-			      pci_cmd & ~PCI_COMMAND_SERR);
++	if (pci_cmd & PCI_COMMAND_SERR)
++		pci_write_config_word(adapter->pdev, PCI_COMMAND,
++				      pci_cmd & ~PCI_COMMAND_SERR);
+ 
+ 	err = e1000_test_msi_interrupt(adapter);
+ 
+-	/* restore previous setting of command word */
+-	pci_write_config_word(adapter->pdev, PCI_COMMAND, pci_cmd);
++	/* re-enable SERR */
++	if (pci_cmd & PCI_COMMAND_SERR) {
++		pci_read_config_word(adapter->pdev, PCI_COMMAND, &pci_cmd);
++		pci_cmd |= PCI_COMMAND_SERR;
++		pci_write_config_word(adapter->pdev, PCI_COMMAND, pci_cmd);
++	}
+ 
+ 	/* success ! */
+ 	if (!err)
 --- a/drivers/net/igb/igb_main.c
 +++ b/drivers/net/igb/igb_main.c
+@@ -630,9 +630,6 @@ static void igb_cache_ring_register(stru
+ 			for (; i < adapter->rss_queues; i++)
+ 				adapter->rx_ring[i]->reg_idx = rbase_offset +
+ 				                               Q_IDX_82576(i);
+-			for (; j < adapter->rss_queues; j++)
+-				adapter->tx_ring[j]->reg_idx = rbase_offset +
+-				                               Q_IDX_82576(j);
+ 		}
+ 	case e1000_82575:
+ 	case e1000_82580:
+@@ -996,7 +993,10 @@ static void igb_set_interrupt_capability
+ 
+ 	/* Number of supported queues. */
+ 	adapter->num_rx_queues = adapter->rss_queues;
+-	adapter->num_tx_queues = adapter->rss_queues;
++	if (adapter->vfs_allocated_count)
++		adapter->num_tx_queues = 1;
++	else
++		adapter->num_tx_queues = adapter->rss_queues;
+ 
+ 	/* start with one vector for every rx queue */
+ 	numvecs = adapter->num_rx_queues;
 @@ -5344,6 +5344,7 @@ static bool igb_clean_tx_irq(struct igb_
  
  	while ((eop_desc->wb.status & cpu_to_le32(E1000_TXD_STAT_DD)) &&
@@ -1472,6 +2234,343 @@
  }
  
  /* waits for MAC not busy, with timeout.  Only called by smsc911x_mac_read
+--- a/drivers/net/wireless/ath/ath9k/ar9002_calib.c
++++ b/drivers/net/wireless/ath/ath9k/ar9002_calib.c
+@@ -239,7 +239,7 @@ static void ar9002_hw_iqcalibrate(struct
+ 			if (qCoff > 15)
+ 				qCoff = 15;
+ 			else if (qCoff <= -16)
+-				qCoff = 16;
++				qCoff = -16;
+ 
+ 			ath_print(common, ATH_DBG_CALIBRATE,
+ 				  "Chn %d : iCoff = 0x%x  qCoff = 0x%x\n",
+--- a/drivers/net/wireless/ath/ath9k/ar9003_eeprom.c
++++ b/drivers/net/wireless/ath/ath9k/ar9003_eeprom.c
+@@ -944,7 +944,7 @@ static u8 ath9k_hw_ar9300_get_num_ant_co
+ 	return 1;
+ }
+ 
+-static u16 ath9k_hw_ar9300_get_eeprom_antenna_cfg(struct ath_hw *ah,
++static u32 ath9k_hw_ar9300_get_eeprom_antenna_cfg(struct ath_hw *ah,
+ 						  struct ath9k_channel *chan)
+ {
+ 	return -EINVAL;
+--- a/drivers/net/wireless/ath/ath9k/eeprom.h
++++ b/drivers/net/wireless/ath/ath9k/eeprom.h
+@@ -669,7 +669,7 @@ struct eeprom_ops {
+ 	int (*get_eeprom_ver)(struct ath_hw *hw);
+ 	int (*get_eeprom_rev)(struct ath_hw *hw);
+ 	u8 (*get_num_ant_config)(struct ath_hw *hw, enum ieee80211_band band);
+-	u16 (*get_eeprom_antenna_cfg)(struct ath_hw *hw,
++	u32 (*get_eeprom_antenna_cfg)(struct ath_hw *hw,
+ 				      struct ath9k_channel *chan);
+ 	void (*set_board_values)(struct ath_hw *hw, struct ath9k_channel *chan);
+ 	void (*set_addac)(struct ath_hw *hw, struct ath9k_channel *chan);
+--- a/drivers/net/wireless/ath/ath9k/eeprom_4k.c
++++ b/drivers/net/wireless/ath/ath9k/eeprom_4k.c
+@@ -1149,13 +1149,13 @@ static void ath9k_hw_4k_set_board_values
+ 	}
+ }
+ 
+-static u16 ath9k_hw_4k_get_eeprom_antenna_cfg(struct ath_hw *ah,
++static u32 ath9k_hw_4k_get_eeprom_antenna_cfg(struct ath_hw *ah,
+ 					      struct ath9k_channel *chan)
+ {
+ 	struct ar5416_eeprom_4k *eep = &ah->eeprom.map4k;
+ 	struct modal_eep_4k_header *pModal = &eep->modalHeader;
+ 
+-	return pModal->antCtrlCommon & 0xFFFF;
++	return pModal->antCtrlCommon;
+ }
+ 
+ static u8 ath9k_hw_4k_get_num_ant_config(struct ath_hw *ah,
+--- a/drivers/net/wireless/ath/ath9k/eeprom_9287.c
++++ b/drivers/net/wireless/ath/ath9k/eeprom_9287.c
+@@ -1131,13 +1131,13 @@ static u8 ath9k_hw_AR9287_get_num_ant_co
+ 	return 1;
+ }
+ 
+-static u16 ath9k_hw_AR9287_get_eeprom_antenna_cfg(struct ath_hw *ah,
++static u32 ath9k_hw_AR9287_get_eeprom_antenna_cfg(struct ath_hw *ah,
+ 						  struct ath9k_channel *chan)
+ {
+ 	struct ar9287_eeprom *eep = &ah->eeprom.map9287;
+ 	struct modal_eep_ar9287_header *pModal = &eep->modalHeader;
+ 
+-	return pModal->antCtrlCommon & 0xFFFF;
++	return pModal->antCtrlCommon;
+ }
+ 
+ static u16 ath9k_hw_AR9287_get_spur_channel(struct ath_hw *ah,
+--- a/drivers/net/wireless/ath/ath9k/eeprom_def.c
++++ b/drivers/net/wireless/ath/ath9k/eeprom_def.c
+@@ -729,7 +729,7 @@ static void ath9k_hw_get_def_gain_bounda
+ 				    vpdTableI[i][sizeCurrVpdTable - 2]);
+ 		vpdStep = (int16_t)((vpdStep < 1) ? 1 : vpdStep);
+ 
+-		if (tgtIndex > maxIndex) {
++		if (tgtIndex >= maxIndex) {
+ 			while ((ss <= tgtIndex) &&
+ 			       (k < (AR5416_NUM_PDADC_VALUES - 1))) {
+ 				tmpVal = (int16_t)((vpdTableI[i][sizeCurrVpdTable - 1] +
+@@ -1437,14 +1437,14 @@ static u8 ath9k_hw_def_get_num_ant_confi
+ 	return num_ant_config;
+ }
+ 
+-static u16 ath9k_hw_def_get_eeprom_antenna_cfg(struct ath_hw *ah,
++static u32 ath9k_hw_def_get_eeprom_antenna_cfg(struct ath_hw *ah,
+ 					       struct ath9k_channel *chan)
+ {
+ 	struct ar5416_eeprom_def *eep = &ah->eeprom.def;
+ 	struct modal_eep_header *pModal =
+ 		&(eep->modalHeader[IS_CHAN_2GHZ(chan)]);
+ 
+-	return pModal->antCtrlCommon & 0xFFFF;
++	return pModal->antCtrlCommon;
+ }
+ 
+ static u16 ath9k_hw_def_get_spur_channel(struct ath_hw *ah, u16 i, bool is2GHz)
+--- a/drivers/net/wireless/ath/ath9k/hw.c
++++ b/drivers/net/wireless/ath/ath9k/hw.c
+@@ -537,7 +537,8 @@ static int __ath9k_hw_init(struct ath_hw
+ 
+ 	if (ah->config.serialize_regmode == SER_REG_MODE_AUTO) {
+ 		if (ah->hw_version.macVersion == AR_SREV_VERSION_5416_PCI ||
+-		    (AR_SREV_9280(ah) && !ah->is_pciexpress)) {
++		    ((AR_SREV_9160(ah) || AR_SREV_9280(ah)) &&
++		     !ah->is_pciexpress)) {
+ 			ah->config.serialize_regmode =
+ 				SER_REG_MODE_ON;
+ 		} else {
+@@ -1232,9 +1233,11 @@ int ath9k_hw_reset(struct ath_hw *ah, st
+ 
+ 	if (!ah->chip_fullsleep) {
+ 		ath9k_hw_abortpcurecv(ah);
+-		if (!ath9k_hw_stopdmarecv(ah))
++		if (!ath9k_hw_stopdmarecv(ah)) {
+ 			ath_print(common, ATH_DBG_XMIT,
+ 				"Failed to stop receive dma\n");
++			bChannelChange = false;
++		}
+ 	}
+ 
+ 	if (!ath9k_hw_setpower(ah, ATH9K_PM_AWAKE))
+@@ -1265,7 +1268,8 @@ int ath9k_hw_reset(struct ath_hw *ah, st
+ 	macStaId1 = REG_READ(ah, AR_STA_ID1) & AR_STA_ID1_BASE_RATE_11B;
+ 
+ 	/* For chips on which RTC reset is done, save TSF before it gets cleared */
+-	if (AR_SREV_9280(ah) && ah->eep_ops->get_eeprom(ah, EEP_OL_PWRCTRL))
++	if (AR_SREV_9100(ah) ||
++	    (AR_SREV_9280(ah) && ah->eep_ops->get_eeprom(ah, EEP_OL_PWRCTRL)))
+ 		tsf = ath9k_hw_gettsf64(ah);
+ 
+ 	saveLedState = REG_READ(ah, AR_CFG_LED) &
+@@ -1297,7 +1301,7 @@ int ath9k_hw_reset(struct ath_hw *ah, st
+ 	}
+ 
+ 	/* Restore TSF */
+-	if (tsf && AR_SREV_9280(ah) && ah->eep_ops->get_eeprom(ah, EEP_OL_PWRCTRL))
++	if (tsf)
+ 		ath9k_hw_settsf64(ah, tsf);
+ 
+ 	if (AR_SREV_9280_10_OR_LATER(ah))
+@@ -1307,6 +1311,17 @@ int ath9k_hw_reset(struct ath_hw *ah, st
+ 	if (r)
+ 		return r;
+ 
++	/*
++	 * Some AR91xx SoC devices frequently fail to accept TSF writes
++	 * right after the chip reset. When that happens, write a new
++	 * value after the initvals have been applied, with an offset
++	 * based on measured time difference
++	 */
++	if (AR_SREV_9100(ah) && (ath9k_hw_gettsf64(ah) < tsf)) {
++		tsf += 1500;
++		ath9k_hw_settsf64(ah, tsf);
++	}
++
+ 	/* Setup MFP options for CCMP */
+ 	if (AR_SREV_9280_20_OR_LATER(ah)) {
+ 		/* Mask Retry(b11), PwrMgt(b12), MoreData(b13) to 0 in mgmt
+--- a/drivers/net/wireless/ath/ath9k/xmit.c
++++ b/drivers/net/wireless/ath/ath9k/xmit.c
+@@ -328,6 +328,7 @@ static void ath_tx_complete_aggr(struct
+ 	u32 ba[WME_BA_BMP_SIZE >> 5];
+ 	int isaggr, txfail, txpending, sendbar = 0, needreset = 0, nbad = 0;
+ 	bool rc_update = true;
++	struct ieee80211_tx_rate rates[4];
+ 
+ 	skb = bf->bf_mpdu;
+ 	hdr = (struct ieee80211_hdr *)skb->data;
+@@ -335,12 +336,30 @@ static void ath_tx_complete_aggr(struct
+ 	tx_info = IEEE80211_SKB_CB(skb);
+ 	hw = bf->aphy->hw;
+ 
++	memcpy(rates, tx_info->control.rates, sizeof(rates));
++
+ 	rcu_read_lock();
+ 
+ 	/* XXX: use ieee80211_find_sta! */
+ 	sta = ieee80211_find_sta_by_hw(hw, hdr->addr1);
+ 	if (!sta) {
+ 		rcu_read_unlock();
++
++		INIT_LIST_HEAD(&bf_head);
++		while (bf) {
++			bf_next = bf->bf_next;
++
++			bf->bf_state.bf_type |= BUF_XRETRY;
++			if ((sc->sc_ah->caps.hw_caps & ATH9K_HW_CAP_EDMA) ||
++			    !bf->bf_stale || bf_next != NULL)
++				list_move_tail(&bf->list, &bf_head);
++
++			ath_tx_rc_status(bf, ts, 0, 0, false);
++			ath_tx_complete_buf(sc, bf, txq, &bf_head, ts,
++				0, 0);
++
++			bf = bf_next;
++		}
+ 		return;
+ 	}
+ 
+@@ -375,6 +394,9 @@ static void ath_tx_complete_aggr(struct
+ 		txfail = txpending = 0;
+ 		bf_next = bf->bf_next;
+ 
++		skb = bf->bf_mpdu;
++		tx_info = IEEE80211_SKB_CB(skb);
++
+ 		if (ATH_BA_ISSET(ba, ATH_BA_INDEX(seq_st, bf->bf_seqno))) {
+ 			/* transmit completion, subframe is
+ 			 * acked by block ack */
+@@ -428,6 +450,7 @@ static void ath_tx_complete_aggr(struct
+ 			spin_unlock_bh(&txq->axq_lock);
+ 
+ 			if (rc_update && (acked_cnt == 1 || txfail_cnt == 1)) {
++				memcpy(tx_info->control.rates, rates, sizeof(rates));
+ 				ath_tx_rc_status(bf, ts, nbad, txok, true);
+ 				rc_update = false;
+ 			} else {
+@@ -487,6 +510,14 @@ static void ath_tx_complete_aggr(struct
+ 		bf = bf_next;
+ 	}
+ 
++	/* prepend un-acked frames to the beginning of the pending frame queue */
++	if (!list_empty(&bf_pending)) {
++		spin_lock_bh(&txq->axq_lock);
++		list_splice(&bf_pending, &tid->buf_q);
++		ath_tx_queue_tid(txq, tid);
++		spin_unlock_bh(&txq->axq_lock);
++	}
++
+ 	if (tid->state & AGGR_CLEANUP) {
+ 		if (tid->baw_head == tid->baw_tail) {
+ 			tid->state &= ~AGGR_ADDBA_COMPLETE;
+@@ -499,14 +530,6 @@ static void ath_tx_complete_aggr(struct
+ 		return;
+ 	}
+ 
+-	/* prepend un-acked frames to the beginning of the pending frame queue */
+-	if (!list_empty(&bf_pending)) {
+-		spin_lock_bh(&txq->axq_lock);
+-		list_splice(&bf_pending, &tid->buf_q);
+-		ath_tx_queue_tid(txq, tid);
+-		spin_unlock_bh(&txq->axq_lock);
+-	}
+-
+ 	rcu_read_unlock();
+ 
+ 	if (needreset)
+@@ -2050,7 +2073,7 @@ static void ath_tx_rc_status(struct ath_
+ 		tx_info->status.rates[i].idx = -1;
+ 	}
+ 
+-	tx_info->status.rates[tx_rateindex].count = bf->bf_retries + 1;
++	tx_info->status.rates[tx_rateindex].count = ts->ts_longretry + 1;
+ }
+ 
+ static void ath_wake_mac80211_queue(struct ath_softc *sc, struct ath_txq *txq)
+@@ -2161,7 +2184,6 @@ static void ath_tx_processq(struct ath_s
+ 			 * This frame is sent out as a single frame.
+ 			 * Use hardware retry status for this frame.
+ 			 */
+-			bf->bf_retries = ts.ts_longretry;
+ 			if (ts.ts_status & ATH9K_TXERR_XRETRY)
+ 				bf->bf_state.bf_type |= BUF_XRETRY;
+ 			ath_tx_rc_status(bf, &ts, 0, txok, true);
+@@ -2280,7 +2302,6 @@ void ath_tx_edma_tasklet(struct ath_soft
+ 		txok = !(txs.ts_status & ATH9K_TXERR_MASK);
+ 
+ 		if (!bf_isampdu(bf)) {
+-			bf->bf_retries = txs.ts_longretry;
+ 			if (txs.ts_status & ATH9K_TXERR_XRETRY)
+ 				bf->bf_state.bf_type |= BUF_XRETRY;
+ 			ath_tx_rc_status(bf, &txs, 0, txok, true);
+@@ -2449,37 +2470,37 @@ void ath_tx_node_init(struct ath_softc *
+ 
+ void ath_tx_node_cleanup(struct ath_softc *sc, struct ath_node *an)
+ {
+-	int i;
+-	struct ath_atx_ac *ac, *ac_tmp;
+-	struct ath_atx_tid *tid, *tid_tmp;
++	struct ath_atx_ac *ac;
++	struct ath_atx_tid *tid;
+ 	struct ath_txq *txq;
++	int i, tidno;
+ 
+-	for (i = 0; i < ATH9K_NUM_TX_QUEUES; i++) {
+-		if (ATH_TXQ_SETUP(sc, i)) {
+-			txq = &sc->tx.txq[i];
++	for (tidno = 0, tid = &an->tid[tidno];
++	     tidno < WME_NUM_TID; tidno++, tid++) {
++		i = tid->ac->qnum;
+ 
+-			spin_lock_bh(&txq->axq_lock);
++		if (!ATH_TXQ_SETUP(sc, i))
++			continue;
+ 
+-			list_for_each_entry_safe(ac,
+-					ac_tmp, &txq->axq_acq, list) {
+-				tid = list_first_entry(&ac->tid_q,
+-						struct ath_atx_tid, list);
+-				if (tid && tid->an != an)
+-					continue;
+-				list_del(&ac->list);
+-				ac->sched = false;
+-
+-				list_for_each_entry_safe(tid,
+-						tid_tmp, &ac->tid_q, list) {
+-					list_del(&tid->list);
+-					tid->sched = false;
+-					ath_tid_drain(sc, txq, tid);
+-					tid->state &= ~AGGR_ADDBA_COMPLETE;
+-					tid->state &= ~AGGR_CLEANUP;
+-				}
+-			}
++		txq = &sc->tx.txq[i];
++		ac = tid->ac;
+ 
+-			spin_unlock_bh(&txq->axq_lock);
++		spin_lock_bh(&txq->axq_lock);
++
++		if (tid->sched) {
++			list_del(&tid->list);
++			tid->sched = false;
++		}
++
++		if (ac->sched) {
++			list_del(&ac->list);
++			tid->ac->sched = false;
+ 		}
++
++		ath_tid_drain(sc, txq, tid);
++		tid->state &= ~AGGR_ADDBA_COMPLETE;
++		tid->state &= ~AGGR_CLEANUP;
++
++		spin_unlock_bh(&txq->axq_lock);
+ 	}
+ }
 --- a/drivers/net/wireless/iwlwifi/iwl-devtrace.h
 +++ b/drivers/net/wireless/iwlwifi/iwl-devtrace.h
 @@ -193,7 +193,7 @@ TRACE_EVENT(iwlwifi_dev_tx,
@@ -1483,6 +2582,41 @@
  	),
  	TP_printk("[%p] TX %.2x (%zu bytes)",
  		  __entry->priv,
+--- a/drivers/net/wireless/iwlwifi/iwl-scan.c
++++ b/drivers/net/wireless/iwlwifi/iwl-scan.c
+@@ -420,11 +420,10 @@ void iwl_bg_scan_check(struct work_struc
+ 		return;
+ 
+ 	mutex_lock(&priv->mutex);
+-	if (test_bit(STATUS_SCANNING, &priv->status) ||
+-	    test_bit(STATUS_SCAN_ABORTING, &priv->status)) {
+-		IWL_DEBUG_SCAN(priv, "Scan completion watchdog resetting "
+-			"adapter (%dms)\n",
+-			jiffies_to_msecs(IWL_SCAN_CHECK_WATCHDOG));
++	if (test_bit(STATUS_SCANNING, &priv->status) &&
++	    !test_bit(STATUS_SCAN_ABORTING, &priv->status)) {
++		IWL_DEBUG_SCAN(priv, "Scan completion watchdog (%dms)\n",
++			       jiffies_to_msecs(IWL_SCAN_CHECK_WATCHDOG));
+ 
+ 		if (!test_bit(STATUS_EXIT_PENDING, &priv->status))
+ 			iwl_send_scan_abort(priv);
+@@ -489,12 +488,11 @@ void iwl_bg_abort_scan(struct work_struc
+ 	    !test_bit(STATUS_GEO_CONFIGURED, &priv->status))
+ 		return;
+ 
+-	mutex_lock(&priv->mutex);
+-
+-	cancel_delayed_work_sync(&priv->scan_check);
+-	set_bit(STATUS_SCAN_ABORTING, &priv->status);
+-	iwl_send_scan_abort(priv);
++	cancel_delayed_work(&priv->scan_check);
+ 
++	mutex_lock(&priv->mutex);
++	if (test_bit(STATUS_SCAN_ABORTING, &priv->status))
++		iwl_send_scan_abort(priv);
+ 	mutex_unlock(&priv->mutex);
+ }
+ EXPORT_SYMBOL(iwl_bg_abort_scan);
 --- a/drivers/net/wireless/rtl818x/rtl8180_dev.c
 +++ b/drivers/net/wireless/rtl818x/rtl8180_dev.c
 @@ -688,6 +688,8 @@ void rtl8180_beacon_work(struct work_str
@@ -1494,6 +2628,39 @@
  
  	/*
  	 * update beacon timestamp w/ TSF value
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@ -1621,6 +1621,7 @@ static void backend_changed(struct xenbu
+ 		if (xennet_connect(netdev) != 0)
+ 			break;
+ 		xenbus_switch_state(dev, XenbusStateConnected);
++		netif_notify_peers(netdev);
+ 		break;
+ 
+ 	case XenbusStateClosing:
+--- a/drivers/parisc/led.c
++++ b/drivers/parisc/led.c
+@@ -176,16 +176,18 @@ static ssize_t led_proc_write(struct fil
+ 	size_t count, loff_t *pos)
+ {
+ 	void *data = PDE(file->f_path.dentry->d_inode)->data;
+-	char *cur, lbuf[count + 1];
++	char *cur, lbuf[32];
+ 	int d;
+ 
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EACCES;
+ 
+-	memset(lbuf, 0, count + 1);
++	if (count >= sizeof(lbuf))
++		count = sizeof(lbuf)-1;
+ 
+ 	if (copy_from_user(lbuf, buf, count))
+ 		return -EFAULT;
++	lbuf[count] = 0;
+ 
+ 	cur = lbuf;
+ 
 --- a/drivers/pci/intel-iommu.c
 +++ b/drivers/pci/intel-iommu.c
 @@ -3030,6 +3030,34 @@ static void __init iommu_exit_mempool(vo
@@ -1615,6 +2782,43 @@
  
  	/*
  	 * Oxford Semiconductor Inc. Tornado PCI express device range.
+--- a/drivers/ssb/driver_chipcommon.c
++++ b/drivers/ssb/driver_chipcommon.c
+@@ -235,6 +235,7 @@ void ssb_chipcommon_init(struct ssb_chip
+ 		return; /* We don't have a ChipCommon */
+ 	if (cc->dev->id.revision >= 11)
+ 		cc->status = chipco_read32(cc, SSB_CHIPCO_CHIPSTAT);
++	ssb_dprintk(KERN_INFO PFX "chipcommon status is 0x%x\n", cc->status);
+ 	ssb_pmu_init(cc);
+ 	chipco_powercontrol_init(cc);
+ 	ssb_chipco_set_clockmode(cc, SSB_CLKMODE_FAST);
+--- a/drivers/ssb/pci.c
++++ b/drivers/ssb/pci.c
+@@ -626,11 +626,22 @@ static int ssb_pci_sprom_get(struct ssb_
+ 		return -ENODEV;
+ 	}
+ 	if (bus->chipco.dev) {	/* can be unavailible! */
+-		bus->sprom_offset = (bus->chipco.dev->id.revision < 31) ?
+-			SSB_SPROM_BASE1 : SSB_SPROM_BASE31;
++		/*
++		 * get SPROM offset: SSB_SPROM_BASE1 except for
++		 * chipcommon rev >= 31 or chip ID is 0x4312 and
++		 * chipcommon status & 3 == 2
++		 */
++		if (bus->chipco.dev->id.revision >= 31)
++			bus->sprom_offset = SSB_SPROM_BASE31;
++		else if (bus->chip_id == 0x4312 &&
++			 (bus->chipco.status & 0x03) == 2)
++			bus->sprom_offset = SSB_SPROM_BASE31;
++		else
++			bus->sprom_offset = SSB_SPROM_BASE1;
+ 	} else {
+ 		bus->sprom_offset = SSB_SPROM_BASE1;
+ 	}
++	ssb_dprintk(KERN_INFO PFX "SPROM offset is 0x%x\n", bus->sprom_offset);
+ 
+ 	buf = kcalloc(SSB_SPROMSIZE_WORDS_R123, sizeof(u16), GFP_KERNEL);
+ 	if (!buf)
 --- a/drivers/staging/hv/Kconfig
 +++ b/drivers/staging/hv/Kconfig
 @@ -17,7 +17,7 @@ config HYPERV_STORAGE
@@ -2088,6 +3292,17 @@
  		unbind_from_irq(irq);
 --- a/fs/block_dev.c
 +++ b/fs/block_dev.c
+@@ -681,8 +681,8 @@ retry:
+ 	if (!bd_may_claim(bdev, whole, holder))
+ 		return -EBUSY;
+ 
+-	/* if someone else is claiming, wait for it to finish */
+-	if (whole->bd_claiming && whole->bd_claiming != holder) {
++	/* if claiming is already in progress, wait for it to finish */
++	if (whole->bd_claiming) {
+ 		wait_queue_head_t *wq = bit_waitqueue(&whole->bd_claiming, 0);
+ 		DEFINE_WAIT(wait);
+ 
 @@ -1339,10 +1339,12 @@ static int __blkdev_get(struct block_dev
  	/*
  	 * hooks: /n/, see "layering violations".
@@ -2434,6 +3649,57 @@
  
  	error = security_sb_kern_mount(mnt->mnt_sb, flags, secdata);
  	if (error)
+--- a/include/drm/drm_pciids.h
++++ b/include/drm/drm_pciids.h
+@@ -146,6 +146,8 @@
+ 	{0x1002, 0x6888, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYPRESS|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6889, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYPRESS|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x688A, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYPRESS|RADEON_NEW_MEMMAP}, \
++	{0x1002, 0x688C, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYPRESS|RADEON_NEW_MEMMAP}, \
++	{0x1002, 0x688D, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYPRESS|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6898, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYPRESS|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6899, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYPRESS|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x689c, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_HEMLOCK|RADEON_NEW_MEMMAP}, \
+@@ -161,6 +163,7 @@
+ 	{0x1002, 0x68be, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_JUNIPER|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68c0, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_REDWOOD|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68c1, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_REDWOOD|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
++	{0x1002, 0x68c7, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_REDWOOD|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68c8, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_REDWOOD|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68c9, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_REDWOOD|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68d8, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_REDWOOD|RADEON_NEW_MEMMAP}, \
+@@ -174,6 +177,7 @@
+ 	{0x1002, 0x68e8, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CEDAR|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68e9, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CEDAR|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68f1, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CEDAR|RADEON_NEW_MEMMAP}, \
++	{0x1002, 0x68f2, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CEDAR|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68f8, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CEDAR|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68f9, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CEDAR|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68fe, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CEDAR|RADEON_NEW_MEMMAP}, \
+@@ -314,6 +318,7 @@
+ 	{0x1002, 0x9456, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV770|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x945A, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV770|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x945B, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV770|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
++	{0x1002, 0x945E, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV770|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x9460, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV770|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x9462, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV770|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x946A, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV770|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+@@ -324,6 +329,7 @@
+ 	{0x1002, 0x9487, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV730|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x9488, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV730|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x9489, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV730|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
++	{0x1002, 0x948A, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV730|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x948F, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV730|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x9490, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV730|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x9491, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV730|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+@@ -366,6 +372,7 @@
+ 	{0x1002, 0x9553, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV710|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x9555, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV710|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x9557, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV710|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
++	{0x1002, 0x955f, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV710|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x9580, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV630|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x9581, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV630|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x9583, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RV630|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
 --- a/include/linux/Kbuild
 +++ b/include/linux/Kbuild
 @@ -276,6 +276,7 @@ ifneq ($(wildcard $(srctree)/arch/$(SRCA
@@ -2494,13 +3760,23 @@
  
  /*
   * Bits used by threaded handlers:
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1775,6 +1775,8 @@ extern void netif_carrier_on(struct net_
+ 
+ extern void netif_carrier_off(struct net_device *dev);
+ 
++extern void netif_notify_peers(struct net_device *dev);
++
+ /**
+  *	netif_dormant_on - mark device as dormant.
+  *	@dev: network device
 --- a/include/linux/notifier.h
 +++ b/include/linux/notifier.h
-@@ -210,7 +210,7 @@ static inline int notifier_to_errno(int
+@@ -210,6 +210,7 @@ static inline int notifier_to_errno(int
  #define NETDEV_POST_INIT	0x0010
  #define NETDEV_UNREGISTER_BATCH 0x0011
  #define NETDEV_BONDING_DESLAVE  0x0012
--#define NETDEV_NOTIFY_PEERS	0x0012
 +#define NETDEV_NOTIFY_PEERS	0x0013
  
  #define SYS_DOWN	0x0001	/* Notify of system down */
@@ -2566,6 +3842,34 @@
  #endif /* CONFIG_NO_HZ */
  
  static u64 sched_avg_period(void)
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -637,7 +637,7 @@ static inline bool si_fromuser(const str
+ 
+ /*
+  * Bad permissions for sending the signal
+- * - the caller must hold at least the RCU read lock
++ * - the caller must hold the RCU read lock
+  */
+ static int check_kill_permission(int sig, struct siginfo *info,
+ 				 struct task_struct *t)
+@@ -1127,11 +1127,14 @@ struct sighand_struct *lock_task_sighand
+ 
+ /*
+  * send signal info to all the members of a group
+- * - the caller must hold the RCU read lock at least
+  */
+ int group_send_sig_info(int sig, struct siginfo *info, struct task_struct *p)
+ {
+-	int ret = check_kill_permission(sig, info, p);
++	int ret;
++
++	rcu_read_lock();
++	ret = check_kill_permission(sig, info, p);
++	rcu_read_unlock();
+ 
+ 	if (!ret && sig)
+ 		ret = do_send_sig_info(sig, info, p, true);
 --- a/kernel/time/tick-sched.c
 +++ b/kernel/time/tick-sched.c
 @@ -325,7 +325,7 @@ void tick_nohz_stop_sched_tick(int inidl
@@ -2577,6 +3881,47 @@
  		next_jiffies = last_jiffies + 1;
  		delta_jiffies = 1;
  	} else {
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -2760,6 +2760,26 @@ out_release:
+ }
+ 
+ /*
++ * This is like a special single-page "expand_downwards()",
++ * except we must first make sure that 'address-PAGE_SIZE'
++ * doesn't hit another vma.
++ *
++ * The "find_vma()" will do the right thing even if we wrap
++ */
++static inline int check_stack_guard_page(struct vm_area_struct *vma, unsigned long address)
++{
++	address &= PAGE_MASK;
++	if ((vma->vm_flags & VM_GROWSDOWN) && address == vma->vm_start) {
++		address -= PAGE_SIZE;
++		if (find_vma(vma->vm_mm, address) != vma)
++			return -ENOMEM;
++
++		expand_stack(vma, address);
++	}
++	return 0;
++}
++
++/*
+  * We enter with non-exclusive mmap_sem (to exclude vma changes,
+  * but allow concurrent faults), and pte mapped but not yet locked.
+  * We return with mmap_sem still held, but pte unmapped and unlocked.
+@@ -2772,6 +2792,11 @@ static int do_anonymous_page(struct mm_s
+ 	spinlock_t *ptl;
+ 	pte_t entry;
+ 
++	if (check_stack_guard_page(vma, address) < 0) {
++		pte_unmap(page_table);
++		return VM_FAULT_SIGBUS;
++	}
++
+ 	if (!(flags & FAULT_FLAG_WRITE)) {
+ 		entry = pte_mkspecial(pfn_pte(my_zero_pfn(address),
+ 						vma->vm_page_prot));
 --- a/mm/swapfile.c
 +++ b/mm/swapfile.c
 @@ -318,8 +318,10 @@ checks:
@@ -2592,6 +3937,226 @@
  		int swap_was_freed;
  		spin_unlock(&swap_lock);
  		swap_was_freed = __try_to_reclaim_swap(si, offset);
+--- a/net/9p/trans_fd.c
++++ b/net/9p/trans_fd.c
+@@ -948,7 +948,7 @@ p9_fd_create_unix(struct p9_client *clie
+ 
+ 	csocket = NULL;
+ 
+-	if (strlen(addr) > UNIX_PATH_MAX) {
++	if (strlen(addr) >= UNIX_PATH_MAX) {
+ 		P9_EPRINTK(KERN_ERR, "p9_trans_unix: address too long: %s\n",
+ 			addr);
+ 		return -ENAMETOOLONG;
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@ -1081,6 +1081,7 @@ static int inetdev_event(struct notifier
+ 		}
+ 		ip_mc_up(in_dev);
+ 		/* fall through */
++	case NETDEV_NOTIFY_PEERS:
+ 	case NETDEV_CHANGEADDR:
+ 		/* Send gratuitous ARP to notify of link change */
+ 		if (IN_DEV_ARP_NOTIFY(in_dev)) {
+--- a/net/mac80211/mesh_plink.c
++++ b/net/mac80211/mesh_plink.c
+@@ -65,7 +65,6 @@ void mesh_plink_inc_estab_count(struct i
+ {
+ 	atomic_inc(&sdata->u.mesh.mshstats.estab_plinks);
+ 	mesh_accept_plinks_update(sdata);
+-	ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_BEACON);
+ }
+ 
+ static inline
+@@ -73,7 +72,6 @@ void mesh_plink_dec_estab_count(struct i
+ {
+ 	atomic_dec(&sdata->u.mesh.mshstats.estab_plinks);
+ 	mesh_accept_plinks_update(sdata);
+-	ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_BEACON);
+ }
+ 
+ /**
+@@ -115,7 +113,7 @@ static struct sta_info *mesh_plink_alloc
+ }
+ 
+ /**
+- * mesh_plink_deactivate - deactivate mesh peer link
++ * __mesh_plink_deactivate - deactivate mesh peer link
+  *
+  * @sta: mesh peer link to deactivate
+  *
+@@ -123,18 +121,23 @@ static struct sta_info *mesh_plink_alloc
+  *
+  * Locking: the caller must hold sta->lock
+  */
+-static void __mesh_plink_deactivate(struct sta_info *sta)
++static bool __mesh_plink_deactivate(struct sta_info *sta)
+ {
+ 	struct ieee80211_sub_if_data *sdata = sta->sdata;
++	bool deactivated = false;
+ 
+-	if (sta->plink_state == PLINK_ESTAB)
++	if (sta->plink_state == PLINK_ESTAB) {
+ 		mesh_plink_dec_estab_count(sdata);
++		deactivated = true;
++	}
+ 	sta->plink_state = PLINK_BLOCKED;
+ 	mesh_path_flush_by_nexthop(sta);
++
++	return deactivated;
+ }
+ 
+ /**
+- * __mesh_plink_deactivate - deactivate mesh peer link
++ * mesh_plink_deactivate - deactivate mesh peer link
+  *
+  * @sta: mesh peer link to deactivate
+  *
+@@ -142,9 +145,15 @@ static void __mesh_plink_deactivate(stru
+  */
+ void mesh_plink_deactivate(struct sta_info *sta)
+ {
++	struct ieee80211_sub_if_data *sdata = sta->sdata;
++	bool deactivated;
++
+ 	spin_lock_bh(&sta->lock);
+-	__mesh_plink_deactivate(sta);
++	deactivated = __mesh_plink_deactivate(sta);
+ 	spin_unlock_bh(&sta->lock);
++
++	if (deactivated)
++		ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_BEACON);
+ }
+ 
+ static int mesh_plink_frame_tx(struct ieee80211_sub_if_data *sdata,
+@@ -381,10 +390,16 @@ int mesh_plink_open(struct sta_info *sta
+ 
+ void mesh_plink_block(struct sta_info *sta)
+ {
++	struct ieee80211_sub_if_data *sdata = sta->sdata;
++	bool deactivated;
++
+ 	spin_lock_bh(&sta->lock);
+-	__mesh_plink_deactivate(sta);
++	deactivated = __mesh_plink_deactivate(sta);
+ 	sta->plink_state = PLINK_BLOCKED;
+ 	spin_unlock_bh(&sta->lock);
++
++	if (deactivated)
++		ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_BEACON);
+ }
+ 
+ 
+@@ -397,6 +412,7 @@ void mesh_rx_plink_frame(struct ieee8021
+ 	enum plink_event event;
+ 	enum plink_frame_type ftype;
+ 	size_t baselen;
++	bool deactivated;
+ 	u8 ie_len;
+ 	u8 *baseaddr;
+ 	__le16 plid, llid, reason;
+@@ -651,8 +667,9 @@ void mesh_rx_plink_frame(struct ieee8021
+ 		case CNF_ACPT:
+ 			del_timer(&sta->plink_timer);
+ 			sta->plink_state = PLINK_ESTAB;
+-			mesh_plink_inc_estab_count(sdata);
+ 			spin_unlock_bh(&sta->lock);
++			mesh_plink_inc_estab_count(sdata);
++			ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_BEACON);
+ 			mpl_dbg("Mesh plink with %pM ESTABLISHED\n",
+ 				sta->sta.addr);
+ 			break;
+@@ -684,8 +701,9 @@ void mesh_rx_plink_frame(struct ieee8021
+ 		case OPN_ACPT:
+ 			del_timer(&sta->plink_timer);
+ 			sta->plink_state = PLINK_ESTAB;
+-			mesh_plink_inc_estab_count(sdata);
+ 			spin_unlock_bh(&sta->lock);
++			mesh_plink_inc_estab_count(sdata);
++			ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_BEACON);
+ 			mpl_dbg("Mesh plink with %pM ESTABLISHED\n",
+ 				sta->sta.addr);
+ 			mesh_plink_frame_tx(sdata, PLINK_CONFIRM, sta->sta.addr, llid,
+@@ -702,11 +720,13 @@ void mesh_rx_plink_frame(struct ieee8021
+ 		case CLS_ACPT:
+ 			reason = cpu_to_le16(MESH_CLOSE_RCVD);
+ 			sta->reason = reason;
+-			__mesh_plink_deactivate(sta);
++			deactivated = __mesh_plink_deactivate(sta);
+ 			sta->plink_state = PLINK_HOLDING;
+ 			llid = sta->llid;
+ 			mod_plink_timer(sta, dot11MeshHoldingTimeout(sdata));
+ 			spin_unlock_bh(&sta->lock);
++			if (deactivated)
++				ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_BEACON);
+ 			mesh_plink_frame_tx(sdata, PLINK_CLOSE, sta->sta.addr, llid,
+ 					    plid, reason);
+ 			break;
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -327,6 +327,24 @@ void netif_carrier_off(struct net_device
+ }
+ EXPORT_SYMBOL(netif_carrier_off);
+ 
++/**
++ * 	netif_notify_peers - notify network peers about existence of @dev
++ * 	@dev: network device
++ *
++ * Generate traffic such that interested network peers are aware of
++ * @dev, such as by generating a gratuitous ARP. This may be used when
++ * a device wants to inform the rest of the network about some sort of
++ * reconfiguration such as a failover event or virtual machine
++ * migration.
++ */
++void netif_notify_peers(struct net_device *dev)
++{
++	rtnl_lock();
++	call_netdevice_notifiers(NETDEV_NOTIFY_PEERS, dev);
++	rtnl_unlock();
++}
++EXPORT_SYMBOL(netif_notify_peers);
++
+ /* "NOOP" scheduler: the best scheduler, recommended for all interfaces
+    under all circumstances. It is difficult to invent anything faster or
+    cheaper.
+--- a/net/wireless/mlme.c
++++ b/net/wireless/mlme.c
+@@ -44,10 +44,10 @@ void cfg80211_send_rx_auth(struct net_de
+ 		}
+ 	}
+ 
+-	WARN_ON(!done);
+-
+-	nl80211_send_rx_auth(rdev, dev, buf, len, GFP_KERNEL);
+-	cfg80211_sme_rx_auth(dev, buf, len);
++	if (done) {
++		nl80211_send_rx_auth(rdev, dev, buf, len, GFP_KERNEL);
++		cfg80211_sme_rx_auth(dev, buf, len);
++	}
+ 
+ 	wdev_unlock(wdev);
+ }
+--- a/net/wireless/scan.c
++++ b/net/wireless/scan.c
+@@ -275,6 +275,7 @@ struct cfg80211_bss *cfg80211_get_bss(st
+ {
+ 	struct cfg80211_registered_device *dev = wiphy_to_dev(wiphy);
+ 	struct cfg80211_internal_bss *bss, *res = NULL;
++	unsigned long now = jiffies;
+ 
+ 	spin_lock_bh(&dev->bss_lock);
+ 
+@@ -283,6 +284,10 @@ struct cfg80211_bss *cfg80211_get_bss(st
+ 			continue;
+ 		if (channel && bss->pub.channel != channel)
+ 			continue;
++		/* Don't get expired BSS structs */
++		if (time_after(now, bss->ts + IEEE80211_SCAN_RESULT_EXPIRE) &&
++		    !atomic_read(&bss->hold))
++			continue;
+ 		if (is_bss(&bss->pub, bssid, ssid, ssid_len)) {
+ 			res = bss;
+ 			kref_get(&res->ref);
 --- a/sound/pci/hda/patch_realtek.c
 +++ b/sound/pci/hda/patch_realtek.c
 @@ -5183,6 +5183,7 @@ static void fillup_priv_adc_nids(struct
