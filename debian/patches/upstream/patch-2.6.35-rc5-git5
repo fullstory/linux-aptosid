@@ -1,3 +1,454 @@
+--- a/Documentation/00-INDEX
++++ b/Documentation/00-INDEX
+@@ -32,8 +32,6 @@ DocBook/
+ 	- directory with DocBook templates etc. for kernel documentation.
+ HOWTO
+ 	- the process and procedures of how to do Linux kernel development.
+-IO-mapping.txt
+-	- how to access I/O mapped memory from within device drivers.
+ IPMI.txt
+ 	- info on Linux Intelligent Platform Management Interface (IPMI) Driver.
+ IRQ-affinity.txt
+@@ -84,6 +82,8 @@ blockdev/
+ 	- info on block devices & drivers
+ btmrvl.txt
+ 	- info on Marvell Bluetooth driver usage.
++bus-virt-phys-mapping.txt
++	- how to access I/O mapped memory from within device drivers.
+ cachetlb.txt
+ 	- describes the cache/TLB flushing interfaces Linux uses.
+ cdrom/
+@@ -168,6 +168,8 @@ initrd.txt
+ 	- how to use the RAM disk as an initial/temporary root filesystem.
+ input/
+ 	- info on Linux input device support.
++io-mapping.txt
++	- description of io_mapping functions in linux/io-mapping.h
+ io_ordering.txt
+ 	- info on ordering I/O writes to memory-mapped addresses.
+ ioctl/
+--- a/Documentation/IO-mapping.txt
++++ /dev/null
+@@ -1,208 +0,0 @@
+-[ NOTE: The virt_to_bus() and bus_to_virt() functions have been
+-	superseded by the functionality provided by the PCI DMA interface
+-	(see Documentation/PCI/PCI-DMA-mapping.txt).  They continue
+-	to be documented below for historical purposes, but new code
+-	must not use them. --davidm 00/12/12 ]
+-
+-[ This is a mail message in response to a query on IO mapping, thus the
+-  strange format for a "document" ]
+-
+-The AHA-1542 is a bus-master device, and your patch makes the driver give the
+-controller the physical address of the buffers, which is correct on x86
+-(because all bus master devices see the physical memory mappings directly). 
+-
+-However, on many setups, there are actually _three_ different ways of looking
+-at memory addresses, and in this case we actually want the third, the
+-so-called "bus address". 
+-
+-Essentially, the three ways of addressing memory are (this is "real memory",
+-that is, normal RAM--see later about other details): 
+-
+- - CPU untranslated.  This is the "physical" address.  Physical address 
+-   0 is what the CPU sees when it drives zeroes on the memory bus.
+-
+- - CPU translated address. This is the "virtual" address, and is 
+-   completely internal to the CPU itself with the CPU doing the appropriate
+-   translations into "CPU untranslated". 
+-
+- - bus address. This is the address of memory as seen by OTHER devices, 
+-   not the CPU. Now, in theory there could be many different bus 
+-   addresses, with each device seeing memory in some device-specific way, but
+-   happily most hardware designers aren't actually actively trying to make
+-   things any more complex than necessary, so you can assume that all 
+-   external hardware sees the memory the same way. 
+-
+-Now, on normal PCs the bus address is exactly the same as the physical
+-address, and things are very simple indeed. However, they are that simple
+-because the memory and the devices share the same address space, and that is
+-not generally necessarily true on other PCI/ISA setups. 
+-
+-Now, just as an example, on the PReP (PowerPC Reference Platform), the 
+-CPU sees a memory map something like this (this is from memory):
+-
+-	0-2 GB		"real memory"
+-	2 GB-3 GB	"system IO" (inb/out and similar accesses on x86)
+-	3 GB-4 GB 	"IO memory" (shared memory over the IO bus)
+-
+-Now, that looks simple enough. However, when you look at the same thing from
+-the viewpoint of the devices, you have the reverse, and the physical memory
+-address 0 actually shows up as address 2 GB for any IO master.
+-
+-So when the CPU wants any bus master to write to physical memory 0, it 
+-has to give the master address 0x80000000 as the memory address.
+-
+-So, for example, depending on how the kernel is actually mapped on the 
+-PPC, you can end up with a setup like this:
+-
+- physical address:	0
+- virtual address:	0xC0000000
+- bus address:		0x80000000
+-
+-where all the addresses actually point to the same thing.  It's just seen 
+-through different translations..
+-
+-Similarly, on the Alpha, the normal translation is
+-
+- physical address:	0
+- virtual address:	0xfffffc0000000000
+- bus address:		0x40000000
+-
+-(but there are also Alphas where the physical address and the bus address
+-are the same). 
+-
+-Anyway, the way to look up all these translations, you do
+-
+-	#include <asm/io.h>
+-
+-	phys_addr = virt_to_phys(virt_addr);
+-	virt_addr = phys_to_virt(phys_addr);
+-	 bus_addr = virt_to_bus(virt_addr);
+-	virt_addr = bus_to_virt(bus_addr);
+-
+-Now, when do you need these?
+-
+-You want the _virtual_ address when you are actually going to access that 
+-pointer from the kernel. So you can have something like this:
+-
+-	/*
+-	 * this is the hardware "mailbox" we use to communicate with
+-	 * the controller. The controller sees this directly.
+-	 */
+-	struct mailbox {
+-		__u32 status;
+-		__u32 bufstart;
+-		__u32 buflen;
+-		..
+-	} mbox;
+-
+-		unsigned char * retbuffer;
+-
+-		/* get the address from the controller */
+-		retbuffer = bus_to_virt(mbox.bufstart);
+-		switch (retbuffer[0]) {
+-			case STATUS_OK:
+-				...
+-
+-on the other hand, you want the bus address when you have a buffer that 
+-you want to give to the controller:
+-
+-	/* ask the controller to read the sense status into "sense_buffer" */
+-	mbox.bufstart = virt_to_bus(&sense_buffer);
+-	mbox.buflen = sizeof(sense_buffer);
+-	mbox.status = 0;
+-	notify_controller(&mbox);
+-
+-And you generally _never_ want to use the physical address, because you can't
+-use that from the CPU (the CPU only uses translated virtual addresses), and
+-you can't use it from the bus master. 
+-
+-So why do we care about the physical address at all? We do need the physical
+-address in some cases, it's just not very often in normal code.  The physical
+-address is needed if you use memory mappings, for example, because the
+-"remap_pfn_range()" mm function wants the physical address of the memory to
+-be remapped as measured in units of pages, a.k.a. the pfn (the memory
+-management layer doesn't know about devices outside the CPU, so it
+-shouldn't need to know about "bus addresses" etc).
+-
+-NOTE NOTE NOTE! The above is only one part of the whole equation. The above
+-only talks about "real memory", that is, CPU memory (RAM). 
+-
+-There is a completely different type of memory too, and that's the "shared
+-memory" on the PCI or ISA bus. That's generally not RAM (although in the case
+-of a video graphics card it can be normal DRAM that is just used for a frame
+-buffer), but can be things like a packet buffer in a network card etc. 
+-
+-This memory is called "PCI memory" or "shared memory" or "IO memory" or
+-whatever, and there is only one way to access it: the readb/writeb and
+-related functions. You should never take the address of such memory, because
+-there is really nothing you can do with such an address: it's not
+-conceptually in the same memory space as "real memory" at all, so you cannot
+-just dereference a pointer. (Sadly, on x86 it _is_ in the same memory space,
+-so on x86 it actually works to just deference a pointer, but it's not
+-portable). 
+-
+-For such memory, you can do things like
+-
+- - reading:
+-	/*
+-	 * read first 32 bits from ISA memory at 0xC0000, aka
+-	 * C000:0000 in DOS terms
+-	 */
+-	unsigned int signature = isa_readl(0xC0000);
+-
+- - remapping and writing:
+-	/*
+-	 * remap framebuffer PCI memory area at 0xFC000000,
+-	 * size 1MB, so that we can access it: We can directly
+-	 * access only the 640k-1MB area, so anything else
+-	 * has to be remapped.
+-	 */
+-	void __iomem *baseptr = ioremap(0xFC000000, 1024*1024);
+-
+-	/* write a 'A' to the offset 10 of the area */
+-	writeb('A',baseptr+10);
+-
+-	/* unmap when we unload the driver */
+-	iounmap(baseptr);
+-
+- - copying and clearing:
+-	/* get the 6-byte Ethernet address at ISA address E000:0040 */
+-	memcpy_fromio(kernel_buffer, 0xE0040, 6);
+-	/* write a packet to the driver */
+-	memcpy_toio(0xE1000, skb->data, skb->len);
+-	/* clear the frame buffer */
+-	memset_io(0xA0000, 0, 0x10000);
+-
+-OK, that just about covers the basics of accessing IO portably.  Questions?
+-Comments? You may think that all the above is overly complex, but one day you
+-might find yourself with a 500 MHz Alpha in front of you, and then you'll be
+-happy that your driver works ;)
+-
+-Note that kernel versions 2.0.x (and earlier) mistakenly called the
+-ioremap() function "vremap()".  ioremap() is the proper name, but I
+-didn't think straight when I wrote it originally.  People who have to
+-support both can do something like:
+- 
+-	/* support old naming silliness */
+-	#if LINUX_VERSION_CODE < 0x020100                                     
+-	#define ioremap vremap
+-	#define iounmap vfree                                                     
+-	#endif
+- 
+-at the top of their source files, and then they can use the right names
+-even on 2.0.x systems. 
+-
+-And the above sounds worse than it really is.  Most real drivers really
+-don't do all that complex things (or rather: the complexity is not so
+-much in the actual IO accesses as in error handling and timeouts etc). 
+-It's generally not hard to fix drivers, and in many cases the code
+-actually looks better afterwards:
+-
+-	unsigned long signature = *(unsigned int *) 0xC0000;
+-		vs
+-	unsigned long signature = readl(0xC0000);
+-
+-I think the second version actually is more readable, no?
+-
+-		Linus
+-
+--- /dev/null
++++ b/Documentation/bus-virt-phys-mapping.txt
+@@ -0,0 +1,208 @@
++[ NOTE: The virt_to_bus() and bus_to_virt() functions have been
++	superseded by the functionality provided by the PCI DMA interface
++	(see Documentation/PCI/PCI-DMA-mapping.txt).  They continue
++	to be documented below for historical purposes, but new code
++	must not use them. --davidm 00/12/12 ]
++
++[ This is a mail message in response to a query on IO mapping, thus the
++  strange format for a "document" ]
++
++The AHA-1542 is a bus-master device, and your patch makes the driver give the
++controller the physical address of the buffers, which is correct on x86
++(because all bus master devices see the physical memory mappings directly). 
++
++However, on many setups, there are actually _three_ different ways of looking
++at memory addresses, and in this case we actually want the third, the
++so-called "bus address". 
++
++Essentially, the three ways of addressing memory are (this is "real memory",
++that is, normal RAM--see later about other details): 
++
++ - CPU untranslated.  This is the "physical" address.  Physical address 
++   0 is what the CPU sees when it drives zeroes on the memory bus.
++
++ - CPU translated address. This is the "virtual" address, and is 
++   completely internal to the CPU itself with the CPU doing the appropriate
++   translations into "CPU untranslated". 
++
++ - bus address. This is the address of memory as seen by OTHER devices, 
++   not the CPU. Now, in theory there could be many different bus 
++   addresses, with each device seeing memory in some device-specific way, but
++   happily most hardware designers aren't actually actively trying to make
++   things any more complex than necessary, so you can assume that all 
++   external hardware sees the memory the same way. 
++
++Now, on normal PCs the bus address is exactly the same as the physical
++address, and things are very simple indeed. However, they are that simple
++because the memory and the devices share the same address space, and that is
++not generally necessarily true on other PCI/ISA setups. 
++
++Now, just as an example, on the PReP (PowerPC Reference Platform), the 
++CPU sees a memory map something like this (this is from memory):
++
++	0-2 GB		"real memory"
++	2 GB-3 GB	"system IO" (inb/out and similar accesses on x86)
++	3 GB-4 GB 	"IO memory" (shared memory over the IO bus)
++
++Now, that looks simple enough. However, when you look at the same thing from
++the viewpoint of the devices, you have the reverse, and the physical memory
++address 0 actually shows up as address 2 GB for any IO master.
++
++So when the CPU wants any bus master to write to physical memory 0, it 
++has to give the master address 0x80000000 as the memory address.
++
++So, for example, depending on how the kernel is actually mapped on the 
++PPC, you can end up with a setup like this:
++
++ physical address:	0
++ virtual address:	0xC0000000
++ bus address:		0x80000000
++
++where all the addresses actually point to the same thing.  It's just seen 
++through different translations..
++
++Similarly, on the Alpha, the normal translation is
++
++ physical address:	0
++ virtual address:	0xfffffc0000000000
++ bus address:		0x40000000
++
++(but there are also Alphas where the physical address and the bus address
++are the same). 
++
++Anyway, the way to look up all these translations, you do
++
++	#include <asm/io.h>
++
++	phys_addr = virt_to_phys(virt_addr);
++	virt_addr = phys_to_virt(phys_addr);
++	 bus_addr = virt_to_bus(virt_addr);
++	virt_addr = bus_to_virt(bus_addr);
++
++Now, when do you need these?
++
++You want the _virtual_ address when you are actually going to access that 
++pointer from the kernel. So you can have something like this:
++
++	/*
++	 * this is the hardware "mailbox" we use to communicate with
++	 * the controller. The controller sees this directly.
++	 */
++	struct mailbox {
++		__u32 status;
++		__u32 bufstart;
++		__u32 buflen;
++		..
++	} mbox;
++
++		unsigned char * retbuffer;
++
++		/* get the address from the controller */
++		retbuffer = bus_to_virt(mbox.bufstart);
++		switch (retbuffer[0]) {
++			case STATUS_OK:
++				...
++
++on the other hand, you want the bus address when you have a buffer that 
++you want to give to the controller:
++
++	/* ask the controller to read the sense status into "sense_buffer" */
++	mbox.bufstart = virt_to_bus(&sense_buffer);
++	mbox.buflen = sizeof(sense_buffer);
++	mbox.status = 0;
++	notify_controller(&mbox);
++
++And you generally _never_ want to use the physical address, because you can't
++use that from the CPU (the CPU only uses translated virtual addresses), and
++you can't use it from the bus master. 
++
++So why do we care about the physical address at all? We do need the physical
++address in some cases, it's just not very often in normal code.  The physical
++address is needed if you use memory mappings, for example, because the
++"remap_pfn_range()" mm function wants the physical address of the memory to
++be remapped as measured in units of pages, a.k.a. the pfn (the memory
++management layer doesn't know about devices outside the CPU, so it
++shouldn't need to know about "bus addresses" etc).
++
++NOTE NOTE NOTE! The above is only one part of the whole equation. The above
++only talks about "real memory", that is, CPU memory (RAM). 
++
++There is a completely different type of memory too, and that's the "shared
++memory" on the PCI or ISA bus. That's generally not RAM (although in the case
++of a video graphics card it can be normal DRAM that is just used for a frame
++buffer), but can be things like a packet buffer in a network card etc. 
++
++This memory is called "PCI memory" or "shared memory" or "IO memory" or
++whatever, and there is only one way to access it: the readb/writeb and
++related functions. You should never take the address of such memory, because
++there is really nothing you can do with such an address: it's not
++conceptually in the same memory space as "real memory" at all, so you cannot
++just dereference a pointer. (Sadly, on x86 it _is_ in the same memory space,
++so on x86 it actually works to just deference a pointer, but it's not
++portable). 
++
++For such memory, you can do things like
++
++ - reading:
++	/*
++	 * read first 32 bits from ISA memory at 0xC0000, aka
++	 * C000:0000 in DOS terms
++	 */
++	unsigned int signature = isa_readl(0xC0000);
++
++ - remapping and writing:
++	/*
++	 * remap framebuffer PCI memory area at 0xFC000000,
++	 * size 1MB, so that we can access it: We can directly
++	 * access only the 640k-1MB area, so anything else
++	 * has to be remapped.
++	 */
++	void __iomem *baseptr = ioremap(0xFC000000, 1024*1024);
++
++	/* write a 'A' to the offset 10 of the area */
++	writeb('A',baseptr+10);
++
++	/* unmap when we unload the driver */
++	iounmap(baseptr);
++
++ - copying and clearing:
++	/* get the 6-byte Ethernet address at ISA address E000:0040 */
++	memcpy_fromio(kernel_buffer, 0xE0040, 6);
++	/* write a packet to the driver */
++	memcpy_toio(0xE1000, skb->data, skb->len);
++	/* clear the frame buffer */
++	memset_io(0xA0000, 0, 0x10000);
++
++OK, that just about covers the basics of accessing IO portably.  Questions?
++Comments? You may think that all the above is overly complex, but one day you
++might find yourself with a 500 MHz Alpha in front of you, and then you'll be
++happy that your driver works ;)
++
++Note that kernel versions 2.0.x (and earlier) mistakenly called the
++ioremap() function "vremap()".  ioremap() is the proper name, but I
++didn't think straight when I wrote it originally.  People who have to
++support both can do something like:
++ 
++	/* support old naming silliness */
++	#if LINUX_VERSION_CODE < 0x020100                                     
++	#define ioremap vremap
++	#define iounmap vfree                                                     
++	#endif
++ 
++at the top of their source files, and then they can use the right names
++even on 2.0.x systems. 
++
++And the above sounds worse than it really is.  Most real drivers really
++don't do all that complex things (or rather: the complexity is not so
++much in the actual IO accesses as in error handling and timeouts etc). 
++It's generally not hard to fix drivers, and in many cases the code
++actually looks better afterwards:
++
++	unsigned long signature = *(unsigned int *) 0xC0000;
++		vs
++	unsigned long signature = readl(0xC0000);
++
++I think the second version actually is more readable, no?
++
++		Linus
++
 --- a/Documentation/kernel-parameters.txt
 +++ b/Documentation/kernel-parameters.txt
 @@ -1265,7 +1265,7 @@ and is between 256 and 4096 characters.
@@ -16,7 +467,7 @@
  PATCHLEVEL = 6
  SUBLEVEL = 35
 -EXTRAVERSION = -rc5
-+EXTRAVERSION = -rc5-git4
++EXTRAVERSION = -rc5-git5
  NAME = Sheep on Meth
  
  # *DOCUMENTATION*
@@ -3463,6 +3914,39 @@
  }
  
  DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_ATI, PCI_DEVICE_ID_ATI_SBX00_SMBUS,
+--- a/arch/x86/kernel/setup_percpu.c
++++ b/arch/x86/kernel/setup_percpu.c
+@@ -238,6 +238,15 @@ void __init setup_per_cpu_areas(void)
+ #ifdef CONFIG_NUMA
+ 		per_cpu(x86_cpu_to_node_map, cpu) =
+ 			early_per_cpu_map(x86_cpu_to_node_map, cpu);
++		/*
++		 * Ensure taht the boot cpu numa_node is correct when the boot
++		 * cpu is on a node that doesn't have memory installed.
++		 * Also cpu_up() will call cpu_to_node() for APs when
++		 * MEMORY_HOTPLUG is defined, before per_cpu(numa_node) is set
++		 * up later with c_init aka intel_init/amd_init.
++		 * So set them all (boot cpu and all APs).
++		 */
++		set_cpu_numa_node(cpu, early_cpu_to_node(cpu));
+ #endif
+ #endif
+ 		/*
+@@ -257,14 +266,6 @@ void __init setup_per_cpu_areas(void)
+ 	early_per_cpu_ptr(x86_cpu_to_node_map) = NULL;
+ #endif
+ 
+-#if defined(CONFIG_X86_64) && defined(CONFIG_NUMA)
+-	/*
+-	 * make sure boot cpu numa_node is right, when boot cpu is on the
+-	 * node that doesn't have mem installed
+-	 */
+-	set_cpu_numa_node(boot_cpu_id, early_cpu_to_node(boot_cpu_id));
+-#endif
+-
+ 	/* Setup node to cpumask map */
+ 	setup_node_to_cpumask_map();
+ 
 --- a/arch/x86/kernel/x86_init.c
 +++ b/arch/x86/kernel/x86_init.c
 @@ -5,6 +5,7 @@
@@ -3502,6 +3986,15 @@
  		} else
  			was_rmapped = 1;
  	}
+@@ -2924,7 +2926,7 @@ static int kvm_mmu_remove_some_alloc_mmu
+ 	return kvm_mmu_zap_page(kvm, page) + 1;
+ }
+ 
+-static int mmu_shrink(int nr_to_scan, gfp_t gfp_mask)
++static int mmu_shrink(struct shrinker *shrink, int nr_to_scan, gfp_t gfp_mask)
+ {
+ 	struct kvm *kvm;
+ 	struct kvm *kvm_freed = NULL;
 --- a/arch/x86/kvm/vmx.c
 +++ b/arch/x86/kvm/vmx.c
 @@ -1744,18 +1744,15 @@ static void enter_lmode(struct kvm_vcpu
@@ -3569,6 +4062,47 @@
  
  	base = p + 1;
  
+--- a/drivers/clocksource/cs5535-clockevt.c
++++ b/drivers/clocksource/cs5535-clockevt.c
+@@ -194,6 +194,6 @@ err_timer:
+ 
+ module_init(cs5535_mfgpt_init);
+ 
+-MODULE_AUTHOR("Andres Salomon <dilinger@collabora.co.uk>");
++MODULE_AUTHOR("Andres Salomon <dilinger@queued.net>");
+ MODULE_DESCRIPTION("CS5535/CS5536 MFGPT clock event driver");
+ MODULE_LICENSE("GPL");
+--- a/drivers/edac/Kconfig
++++ b/drivers/edac/Kconfig
+@@ -209,7 +209,7 @@ config EDAC_I5100
+ 
+ config EDAC_MPC85XX
+ 	tristate "Freescale MPC83xx / MPC85xx"
+-	depends on EDAC_MM_EDAC && FSL_SOC && (PPC_83xx || MPC85xx)
++	depends on EDAC_MM_EDAC && FSL_SOC && (PPC_83xx || PPC_85xx)
+ 	help
+ 	  Support for error detection and correction on the Freescale
+ 	  MPC8349, MPC8560, MPC8540, MPC8548
+--- a/drivers/edac/mpc85xx_edac.c
++++ b/drivers/edac/mpc85xx_edac.c
+@@ -1120,6 +1120,7 @@ static struct of_device_id mpc85xx_mc_er
+ 	{ .compatible = "fsl,mpc8555-memory-controller", },
+ 	{ .compatible = "fsl,mpc8560-memory-controller", },
+ 	{ .compatible = "fsl,mpc8568-memory-controller", },
++	{ .compatible = "fsl,mpc8569-memory-controller", },
+ 	{ .compatible = "fsl,mpc8572-memory-controller", },
+ 	{ .compatible = "fsl,mpc8349-memory-controller", },
+ 	{ .compatible = "fsl,p2020-memory-controller", },
+--- a/drivers/gpio/cs5535-gpio.c
++++ b/drivers/gpio/cs5535-gpio.c
+@@ -352,6 +352,6 @@ static void __exit cs5535_gpio_exit(void
+ module_init(cs5535_gpio_init);
+ module_exit(cs5535_gpio_exit);
+ 
+-MODULE_AUTHOR("Andres Salomon <dilinger@collabora.co.uk>");
++MODULE_AUTHOR("Andres Salomon <dilinger@queued.net>");
+ MODULE_DESCRIPTION("AMD CS5535/CS5536 GPIO driver");
+ MODULE_LICENSE("GPL");
 --- a/drivers/gpu/drm/i915/i915_gem.c
 +++ b/drivers/gpu/drm/i915/i915_gem.c
 @@ -2241,6 +2241,7 @@ i915_gem_object_get_pages(struct drm_gem
@@ -3579,6 +4113,15 @@
  					   gfpmask);
  		if (IS_ERR(page))
  			goto err_pages;
+@@ -4977,7 +4978,7 @@ i915_gpu_is_active(struct drm_device *de
+ }
+ 
+ static int
+-i915_gem_shrink(int nr_to_scan, gfp_t gfp_mask)
++i915_gem_shrink(struct shrinker *shrink, int nr_to_scan, gfp_t gfp_mask)
+ {
+ 	drm_i915_private_t *dev_priv, *next_dev;
+ 	struct drm_i915_gem_object *obj_priv, *next_obj;
 --- a/drivers/input/keyboard/Kconfig
 +++ b/drivers/input/keyboard/Kconfig
 @@ -69,11 +69,11 @@ config KEYBOARD_ATARI
@@ -3664,6 +4207,191 @@
  
  	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
  	if (!res) {
+--- a/drivers/misc/cs5535-mfgpt.c
++++ b/drivers/misc/cs5535-mfgpt.c
+@@ -366,6 +366,6 @@ static int __init cs5535_mfgpt_init(void
+ 
+ module_init(cs5535_mfgpt_init);
+ 
+-MODULE_AUTHOR("Andres Salomon <dilinger@collabora.co.uk>");
++MODULE_AUTHOR("Andres Salomon <dilinger@queued.net>");
+ MODULE_DESCRIPTION("CS5535/CS5536 MFGPT timer driver");
+ MODULE_LICENSE("GPL");
+--- a/drivers/mmc/host/sdhci-s3c.c
++++ b/drivers/mmc/host/sdhci-s3c.c
+@@ -365,6 +365,26 @@ static int __devinit sdhci_s3c_probe(str
+ 
+ static int __devexit sdhci_s3c_remove(struct platform_device *pdev)
+ {
++	struct sdhci_host *host =  platform_get_drvdata(pdev);
++	struct sdhci_s3c *sc = sdhci_priv(host);
++	int ptr;
++
++	sdhci_remove_host(host, 1);
++
++	for (ptr = 0; ptr < 3; ptr++) {
++		clk_disable(sc->clk_bus[ptr]);
++		clk_put(sc->clk_bus[ptr]);
++	}
++	clk_disable(sc->clk_io);
++	clk_put(sc->clk_io);
++
++	iounmap(host->ioaddr);
++	release_resource(sc->ioarea);
++	kfree(sc->ioarea);
++
++	sdhci_free_host(host);
++	platform_set_drvdata(pdev, NULL);
++
+ 	return 0;
+ }
+ 
+--- a/drivers/net/ibmveth.c
++++ b/drivers/net/ibmveth.c
+@@ -677,7 +677,7 @@ static int ibmveth_close(struct net_devi
+ 	if (!adapter->pool_config)
+ 		netif_stop_queue(netdev);
+ 
+-	free_irq(netdev->irq, netdev);
++	h_vio_signal(adapter->vdev->unit_address, VIO_IRQ_DISABLE);
+ 
+ 	do {
+ 		lpar_rc = h_free_logical_lan(adapter->vdev->unit_address);
+@@ -689,6 +689,8 @@ static int ibmveth_close(struct net_devi
+ 				     lpar_rc);
+ 	}
+ 
++	free_irq(netdev->irq, netdev);
++
+ 	adapter->rx_no_buffer = *(u64*)(((char*)adapter->buffer_list_addr) + 4096 - 8);
+ 
+ 	ibmveth_cleanup(adapter);
+--- a/drivers/net/pcmcia/axnet_cs.c
++++ b/drivers/net/pcmcia/axnet_cs.c
+@@ -1168,6 +1168,7 @@ static irqreturn_t ax_interrupt(int irq,
+ 	int interrupts, nr_serviced = 0, i;
+ 	struct ei_device *ei_local;
+     	int handled = 0;
++	unsigned long flags;
+ 
+ 	e8390_base = dev->base_addr;
+ 	ei_local = netdev_priv(dev);
+@@ -1176,7 +1177,7 @@ static irqreturn_t ax_interrupt(int irq,
+ 	 *	Protect the irq test too.
+ 	 */
+ 	 
+-	spin_lock(&ei_local->page_lock);
++	spin_lock_irqsave(&ei_local->page_lock, flags);
+ 
+ 	if (ei_local->irqlock) 
+ 	{
+@@ -1188,7 +1189,7 @@ static irqreturn_t ax_interrupt(int irq,
+ 			   dev->name, inb_p(e8390_base + EN0_ISR),
+ 			   inb_p(e8390_base + EN0_IMR));
+ #endif
+-		spin_unlock(&ei_local->page_lock);
++		spin_unlock_irqrestore(&ei_local->page_lock, flags);
+ 		return IRQ_NONE;
+ 	}
+     
+@@ -1261,7 +1262,7 @@ static irqreturn_t ax_interrupt(int irq,
+ 	ei_local->irqlock = 0;
+ 	outb_p(ENISR_ALL, e8390_base + EN0_IMR);
+ 
+-	spin_unlock(&ei_local->page_lock);
++	spin_unlock_irqrestore(&ei_local->page_lock, flags);
+ 	return IRQ_RETVAL(handled);
+ }
+ 
+--- a/drivers/net/r8169.c
++++ b/drivers/net/r8169.c
+@@ -1316,7 +1316,7 @@ static void rtl8169_get_mac_version(stru
+ 		{ 0x7c800000, 0x28000000,	RTL_GIGA_MAC_VER_26 },
+ 
+ 		/* 8168C family. */
+-		{ 0x7cf00000, 0x3ca00000,	RTL_GIGA_MAC_VER_24 },
++		{ 0x7cf00000, 0x3cb00000,	RTL_GIGA_MAC_VER_24 },
+ 		{ 0x7cf00000, 0x3c900000,	RTL_GIGA_MAC_VER_23 },
+ 		{ 0x7cf00000, 0x3c800000,	RTL_GIGA_MAC_VER_18 },
+ 		{ 0x7c800000, 0x3c800000,	RTL_GIGA_MAC_VER_24 },
+--- a/drivers/net/wireless/ath/ath9k/hif_usb.c
++++ b/drivers/net/wireless/ath/ath9k/hif_usb.c
+@@ -730,13 +730,17 @@ static int ath9k_hif_usb_alloc_urbs(stru
+ 
+ 	/* RX */
+ 	if (ath9k_hif_usb_alloc_rx_urbs(hif_dev) < 0)
+-		goto err;
++		goto err_rx;
+ 
+ 	/* Register Read */
+ 	if (ath9k_hif_usb_alloc_reg_in_urb(hif_dev) < 0)
+-		goto err;
++		goto err_reg;
+ 
+ 	return 0;
++err_reg:
++	ath9k_hif_usb_dealloc_rx_urbs(hif_dev);
++err_rx:
++	ath9k_hif_usb_dealloc_tx_urbs(hif_dev);
+ err:
+ 	return -ENOMEM;
+ }
+--- a/drivers/net/wireless/hostap/hostap_pci.c
++++ b/drivers/net/wireless/hostap/hostap_pci.c
+@@ -330,6 +330,7 @@ static int prism2_pci_probe(struct pci_d
+ 
+         dev->irq = pdev->irq;
+         hw_priv->mem_start = mem;
++	dev->base_addr = (unsigned long) mem;
+ 
+ 	prism2_pci_cor_sreset(local);
+ 
+--- a/drivers/net/wireless/iwlwifi/iwl-sta.h
++++ b/drivers/net/wireless/iwlwifi/iwl-sta.h
+@@ -97,6 +97,17 @@ static inline void iwl_clear_driver_stat
+ 	spin_lock_irqsave(&priv->sta_lock, flags);
+ 	memset(priv->stations, 0, sizeof(priv->stations));
+ 	priv->num_stations = 0;
++
++	/*
++	 * Remove all key information that is not stored as part of station
++	 * information since mac80211 may not have had a
++	 * chance to remove all the keys. When device is reconfigured by
++	 * mac80211 after an error all keys will be reconfigured.
++	 */
++	priv->ucode_key_table = 0;
++	priv->key_mapping_key = 0;
++	memset(priv->wep_keys, 0, sizeof(priv->wep_keys));
++
+ 	spin_unlock_irqrestore(&priv->sta_lock, flags);
+ }
+ 
+--- a/drivers/net/wireless/rt2x00/rt2x00dev.c
++++ b/drivers/net/wireless/rt2x00/rt2x00dev.c
+@@ -854,6 +854,11 @@ int rt2x00lib_probe_dev(struct rt2x00_de
+ 		    BIT(NL80211_IFTYPE_WDS);
+ 
+ 	/*
++	 * Initialize configuration work.
++	 */
++	INIT_WORK(&rt2x00dev->intf_work, rt2x00lib_intf_scheduled);
++
++	/*
+ 	 * Let the driver probe the device to detect the capabilities.
+ 	 */
+ 	retval = rt2x00dev->ops->lib->probe_hw(rt2x00dev);
+@@ -863,11 +868,6 @@ int rt2x00lib_probe_dev(struct rt2x00_de
+ 	}
+ 
+ 	/*
+-	 * Initialize configuration work.
+-	 */
+-	INIT_WORK(&rt2x00dev->intf_work, rt2x00lib_intf_scheduled);
+-
+-	/*
+ 	 * Allocate queue array.
+ 	 */
+ 	retval = rt2x00queue_allocate(rt2x00dev);
 --- a/drivers/pci/setup-res.c
 +++ b/drivers/pci/setup-res.c
 @@ -156,6 +156,38 @@ static int __pci_assign_resource(struct
@@ -3748,6 +4476,17 @@
  	cmd = (addr >> 24) & 0xFF;
  	if (cmd == IPC_I2C_READ) {
  		writel(addr, ipcdev.i2c_base + IPC_I2C_CNTRL_ADDR);
+--- a/drivers/power/ds2782_battery.c
++++ b/drivers/power/ds2782_battery.c
+@@ -163,7 +163,7 @@ static int ds2782_get_capacity(struct ds
+ 	if (err)
+ 		return err;
+ 	*capacity = raw;
+-	return raw;
++	return 0;
+ }
+ 
+ static int ds2786_get_current(struct ds278x_info *info, int *current_uA)
 --- a/drivers/s390/block/dasd_devmap.c
 +++ b/drivers/s390/block/dasd_devmap.c
 @@ -948,8 +948,10 @@ static ssize_t dasd_alias_show(struct de
@@ -3804,6 +4543,610 @@
  /* SPI Controller mode register definitions */
  #define	SPMODE_LOOP		(1 << 30)
  #define	SPMODE_CI_INACTIVEHIGH	(1 << 29)
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -177,8 +177,8 @@ static void handle_tx(struct vhost_net *
+ 			break;
+ 		}
+ 		if (err != len)
+-			pr_err("Truncated TX packet: "
+-			       " len %d != %zd\n", err, len);
++			pr_debug("Truncated TX packet: "
++				 " len %d != %zd\n", err, len);
+ 		vhost_add_used_and_signal(&net->dev, vq, head, 0);
+ 		total_len += len;
+ 		if (unlikely(total_len >= VHOST_NET_WEIGHT)) {
+@@ -275,8 +275,8 @@ static void handle_rx(struct vhost_net *
+ 		}
+ 		/* TODO: Should check and handle checksum. */
+ 		if (err > len) {
+-			pr_err("Discarded truncated rx packet: "
+-			       " len %d > %zd\n", err, len);
++			pr_debug("Discarded truncated rx packet: "
++				 " len %d > %zd\n", err, len);
+ 			vhost_discard_vq_desc(vq);
+ 			continue;
+ 		}
+@@ -534,11 +534,16 @@ static long vhost_net_set_backend(struct
+ 	rcu_assign_pointer(vq->private_data, sock);
+ 	vhost_net_enable_vq(n, vq);
+ done:
++	mutex_unlock(&vq->mutex);
++
+ 	if (oldsock) {
+ 		vhost_net_flush_vq(n, index);
+ 		fput(oldsock->file);
+ 	}
+ 
++	mutex_unlock(&n->dev.mutex);
++	return 0;
++
+ err_vq:
+ 	mutex_unlock(&vq->mutex);
+ err:
+--- a/fs/btrfs/ctree.c
++++ b/fs/btrfs/ctree.c
+@@ -2304,12 +2304,17 @@ noinline int btrfs_leaf_free_space(struc
+ 	return ret;
+ }
+ 
++/*
++ * min slot controls the lowest index we're willing to push to the
++ * right.  We'll push up to and including min_slot, but no lower
++ */
+ static noinline int __push_leaf_right(struct btrfs_trans_handle *trans,
+ 				      struct btrfs_root *root,
+ 				      struct btrfs_path *path,
+ 				      int data_size, int empty,
+ 				      struct extent_buffer *right,
+-				      int free_space, u32 left_nritems)
++				      int free_space, u32 left_nritems,
++				      u32 min_slot)
+ {
+ 	struct extent_buffer *left = path->nodes[0];
+ 	struct extent_buffer *upper = path->nodes[1];
+@@ -2327,7 +2332,7 @@ static noinline int __push_leaf_right(st
+ 	if (empty)
+ 		nr = 0;
+ 	else
+-		nr = 1;
++		nr = max_t(u32, 1, min_slot);
+ 
+ 	if (path->slots[0] >= left_nritems)
+ 		push_space += data_size;
+@@ -2469,10 +2474,14 @@ out_unlock:
+  *
+  * returns 1 if the push failed because the other node didn't have enough
+  * room, 0 if everything worked out and < 0 if there were major errors.
++ *
++ * this will push starting from min_slot to the end of the leaf.  It won't
++ * push any slot lower than min_slot
+  */
+ static int push_leaf_right(struct btrfs_trans_handle *trans, struct btrfs_root
+-			   *root, struct btrfs_path *path, int data_size,
+-			   int empty)
++			   *root, struct btrfs_path *path,
++			   int min_data_size, int data_size,
++			   int empty, u32 min_slot)
+ {
+ 	struct extent_buffer *left = path->nodes[0];
+ 	struct extent_buffer *right;
+@@ -2514,8 +2523,8 @@ static int push_leaf_right(struct btrfs_
+ 	if (left_nritems == 0)
+ 		goto out_unlock;
+ 
+-	return __push_leaf_right(trans, root, path, data_size, empty,
+-				right, free_space, left_nritems);
++	return __push_leaf_right(trans, root, path, min_data_size, empty,
++				right, free_space, left_nritems, min_slot);
+ out_unlock:
+ 	btrfs_tree_unlock(right);
+ 	free_extent_buffer(right);
+@@ -2525,12 +2534,17 @@ out_unlock:
+ /*
+  * push some data in the path leaf to the left, trying to free up at
+  * least data_size bytes.  returns zero if the push worked, nonzero otherwise
++ *
++ * max_slot can put a limit on how far into the leaf we'll push items.  The
++ * item at 'max_slot' won't be touched.  Use (u32)-1 to make us do all the
++ * items
+  */
+ static noinline int __push_leaf_left(struct btrfs_trans_handle *trans,
+ 				     struct btrfs_root *root,
+ 				     struct btrfs_path *path, int data_size,
+ 				     int empty, struct extent_buffer *left,
+-				     int free_space, int right_nritems)
++				     int free_space, u32 right_nritems,
++				     u32 max_slot)
+ {
+ 	struct btrfs_disk_key disk_key;
+ 	struct extent_buffer *right = path->nodes[0];
+@@ -2549,9 +2563,9 @@ static noinline int __push_leaf_left(str
+ 	slot = path->slots[1];
+ 
+ 	if (empty)
+-		nr = right_nritems;
++		nr = min(right_nritems, max_slot);
+ 	else
+-		nr = right_nritems - 1;
++		nr = min(right_nritems - 1, max_slot);
+ 
+ 	for (i = 0; i < nr; i++) {
+ 		item = btrfs_item_nr(right, i);
+@@ -2712,10 +2726,14 @@ out:
+ /*
+  * push some data in the path leaf to the left, trying to free up at
+  * least data_size bytes.  returns zero if the push worked, nonzero otherwise
++ *
++ * max_slot can put a limit on how far into the leaf we'll push items.  The
++ * item at 'max_slot' won't be touched.  Use (u32)-1 to make us push all the
++ * items
+  */
+ static int push_leaf_left(struct btrfs_trans_handle *trans, struct btrfs_root
+-			  *root, struct btrfs_path *path, int data_size,
+-			  int empty)
++			  *root, struct btrfs_path *path, int min_data_size,
++			  int data_size, int empty, u32 max_slot)
+ {
+ 	struct extent_buffer *right = path->nodes[0];
+ 	struct extent_buffer *left;
+@@ -2761,8 +2779,9 @@ static int push_leaf_left(struct btrfs_t
+ 		goto out;
+ 	}
+ 
+-	return __push_leaf_left(trans, root, path, data_size,
+-			       empty, left, free_space, right_nritems);
++	return __push_leaf_left(trans, root, path, min_data_size,
++			       empty, left, free_space, right_nritems,
++			       max_slot);
+ out:
+ 	btrfs_tree_unlock(left);
+ 	free_extent_buffer(left);
+@@ -2855,6 +2874,64 @@ static noinline int copy_for_split(struc
+ }
+ 
+ /*
++ * double splits happen when we need to insert a big item in the middle
++ * of a leaf.  A double split can leave us with 3 mostly empty leaves:
++ * leaf: [ slots 0 - N] [ our target ] [ N + 1 - total in leaf ]
++ *          A                 B                 C
++ *
++ * We avoid this by trying to push the items on either side of our target
++ * into the adjacent leaves.  If all goes well we can avoid the double split
++ * completely.
++ */
++static noinline int push_for_double_split(struct btrfs_trans_handle *trans,
++					  struct btrfs_root *root,
++					  struct btrfs_path *path,
++					  int data_size)
++{
++	int ret;
++	int progress = 0;
++	int slot;
++	u32 nritems;
++
++	slot = path->slots[0];
++
++	/*
++	 * try to push all the items after our slot into the
++	 * right leaf
++	 */
++	ret = push_leaf_right(trans, root, path, 1, data_size, 0, slot);
++	if (ret < 0)
++		return ret;
++
++	if (ret == 0)
++		progress++;
++
++	nritems = btrfs_header_nritems(path->nodes[0]);
++	/*
++	 * our goal is to get our slot at the start or end of a leaf.  If
++	 * we've done so we're done
++	 */
++	if (path->slots[0] == 0 || path->slots[0] == nritems)
++		return 0;
++
++	if (btrfs_leaf_free_space(root, path->nodes[0]) >= data_size)
++		return 0;
++
++	/* try to push all the items before our slot into the next leaf */
++	slot = path->slots[0];
++	ret = push_leaf_left(trans, root, path, 1, data_size, 0, slot);
++	if (ret < 0)
++		return ret;
++
++	if (ret == 0)
++		progress++;
++
++	if (progress)
++		return 0;
++	return 1;
++}
++
++/*
+  * split the path's leaf in two, making sure there is at least data_size
+  * available for the resulting leaf level of the path.
+  *
+@@ -2876,6 +2953,7 @@ static noinline int split_leaf(struct bt
+ 	int wret;
+ 	int split;
+ 	int num_doubles = 0;
++	int tried_avoid_double = 0;
+ 
+ 	l = path->nodes[0];
+ 	slot = path->slots[0];
+@@ -2884,12 +2962,14 @@ static noinline int split_leaf(struct bt
+ 		return -EOVERFLOW;
+ 
+ 	/* first try to make some room by pushing left and right */
+-	if (data_size && ins_key->type != BTRFS_DIR_ITEM_KEY) {
+-		wret = push_leaf_right(trans, root, path, data_size, 0);
++	if (data_size) {
++		wret = push_leaf_right(trans, root, path, data_size,
++				       data_size, 0, 0);
+ 		if (wret < 0)
+ 			return wret;
+ 		if (wret) {
+-			wret = push_leaf_left(trans, root, path, data_size, 0);
++			wret = push_leaf_left(trans, root, path, data_size,
++					      data_size, 0, (u32)-1);
+ 			if (wret < 0)
+ 				return wret;
+ 		}
+@@ -2923,6 +3003,8 @@ again:
+ 				if (mid != nritems &&
+ 				    leaf_space_used(l, mid, nritems - mid) +
+ 				    data_size > BTRFS_LEAF_DATA_SIZE(root)) {
++					if (data_size && !tried_avoid_double)
++						goto push_for_double;
+ 					split = 2;
+ 				}
+ 			}
+@@ -2939,6 +3021,8 @@ again:
+ 				if (mid != nritems &&
+ 				    leaf_space_used(l, mid, nritems - mid) +
+ 				    data_size > BTRFS_LEAF_DATA_SIZE(root)) {
++					if (data_size && !tried_avoid_double)
++						goto push_for_double;
+ 					split = 2 ;
+ 				}
+ 			}
+@@ -3019,6 +3103,13 @@ again:
+ 	}
+ 
+ 	return ret;
++
++push_for_double:
++	push_for_double_split(trans, root, path, data_size);
++	tried_avoid_double = 1;
++	if (btrfs_leaf_free_space(root, path->nodes[0]) >= data_size)
++		return 0;
++	goto again;
+ }
+ 
+ static noinline int setup_leaf_for_split(struct btrfs_trans_handle *trans,
+@@ -3915,13 +4006,15 @@ int btrfs_del_items(struct btrfs_trans_h
+ 			extent_buffer_get(leaf);
+ 
+ 			btrfs_set_path_blocking(path);
+-			wret = push_leaf_left(trans, root, path, 1, 1);
++			wret = push_leaf_left(trans, root, path, 1, 1,
++					      1, (u32)-1);
+ 			if (wret < 0 && wret != -ENOSPC)
+ 				ret = wret;
+ 
+ 			if (path->nodes[0] == leaf &&
+ 			    btrfs_header_nritems(leaf)) {
+-				wret = push_leaf_right(trans, root, path, 1, 1);
++				wret = push_leaf_right(trans, root, path, 1,
++						       1, 1, 0);
+ 				if (wret < 0 && wret != -ENOSPC)
+ 					ret = wret;
+ 			}
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -1458,7 +1458,7 @@ static noinline long btrfs_ioctl_clone(s
+ 	 */
+ 
+ 	/* the destination must be opened for writing */
+-	if (!(file->f_mode & FMODE_WRITE))
++	if (!(file->f_mode & FMODE_WRITE) || (file->f_flags & O_APPEND))
+ 		return -EINVAL;
+ 
+ 	ret = mnt_want_write(file->f_path.mnt);
+@@ -1511,7 +1511,7 @@ static noinline long btrfs_ioctl_clone(s
+ 
+ 	/* determine range to clone */
+ 	ret = -EINVAL;
+-	if (off >= src->i_size || off + len > src->i_size)
++	if (off + len > src->i_size || off + len < off)
+ 		goto out_unlock;
+ 	if (len == 0)
+ 		olen = len = src->i_size - off;
+@@ -1578,6 +1578,7 @@ static noinline long btrfs_ioctl_clone(s
+ 			u64 disko = 0, diskl = 0;
+ 			u64 datao = 0, datal = 0;
+ 			u8 comp;
++			u64 endoff;
+ 
+ 			size = btrfs_item_size_nr(leaf, slot);
+ 			read_extent_buffer(leaf, buf,
+@@ -1712,9 +1713,18 @@ static noinline long btrfs_ioctl_clone(s
+ 			btrfs_release_path(root, path);
+ 
+ 			inode->i_mtime = inode->i_ctime = CURRENT_TIME;
+-			if (new_key.offset + datal > inode->i_size)
+-				btrfs_i_size_write(inode,
+-						   new_key.offset + datal);
++
++			/*
++			 * we round up to the block size at eof when
++			 * determining which extents to clone above,
++			 * but shouldn't round up the file size
++			 */
++			endoff = new_key.offset + datal;
++			if (endoff > off+olen)
++				endoff = off+olen;
++			if (endoff > inode->i_size)
++				btrfs_i_size_write(inode, endoff);
++
+ 			BTRFS_I(inode)->flags = BTRFS_I(src)->flags;
+ 			ret = btrfs_update_inode(trans, root, inode);
+ 			BUG_ON(ret);
+--- a/fs/ceph/auth_x.c
++++ b/fs/ceph/auth_x.c
+@@ -613,6 +613,9 @@ static void ceph_x_destroy(struct ceph_a
+ 		remove_ticket_handler(ac, th);
+ 	}
+ 
++	if (xi->auth_authorizer.buf)
++		ceph_buffer_put(xi->auth_authorizer.buf);
++
+ 	kfree(ac->private);
+ 	ac->private = NULL;
+ }
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -1514,6 +1514,9 @@ static struct ceph_msg *create_request_m
+ 	ceph_encode_filepath(&p, end, ino1, path1);
+ 	ceph_encode_filepath(&p, end, ino2, path2);
+ 
++	/* make note of release offset, in case we need to replay */
++	req->r_request_release_offset = p - msg->front.iov_base;
++
+ 	/* cap releases */
+ 	releases = 0;
+ 	if (req->r_inode_drop)
+@@ -1580,6 +1583,32 @@ static int __prepare_send_request(struct
+ 	dout("prepare_send_request %p tid %lld %s (attempt %d)\n", req,
+ 	     req->r_tid, ceph_mds_op_name(req->r_op), req->r_attempts);
+ 
++	if (req->r_got_unsafe) {
++		/*
++		 * Replay.  Do not regenerate message (and rebuild
++		 * paths, etc.); just use the original message.
++		 * Rebuilding paths will break for renames because
++		 * d_move mangles the src name.
++		 */
++		msg = req->r_request;
++		rhead = msg->front.iov_base;
++
++		flags = le32_to_cpu(rhead->flags);
++		flags |= CEPH_MDS_FLAG_REPLAY;
++		rhead->flags = cpu_to_le32(flags);
++
++		if (req->r_target_inode)
++			rhead->ino = cpu_to_le64(ceph_ino(req->r_target_inode));
++
++		rhead->num_retry = req->r_attempts - 1;
++
++		/* remove cap/dentry releases from message */
++		rhead->num_releases = 0;
++		msg->hdr.front_len = cpu_to_le32(req->r_request_release_offset);
++		msg->front.iov_len = req->r_request_release_offset;
++		return 0;
++	}
++
+ 	if (req->r_request) {
+ 		ceph_msg_put(req->r_request);
+ 		req->r_request = NULL;
+@@ -1601,13 +1630,9 @@ static int __prepare_send_request(struct
+ 	rhead->flags = cpu_to_le32(flags);
+ 	rhead->num_fwd = req->r_num_fwd;
+ 	rhead->num_retry = req->r_attempts - 1;
++	rhead->ino = 0;
+ 
+ 	dout(" r_locked_dir = %p\n", req->r_locked_dir);
+-
+-	if (req->r_target_inode && req->r_got_unsafe)
+-		rhead->ino = cpu_to_le64(ceph_ino(req->r_target_inode));
+-	else
+-		rhead->ino = 0;
+ 	return 0;
+ }
+ 
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@ -188,6 +188,7 @@ struct ceph_mds_request {
+ 	int r_old_inode_drop, r_old_inode_unless;
+ 
+ 	struct ceph_msg  *r_request;  /* original request */
++	int r_request_release_offset;
+ 	struct ceph_msg  *r_reply;
+ 	struct ceph_mds_reply_info_parsed r_reply_info;
+ 	int r_err;
+--- a/fs/ceph/messenger.c
++++ b/fs/ceph/messenger.c
+@@ -43,7 +43,8 @@ static void ceph_fault(struct ceph_conne
+  * nicely render a sockaddr as a string.
+  */
+ #define MAX_ADDR_STR 20
+-static char addr_str[MAX_ADDR_STR][40];
++#define MAX_ADDR_STR_LEN 60
++static char addr_str[MAX_ADDR_STR][MAX_ADDR_STR_LEN];
+ static DEFINE_SPINLOCK(addr_str_lock);
+ static int last_addr_str;
+ 
+@@ -52,7 +53,6 @@ const char *pr_addr(const struct sockadd
+ 	int i;
+ 	char *s;
+ 	struct sockaddr_in *in4 = (void *)ss;
+-	unsigned char *quad = (void *)&in4->sin_addr.s_addr;
+ 	struct sockaddr_in6 *in6 = (void *)ss;
+ 
+ 	spin_lock(&addr_str_lock);
+@@ -64,25 +64,13 @@ const char *pr_addr(const struct sockadd
+ 
+ 	switch (ss->ss_family) {
+ 	case AF_INET:
+-		sprintf(s, "%u.%u.%u.%u:%u",
+-			(unsigned int)quad[0],
+-			(unsigned int)quad[1],
+-			(unsigned int)quad[2],
+-			(unsigned int)quad[3],
+-			(unsigned int)ntohs(in4->sin_port));
++		snprintf(s, MAX_ADDR_STR_LEN, "%pI4:%u", &in4->sin_addr,
++			 (unsigned int)ntohs(in4->sin_port));
+ 		break;
+ 
+ 	case AF_INET6:
+-		sprintf(s, "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x:%u",
+-			in6->sin6_addr.s6_addr16[0],
+-			in6->sin6_addr.s6_addr16[1],
+-			in6->sin6_addr.s6_addr16[2],
+-			in6->sin6_addr.s6_addr16[3],
+-			in6->sin6_addr.s6_addr16[4],
+-			in6->sin6_addr.s6_addr16[5],
+-			in6->sin6_addr.s6_addr16[6],
+-			in6->sin6_addr.s6_addr16[7],
+-			(unsigned int)ntohs(in6->sin6_port));
++		snprintf(s, MAX_ADDR_STR_LEN, "[%pI6c]:%u", &in6->sin6_addr,
++			 (unsigned int)ntohs(in6->sin6_port));
+ 		break;
+ 
+ 	default:
+@@ -215,12 +203,13 @@ static void set_sock_callbacks(struct so
+  */
+ static struct socket *ceph_tcp_connect(struct ceph_connection *con)
+ {
+-	struct sockaddr *paddr = (struct sockaddr *)&con->peer_addr.in_addr;
++	struct sockaddr_storage *paddr = &con->peer_addr.in_addr;
+ 	struct socket *sock;
+ 	int ret;
+ 
+ 	BUG_ON(con->sock);
+-	ret = sock_create_kern(AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
++	ret = sock_create_kern(con->peer_addr.in_addr.ss_family, SOCK_STREAM,
++			       IPPROTO_TCP, &sock);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 	con->sock = sock;
+@@ -234,7 +223,8 @@ static struct socket *ceph_tcp_connect(s
+ 
+ 	dout("connect %s\n", pr_addr(&con->peer_addr.in_addr));
+ 
+-	ret = sock->ops->connect(sock, paddr, sizeof(*paddr), O_NONBLOCK);
++	ret = sock->ops->connect(sock, (struct sockaddr *)paddr, sizeof(*paddr),
++				 O_NONBLOCK);
+ 	if (ret == -EINPROGRESS) {
+ 		dout("connect %s EINPROGRESS sk_state = %u\n",
+ 		     pr_addr(&con->peer_addr.in_addr),
+@@ -1009,19 +999,32 @@ int ceph_parse_ips(const char *c, const
+ 		struct sockaddr_in *in4 = (void *)ss;
+ 		struct sockaddr_in6 *in6 = (void *)ss;
+ 		int port;
++		char delim = ',';
++
++		if (*p == '[') {
++			delim = ']';
++			p++;
++		}
+ 
+ 		memset(ss, 0, sizeof(*ss));
+ 		if (in4_pton(p, end - p, (u8 *)&in4->sin_addr.s_addr,
+-			     ',', &ipend)) {
++			     delim, &ipend))
+ 			ss->ss_family = AF_INET;
+-		} else if (in6_pton(p, end - p, (u8 *)&in6->sin6_addr.s6_addr,
+-				    ',', &ipend)) {
++		else if (in6_pton(p, end - p, (u8 *)&in6->sin6_addr.s6_addr,
++				  delim, &ipend))
+ 			ss->ss_family = AF_INET6;
+-		} else {
++		else
+ 			goto bad;
+-		}
+ 		p = ipend;
+ 
++		if (delim == ']') {
++			if (*p != ']') {
++				dout("missing matching ']'\n");
++				goto bad;
++			}
++			p++;
++		}
++
+ 		/* port? */
+ 		if (p < end && *p == ':') {
+ 			port = 0;
+@@ -1055,7 +1058,7 @@ int ceph_parse_ips(const char *c, const
+ 	return 0;
+ 
+ bad:
+-	pr_err("parse_ips bad ip '%s'\n", c);
++	pr_err("parse_ips bad ip '%.*s'\n", (int)(end - c), c);
+ 	return -EINVAL;
+ }
+ 
+@@ -2015,20 +2018,20 @@ void ceph_con_revoke(struct ceph_connect
+ {
+ 	mutex_lock(&con->mutex);
+ 	if (!list_empty(&msg->list_head)) {
+-		dout("con_revoke %p msg %p\n", con, msg);
++		dout("con_revoke %p msg %p - was on queue\n", con, msg);
+ 		list_del_init(&msg->list_head);
+ 		ceph_msg_put(msg);
+ 		msg->hdr.seq = 0;
+-		if (con->out_msg == msg) {
+-			ceph_msg_put(con->out_msg);
+-			con->out_msg = NULL;
+-		}
++	}
++	if (con->out_msg == msg) {
++		dout("con_revoke %p msg %p - was sending\n", con, msg);
++		con->out_msg = NULL;
+ 		if (con->out_kvec_is_msg) {
+ 			con->out_skip = con->out_kvec_bytes;
+ 			con->out_kvec_is_msg = false;
+ 		}
+-	} else {
+-		dout("con_revoke %p msg %p - not queued (sent?)\n", con, msg);
++		ceph_msg_put(msg);
++		msg->hdr.seq = 0;
+ 	}
+ 	mutex_unlock(&con->mutex);
+ }
+--- a/fs/ceph/osdmap.c
++++ b/fs/ceph/osdmap.c
+@@ -568,6 +568,7 @@ struct ceph_osdmap *osdmap_decode(void *
+ 		if (ev > CEPH_PG_POOL_VERSION) {
+ 			pr_warning("got unknown v %d > %d of ceph_pg_pool\n",
+ 				   ev, CEPH_PG_POOL_VERSION);
++			kfree(pi);
+ 			goto bad;
+ 		}
+ 		__decode_pool(p, pi);
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -896,7 +896,7 @@ EXPORT_SYMBOL(shrink_dcache_parent);
+  *
+  * In this case we return -1 to tell the caller that we baled.
+  */
+-static int shrink_dcache_memory(int nr, gfp_t gfp_mask)
++static int shrink_dcache_memory(struct shrinker *shrink, int nr, gfp_t gfp_mask)
+ {
+ 	if (nr) {
+ 		if (!(gfp_mask & __GFP_FS))
 --- a/fs/gfs2/bmap.c
 +++ b/fs/gfs2/bmap.c
 @@ -1041,6 +1041,7 @@ static int trunc_start(struct gfs2_inode
@@ -3846,6 +5189,15 @@
  	if (test_and_clear_bit(GLF_REPLY_PENDING, &gl->gl_flags)) {
  		finish_xmote(gl, gl->gl_reply);
  		drop_ref = 1;
+@@ -1348,7 +1358,7 @@ void gfs2_glock_complete(struct gfs2_glo
+ }
+ 
+ 
+-static int gfs2_shrink_glock_memory(int nr, gfp_t gfp_mask)
++static int gfs2_shrink_glock_memory(struct shrinker *shrink, int nr, gfp_t gfp_mask)
+ {
+ 	struct gfs2_glock *gl;
+ 	int may_demote;
 --- a/fs/gfs2/inode.c
 +++ b/fs/gfs2/inode.c
 @@ -169,7 +169,7 @@ struct inode *gfs2_inode_lookup(struct s
@@ -3904,6 +5256,15 @@
  	gfs2_glock_put(ip->i_gl);
 --- a/fs/gfs2/quota.c
 +++ b/fs/gfs2/quota.c
+@@ -77,7 +77,7 @@ static LIST_HEAD(qd_lru_list);
+ static atomic_t qd_lru_count = ATOMIC_INIT(0);
+ static DEFINE_SPINLOCK(qd_lru_lock);
+ 
+-int gfs2_shrink_qd_memory(int nr, gfp_t gfp_mask)
++int gfs2_shrink_qd_memory(struct shrinker *shrink, int nr, gfp_t gfp_mask)
+ {
+ 	struct gfs2_quota_data *qd;
+ 	struct gfs2_sbd *sdp;
 @@ -694,10 +694,8 @@ get_a_page:
  		if (!buffer_mapped(bh))
  			goto unlock_out;
@@ -3926,6 +5287,28 @@
  		ptr = ptr + nbytes;
  		nbytes = sizeof(struct gfs2_quota) - nbytes;
  		offset = 0;
+--- a/fs/gfs2/quota.h
++++ b/fs/gfs2/quota.h
+@@ -51,7 +51,7 @@ static inline int gfs2_quota_lock_check(
+ 	return ret;
+ }
+ 
+-extern int gfs2_shrink_qd_memory(int nr, gfp_t gfp_mask);
++extern int gfs2_shrink_qd_memory(struct shrinker *shrink, int nr, gfp_t gfp_mask);
+ extern const struct quotactl_ops gfs2_quotactl_ops;
+ 
+ #endif /* __QUOTA_DOT_H__ */
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -512,7 +512,7 @@ static void prune_icache(int nr_to_scan)
+  * This function is passed the number of inodes to scan, and it returns the
+  * total number of remaining possibly-reclaimable inodes.
+  */
+-static int shrink_icache_memory(int nr, gfp_t gfp_mask)
++static int shrink_icache_memory(struct shrinker *shrink, int nr, gfp_t gfp_mask)
+ {
+ 	if (nr) {
+ 		/*
 --- a/fs/jbd2/journal.c
 +++ b/fs/jbd2/journal.c
 @@ -297,7 +297,6 @@ int jbd2_journal_write_metadata_buffer(t
@@ -3996,6 +5379,56 @@
  }
  
  void jbd2_buffer_abort_trigger(struct journal_head *jh,
+--- a/fs/mbcache.c
++++ b/fs/mbcache.c
+@@ -115,7 +115,7 @@ mb_cache_indexes(struct mb_cache *cache)
+  * What the mbcache registers as to get shrunk dynamically.
+  */
+ 
+-static int mb_cache_shrink_fn(int nr_to_scan, gfp_t gfp_mask);
++static int mb_cache_shrink_fn(struct shrinker *shrink, int nr_to_scan, gfp_t gfp_mask);
+ 
+ static struct shrinker mb_cache_shrinker = {
+ 	.shrink = mb_cache_shrink_fn,
+@@ -191,13 +191,14 @@ forget:
+  * This function is called by the kernel memory management when memory
+  * gets low.
+  *
++ * @shrink: (ignored)
+  * @nr_to_scan: Number of objects to scan
+  * @gfp_mask: (ignored)
+  *
+  * Returns the number of objects which are present in the cache.
+  */
+ static int
+-mb_cache_shrink_fn(int nr_to_scan, gfp_t gfp_mask)
++mb_cache_shrink_fn(struct shrinker *shrink, int nr_to_scan, gfp_t gfp_mask)
+ {
+ 	LIST_HEAD(free_list);
+ 	struct list_head *l, *ltmp;
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -1710,7 +1710,7 @@ static void nfs_access_free_list(struct
+ 	}
+ }
+ 
+-int nfs_access_cache_shrinker(int nr_to_scan, gfp_t gfp_mask)
++int nfs_access_cache_shrinker(struct shrinker *shrink, int nr_to_scan, gfp_t gfp_mask)
+ {
+ 	LIST_HEAD(head);
+ 	struct nfs_inode *nfsi;
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -205,7 +205,8 @@ extern struct rpc_procinfo nfs4_procedur
+ void nfs_close_context(struct nfs_open_context *ctx, int is_sync);
+ 
+ /* dir.c */
+-extern int nfs_access_cache_shrinker(int nr_to_scan, gfp_t gfp_mask);
++extern int nfs_access_cache_shrinker(struct shrinker *shrink,
++					int nr_to_scan, gfp_t gfp_mask);
+ 
+ /* inode.c */
+ extern struct workqueue_struct *nfsiod_workqueue;
 --- a/fs/ocfs2/aops.c
 +++ b/fs/ocfs2/aops.c
 @@ -196,15 +196,14 @@ int ocfs2_get_block(struct inode *inode,
@@ -5189,6 +6622,356 @@
  	if (data == NULL)
  		goto out_readerr;
  
+--- a/fs/quota/dquot.c
++++ b/fs/quota/dquot.c
+@@ -676,7 +676,7 @@ static void prune_dqcache(int count)
+  * This is called from kswapd when we think we need some
+  * more memory
+  */
+-static int shrink_dqcache_memory(int nr, gfp_t gfp_mask)
++static int shrink_dqcache_memory(struct shrinker *shrink, int nr, gfp_t gfp_mask)
+ {
+ 	if (nr) {
+ 		spin_lock(&dq_list_lock);
+--- a/fs/ubifs/shrinker.c
++++ b/fs/ubifs/shrinker.c
+@@ -277,7 +277,7 @@ static int kick_a_thread(void)
+ 	return 0;
+ }
+ 
+-int ubifs_shrinker(int nr, gfp_t gfp_mask)
++int ubifs_shrinker(struct shrinker *shrink, int nr, gfp_t gfp_mask)
+ {
+ 	int freed, contention = 0;
+ 	long clean_zn_cnt = atomic_long_read(&ubifs_clean_zn_cnt);
+--- a/fs/ubifs/ubifs.h
++++ b/fs/ubifs/ubifs.h
+@@ -1575,7 +1575,7 @@ int ubifs_tnc_start_commit(struct ubifs_
+ int ubifs_tnc_end_commit(struct ubifs_info *c);
+ 
+ /* shrinker.c */
+-int ubifs_shrinker(int nr_to_scan, gfp_t gfp_mask);
++int ubifs_shrinker(struct shrinker *shrink, int nr_to_scan, gfp_t gfp_mask);
+ 
+ /* commit.c */
+ int ubifs_bg_thread(void *info);
+--- a/fs/xfs/linux-2.6/xfs_buf.c
++++ b/fs/xfs/linux-2.6/xfs_buf.c
+@@ -45,7 +45,7 @@
+ 
+ static kmem_zone_t *xfs_buf_zone;
+ STATIC int xfsbufd(void *);
+-STATIC int xfsbufd_wakeup(int, gfp_t);
++STATIC int xfsbufd_wakeup(struct shrinker *, int, gfp_t);
+ STATIC void xfs_buf_delwri_queue(xfs_buf_t *, int);
+ static struct shrinker xfs_buf_shake = {
+ 	.shrink = xfsbufd_wakeup,
+@@ -340,7 +340,7 @@ _xfs_buf_lookup_pages(
+ 					__func__, gfp_mask);
+ 
+ 			XFS_STATS_INC(xb_page_retries);
+-			xfsbufd_wakeup(0, gfp_mask);
++			xfsbufd_wakeup(NULL, 0, gfp_mask);
+ 			congestion_wait(BLK_RW_ASYNC, HZ/50);
+ 			goto retry;
+ 		}
+@@ -1762,6 +1762,7 @@ xfs_buf_runall_queues(
+ 
+ STATIC int
+ xfsbufd_wakeup(
++	struct shrinker		*shrink,
+ 	int			priority,
+ 	gfp_t			mask)
+ {
+--- a/fs/xfs/linux-2.6/xfs_super.c
++++ b/fs/xfs/linux-2.6/xfs_super.c
+@@ -1883,7 +1883,6 @@ init_xfs_fs(void)
+ 		goto out_cleanup_procfs;
+ 
+ 	vfs_initquota();
+-	xfs_inode_shrinker_init();
+ 
+ 	error = register_filesystem(&xfs_fs_type);
+ 	if (error)
+@@ -1911,7 +1910,6 @@ exit_xfs_fs(void)
+ {
+ 	vfs_exitquota();
+ 	unregister_filesystem(&xfs_fs_type);
+-	xfs_inode_shrinker_destroy();
+ 	xfs_sysctl_unregister();
+ 	xfs_cleanup_procfs();
+ 	xfs_buf_terminate();
+--- a/fs/xfs/linux-2.6/xfs_sync.c
++++ b/fs/xfs/linux-2.6/xfs_sync.c
+@@ -144,6 +144,41 @@ restart:
+ 	return last_error;
+ }
+ 
++/*
++ * Select the next per-ag structure to iterate during the walk. The reclaim
++ * walk is optimised only to walk AGs with reclaimable inodes in them.
++ */
++static struct xfs_perag *
++xfs_inode_ag_iter_next_pag(
++	struct xfs_mount	*mp,
++	xfs_agnumber_t		*first,
++	int			tag)
++{
++	struct xfs_perag	*pag = NULL;
++
++	if (tag == XFS_ICI_RECLAIM_TAG) {
++		int found;
++		int ref;
++
++		spin_lock(&mp->m_perag_lock);
++		found = radix_tree_gang_lookup_tag(&mp->m_perag_tree,
++				(void **)&pag, *first, 1, tag);
++		if (found <= 0) {
++			spin_unlock(&mp->m_perag_lock);
++			return NULL;
++		}
++		*first = pag->pag_agno + 1;
++		/* open coded pag reference increment */
++		ref = atomic_inc_return(&pag->pag_ref);
++		spin_unlock(&mp->m_perag_lock);
++		trace_xfs_perag_get_reclaim(mp, pag->pag_agno, ref, _RET_IP_);
++	} else {
++		pag = xfs_perag_get(mp, *first);
++		(*first)++;
++	}
++	return pag;
++}
++
+ int
+ xfs_inode_ag_iterator(
+ 	struct xfs_mount	*mp,
+@@ -154,16 +189,15 @@ xfs_inode_ag_iterator(
+ 	int			exclusive,
+ 	int			*nr_to_scan)
+ {
++	struct xfs_perag	*pag;
+ 	int			error = 0;
+ 	int			last_error = 0;
+ 	xfs_agnumber_t		ag;
+ 	int			nr;
+ 
+ 	nr = nr_to_scan ? *nr_to_scan : INT_MAX;
+-	for (ag = 0; ag < mp->m_sb.sb_agcount; ag++) {
+-		struct xfs_perag	*pag;
+-
+-		pag = xfs_perag_get(mp, ag);
++	ag = 0;
++	while ((pag = xfs_inode_ag_iter_next_pag(mp, &ag, tag))) {
+ 		error = xfs_inode_ag_walk(mp, pag, execute, flags, tag,
+ 						exclusive, &nr);
+ 		xfs_perag_put(pag);
+@@ -640,6 +674,17 @@ __xfs_inode_set_reclaim_tag(
+ 	radix_tree_tag_set(&pag->pag_ici_root,
+ 			   XFS_INO_TO_AGINO(ip->i_mount, ip->i_ino),
+ 			   XFS_ICI_RECLAIM_TAG);
++
++	if (!pag->pag_ici_reclaimable) {
++		/* propagate the reclaim tag up into the perag radix tree */
++		spin_lock(&ip->i_mount->m_perag_lock);
++		radix_tree_tag_set(&ip->i_mount->m_perag_tree,
++				XFS_INO_TO_AGNO(ip->i_mount, ip->i_ino),
++				XFS_ICI_RECLAIM_TAG);
++		spin_unlock(&ip->i_mount->m_perag_lock);
++		trace_xfs_perag_set_reclaim(ip->i_mount, pag->pag_agno,
++							-1, _RET_IP_);
++	}
+ 	pag->pag_ici_reclaimable++;
+ }
+ 
+@@ -674,6 +719,16 @@ __xfs_inode_clear_reclaim_tag(
+ 	radix_tree_tag_clear(&pag->pag_ici_root,
+ 			XFS_INO_TO_AGINO(mp, ip->i_ino), XFS_ICI_RECLAIM_TAG);
+ 	pag->pag_ici_reclaimable--;
++	if (!pag->pag_ici_reclaimable) {
++		/* clear the reclaim tag from the perag radix tree */
++		spin_lock(&ip->i_mount->m_perag_lock);
++		radix_tree_tag_clear(&ip->i_mount->m_perag_tree,
++				XFS_INO_TO_AGNO(ip->i_mount, ip->i_ino),
++				XFS_ICI_RECLAIM_TAG);
++		spin_unlock(&ip->i_mount->m_perag_lock);
++		trace_xfs_perag_clear_reclaim(ip->i_mount, pag->pag_agno,
++							-1, _RET_IP_);
++	}
+ }
+ 
+ /*
+@@ -828,83 +883,52 @@ xfs_reclaim_inodes(
+ 
+ /*
+  * Shrinker infrastructure.
+- *
+- * This is all far more complex than it needs to be. It adds a global list of
+- * mounts because the shrinkers can only call a global context. We need to make
+- * the shrinkers pass a context to avoid the need for global state.
+  */
+-static LIST_HEAD(xfs_mount_list);
+-static struct rw_semaphore xfs_mount_list_lock;
+-
+ static int
+ xfs_reclaim_inode_shrink(
++	struct shrinker	*shrink,
+ 	int		nr_to_scan,
+ 	gfp_t		gfp_mask)
+ {
+ 	struct xfs_mount *mp;
+ 	struct xfs_perag *pag;
+ 	xfs_agnumber_t	ag;
+-	int		reclaimable = 0;
++	int		reclaimable;
+ 
++	mp = container_of(shrink, struct xfs_mount, m_inode_shrink);
+ 	if (nr_to_scan) {
+ 		if (!(gfp_mask & __GFP_FS))
+ 			return -1;
+ 
+-		down_read(&xfs_mount_list_lock);
+-		list_for_each_entry(mp, &xfs_mount_list, m_mplist) {
+-			xfs_inode_ag_iterator(mp, xfs_reclaim_inode, 0,
++		xfs_inode_ag_iterator(mp, xfs_reclaim_inode, 0,
+ 					XFS_ICI_RECLAIM_TAG, 1, &nr_to_scan);
+-			if (nr_to_scan <= 0)
+-				break;
+-		}
+-		up_read(&xfs_mount_list_lock);
+-	}
++		/* if we don't exhaust the scan, don't bother coming back */
++		if (nr_to_scan > 0)
++			return -1;
++       }
+ 
+-	down_read(&xfs_mount_list_lock);
+-	list_for_each_entry(mp, &xfs_mount_list, m_mplist) {
+-		for (ag = 0; ag < mp->m_sb.sb_agcount; ag++) {
+-			pag = xfs_perag_get(mp, ag);
+-			reclaimable += pag->pag_ici_reclaimable;
+-			xfs_perag_put(pag);
+-		}
++	reclaimable = 0;
++	ag = 0;
++	while ((pag = xfs_inode_ag_iter_next_pag(mp, &ag,
++					XFS_ICI_RECLAIM_TAG))) {
++		reclaimable += pag->pag_ici_reclaimable;
++		xfs_perag_put(pag);
+ 	}
+-	up_read(&xfs_mount_list_lock);
+ 	return reclaimable;
+ }
+ 
+-static struct shrinker xfs_inode_shrinker = {
+-	.shrink = xfs_reclaim_inode_shrink,
+-	.seeks = DEFAULT_SEEKS,
+-};
+-
+-void __init
+-xfs_inode_shrinker_init(void)
+-{
+-	init_rwsem(&xfs_mount_list_lock);
+-	register_shrinker(&xfs_inode_shrinker);
+-}
+-
+-void
+-xfs_inode_shrinker_destroy(void)
+-{
+-	ASSERT(list_empty(&xfs_mount_list));
+-	unregister_shrinker(&xfs_inode_shrinker);
+-}
+-
+ void
+ xfs_inode_shrinker_register(
+ 	struct xfs_mount	*mp)
+ {
+-	down_write(&xfs_mount_list_lock);
+-	list_add_tail(&mp->m_mplist, &xfs_mount_list);
+-	up_write(&xfs_mount_list_lock);
++	mp->m_inode_shrink.shrink = xfs_reclaim_inode_shrink;
++	mp->m_inode_shrink.seeks = DEFAULT_SEEKS;
++	register_shrinker(&mp->m_inode_shrink);
+ }
+ 
+ void
+ xfs_inode_shrinker_unregister(
+ 	struct xfs_mount	*mp)
+ {
+-	down_write(&xfs_mount_list_lock);
+-	list_del(&mp->m_mplist);
+-	up_write(&xfs_mount_list_lock);
++	unregister_shrinker(&mp->m_inode_shrink);
+ }
+--- a/fs/xfs/linux-2.6/xfs_sync.h
++++ b/fs/xfs/linux-2.6/xfs_sync.h
+@@ -55,8 +55,6 @@ int xfs_inode_ag_iterator(struct xfs_mou
+ 	int (*execute)(struct xfs_inode *ip, struct xfs_perag *pag, int flags),
+ 	int flags, int tag, int write_lock, int *nr_to_scan);
+ 
+-void xfs_inode_shrinker_init(void);
+-void xfs_inode_shrinker_destroy(void);
+ void xfs_inode_shrinker_register(struct xfs_mount *mp);
+ void xfs_inode_shrinker_unregister(struct xfs_mount *mp);
+ 
+--- a/fs/xfs/linux-2.6/xfs_trace.h
++++ b/fs/xfs/linux-2.6/xfs_trace.h
+@@ -124,7 +124,10 @@ DEFINE_EVENT(xfs_perag_class, name,	\
+ 		 unsigned long caller_ip),					\
+ 	TP_ARGS(mp, agno, refcount, caller_ip))
+ DEFINE_PERAG_REF_EVENT(xfs_perag_get);
++DEFINE_PERAG_REF_EVENT(xfs_perag_get_reclaim);
+ DEFINE_PERAG_REF_EVENT(xfs_perag_put);
++DEFINE_PERAG_REF_EVENT(xfs_perag_set_reclaim);
++DEFINE_PERAG_REF_EVENT(xfs_perag_clear_reclaim);
+ 
+ TRACE_EVENT(xfs_attr_list_node_descend,
+ 	TP_PROTO(struct xfs_attr_list_context *ctx,
+--- a/fs/xfs/quota/xfs_qm.c
++++ b/fs/xfs/quota/xfs_qm.c
+@@ -69,7 +69,7 @@ STATIC void	xfs_qm_list_destroy(xfs_dqli
+ 
+ STATIC int	xfs_qm_init_quotainos(xfs_mount_t *);
+ STATIC int	xfs_qm_init_quotainfo(xfs_mount_t *);
+-STATIC int	xfs_qm_shake(int, gfp_t);
++STATIC int	xfs_qm_shake(struct shrinker *, int, gfp_t);
+ 
+ static struct shrinker xfs_qm_shaker = {
+ 	.shrink = xfs_qm_shake,
+@@ -2117,7 +2117,10 @@ xfs_qm_shake_freelist(
+  */
+ /* ARGSUSED */
+ STATIC int
+-xfs_qm_shake(int nr_to_scan, gfp_t gfp_mask)
++xfs_qm_shake(
++	struct shrinker	*shrink,
++	int		nr_to_scan,
++	gfp_t		gfp_mask)
+ {
+ 	int	ndqused, nfree, n;
+ 
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -259,7 +259,7 @@ typedef struct xfs_mount {
+ 	wait_queue_head_t	m_wait_single_sync_task;
+ 	__int64_t		m_update_flags;	/* sb flags we need to update
+ 						   on the next remount,rw */
+-	struct list_head	m_mplist;	/* inode shrinker mount list */
++	struct shrinker		m_inode_shrink;	/* inode reclaim shrinker */
+ } xfs_mount_t;
+ 
+ /*
+--- a/include/linux/fdtable.h
++++ b/include/linux/fdtable.h
+@@ -61,7 +61,8 @@ struct files_struct {
+ 	(rcu_dereference_check((fdtfd), \
+ 			       rcu_read_lock_held() || \
+ 			       lockdep_is_held(&(files)->file_lock) || \
+-			       atomic_read(&(files)->count) == 1))
++			       atomic_read(&(files)->count) == 1 || \
++			       rcu_my_thread_group_empty()))
+ 
+ #define files_fdtable(files) \
+ 		(rcu_dereference_check_fdtable((files), (files)->fdt))
 --- a/include/linux/i8042.h
 +++ b/include/linux/i8042.h
 @@ -46,31 +46,31 @@ int i8042_remove_filter(bool (*filter)(u
@@ -5441,6 +7224,17 @@
 +#endif /* __KERNEL__ */
 +
 +#endif /* _LINUX_MEMBLOCK_H */
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -999,7 +999,7 @@ static inline void sync_mm_rss(struct ta
+  * querying the cache size, so a fastpath for that case is appropriate.
+  */
+ struct shrinker {
+-	int (*shrink)(int nr_to_scan, gfp_t gfp_mask);
++	int (*shrink)(struct shrinker *, int nr_to_scan, gfp_t gfp_mask);
+ 	int seeks;	/* seeks to recreate an obj */
+ 
+ 	/* These are for internal use */
 --- a/include/linux/pci.h
 +++ b/include/linux/pci.h
 @@ -288,6 +288,7 @@ struct pci_dev {
@@ -5473,6 +7267,97 @@
  	static struct ftrace_event_call					\
  	__attribute__((__aligned__(4))) event_exit_##sname;		\
  	static struct ftrace_event_call __used				\
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -1224,12 +1224,7 @@ static inline void sk_tx_queue_clear(str
+ 
+ static inline int sk_tx_queue_get(const struct sock *sk)
+ {
+-	return sk->sk_tx_queue_mapping;
+-}
+-
+-static inline bool sk_tx_queue_recorded(const struct sock *sk)
+-{
+-	return (sk && sk->sk_tx_queue_mapping >= 0);
++	return sk ? sk->sk_tx_queue_mapping : -1;
+ }
+ 
+ static inline void sk_set_socket(struct sock *sk, struct socket *sock)
+--- a/ipc/sem.c
++++ b/ipc/sem.c
+@@ -1256,6 +1256,33 @@ out:
+ 	return un;
+ }
+ 
++
++/**
++ * get_queue_result - Retrieve the result code from sem_queue
++ * @q: Pointer to queue structure
++ *
++ * Retrieve the return code from the pending queue. If IN_WAKEUP is found in
++ * q->status, then we must loop until the value is replaced with the final
++ * value: This may happen if a task is woken up by an unrelated event (e.g.
++ * signal) and in parallel the task is woken up by another task because it got
++ * the requested semaphores.
++ *
++ * The function can be called with or without holding the semaphore spinlock.
++ */
++static int get_queue_result(struct sem_queue *q)
++{
++	int error;
++
++	error = q->status;
++	while (unlikely(error == IN_WAKEUP)) {
++		cpu_relax();
++		error = q->status;
++	}
++
++	return error;
++}
++
++
+ SYSCALL_DEFINE4(semtimedop, int, semid, struct sembuf __user *, tsops,
+ 		unsigned, nsops, const struct timespec __user *, timeout)
+ {
+@@ -1409,15 +1436,18 @@ SYSCALL_DEFINE4(semtimedop, int, semid,
+ 	else
+ 		schedule();
+ 
+-	error = queue.status;
+-	while(unlikely(error == IN_WAKEUP)) {
+-		cpu_relax();
+-		error = queue.status;
+-	}
++	error = get_queue_result(&queue);
+ 
+ 	if (error != -EINTR) {
+ 		/* fast path: update_queue already obtained all requested
+-		 * resources */
++		 * resources.
++		 * Perform a smp_mb(): User space could assume that semop()
++		 * is a memory barrier: Without the mb(), the cpu could
++		 * speculatively read in user space stale data that was
++		 * overwritten by the previous owner of the semaphore.
++		 */
++		smp_mb();
++
+ 		goto out_free;
+ 	}
+ 
+@@ -1427,10 +1457,12 @@ SYSCALL_DEFINE4(semtimedop, int, semid,
+ 		goto out_free;
+ 	}
+ 
++	error = get_queue_result(&queue);
++
+ 	/*
+ 	 * If queue.status != -EINTR we are woken up by another process
+ 	 */
+-	error = queue.status;
++
+ 	if (error != -EINTR) {
+ 		goto out_unlock_free;
+ 	}
 --- a/kernel/early_res.c
 +++ b/kernel/early_res.c
 @@ -7,6 +7,8 @@
@@ -6092,6 +7977,59 @@
  obj-$(CONFIG_BOUNCE)	+= bounce.o
  obj-$(CONFIG_SWAP)	+= page_io.o swap_state.o swapfile.o thrash.o
  obj-$(CONFIG_HAS_DMA)	+= dmapool.o
+--- a/mm/bootmem.c
++++ b/mm/bootmem.c
+@@ -833,15 +833,24 @@ static void * __init ___alloc_bootmem_no
+ void * __init __alloc_bootmem_node(pg_data_t *pgdat, unsigned long size,
+ 				   unsigned long align, unsigned long goal)
+ {
++	void *ptr;
++
+ 	if (WARN_ON_ONCE(slab_is_available()))
+ 		return kzalloc_node(size, GFP_NOWAIT, pgdat->node_id);
+ 
+ #ifdef CONFIG_NO_BOOTMEM
+-	return __alloc_memory_core_early(pgdat->node_id, size, align,
++	ptr = __alloc_memory_core_early(pgdat->node_id, size, align,
++					 goal, -1ULL);
++	if (ptr)
++		return ptr;
++
++	ptr = __alloc_memory_core_early(MAX_NUMNODES, size, align,
+ 					 goal, -1ULL);
+ #else
+-	return ___alloc_bootmem_node(pgdat->bdata, size, align, goal, 0);
++	ptr = ___alloc_bootmem_node(pgdat->bdata, size, align, goal, 0);
+ #endif
++
++	return ptr;
+ }
+ 
+ void * __init __alloc_bootmem_node_high(pg_data_t *pgdat, unsigned long size,
+@@ -977,14 +986,21 @@ void * __init __alloc_bootmem_low(unsign
+ void * __init __alloc_bootmem_low_node(pg_data_t *pgdat, unsigned long size,
+ 				       unsigned long align, unsigned long goal)
+ {
++	void *ptr;
++
+ 	if (WARN_ON_ONCE(slab_is_available()))
+ 		return kzalloc_node(size, GFP_NOWAIT, pgdat->node_id);
+ 
+ #ifdef CONFIG_NO_BOOTMEM
+-	return __alloc_memory_core_early(pgdat->node_id, size, align,
++	ptr = __alloc_memory_core_early(pgdat->node_id, size, align,
++				goal, ARCH_LOW_ADDRESS_LIMIT);
++	if (ptr)
++		return ptr;
++	ptr = __alloc_memory_core_early(MAX_NUMNODES, size, align,
+ 				goal, ARCH_LOW_ADDRESS_LIMIT);
+ #else
+-	return ___alloc_bootmem_node(pgdat->bdata, size, align,
++	ptr = ___alloc_bootmem_node(pgdat->bdata, size, align,
+ 				goal, ARCH_LOW_ADDRESS_LIMIT);
+ #endif
++	return ptr;
+ }
 --- /dev/null
 +++ b/mm/memblock.c
 @@ -0,0 +1,541 @@
@@ -6638,7 +8576,17 @@
 +}
 --- a/mm/page_alloc.c
 +++ b/mm/page_alloc.c
-@@ -3659,6 +3659,11 @@ void * __init __alloc_memory_core_early(
+@@ -3634,6 +3634,9 @@ void * __init __alloc_memory_core_early(
+ 	int i;
+ 	void *ptr;
+ 
++	if (limit > get_max_mapped())
++		limit = get_max_mapped();
++
+ 	/* need to go over early_node_map to find out good range for node */
+ 	for_each_active_range_index_in_nid(i, nid) {
+ 		u64 addr;
+@@ -3659,6 +3662,11 @@ void * __init __alloc_memory_core_early(
  		ptr = phys_to_virt(addr);
  		memset(ptr, 0, size);
  		reserve_early_without_check(addr, addr + size, "BOOTMEM");
@@ -6673,6 +8621,397 @@
  	} else {
  		/*
   		 * We don't have to allocate page_cgroup again, but
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -213,8 +213,9 @@ unsigned long shrink_slab(unsigned long
+ 	list_for_each_entry(shrinker, &shrinker_list, list) {
+ 		unsigned long long delta;
+ 		unsigned long total_scan;
+-		unsigned long max_pass = (*shrinker->shrink)(0, gfp_mask);
++		unsigned long max_pass;
+ 
++		max_pass = (*shrinker->shrink)(shrinker, 0, gfp_mask);
+ 		delta = (4 * scanned) / shrinker->seeks;
+ 		delta *= max_pass;
+ 		do_div(delta, lru_pages + 1);
+@@ -242,8 +243,9 @@ unsigned long shrink_slab(unsigned long
+ 			int shrink_ret;
+ 			int nr_before;
+ 
+-			nr_before = (*shrinker->shrink)(0, gfp_mask);
+-			shrink_ret = (*shrinker->shrink)(this_scan, gfp_mask);
++			nr_before = (*shrinker->shrink)(shrinker, 0, gfp_mask);
++			shrink_ret = (*shrinker->shrink)(shrinker, this_scan,
++								gfp_mask);
+ 			if (shrink_ret == -1)
+ 				break;
+ 			if (shrink_ret < nr_before)
+@@ -296,7 +298,7 @@ static int may_write_to_queue(struct bac
+ static void handle_write_error(struct address_space *mapping,
+ 				struct page *page, int error)
+ {
+-	lock_page(page);
++	lock_page_nosync(page);
+ 	if (page_mapping(page) == mapping)
+ 		mapping_set_error(mapping, error);
+ 	unlock_page(page);
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@ -358,6 +358,11 @@ struct hci_conn *hci_connect(struct hci_
+ 		acl->sec_level = sec_level;
+ 		acl->auth_type = auth_type;
+ 		hci_acl_connect(acl);
++	} else {
++		if (acl->sec_level < sec_level)
++			acl->sec_level = sec_level;
++		if (acl->auth_type < auth_type)
++			acl->auth_type = auth_type;
+ 	}
+ 
+ 	if (type == ACL_LINK)
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -1049,6 +1049,8 @@ static inline void hci_auth_complete_evt
+ 	if (conn) {
+ 		if (!ev->status)
+ 			conn->link_mode |= HCI_LM_AUTH;
++		else
++			conn->sec_level = BT_SECURITY_LOW;
+ 
+ 		clear_bit(HCI_CONN_AUTH_PEND, &conn->pend);
+ 
+--- a/net/bluetooth/l2cap.c
++++ b/net/bluetooth/l2cap.c
+@@ -401,6 +401,11 @@ static inline void l2cap_send_rr_or_rnr(
+ 	l2cap_send_sframe(pi, control);
+ }
+ 
++static inline int __l2cap_no_conn_pending(struct sock *sk)
++{
++	return !(l2cap_pi(sk)->conf_state & L2CAP_CONF_CONNECT_PEND);
++}
++
+ static void l2cap_do_start(struct sock *sk)
+ {
+ 	struct l2cap_conn *conn = l2cap_pi(sk)->conn;
+@@ -409,12 +414,13 @@ static void l2cap_do_start(struct sock *
+ 		if (!(conn->info_state & L2CAP_INFO_FEAT_MASK_REQ_DONE))
+ 			return;
+ 
+-		if (l2cap_check_security(sk)) {
++		if (l2cap_check_security(sk) && __l2cap_no_conn_pending(sk)) {
+ 			struct l2cap_conn_req req;
+ 			req.scid = cpu_to_le16(l2cap_pi(sk)->scid);
+ 			req.psm  = l2cap_pi(sk)->psm;
+ 
+ 			l2cap_pi(sk)->ident = l2cap_get_ident(conn);
++			l2cap_pi(sk)->conf_state |= L2CAP_CONF_CONNECT_PEND;
+ 
+ 			l2cap_send_cmd(conn, l2cap_pi(sk)->ident,
+ 					L2CAP_CONN_REQ, sizeof(req), &req);
+@@ -464,12 +470,14 @@ static void l2cap_conn_start(struct l2ca
+ 		}
+ 
+ 		if (sk->sk_state == BT_CONNECT) {
+-			if (l2cap_check_security(sk)) {
++			if (l2cap_check_security(sk) &&
++					__l2cap_no_conn_pending(sk)) {
+ 				struct l2cap_conn_req req;
+ 				req.scid = cpu_to_le16(l2cap_pi(sk)->scid);
+ 				req.psm  = l2cap_pi(sk)->psm;
+ 
+ 				l2cap_pi(sk)->ident = l2cap_get_ident(conn);
++				l2cap_pi(sk)->conf_state |= L2CAP_CONF_CONNECT_PEND;
+ 
+ 				l2cap_send_cmd(conn, l2cap_pi(sk)->ident,
+ 					L2CAP_CONN_REQ, sizeof(req), &req);
+@@ -2912,7 +2920,6 @@ static inline int l2cap_connect_rsp(stru
+ 		l2cap_pi(sk)->ident = 0;
+ 		l2cap_pi(sk)->dcid = dcid;
+ 		l2cap_pi(sk)->conf_state |= L2CAP_CONF_REQ_SENT;
+-
+ 		l2cap_pi(sk)->conf_state &= ~L2CAP_CONF_CONNECT_PEND;
+ 
+ 		l2cap_send_cmd(conn, l2cap_get_ident(conn), L2CAP_CONF_REQ,
+@@ -4404,6 +4411,7 @@ static int l2cap_security_cfm(struct hci
+ 				req.psm  = l2cap_pi(sk)->psm;
+ 
+ 				l2cap_pi(sk)->ident = l2cap_get_ident(conn);
++				l2cap_pi(sk)->conf_state |= L2CAP_CONF_CONNECT_PEND;
+ 
+ 				l2cap_send_cmd(conn, l2cap_pi(sk)->ident,
+ 					L2CAP_CONN_REQ, sizeof(req), &req);
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -217,14 +217,6 @@ static bool br_devices_support_netpoll(s
+ 	return count != 0 && ret;
+ }
+ 
+-static void br_poll_controller(struct net_device *br_dev)
+-{
+-	struct netpoll *np = br_dev->npinfo->netpoll;
+-
+-	if (np->real_dev != br_dev)
+-		netpoll_poll_dev(np->real_dev);
+-}
+-
+ void br_netpoll_cleanup(struct net_device *dev)
+ {
+ 	struct net_bridge *br = netdev_priv(dev);
+@@ -295,7 +287,6 @@ static const struct net_device_ops br_ne
+ 	.ndo_do_ioctl		 = br_dev_ioctl,
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ 	.ndo_netpoll_cleanup	 = br_netpoll_cleanup,
+-	.ndo_poll_controller	 = br_poll_controller,
+ #endif
+ };
+ 
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -50,14 +50,7 @@ int br_dev_queue_push_xmit(struct sk_buf
+ 			kfree_skb(skb);
+ 		else {
+ 			skb_push(skb, ETH_HLEN);
+-
+-#ifdef CONFIG_NET_POLL_CONTROLLER
+-			if (unlikely(skb->dev->priv_flags & IFF_IN_NETPOLL)) {
+-				netpoll_send_skb(skb->dev->npinfo->netpoll, skb);
+-				skb->dev->priv_flags &= ~IFF_IN_NETPOLL;
+-			} else
+-#endif
+-				dev_queue_xmit(skb);
++			dev_queue_xmit(skb);
+ 		}
+ 	}
+ 
+@@ -73,23 +66,9 @@ int br_forward_finish(struct sk_buff *sk
+ 
+ static void __br_deliver(const struct net_bridge_port *to, struct sk_buff *skb)
+ {
+-#ifdef CONFIG_NET_POLL_CONTROLLER
+-	struct net_bridge *br = to->br;
+-	if (unlikely(br->dev->priv_flags & IFF_IN_NETPOLL)) {
+-		struct netpoll *np;
+-		to->dev->npinfo = skb->dev->npinfo;
+-		np = skb->dev->npinfo->netpoll;
+-		np->real_dev = np->dev = to->dev;
+-		to->dev->priv_flags |= IFF_IN_NETPOLL;
+-	}
+-#endif
+ 	skb->dev = to->dev;
+ 	NF_HOOK(NFPROTO_BRIDGE, NF_BR_LOCAL_OUT, skb, NULL, skb->dev,
+ 		br_forward_finish);
+-#ifdef CONFIG_NET_POLL_CONTROLLER
+-	if (skb->dev->npinfo)
+-		skb->dev->npinfo->netpoll->dev = br->dev;
+-#endif
+ }
+ 
+ static void __br_forward(const struct net_bridge_port *to, struct sk_buff *skb)
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -1911,8 +1911,16 @@ static int dev_gso_segment(struct sk_buf
+  */
+ static inline void skb_orphan_try(struct sk_buff *skb)
+ {
+-	if (!skb_tx(skb)->flags)
++	struct sock *sk = skb->sk;
++
++	if (sk && !skb_tx(skb)->flags) {
++		/* skb_tx_hash() wont be able to get sk.
++		 * We copy sk_hash into skb->rxhash
++		 */
++		if (!skb->rxhash)
++			skb->rxhash = sk->sk_hash;
+ 		skb_orphan(skb);
++	}
+ }
+ 
+ int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+@@ -1998,8 +2006,7 @@ u16 skb_tx_hash(const struct net_device
+ 	if (skb->sk && skb->sk->sk_hash)
+ 		hash = skb->sk->sk_hash;
+ 	else
+-		hash = (__force u16) skb->protocol;
+-
++		hash = (__force u16) skb->protocol ^ skb->rxhash;
+ 	hash = jhash_1word(hash, hashrnd);
+ 
+ 	return (u16) (((u64) hash * dev->real_num_tx_queues) >> 32);
+@@ -2022,12 +2029,11 @@ static inline u16 dev_cap_txqueue(struct
+ static struct netdev_queue *dev_pick_tx(struct net_device *dev,
+ 					struct sk_buff *skb)
+ {
+-	u16 queue_index;
++	int queue_index;
+ 	struct sock *sk = skb->sk;
+ 
+-	if (sk_tx_queue_recorded(sk)) {
+-		queue_index = sk_tx_queue_get(sk);
+-	} else {
++	queue_index = sk_tx_queue_get(sk);
++	if (queue_index < 0) {
+ 		const struct net_device_ops *ops = dev->netdev_ops;
+ 
+ 		if (ops->ndo_select_queue) {
+--- a/net/core/neighbour.c
++++ b/net/core/neighbour.c
+@@ -949,7 +949,10 @@ static void neigh_update_hhs(struct neig
+ {
+ 	struct hh_cache *hh;
+ 	void (*update)(struct hh_cache*, const struct net_device*, const unsigned char *)
+-		= neigh->dev->header_ops->cache_update;
++		= NULL;
++
++	if (neigh->dev->header_ops)
++		update = neigh->dev->header_ops->cache_update;
+ 
+ 	if (update) {
+ 		for (hh = neigh->hh; hh; hh = hh->hh_next) {
+--- a/net/dsa/Kconfig
++++ b/net/dsa/Kconfig
+@@ -1,7 +1,7 @@
+ menuconfig NET_DSA
+ 	bool "Distributed Switch Architecture support"
+ 	default n
+-	depends on EXPERIMENTAL && !S390
++	depends on EXPERIMENTAL && NET_ETHERNET && !S390
+ 	select PHYLIB
+ 	---help---
+ 	  This allows you to use hardware switch chips that use
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -442,8 +442,10 @@ static netdev_tx_t reg_vif_xmit(struct s
+ 	int err;
+ 
+ 	err = ipmr_fib_lookup(net, &fl, &mrt);
+-	if (err < 0)
++	if (err < 0) {
++		kfree_skb(skb);
+ 		return err;
++	}
+ 
+ 	read_lock(&mrt_lock);
+ 	dev->stats.tx_bytes += skb->len;
+@@ -1728,8 +1730,10 @@ int ip_mr_input(struct sk_buff *skb)
+ 		goto dont_forward;
+ 
+ 	err = ipmr_fib_lookup(net, &skb_rtable(skb)->fl, &mrt);
+-	if (err < 0)
++	if (err < 0) {
++		kfree_skb(skb);
+ 		return err;
++	}
+ 
+ 	if (!local) {
+ 		    if (IPCB(skb)->opt.router_alert) {
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -608,6 +608,7 @@ ssize_t tcp_splice_read(struct socket *s
+ 	ssize_t spliced;
+ 	int ret;
+ 
++	sock_rps_record_flow(sk);
+ 	/*
+ 	 * We can't seek on a socket input
+ 	 */
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -2208,6 +2208,9 @@ void tcp_xmit_retransmit_queue(struct so
+ 	int mib_idx;
+ 	int fwd_rexmitting = 0;
+ 
++	if (!tp->packets_out)
++		return;
++
+ 	if (!tp->lost_out)
+ 		tp->retransmit_high = tp->snd_una;
+ 
+--- a/net/ipv6/mip6.c
++++ b/net/ipv6/mip6.c
+@@ -347,11 +347,12 @@ static const struct xfrm_type mip6_desto
+ 
+ static int mip6_rthdr_input(struct xfrm_state *x, struct sk_buff *skb)
+ {
++	struct ipv6hdr *iph = ipv6_hdr(skb);
+ 	struct rt2_hdr *rt2 = (struct rt2_hdr *)skb->data;
+ 	int err = rt2->rt_hdr.nexthdr;
+ 
+ 	spin_lock(&x->lock);
+-	if (!ipv6_addr_equal(&rt2->addr, (struct in6_addr *)x->coaddr) &&
++	if (!ipv6_addr_equal(&iph->daddr, (struct in6_addr *)x->coaddr) &&
+ 	    !ipv6_addr_any((struct in6_addr *)x->coaddr))
+ 		err = -ENOENT;
+ 	spin_unlock(&x->lock);
+--- a/net/phonet/pep.c
++++ b/net/phonet/pep.c
+@@ -698,6 +698,7 @@ static struct sock *pep_sock_accept(stru
+ 		newsk = NULL;
+ 		goto out;
+ 	}
++	kfree_skb(oskb);
+ 
+ 	sock_hold(sk);
+ 	pep_sk(newsk)->listener = sk;
+--- a/net/sched/act_nat.c
++++ b/net/sched/act_nat.c
+@@ -205,7 +205,7 @@ static int tcf_nat(struct sk_buff *skb,
+ 	{
+ 		struct icmphdr *icmph;
+ 
+-		if (!pskb_may_pull(skb, ihl + sizeof(*icmph) + sizeof(*iph)))
++		if (!pskb_may_pull(skb, ihl + sizeof(*icmph)))
+ 			goto drop;
+ 
+ 		icmph = (void *)(skb_network_header(skb) + ihl);
+@@ -215,6 +215,9 @@ static int tcf_nat(struct sk_buff *skb,
+ 		    (icmph->type != ICMP_PARAMETERPROB))
+ 			break;
+ 
++		if (!pskb_may_pull(skb, ihl + sizeof(*icmph) + sizeof(*iph)))
++			goto drop;
++
+ 		iph = (void *)(icmph + 1);
+ 		if (egress)
+ 			addr = iph->daddr;
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -1594,8 +1594,8 @@ xfrm_resolve_and_create_bundle(struct xf
+ 
+ 	/* Try to instantiate a bundle */
+ 	err = xfrm_tmpl_resolve(pols, num_pols, fl, xfrm, family);
+-	if (err < 0) {
+-		if (err != -EAGAIN)
++	if (err <= 0) {
++		if (err != 0 && err != -EAGAIN)
+ 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTPOLERROR);
+ 		return ERR_PTR(err);
+ 	}
+@@ -1678,6 +1678,13 @@ xfrm_bundle_lookup(struct net *net, stru
+ 			goto make_dummy_bundle;
+ 		dst_hold(&xdst->u.dst);
+ 		return oldflo;
++	} else if (new_xdst == NULL) {
++		num_xfrms = 0;
++		if (oldflo == NULL)
++			goto make_dummy_bundle;
++		xdst->num_xfrms = 0;
++		dst_hold(&xdst->u.dst);
++		return oldflo;
+ 	}
+ 
+ 	/* Kill the previous bundle */
+@@ -1760,6 +1767,10 @@ restart:
+ 				xfrm_pols_put(pols, num_pols);
+ 				err = PTR_ERR(xdst);
+ 				goto dropdst;
++			} else if (xdst == NULL) {
++				num_xfrms = 0;
++				drop_pols = num_pols;
++				goto no_transform;
+ 			}
+ 
+ 			spin_lock_bh(&xfrm_policy_sk_bundle_lock);
 --- a/tools/perf/builtin-report.c
 +++ b/tools/perf/builtin-report.c
 @@ -107,7 +107,7 @@ static int perf_session__add_hist_entry(
