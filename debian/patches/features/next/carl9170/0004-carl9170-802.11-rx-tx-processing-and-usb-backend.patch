@@ -1,0 +1,3437 @@
+commit a84fab3cbfdc427e7d366f1cc844f27b2084c26c
+Author: Christian Lamparter <chunkeey@googlemail.com>
+Date:   Mon Sep 6 01:09:20 2010 +0200
+
+    carl9170: 802.11 rx/tx processing and usb backend
+    
+    Signed-off-by: Christian Lamparter <chunkeey@googlemail.com>
+    Signed-off-by: John W. Linville <linville@tuxdriver.com>
+
+--- /dev/null
++++ b/drivers/net/wireless/ath/carl9170/rx.c
+@@ -0,0 +1,909 @@
++/*
++ * Atheros CARL9170 driver
++ *
++ * 802.11 & command trap routines
++ *
++ * Copyright 2008, Johannes Berg <johannes@sipsolutions.net>
++ * Copyright 2009, 2010, Christian Lamparter <chunkeey@googlemail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; see the file COPYING.  If not, see
++ * http://www.gnu.org/licenses/.
++ *
++ * This file incorporates work covered by the following copyright and
++ * permission notice:
++ *    Copyright (c) 2007-2008 Atheros Communications, Inc.
++ *
++ *    Permission to use, copy, modify, and/or distribute this software for any
++ *    purpose with or without fee is hereby granted, provided that the above
++ *    copyright notice and this permission notice appear in all copies.
++ *
++ *    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ *    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ *    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ *    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ *    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ *    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ *    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/module.h>
++#include <linux/etherdevice.h>
++#include <linux/crc32.h>
++#include <net/mac80211.h>
++#include "carl9170.h"
++#include "hw.h"
++#include "cmd.h"
++
++static void carl9170_dbg_message(struct ar9170 *ar, const char *buf, u32 len)
++{
++	bool restart = false;
++	enum carl9170_restart_reasons reason = CARL9170_RR_NO_REASON;
++
++	if (len > 3) {
++		if (memcmp(buf, CARL9170_ERR_MAGIC, 3) == 0) {
++			ar->fw.err_counter++;
++			if (ar->fw.err_counter > 3) {
++				restart = true;
++				reason = CARL9170_RR_TOO_MANY_FIRMWARE_ERRORS;
++			}
++		}
++
++		if (memcmp(buf, CARL9170_BUG_MAGIC, 3) == 0) {
++			ar->fw.bug_counter++;
++			restart = true;
++			reason = CARL9170_RR_FATAL_FIRMWARE_ERROR;
++		}
++	}
++
++	wiphy_info(ar->hw->wiphy, "FW: %.*s\n", len, buf);
++
++	if (restart)
++		carl9170_restart(ar, reason);
++}
++
++static void carl9170_handle_ps(struct ar9170 *ar, struct carl9170_rsp *rsp)
++{
++	u32 ps;
++	bool new_ps;
++
++	ps = le32_to_cpu(rsp->psm.state);
++
++	new_ps = (ps & CARL9170_PSM_COUNTER) != CARL9170_PSM_WAKE;
++	if (ar->ps.state != new_ps) {
++		if (!new_ps) {
++			ar->ps.sleep_ms = jiffies_to_msecs(jiffies -
++				ar->ps.last_action);
++		}
++
++		ar->ps.last_action = jiffies;
++
++		ar->ps.state = new_ps;
++	}
++}
++
++static int carl9170_check_sequence(struct ar9170 *ar, unsigned int seq)
++{
++	if (ar->cmd_seq < -1)
++		return 0;
++
++	/*
++	 * Initialize Counter
++	 */
++	if (ar->cmd_seq < 0)
++		ar->cmd_seq = seq;
++
++	/*
++	 * The sequence is strictly monotonic increasing and it never skips!
++	 *
++	 * Therefore we can safely assume that whenever we received an
++	 * unexpected sequence we have lost some valuable data.
++	 */
++	if (seq != ar->cmd_seq) {
++		int count;
++
++		count = (seq - ar->cmd_seq) % ar->fw.cmd_bufs;
++
++		wiphy_err(ar->hw->wiphy, "lost %d command responses/traps! "
++			  "w:%d g:%d\n", count, ar->cmd_seq, seq);
++
++		carl9170_restart(ar, CARL9170_RR_LOST_RSP);
++		return -EIO;
++	}
++
++	ar->cmd_seq = (ar->cmd_seq + 1) % ar->fw.cmd_bufs;
++	return 0;
++}
++
++static void carl9170_cmd_callback(struct ar9170 *ar, u32 len, void *buffer)
++{
++	/*
++	 * Some commands may have a variable response length
++	 * and we cannot predict the correct length in advance.
++	 * So we only check if we provided enough space for the data.
++	 */
++	if (unlikely(ar->readlen != (len - 4))) {
++		dev_warn(&ar->udev->dev, "received invalid command response:"
++			 "got %d, instead of %d\n", len - 4, ar->readlen);
++		print_hex_dump_bytes("carl9170 cmd:", DUMP_PREFIX_OFFSET,
++			ar->cmd_buf, (ar->cmd.hdr.len + 4) & 0x3f);
++		print_hex_dump_bytes("carl9170 rsp:", DUMP_PREFIX_OFFSET,
++			buffer, len);
++		/*
++		 * Do not complete. The command times out,
++		 * and we get a stack trace from there.
++		 */
++		carl9170_restart(ar, CARL9170_RR_INVALID_RSP);
++	}
++
++	spin_lock(&ar->cmd_lock);
++	if (ar->readbuf) {
++		if (len >= 4)
++			memcpy(ar->readbuf, buffer + 4, len - 4);
++
++		ar->readbuf = NULL;
++	}
++	complete(&ar->cmd_wait);
++	spin_unlock(&ar->cmd_lock);
++}
++
++void carl9170_handle_command_response(struct ar9170 *ar, void *buf, u32 len)
++{
++	struct carl9170_rsp *cmd = (void *) buf;
++	struct ieee80211_vif *vif;
++
++	if (carl9170_check_sequence(ar, cmd->hdr.seq))
++		return;
++
++	if ((cmd->hdr.cmd & CARL9170_RSP_FLAG) != CARL9170_RSP_FLAG) {
++		if (!(cmd->hdr.cmd & CARL9170_CMD_ASYNC_FLAG))
++			carl9170_cmd_callback(ar, len, buf);
++
++		return;
++	}
++
++	if (unlikely(cmd->hdr.len != (len - 4))) {
++		if (net_ratelimit()) {
++			wiphy_err(ar->hw->wiphy, "FW: received over-/under"
++				"sized event %x (%d, but should be %d).\n",
++			       cmd->hdr.cmd, cmd->hdr.len, len - 4);
++
++			print_hex_dump_bytes("dump:", DUMP_PREFIX_NONE,
++					     buf, len);
++		}
++
++		return;
++	}
++
++	/* hardware event handlers */
++	switch (cmd->hdr.cmd) {
++	case CARL9170_RSP_PRETBTT:
++		/* pre-TBTT event */
++		rcu_read_lock();
++		vif = carl9170_get_main_vif(ar);
++
++		if (!vif) {
++			rcu_read_unlock();
++			break;
++		}
++
++		switch (vif->type) {
++		case NL80211_IFTYPE_STATION:
++			carl9170_handle_ps(ar, cmd);
++			break;
++
++		case NL80211_IFTYPE_AP:
++		case NL80211_IFTYPE_ADHOC:
++			carl9170_update_beacon(ar, true);
++			break;
++
++		default:
++			break;
++		}
++		rcu_read_unlock();
++
++		break;
++
++
++	case CARL9170_RSP_TXCOMP:
++		/* TX status notification */
++		carl9170_tx_process_status(ar, cmd);
++		break;
++
++	case CARL9170_RSP_BEACON_CONFIG:
++		/*
++		 * (IBSS) beacon send notification
++		 * bytes: 04 c2 XX YY B4 B3 B2 B1
++		 *
++		 * XX always 80
++		 * YY always 00
++		 * B1-B4 "should" be the number of send out beacons.
++		 */
++		break;
++
++	case CARL9170_RSP_ATIM:
++		/* End of Atim Window */
++		break;
++
++	case CARL9170_RSP_WATCHDOG:
++		/* Watchdog Interrupt */
++		carl9170_restart(ar, CARL9170_RR_WATCHDOG);
++		break;
++
++	case CARL9170_RSP_TEXT:
++		/* firmware debug */
++		carl9170_dbg_message(ar, (char *)buf + 4, len - 4);
++		break;
++
++	case CARL9170_RSP_HEXDUMP:
++		wiphy_dbg(ar->hw->wiphy, "FW: HD %d\n", len - 4);
++		print_hex_dump_bytes("FW:", DUMP_PREFIX_NONE,
++				     (char *)buf + 4, len - 4);
++		break;
++
++	case CARL9170_RSP_RADAR:
++		if (!net_ratelimit())
++			break;
++
++		wiphy_info(ar->hw->wiphy, "FW: RADAR! Please report this "
++		       "incident to linux-wireless@vger.kernel.org !\n");
++		break;
++
++	case CARL9170_RSP_GPIO:
++#ifdef CONFIG_CARL9170_WPC
++		if (ar->wps.pbc) {
++			bool state = !!(cmd->gpio.gpio & cpu_to_le32(
++				AR9170_GPIO_PORT_WPS_BUTTON_PRESSED));
++
++			if (state != ar->wps.pbc_state) {
++				ar->wps.pbc_state = state;
++				input_report_key(ar->wps.pbc, KEY_WPS_BUTTON,
++						 state);
++				input_sync(ar->wps.pbc);
++			}
++		}
++#endif /* CONFIG_CARL9170_WPC */
++		break;
++
++	case CARL9170_RSP_BOOT:
++		complete(&ar->fw_boot_wait);
++		break;
++
++	default:
++		wiphy_err(ar->hw->wiphy, "FW: received unhandled event %x\n",
++			cmd->hdr.cmd);
++		print_hex_dump_bytes("dump:", DUMP_PREFIX_NONE, buf, len);
++		break;
++	}
++}
++
++static int carl9170_rx_mac_status(struct ar9170 *ar,
++	struct ar9170_rx_head *head, struct ar9170_rx_macstatus *mac,
++	struct ieee80211_rx_status *status)
++{
++	struct ieee80211_channel *chan;
++	u8 error, decrypt;
++
++	BUILD_BUG_ON(sizeof(struct ar9170_rx_head) != 12);
++	BUILD_BUG_ON(sizeof(struct ar9170_rx_macstatus) != 4);
++
++	error = mac->error;
++
++	if (error & AR9170_RX_ERROR_WRONG_RA) {
++		if (!ar->sniffer_enabled)
++			return -EINVAL;
++	}
++
++	if (error & AR9170_RX_ERROR_PLCP) {
++		if (!(ar->filter_state & FIF_PLCPFAIL))
++			return -EINVAL;
++
++		status->flag |= RX_FLAG_FAILED_PLCP_CRC;
++	}
++
++	if (error & AR9170_RX_ERROR_FCS) {
++		ar->tx_fcs_errors++;
++
++		if (!(ar->filter_state & FIF_FCSFAIL))
++			return -EINVAL;
++
++		status->flag |= RX_FLAG_FAILED_FCS_CRC;
++	}
++
++	decrypt = ar9170_get_decrypt_type(mac);
++	if (!(decrypt & AR9170_RX_ENC_SOFTWARE) &&
++	    decrypt != AR9170_ENC_ALG_NONE) {
++		if ((decrypt == AR9170_ENC_ALG_TKIP) &&
++		    (error & AR9170_RX_ERROR_MMIC))
++			status->flag |= RX_FLAG_MMIC_ERROR;
++
++		status->flag |= RX_FLAG_DECRYPTED;
++	}
++
++	if (error & AR9170_RX_ERROR_DECRYPT && !ar->sniffer_enabled)
++		return -ENODATA;
++
++	error &= ~(AR9170_RX_ERROR_MMIC |
++		   AR9170_RX_ERROR_FCS |
++		   AR9170_RX_ERROR_WRONG_RA |
++		   AR9170_RX_ERROR_DECRYPT |
++		   AR9170_RX_ERROR_PLCP);
++
++	/* drop any other error frames */
++	if (unlikely(error)) {
++		/* TODO: update netdevice's RX dropped/errors statistics */
++
++		if (net_ratelimit())
++			wiphy_dbg(ar->hw->wiphy, "received frame with "
++			       "suspicious error code (%#x).\n", error);
++
++		return -EINVAL;
++	}
++
++	chan = ar->channel;
++	if (chan) {
++		status->band = chan->band;
++		status->freq = chan->center_freq;
++	}
++
++	switch (mac->status & AR9170_RX_STATUS_MODULATION) {
++	case AR9170_RX_STATUS_MODULATION_CCK:
++		if (mac->status & AR9170_RX_STATUS_SHORT_PREAMBLE)
++			status->flag |= RX_FLAG_SHORTPRE;
++		switch (head->plcp[0]) {
++		case AR9170_RX_PHY_RATE_CCK_1M:
++			status->rate_idx = 0;
++			break;
++		case AR9170_RX_PHY_RATE_CCK_2M:
++			status->rate_idx = 1;
++			break;
++		case AR9170_RX_PHY_RATE_CCK_5M:
++			status->rate_idx = 2;
++			break;
++		case AR9170_RX_PHY_RATE_CCK_11M:
++			status->rate_idx = 3;
++			break;
++		default:
++			if (net_ratelimit()) {
++				wiphy_err(ar->hw->wiphy, "invalid plcp cck "
++				       "rate (%x).\n", head->plcp[0]);
++			}
++
++			return -EINVAL;
++		}
++		break;
++
++	case AR9170_RX_STATUS_MODULATION_DUPOFDM:
++	case AR9170_RX_STATUS_MODULATION_OFDM:
++		switch (head->plcp[0] & 0xf) {
++		case AR9170_TXRX_PHY_RATE_OFDM_6M:
++			status->rate_idx = 0;
++			break;
++		case AR9170_TXRX_PHY_RATE_OFDM_9M:
++			status->rate_idx = 1;
++			break;
++		case AR9170_TXRX_PHY_RATE_OFDM_12M:
++			status->rate_idx = 2;
++			break;
++		case AR9170_TXRX_PHY_RATE_OFDM_18M:
++			status->rate_idx = 3;
++			break;
++		case AR9170_TXRX_PHY_RATE_OFDM_24M:
++			status->rate_idx = 4;
++			break;
++		case AR9170_TXRX_PHY_RATE_OFDM_36M:
++			status->rate_idx = 5;
++			break;
++		case AR9170_TXRX_PHY_RATE_OFDM_48M:
++			status->rate_idx = 6;
++			break;
++		case AR9170_TXRX_PHY_RATE_OFDM_54M:
++			status->rate_idx = 7;
++			break;
++		default:
++			if (net_ratelimit()) {
++				wiphy_err(ar->hw->wiphy, "invalid plcp ofdm "
++					"rate (%x).\n", head->plcp[0]);
++			}
++
++			return -EINVAL;
++		}
++		if (status->band == IEEE80211_BAND_2GHZ)
++			status->rate_idx += 4;
++		break;
++
++	case AR9170_RX_STATUS_MODULATION_HT:
++		if (head->plcp[3] & 0x80)
++			status->flag |= RX_FLAG_40MHZ;
++		if (head->plcp[6] & 0x80)
++			status->flag |= RX_FLAG_SHORT_GI;
++
++		status->rate_idx = clamp(0, 75, head->plcp[3] & 0x7f);
++		status->flag |= RX_FLAG_HT;
++		break;
++
++	default:
++		BUG();
++		return -ENOSYS;
++	}
++
++	return 0;
++}
++
++static void carl9170_rx_phy_status(struct ar9170 *ar,
++	struct ar9170_rx_phystatus *phy, struct ieee80211_rx_status *status)
++{
++	int i;
++
++	BUILD_BUG_ON(sizeof(struct ar9170_rx_phystatus) != 20);
++
++	for (i = 0; i < 3; i++)
++		if (phy->rssi[i] != 0x80)
++			status->antenna |= BIT(i);
++
++	/* post-process RSSI */
++	for (i = 0; i < 7; i++)
++		if (phy->rssi[i] & 0x80)
++			phy->rssi[i] = ((phy->rssi[i] & 0x7f) + 1) & 0x7f;
++
++	/* TODO: we could do something with phy_errors */
++	status->signal = ar->noise[0] + phy->rssi_combined;
++}
++
++static struct sk_buff *carl9170_rx_copy_data(u8 *buf, int len)
++{
++	struct sk_buff *skb;
++	int reserved = 0;
++	struct ieee80211_hdr *hdr = (void *) buf;
++
++	if (ieee80211_is_data_qos(hdr->frame_control)) {
++		u8 *qc = ieee80211_get_qos_ctl(hdr);
++		reserved += NET_IP_ALIGN;
++
++		if (*qc & IEEE80211_QOS_CONTROL_A_MSDU_PRESENT)
++			reserved += NET_IP_ALIGN;
++	}
++
++	if (ieee80211_has_a4(hdr->frame_control))
++		reserved += NET_IP_ALIGN;
++
++	reserved = 32 + (reserved & NET_IP_ALIGN);
++
++	skb = dev_alloc_skb(len + reserved);
++	if (likely(skb)) {
++		skb_reserve(skb, reserved);
++		memcpy(skb_put(skb, len), buf, len);
++	}
++
++	return skb;
++}
++
++static u8 *carl9170_find_ie(u8 *data, unsigned int len, u8 ie)
++{
++	struct ieee80211_mgmt *mgmt = (void *)data;
++	u8 *pos, *end;
++
++	pos = (u8 *)mgmt->u.beacon.variable;
++	end = data + len;
++	while (pos < end) {
++		if (pos + 2 + pos[1] > end)
++			return NULL;
++
++		if (pos[0] == ie)
++			return pos;
++
++		pos += 2 + pos[1];
++	}
++	return NULL;
++}
++
++/*
++ * NOTE:
++ *
++ * The firmware is in charge of waking up the device just before
++ * the AP is expected to transmit the next beacon.
++ *
++ * This leaves the driver with the important task of deciding when
++ * to set the PHY back to bed again.
++ */
++static void carl9170_ps_beacon(struct ar9170 *ar, void *data, unsigned int len)
++{
++	struct ieee80211_hdr *hdr = (void *) data;
++	struct ieee80211_tim_ie *tim_ie;
++	u8 *tim;
++	u8 tim_len;
++	bool cam;
++
++	if (likely(!(ar->hw->conf.flags & IEEE80211_CONF_PS)))
++		return;
++
++	/* check if this really is a beacon */
++	if (!ieee80211_is_beacon(hdr->frame_control))
++		return;
++
++	/* min. beacon length + FCS_LEN */
++	if (len <= 40 + FCS_LEN)
++		return;
++
++	/* and only beacons from the associated BSSID, please */
++	if (compare_ether_addr(hdr->addr3, ar->common.curbssid) ||
++	    !ar->common.curaid)
++		return;
++
++	ar->ps.last_beacon = jiffies;
++
++	tim = carl9170_find_ie(data, len - FCS_LEN, WLAN_EID_TIM);
++	if (!tim)
++		return;
++
++	if (tim[1] < sizeof(*tim_ie))
++		return;
++
++	tim_len = tim[1];
++	tim_ie = (struct ieee80211_tim_ie *) &tim[2];
++
++	if (!WARN_ON_ONCE(!ar->hw->conf.ps_dtim_period))
++		ar->ps.dtim_counter = (tim_ie->dtim_count - 1) %
++			ar->hw->conf.ps_dtim_period;
++
++	/* Check whenever the PHY can be turned off again. */
++
++	/* 1. What about buffered unicast traffic for our AID? */
++	cam = ieee80211_check_tim(tim_ie, tim_len, ar->common.curaid);
++
++	/* 2. Maybe the AP wants to send multicast/broadcast data? */
++	cam = !!(tim_ie->bitmap_ctrl & 0x01);
++
++	if (!cam) {
++		/* back to low-power land. */
++		ar->ps.off_override &= ~PS_OFF_BCN;
++		carl9170_ps_check(ar);
++	} else {
++		/* force CAM */
++		ar->ps.off_override |= PS_OFF_BCN;
++	}
++}
++
++/*
++ * If the frame alignment is right (or the kernel has
++ * CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS), and there
++ * is only a single MPDU in the USB frame, then we could
++ * submit to mac80211 the SKB directly. However, since
++ * there may be multiple packets in one SKB in stream
++ * mode, and we need to observe the proper ordering,
++ * this is non-trivial.
++ */
++
++static void carl9170_handle_mpdu(struct ar9170 *ar, u8 *buf, int len)
++{
++	struct ar9170_rx_head *head;
++	struct ar9170_rx_macstatus *mac;
++	struct ar9170_rx_phystatus *phy = NULL;
++	struct ieee80211_rx_status status;
++	struct sk_buff *skb;
++	int mpdu_len;
++
++	if (!IS_STARTED(ar))
++		return;
++
++	if (unlikely(len < sizeof(*mac))) {
++		ar->rx_dropped++;
++		return;
++	}
++
++	mpdu_len = len - sizeof(*mac);
++
++	mac = (void *)(buf + mpdu_len);
++	if (unlikely(mac->error & AR9170_RX_ERROR_FATAL)) {
++		ar->rx_dropped++;
++		return;
++	}
++
++	switch (mac->status & AR9170_RX_STATUS_MPDU) {
++	case AR9170_RX_STATUS_MPDU_FIRST:
++		/* Aggregated MPDUs start with an PLCP header */
++		if (likely(mpdu_len >= sizeof(struct ar9170_rx_head))) {
++			head = (void *) buf;
++
++			/*
++			 * The PLCP header needs to be cached for the
++			 * following MIDDLE + LAST A-MPDU packets.
++			 *
++			 * So, if you are wondering why all frames seem
++			 * to share a common RX status information,
++			 * then you have the answer right here...
++			 */
++			memcpy(&ar->rx_plcp, (void *) buf,
++			       sizeof(struct ar9170_rx_head));
++
++			mpdu_len -= sizeof(struct ar9170_rx_head);
++			buf += sizeof(struct ar9170_rx_head);
++
++			ar->rx_has_plcp = true;
++		} else {
++			if (net_ratelimit()) {
++				wiphy_err(ar->hw->wiphy, "plcp info "
++					"is clipped.\n");
++			}
++
++			ar->rx_dropped++;
++			return;
++		}
++		break;
++
++	case AR9170_RX_STATUS_MPDU_LAST:
++		/*
++		 * The last frame of an A-MPDU has an extra tail
++		 * which does contain the phy status of the whole
++		 * aggregate.
++		 */
++
++		if (likely(mpdu_len >= sizeof(struct ar9170_rx_phystatus))) {
++			mpdu_len -= sizeof(struct ar9170_rx_phystatus);
++			phy = (void *)(buf + mpdu_len);
++		} else {
++			if (net_ratelimit()) {
++				wiphy_err(ar->hw->wiphy, "frame tail "
++					"is clipped.\n");
++			}
++
++			ar->rx_dropped++;
++			return;
++		}
++
++	case AR9170_RX_STATUS_MPDU_MIDDLE:
++		/*  These are just data + mac status */
++		if (unlikely(!ar->rx_has_plcp)) {
++			if (!net_ratelimit())
++				return;
++
++			wiphy_err(ar->hw->wiphy, "rx stream does not start "
++					"with a first_mpdu frame tag.\n");
++
++			ar->rx_dropped++;
++			return;
++		}
++
++		head = &ar->rx_plcp;
++		break;
++
++	case AR9170_RX_STATUS_MPDU_SINGLE:
++		/* single mpdu has both: plcp (head) and phy status (tail) */
++		head = (void *) buf;
++
++		mpdu_len -= sizeof(struct ar9170_rx_head);
++		mpdu_len -= sizeof(struct ar9170_rx_phystatus);
++
++		buf += sizeof(struct ar9170_rx_head);
++		phy = (void *)(buf + mpdu_len);
++		break;
++
++	default:
++		BUG_ON(1);
++		break;
++	}
++
++	/* FC + DU + RA + FCS */
++	if (unlikely(mpdu_len < (2 + 2 + 6 + FCS_LEN))) {
++		ar->rx_dropped++;
++		return;
++	}
++
++	memset(&status, 0, sizeof(status));
++	if (unlikely(carl9170_rx_mac_status(ar, head, mac, &status))) {
++		ar->rx_dropped++;
++		return;
++	}
++
++	if (phy)
++		carl9170_rx_phy_status(ar, phy, &status);
++
++	carl9170_ps_beacon(ar, buf, mpdu_len);
++
++	skb = carl9170_rx_copy_data(buf, mpdu_len);
++	if (likely(skb)) {
++		memcpy(IEEE80211_SKB_RXCB(skb), &status, sizeof(status));
++		ieee80211_rx(ar->hw, skb);
++	} else {
++		ar->rx_dropped++;
++	}
++}
++
++static void carl9170_rx_untie_cmds(struct ar9170 *ar, const u8 *respbuf,
++				   const unsigned int resplen)
++{
++	struct carl9170_rsp *cmd;
++	int i = 0;
++
++	while (i < resplen) {
++		cmd = (void *) &respbuf[i];
++
++		i += cmd->hdr.len + 4;
++		if (unlikely(i > resplen))
++			break;
++
++		carl9170_handle_command_response(ar, cmd, cmd->hdr.len + 4);
++	}
++
++	if (unlikely(i != resplen)) {
++		if (!net_ratelimit())
++			return;
++
++		wiphy_err(ar->hw->wiphy, "malformed firmware trap:\n");
++		print_hex_dump_bytes("rxcmd:", DUMP_PREFIX_OFFSET,
++				     respbuf, resplen);
++	}
++}
++
++static void __carl9170_rx(struct ar9170 *ar, u8 *buf, unsigned int len)
++{
++	unsigned int i = 0;
++
++	/* weird thing, but this is the same in the original driver */
++	while (len > 2 && i < 12 && buf[0] == 0xff && buf[1] == 0xff) {
++		i += 2;
++		len -= 2;
++		buf += 2;
++	}
++
++	if (unlikely(len < 4))
++		return;
++
++	/* found the 6 * 0xffff marker? */
++	if (i == 12)
++		carl9170_rx_untie_cmds(ar, buf, len);
++	else
++		carl9170_handle_mpdu(ar, buf, len);
++}
++
++static void carl9170_rx_stream(struct ar9170 *ar, void *buf, unsigned int len)
++{
++	unsigned int tlen, wlen = 0, clen = 0;
++	struct ar9170_stream *rx_stream;
++	u8 *tbuf;
++
++	tbuf = buf;
++	tlen = len;
++
++	while (tlen >= 4) {
++		rx_stream = (void *) tbuf;
++		clen = le16_to_cpu(rx_stream->length);
++		wlen = ALIGN(clen, 4);
++
++		/* check if this is stream has a valid tag.*/
++		if (rx_stream->tag != cpu_to_le16(AR9170_RX_STREAM_TAG)) {
++			/*
++			 * TODO: handle the highly unlikely event that the
++			 * corrupted stream has the TAG at the right position.
++			 */
++
++			/* check if the frame can be repaired. */
++			if (!ar->rx_failover_missing) {
++
++				/* this is not "short read". */
++				if (net_ratelimit()) {
++					wiphy_err(ar->hw->wiphy,
++						"missing tag!\n");
++				}
++
++				__carl9170_rx(ar, tbuf, tlen);
++				return;
++			}
++
++			if (ar->rx_failover_missing > tlen) {
++				if (net_ratelimit()) {
++					wiphy_err(ar->hw->wiphy,
++						"possible multi "
++						"stream corruption!\n");
++					goto err_telluser;
++				} else {
++					goto err_silent;
++				}
++			}
++
++			memcpy(skb_put(ar->rx_failover, tlen), tbuf, tlen);
++			ar->rx_failover_missing -= tlen;
++
++			if (ar->rx_failover_missing <= 0) {
++				/*
++				 * nested carl9170_rx_stream call!
++				 *
++				 * termination is guranteed, even when the
++				 * combined frame also have an element with
++				 * a bad tag.
++				 */
++
++				ar->rx_failover_missing = 0;
++				carl9170_rx_stream(ar, ar->rx_failover->data,
++						   ar->rx_failover->len);
++
++				skb_reset_tail_pointer(ar->rx_failover);
++				skb_trim(ar->rx_failover, 0);
++			}
++
++			return;
++		}
++
++		/* check if stream is clipped */
++		if (wlen > tlen - 4) {
++			if (ar->rx_failover_missing) {
++				/* TODO: handle double stream corruption. */
++				if (net_ratelimit()) {
++					wiphy_err(ar->hw->wiphy, "double rx "
++						"stream corruption!\n");
++					goto err_telluser;
++				} else {
++					goto err_silent;
++				}
++			}
++
++			/*
++			 * save incomplete data set.
++			 * the firmware will resend the missing bits when
++			 * the rx - descriptor comes round again.
++			 */
++
++			memcpy(skb_put(ar->rx_failover, tlen), tbuf, tlen);
++			ar->rx_failover_missing = clen - tlen;
++			return;
++		}
++		__carl9170_rx(ar, rx_stream->payload, clen);
++
++		tbuf += wlen + 4;
++		tlen -= wlen + 4;
++	}
++
++	if (tlen) {
++		if (net_ratelimit()) {
++			wiphy_err(ar->hw->wiphy, "%d bytes of unprocessed "
++				"data left in rx stream!\n", tlen);
++		}
++
++		goto err_telluser;
++	}
++
++	return;
++
++err_telluser:
++	wiphy_err(ar->hw->wiphy, "damaged RX stream data [want:%d, "
++		"data:%d, rx:%d, pending:%d ]\n", clen, wlen, tlen,
++		ar->rx_failover_missing);
++
++	if (ar->rx_failover_missing)
++		print_hex_dump_bytes("rxbuf:", DUMP_PREFIX_OFFSET,
++				     ar->rx_failover->data,
++				     ar->rx_failover->len);
++
++	print_hex_dump_bytes("stream:", DUMP_PREFIX_OFFSET,
++			     buf, len);
++
++	wiphy_err(ar->hw->wiphy, "please check your hardware and cables, if "
++		"you see this message frequently.\n");
++
++err_silent:
++	if (ar->rx_failover_missing) {
++		skb_reset_tail_pointer(ar->rx_failover);
++		skb_trim(ar->rx_failover, 0);
++		ar->rx_failover_missing = 0;
++	}
++}
++
++void carl9170_rx(struct ar9170 *ar, void *buf, unsigned int len)
++{
++	if (ar->fw.rx_stream)
++		carl9170_rx_stream(ar, buf, len);
++	else
++		__carl9170_rx(ar, buf, len);
++}
+--- /dev/null
++++ b/drivers/net/wireless/ath/carl9170/tx.c
+@@ -0,0 +1,1373 @@
++/*
++ * Atheros CARL9170 driver
++ *
++ * 802.11 xmit & status routines
++ *
++ * Copyright 2008, Johannes Berg <johannes@sipsolutions.net>
++ * Copyright 2009, 2010, Christian Lamparter <chunkeey@googlemail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; see the file COPYING.  If not, see
++ * http://www.gnu.org/licenses/.
++ *
++ * This file incorporates work covered by the following copyright and
++ * permission notice:
++ *    Copyright (c) 2007-2008 Atheros Communications, Inc.
++ *
++ *    Permission to use, copy, modify, and/or distribute this software for any
++ *    purpose with or without fee is hereby granted, provided that the above
++ *    copyright notice and this permission notice appear in all copies.
++ *
++ *    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ *    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ *    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ *    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ *    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ *    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ *    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/module.h>
++#include <linux/etherdevice.h>
++#include <net/mac80211.h>
++#include "carl9170.h"
++#include "hw.h"
++#include "cmd.h"
++
++static inline unsigned int __carl9170_get_queue(struct ar9170 *ar,
++						unsigned int queue)
++{
++	if (unlikely(modparam_noht)) {
++		return queue;
++	} else {
++		/*
++		 * This is just another workaround, until
++		 * someone figures out how to get QoS and
++		 * AMPDU to play nicely together.
++		 */
++
++		return 2;		/* AC_BE */
++	}
++}
++
++static inline unsigned int carl9170_get_queue(struct ar9170 *ar,
++					      struct sk_buff *skb)
++{
++	return __carl9170_get_queue(ar, skb_get_queue_mapping(skb));
++}
++
++static bool is_mem_full(struct ar9170 *ar)
++{
++	return (DIV_ROUND_UP(IEEE80211_MAX_FRAME_LEN, ar->fw.mem_block_size) >
++		atomic_read(&ar->mem_free_blocks));
++}
++
++static void carl9170_tx_accounting(struct ar9170 *ar, struct sk_buff *skb)
++{
++	int queue, i;
++	bool mem_full;
++
++	atomic_inc(&ar->tx_total_queued);
++
++	queue = skb_get_queue_mapping(skb);
++	spin_lock_bh(&ar->tx_stats_lock);
++
++	/*
++	 * The driver has to accept the frame, regardless if the queue is
++	 * full to the brim, or not. We have to do the queuing internally,
++	 * since mac80211 assumes that a driver which can operate with
++	 * aggregated frames does not reject frames for this reason.
++	 */
++	ar->tx_stats[queue].len++;
++	ar->tx_stats[queue].count++;
++
++	mem_full = is_mem_full(ar);
++	for (i = 0; i < ar->hw->queues; i++) {
++		if (mem_full || ar->tx_stats[i].len >= ar->tx_stats[i].limit) {
++			ieee80211_stop_queue(ar->hw, i);
++			ar->queue_stop_timeout[i] = jiffies;
++		}
++	}
++
++	spin_unlock_bh(&ar->tx_stats_lock);
++}
++
++static void carl9170_tx_accounting_free(struct ar9170 *ar, struct sk_buff *skb)
++{
++	struct ieee80211_tx_info *txinfo;
++	int queue;
++
++	txinfo = IEEE80211_SKB_CB(skb);
++	queue = skb_get_queue_mapping(skb);
++
++	spin_lock_bh(&ar->tx_stats_lock);
++
++	ar->tx_stats[queue].len--;
++
++	if (!is_mem_full(ar)) {
++		unsigned int i;
++		for (i = 0; i < ar->hw->queues; i++) {
++			if (ar->tx_stats[i].len >= CARL9170_NUM_TX_LIMIT_SOFT)
++				continue;
++
++			if (ieee80211_queue_stopped(ar->hw, i)) {
++				unsigned long tmp;
++
++				tmp = jiffies - ar->queue_stop_timeout[i];
++				if (tmp > ar->max_queue_stop_timeout[i])
++					ar->max_queue_stop_timeout[i] = tmp;
++			}
++
++			ieee80211_wake_queue(ar->hw, i);
++		}
++	}
++
++	spin_unlock_bh(&ar->tx_stats_lock);
++	if (atomic_dec_and_test(&ar->tx_total_queued))
++		complete(&ar->tx_flush);
++}
++
++static int carl9170_alloc_dev_space(struct ar9170 *ar, struct sk_buff *skb)
++{
++	struct _carl9170_tx_superframe *super = (void *) skb->data;
++	unsigned int chunks;
++	int cookie = -1;
++
++	atomic_inc(&ar->mem_allocs);
++
++	chunks = DIV_ROUND_UP(skb->len, ar->fw.mem_block_size);
++	if (unlikely(atomic_sub_return(chunks, &ar->mem_free_blocks) < 0)) {
++		atomic_add(chunks, &ar->mem_free_blocks);
++		return -ENOSPC;
++	}
++
++	spin_lock_bh(&ar->mem_lock);
++	cookie = bitmap_find_free_region(ar->mem_bitmap, ar->fw.mem_blocks, 0);
++	spin_unlock_bh(&ar->mem_lock);
++
++	if (unlikely(cookie < 0)) {
++		atomic_add(chunks, &ar->mem_free_blocks);
++		return -ENOSPC;
++	}
++
++	super = (void *) skb->data;
++
++	/*
++	 * Cookie #0 serves two special purposes:
++	 *  1. The firmware might use it generate BlockACK frames
++	 *     in responds of an incoming BlockAckReqs.
++	 *
++	 *  2. Prevent double-free bugs.
++	 */
++	super->s.cookie = (u8) cookie + 1;
++	return 0;
++}
++
++static void carl9170_release_dev_space(struct ar9170 *ar, struct sk_buff *skb)
++{
++	struct _carl9170_tx_superframe *super = (void *) skb->data;
++	int cookie;
++
++	/* make a local copy of the cookie */
++	cookie = super->s.cookie;
++	/* invalidate cookie */
++	super->s.cookie = 0;
++
++	/*
++	 * Do a out-of-bounds check on the cookie:
++	 *
++	 *  * cookie "0" is reserved and won't be assigned to any
++	 *    out-going frame. Internally however, it is used to
++	 *    mark no longer/un-accounted frames and serves as a
++	 *    cheap way of preventing frames from being freed
++	 *    twice by _accident_. NB: There is a tiny race...
++	 *
++	 *  * obviously, cookie number is limited by the amount
++	 *    of available memory blocks, so the number can
++	 *    never execeed the mem_blocks count.
++	 */
++	if (unlikely(WARN_ON_ONCE(cookie == 0) ||
++	    WARN_ON_ONCE(cookie > ar->fw.mem_blocks)))
++		return;
++
++	atomic_add(DIV_ROUND_UP(skb->len, ar->fw.mem_block_size),
++		   &ar->mem_free_blocks);
++
++	spin_lock_bh(&ar->mem_lock);
++	bitmap_release_region(ar->mem_bitmap, cookie - 1, 0);
++	spin_unlock_bh(&ar->mem_lock);
++}
++
++/* Called from any context */
++static void carl9170_tx_release(struct kref *ref)
++{
++	struct ar9170 *ar;
++	struct carl9170_tx_info *arinfo;
++	struct ieee80211_tx_info *txinfo;
++	struct sk_buff *skb;
++
++	arinfo = container_of(ref, struct carl9170_tx_info, ref);
++	txinfo = container_of((void *) arinfo, struct ieee80211_tx_info,
++			      rate_driver_data);
++	skb = container_of((void *) txinfo, struct sk_buff, cb);
++
++	ar = arinfo->ar;
++	if (WARN_ON_ONCE(!ar))
++		return;
++
++	BUILD_BUG_ON(
++	    offsetof(struct ieee80211_tx_info, status.ampdu_ack_len) != 23);
++
++	memset(&txinfo->status.ampdu_ack_len, 0,
++	       sizeof(struct ieee80211_tx_info) -
++	       offsetof(struct ieee80211_tx_info, status.ampdu_ack_len));
++
++	if (atomic_read(&ar->tx_total_queued))
++		ar->tx_schedule = true;
++
++	if (txinfo->flags & IEEE80211_TX_CTL_AMPDU) {
++		if (!atomic_read(&ar->tx_ampdu_upload))
++			ar->tx_ampdu_schedule = true;
++
++		if (txinfo->flags & IEEE80211_TX_STAT_AMPDU) {
++			txinfo->status.ampdu_len = txinfo->pad[0];
++			txinfo->status.ampdu_ack_len = txinfo->pad[1];
++			txinfo->pad[0] = txinfo->pad[1] = 0;
++		} else if (txinfo->flags & IEEE80211_TX_STAT_ACK) {
++			/*
++			 * drop redundant tx_status reports:
++			 *
++			 * 1. ampdu_ack_len of the final tx_status does
++			 *    include the feedback of this particular frame.
++			 *
++			 * 2. tx_status_irqsafe only queues up to 128
++			 *    tx feedback reports and discards the rest.
++			 *
++			 * 3. minstrel_ht is picky, it only accepts
++			 *    reports of frames with the TX_STATUS_AMPDU flag.
++			 */
++
++			dev_kfree_skb_any(skb);
++			return;
++		} else {
++			/*
++			 * Frame has failed, but we want to keep it in
++			 * case it was lost due to a power-state
++			 * transition.
++			 */
++		}
++	}
++
++	skb_pull(skb, sizeof(struct _carl9170_tx_superframe));
++	ieee80211_tx_status_irqsafe(ar->hw, skb);
++}
++
++void carl9170_tx_get_skb(struct sk_buff *skb)
++{
++	struct carl9170_tx_info *arinfo = (void *)
++		(IEEE80211_SKB_CB(skb))->rate_driver_data;
++	kref_get(&arinfo->ref);
++}
++
++int carl9170_tx_put_skb(struct sk_buff *skb)
++{
++	struct carl9170_tx_info *arinfo = (void *)
++		(IEEE80211_SKB_CB(skb))->rate_driver_data;
++
++	return kref_put(&arinfo->ref, carl9170_tx_release);
++}
++
++/* Caller must hold the tid_info->lock & rcu_read_lock */
++static void carl9170_tx_shift_bm(struct ar9170 *ar,
++	struct carl9170_sta_tid *tid_info, u16 seq)
++{
++	u16 off;
++
++	off = SEQ_DIFF(seq, tid_info->bsn);
++
++	if (WARN_ON_ONCE(off >= CARL9170_BAW_BITS))
++		return;
++
++	/*
++	 * Sanity check. For each MPDU we set the bit in bitmap and
++	 * clear it once we received the tx_status.
++	 * But if the bit is already cleared then we've been bitten
++	 * by a bug.
++	 */
++	WARN_ON_ONCE(!test_and_clear_bit(off, tid_info->bitmap));
++
++	off = SEQ_DIFF(tid_info->snx, tid_info->bsn);
++	if (WARN_ON_ONCE(off >= CARL9170_BAW_BITS))
++		return;
++
++	if (!bitmap_empty(tid_info->bitmap, off))
++		off = find_first_bit(tid_info->bitmap, off);
++
++	tid_info->bsn += off;
++	tid_info->bsn &= 0x0fff;
++
++	bitmap_shift_right(tid_info->bitmap, tid_info->bitmap,
++			   off, CARL9170_BAW_BITS);
++}
++
++static void carl9170_tx_status_process_ampdu(struct ar9170 *ar,
++	struct sk_buff *skb, struct ieee80211_tx_info *txinfo)
++{
++	struct _carl9170_tx_superframe *super = (void *) skb->data;
++	struct ieee80211_hdr *hdr = (void *) super->frame_data;
++	struct ieee80211_tx_info *tx_info;
++	struct carl9170_tx_info *ar_info;
++	struct carl9170_sta_info *sta_info;
++	struct ieee80211_sta *sta;
++	struct carl9170_sta_tid *tid_info;
++	struct ieee80211_vif *vif;
++	unsigned int vif_id;
++	u8 tid;
++
++	if (!(txinfo->flags & IEEE80211_TX_CTL_AMPDU) ||
++	    txinfo->flags & IEEE80211_TX_CTL_INJECTED)
++		return;
++
++	tx_info = IEEE80211_SKB_CB(skb);
++	ar_info = (void *) tx_info->rate_driver_data;
++
++	vif_id = (super->s.misc & CARL9170_TX_SUPER_MISC_VIF_ID) >>
++		 CARL9170_TX_SUPER_MISC_VIF_ID_S;
++
++	if (WARN_ON_ONCE(vif_id >= AR9170_MAX_VIRTUAL_MAC))
++		return;
++
++	rcu_read_lock();
++	vif = rcu_dereference(ar->vif_priv[vif_id].vif);
++	if (unlikely(!vif))
++		goto out_rcu;
++
++	/*
++	 * Normally we should use wrappers like ieee80211_get_DA to get
++	 * the correct peer ieee80211_sta.
++	 *
++	 * But there is a problem with indirect traffic (broadcasts, or
++	 * data which is designated for other stations) in station mode.
++	 * The frame will be directed to the AP for distribution and not
++	 * to the actual destination.
++	 */
++	sta = ieee80211_find_sta(vif, hdr->addr1);
++	if (unlikely(!sta))
++		goto out_rcu;
++
++	tid = get_tid_h(hdr);
++
++	sta_info = (void *) sta->drv_priv;
++	tid_info = rcu_dereference(sta_info->agg[tid]);
++	if (!tid_info)
++		goto out_rcu;
++
++	spin_lock_bh(&tid_info->lock);
++	if (likely(tid_info->state >= CARL9170_TID_STATE_IDLE))
++		carl9170_tx_shift_bm(ar, tid_info, get_seq_h(hdr));
++
++	if (sta_info->stats[tid].clear) {
++		sta_info->stats[tid].clear = false;
++		sta_info->stats[tid].ampdu_len = 0;
++		sta_info->stats[tid].ampdu_ack_len = 0;
++	}
++
++	sta_info->stats[tid].ampdu_len++;
++	if (txinfo->status.rates[0].count == 1)
++		sta_info->stats[tid].ampdu_ack_len++;
++
++	if (super->f.mac_control & cpu_to_le16(AR9170_TX_MAC_IMM_BA)) {
++		txinfo->pad[0] = sta_info->stats[tid].ampdu_len;
++		txinfo->pad[1] = sta_info->stats[tid].ampdu_ack_len;
++		txinfo->flags |= IEEE80211_TX_STAT_AMPDU;
++		sta_info->stats[tid].clear = true;
++	}
++	spin_unlock_bh(&tid_info->lock);
++
++out_rcu:
++	rcu_read_unlock();
++}
++
++void carl9170_tx_status(struct ar9170 *ar, struct sk_buff *skb,
++			const bool success)
++{
++	struct ieee80211_tx_info *txinfo;
++
++	carl9170_tx_accounting_free(ar, skb);
++
++	txinfo = IEEE80211_SKB_CB(skb);
++
++	if (success)
++		txinfo->flags |= IEEE80211_TX_STAT_ACK;
++	else
++		ar->tx_ack_failures++;
++
++	if (txinfo->flags & IEEE80211_TX_CTL_AMPDU)
++		carl9170_tx_status_process_ampdu(ar, skb, txinfo);
++
++	carl9170_tx_put_skb(skb);
++}
++
++/* This function may be called form any context */
++void carl9170_tx_callback(struct ar9170 *ar, struct sk_buff *skb)
++{
++	struct ieee80211_tx_info *txinfo = IEEE80211_SKB_CB(skb);
++
++	atomic_dec(&ar->tx_total_pending);
++
++	if (txinfo->flags & IEEE80211_TX_CTL_AMPDU)
++		atomic_dec(&ar->tx_ampdu_upload);
++
++	if (carl9170_tx_put_skb(skb))
++		tasklet_hi_schedule(&ar->usb_tasklet);
++}
++
++static struct sk_buff *carl9170_get_queued_skb(struct ar9170 *ar, u8 cookie,
++					       struct sk_buff_head *queue)
++{
++	struct sk_buff *skb;
++
++	spin_lock_bh(&queue->lock);
++	skb_queue_walk(queue, skb) {
++		struct _carl9170_tx_superframe *txc = (void *) skb->data;
++
++		if (txc->s.cookie != cookie)
++			continue;
++
++		__skb_unlink(skb, queue);
++		spin_unlock_bh(&queue->lock);
++
++		carl9170_release_dev_space(ar, skb);
++		return skb;
++	}
++	spin_unlock_bh(&queue->lock);
++
++	return NULL;
++}
++
++static void carl9170_tx_fill_rateinfo(struct ar9170 *ar, unsigned int rix,
++	unsigned int tries, struct ieee80211_tx_info *txinfo)
++{
++	unsigned int i;
++
++	for (i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
++		if (txinfo->status.rates[i].idx < 0)
++			break;
++
++		if (i == rix) {
++			txinfo->status.rates[i].count = tries;
++			i++;
++			break;
++		}
++	}
++
++	for (; i < IEEE80211_TX_MAX_RATES; i++) {
++		txinfo->status.rates[i].idx = -1;
++		txinfo->status.rates[i].count = 0;
++	}
++}
++
++static void carl9170_check_queue_stop_timeout(struct ar9170 *ar)
++{
++	int i;
++	struct sk_buff *skb;
++	struct ieee80211_tx_info *txinfo;
++	struct carl9170_tx_info *arinfo;
++	bool restart = false;
++
++	for (i = 0; i < ar->hw->queues; i++) {
++		spin_lock_bh(&ar->tx_status[i].lock);
++
++		skb = skb_peek(&ar->tx_status[i]);
++
++		if (!skb)
++			goto next;
++
++		txinfo = IEEE80211_SKB_CB(skb);
++		arinfo = (void *) txinfo->rate_driver_data;
++
++		if (time_is_before_jiffies(arinfo->timeout +
++		    msecs_to_jiffies(CARL9170_QUEUE_STUCK_TIMEOUT)) == true)
++			restart = true;
++
++next:
++		spin_unlock_bh(&ar->tx_status[i].lock);
++	}
++
++	if (restart) {
++		/*
++		 * At least one queue has been stuck for long enough.
++		 * Give the device a kick and hope it gets back to
++		 * work.
++		 *
++		 * possible reasons may include:
++		 *  - frames got lost/corrupted (bad connection to the device)
++		 *  - stalled rx processing/usb controller hiccups
++		 *  - firmware errors/bugs
++		 *  - every bug you can think of.
++		 *  - all bugs you can't...
++		 *  - ...
++		 */
++		carl9170_restart(ar, CARL9170_RR_STUCK_TX);
++	}
++}
++
++void carl9170_tx_janitor(struct work_struct *work)
++{
++	struct ar9170 *ar = container_of(work, struct ar9170,
++					 tx_janitor.work);
++	if (!IS_STARTED(ar))
++		return;
++
++	ar->tx_janitor_last_run = jiffies;
++
++	carl9170_check_queue_stop_timeout(ar);
++
++	if (!atomic_read(&ar->tx_total_queued))
++		return;
++
++	ieee80211_queue_delayed_work(ar->hw, &ar->tx_janitor,
++		msecs_to_jiffies(CARL9170_TX_TIMEOUT));
++}
++
++static void __carl9170_tx_process_status(struct ar9170 *ar,
++	const uint8_t cookie, const uint8_t info)
++{
++	struct sk_buff *skb;
++	struct ieee80211_tx_info *txinfo;
++	struct carl9170_tx_info *arinfo;
++	unsigned int r, t, q;
++	bool success = true;
++
++	q = ar9170_qmap[info & CARL9170_TX_STATUS_QUEUE];
++
++	skb = carl9170_get_queued_skb(ar, cookie, &ar->tx_status[q]);
++	if (!skb) {
++		/*
++		 * We have lost the race to another thread.
++		 */
++
++		return ;
++	}
++
++	txinfo = IEEE80211_SKB_CB(skb);
++	arinfo = (void *) txinfo->rate_driver_data;
++
++	if (!(info & CARL9170_TX_STATUS_SUCCESS))
++		success = false;
++
++	r = (info & CARL9170_TX_STATUS_RIX) >> CARL9170_TX_STATUS_RIX_S;
++	t = (info & CARL9170_TX_STATUS_TRIES) >> CARL9170_TX_STATUS_TRIES_S;
++
++	carl9170_tx_fill_rateinfo(ar, r, t, txinfo);
++	carl9170_tx_status(ar, skb, success);
++}
++
++void carl9170_tx_process_status(struct ar9170 *ar,
++				const struct carl9170_rsp *cmd)
++{
++	unsigned int i;
++
++	for (i = 0;  i < cmd->hdr.ext; i++) {
++		if (WARN_ON(i > ((cmd->hdr.len / 2) + 1))) {
++			print_hex_dump_bytes("UU:", DUMP_PREFIX_NONE,
++					     (void *) cmd, cmd->hdr.len + 4);
++			break;
++		}
++
++		__carl9170_tx_process_status(ar, cmd->_tx_status[i].cookie,
++					     cmd->_tx_status[i].info);
++	}
++}
++
++static __le32 carl9170_tx_physet(struct ar9170 *ar,
++	struct ieee80211_tx_info *info, struct ieee80211_tx_rate *txrate)
++{
++	struct ieee80211_rate *rate = NULL;
++	u32 power, chains;
++	__le32 tmp;
++
++	tmp = cpu_to_le32(0);
++
++	if (txrate->flags & IEEE80211_TX_RC_40_MHZ_WIDTH)
++		tmp |= cpu_to_le32(AR9170_TX_PHY_BW_40MHZ <<
++			AR9170_TX_PHY_BW_S);
++	/* this works because 40 MHz is 2 and dup is 3 */
++	if (txrate->flags & IEEE80211_TX_RC_DUP_DATA)
++		tmp |= cpu_to_le32(AR9170_TX_PHY_BW_40MHZ_DUP <<
++			AR9170_TX_PHY_BW_S);
++
++	if (txrate->flags & IEEE80211_TX_RC_SHORT_GI)
++		tmp |= cpu_to_le32(AR9170_TX_PHY_SHORT_GI);
++
++	if (txrate->flags & IEEE80211_TX_RC_MCS) {
++		u32 r = txrate->idx;
++		u8 *txpower;
++
++		/* heavy clip control */
++		tmp |= cpu_to_le32((r & 0x7) <<
++			AR9170_TX_PHY_TX_HEAVY_CLIP_S);
++
++		if (txrate->flags & IEEE80211_TX_RC_40_MHZ_WIDTH) {
++			if (info->band == IEEE80211_BAND_5GHZ)
++				txpower = ar->power_5G_ht40;
++			else
++				txpower = ar->power_2G_ht40;
++		} else {
++			if (info->band == IEEE80211_BAND_5GHZ)
++				txpower = ar->power_5G_ht20;
++			else
++				txpower = ar->power_2G_ht20;
++		}
++
++		power = txpower[r & 7];
++
++		/* +1 dBm for HT40 */
++		if (txrate->flags & IEEE80211_TX_RC_40_MHZ_WIDTH)
++			power += 2;
++
++		r <<= AR9170_TX_PHY_MCS_S;
++		BUG_ON(r & ~AR9170_TX_PHY_MCS);
++
++		tmp |= cpu_to_le32(r & AR9170_TX_PHY_MCS);
++		tmp |= cpu_to_le32(AR9170_TX_PHY_MOD_HT);
++
++		/*
++		 * green field preamble does not work.
++		 *
++		 * if (txrate->flags & IEEE80211_TX_RC_GREEN_FIELD)
++		 * tmp |= cpu_to_le32(AR9170_TX_PHY_GREENFIELD);
++		 */
++	} else {
++		u8 *txpower;
++		u32 mod;
++		u32 phyrate;
++		u8 idx = txrate->idx;
++
++		if (info->band != IEEE80211_BAND_2GHZ) {
++			idx += 4;
++			txpower = ar->power_5G_leg;
++			mod = AR9170_TX_PHY_MOD_OFDM;
++		} else {
++			if (idx < 4) {
++				txpower = ar->power_2G_cck;
++				mod = AR9170_TX_PHY_MOD_CCK;
++			} else {
++				mod = AR9170_TX_PHY_MOD_OFDM;
++				txpower = ar->power_2G_ofdm;
++			}
++		}
++
++		rate = &__carl9170_ratetable[idx];
++
++		phyrate = rate->hw_value & 0xF;
++		power = txpower[(rate->hw_value & 0x30) >> 4];
++		phyrate <<= AR9170_TX_PHY_MCS_S;
++
++		tmp |= cpu_to_le32(mod);
++		tmp |= cpu_to_le32(phyrate);
++
++		/*
++		 * short preamble seems to be broken too.
++		 *
++		 * if (txrate->flags & IEEE80211_TX_RC_USE_SHORT_PREAMBLE)
++		 *	tmp |= cpu_to_le32(AR9170_TX_PHY_SHORT_PREAMBLE);
++		 */
++	}
++	power <<= AR9170_TX_PHY_TX_PWR_S;
++	power &= AR9170_TX_PHY_TX_PWR;
++	tmp |= cpu_to_le32(power);
++
++	/* set TX chains */
++	if (ar->eeprom.tx_mask == 1) {
++		chains = AR9170_TX_PHY_TXCHAIN_1;
++	} else {
++		chains = AR9170_TX_PHY_TXCHAIN_2;
++
++		/* >= 36M legacy OFDM - use only one chain */
++		if (rate && rate->bitrate >= 360 &&
++		    !(txrate->flags & IEEE80211_TX_RC_MCS))
++			chains = AR9170_TX_PHY_TXCHAIN_1;
++	}
++	tmp |= cpu_to_le32(chains << AR9170_TX_PHY_TXCHAIN_S);
++
++	return tmp;
++}
++
++static bool carl9170_tx_rts_check(struct ar9170 *ar,
++				  struct ieee80211_tx_rate *rate,
++				  bool ampdu, bool multi)
++{
++	switch (ar->erp_mode) {
++	case CARL9170_ERP_AUTO:
++		if (ampdu)
++			break;
++
++	case CARL9170_ERP_MAC80211:
++		if (!(rate->flags & IEEE80211_TX_RC_USE_RTS_CTS))
++			break;
++
++	case CARL9170_ERP_RTS:
++		if (likely(!multi))
++			return true;
++
++	default:
++		break;
++	}
++
++	return false;
++}
++
++static bool carl9170_tx_cts_check(struct ar9170 *ar,
++				  struct ieee80211_tx_rate *rate)
++{
++	switch (ar->erp_mode) {
++	case CARL9170_ERP_AUTO:
++	case CARL9170_ERP_MAC80211:
++		if (!(rate->flags & IEEE80211_TX_RC_USE_CTS_PROTECT))
++			break;
++
++	case CARL9170_ERP_CTS:
++		return true;
++
++	default:
++		break;
++	}
++
++	return false;
++}
++
++static int carl9170_tx_prepare(struct ar9170 *ar, struct sk_buff *skb)
++{
++	struct ieee80211_hdr *hdr;
++	struct _carl9170_tx_superframe *txc;
++	struct carl9170_vif_info *cvif;
++	struct ieee80211_tx_info *info;
++	struct ieee80211_tx_rate *txrate;
++	struct ieee80211_sta *sta;
++	struct carl9170_tx_info *arinfo;
++	unsigned int hw_queue;
++	int i;
++	u16 keytype = 0;
++	u16 len, icv = 0;
++	bool ampdu, no_ack;
++
++	BUILD_BUG_ON(sizeof(*arinfo) > sizeof(info->rate_driver_data));
++	BUILD_BUG_ON(sizeof(struct _carl9170_tx_superdesc) !=
++		     CARL9170_TX_SUPERDESC_LEN);
++
++	BUILD_BUG_ON(sizeof(struct _ar9170_tx_hwdesc) !=
++		     AR9170_TX_HWDESC_LEN);
++
++	BUILD_BUG_ON(IEEE80211_TX_MAX_RATES < CARL9170_TX_MAX_RATES);
++
++	hw_queue = ar9170_qmap[carl9170_get_queue(ar, skb)];
++
++	hdr = (void *)skb->data;
++	info = IEEE80211_SKB_CB(skb);
++	len = skb->len;
++
++	/*
++	 * Note: If the frame was sent through a monitor interface,
++	 * the ieee80211_vif pointer can be NULL.
++	 */
++	if (likely(info->control.vif))
++		cvif = (void *) info->control.vif->drv_priv;
++	else
++		cvif = NULL;
++
++	sta = info->control.sta;
++
++	txc = (void *)skb_push(skb, sizeof(*txc));
++	memset(txc, 0, sizeof(*txc));
++
++	ampdu = !!(info->flags & IEEE80211_TX_CTL_AMPDU);
++	no_ack = !!(info->flags & IEEE80211_TX_CTL_NO_ACK);
++
++	if (info->control.hw_key) {
++		icv = info->control.hw_key->icv_len;
++
++		switch (info->control.hw_key->cipher) {
++		case WLAN_CIPHER_SUITE_WEP40:
++		case WLAN_CIPHER_SUITE_WEP104:
++		case WLAN_CIPHER_SUITE_TKIP:
++			keytype = AR9170_TX_MAC_ENCR_RC4;
++			break;
++		case WLAN_CIPHER_SUITE_CCMP:
++			keytype = AR9170_TX_MAC_ENCR_AES;
++			break;
++		default:
++			WARN_ON(1);
++			goto err_out;
++		}
++	}
++
++	BUILD_BUG_ON(AR9170_MAX_VIRTUAL_MAC >
++		((CARL9170_TX_SUPER_MISC_VIF_ID >>
++		 CARL9170_TX_SUPER_MISC_VIF_ID_S) + 1));
++
++	txc->s.len = cpu_to_le16(len + sizeof(*txc));
++	txc->f.length = cpu_to_le16(len + icv + 4);
++	SET_VAL(CARL9170_TX_SUPER_MISC_VIF_ID, txc->s.misc,
++		cvif ? cvif->id : 0);
++
++	txc->f.mac_control = cpu_to_le16(AR9170_TX_MAC_HW_DURATION |
++					 AR9170_TX_MAC_BACKOFF);
++
++	SET_VAL(CARL9170_TX_SUPER_MISC_QUEUE, txc->s.misc, hw_queue);
++
++	txc->f.mac_control |= cpu_to_le16(hw_queue << AR9170_TX_MAC_QOS_S);
++	txc->f.mac_control |= cpu_to_le16(keytype);
++	txc->f.phy_control = cpu_to_le32(0);
++
++	if (no_ack)
++		txc->f.mac_control |= cpu_to_le16(AR9170_TX_MAC_NO_ACK);
++
++	if (info->flags & IEEE80211_TX_CTL_SEND_AFTER_DTIM)
++		txc->s.misc |= CARL9170_TX_SUPER_MISC_CAB;
++
++	txrate = &info->control.rates[0];
++	if (carl9170_tx_rts_check(ar, txrate, ampdu, no_ack))
++		txc->f.mac_control |= cpu_to_le16(AR9170_TX_MAC_PROT_RTS);
++	else if (carl9170_tx_cts_check(ar, txrate))
++		txc->f.mac_control |= cpu_to_le16(AR9170_TX_MAC_PROT_CTS);
++
++	SET_VAL(CARL9170_TX_SUPER_RI_TRIES, txc->s.ri[0], txrate->count);
++	txc->f.phy_control |= carl9170_tx_physet(ar, info, txrate);
++
++	if (info->flags & IEEE80211_TX_CTL_AMPDU) {
++		for (i = 1; i < CARL9170_TX_MAX_RATES; i++) {
++			txrate = &info->control.rates[i];
++			if (txrate->idx >= 0)
++				continue;
++
++			txrate->idx = 0;
++			txrate->count = ar->hw->max_rate_tries;
++		}
++	}
++
++	/*
++	 * NOTE: For the first rate, the ERP & AMPDU flags are directly
++	 * taken from mac_control. For all fallback rate, the firmware
++	 * updates the mac_control flags from the rate info field.
++	 */
++	for (i = 1; i < CARL9170_TX_MAX_RATES; i++) {
++		txrate = &info->control.rates[i];
++		if (txrate->idx < 0)
++			break;
++
++		SET_VAL(CARL9170_TX_SUPER_RI_TRIES, txc->s.ri[i],
++			txrate->count);
++
++		if (carl9170_tx_rts_check(ar, txrate, ampdu, no_ack))
++			txc->s.ri[i] |= (AR9170_TX_MAC_PROT_RTS <<
++				CARL9170_TX_SUPER_RI_ERP_PROT_S);
++		else if (carl9170_tx_cts_check(ar, txrate))
++			txc->s.ri[i] |= (AR9170_TX_MAC_PROT_CTS <<
++				CARL9170_TX_SUPER_RI_ERP_PROT_S);
++
++		/*
++		 * unaggregated fallback, in case aggregation
++		 * proves to be unsuccessful and unreliable.
++		 */
++		if (ampdu && i < 3)
++			txc->s.ri[i] |= CARL9170_TX_SUPER_RI_AMPDU;
++
++		txc->s.rr[i - 1] = carl9170_tx_physet(ar, info, txrate);
++	}
++
++	if (ieee80211_is_probe_resp(hdr->frame_control))
++		txc->s.misc |= CARL9170_TX_SUPER_MISC_FILL_IN_TSF;
++
++	if (ampdu) {
++		unsigned int density, factor;
++
++		if (unlikely(!sta || !cvif))
++			goto err_out;
++
++		density = info->control.sta->ht_cap.ampdu_density;
++		factor = info->control.sta->ht_cap.ampdu_factor;
++
++		if (density) {
++			/*
++			 * Watch out!
++			 *
++			 * Otus uses slightly different density values than
++			 * those from the 802.11n spec.
++			 */
++
++			density = max_t(unsigned int, density + 1, 7u);
++		}
++
++		factor = min_t(unsigned int, 1u, factor);
++
++		SET_VAL(CARL9170_TX_SUPER_AMPDU_DENSITY,
++			txc->s.ampdu_settings, density);
++
++		SET_VAL(CARL9170_TX_SUPER_AMPDU_FACTOR,
++			txc->s.ampdu_settings, factor);
++
++		if (info->control.rates[0].flags & IEEE80211_TX_RC_MCS) {
++			txc->f.mac_control |= cpu_to_le16(AR9170_TX_MAC_AGGR);
++		} else {
++			/*
++			 * Not sure if it's even possible to aggregate
++			 * non-ht rates with this HW.
++			 */
++			WARN_ON_ONCE(1);
++		}
++	}
++
++	arinfo = (void *)info->rate_driver_data;
++	arinfo->timeout = jiffies;
++	arinfo->ar = ar;
++	kref_init(&arinfo->ref);
++	return 0;
++
++err_out:
++	skb_pull(skb, sizeof(*txc));
++	return -EINVAL;
++}
++
++static void carl9170_set_immba(struct ar9170 *ar, struct sk_buff *skb)
++{
++	struct _carl9170_tx_superframe *super;
++
++	super = (void *) skb->data;
++	super->f.mac_control |= cpu_to_le16(AR9170_TX_MAC_IMM_BA);
++}
++
++static void carl9170_set_ampdu_params(struct ar9170 *ar, struct sk_buff *skb)
++{
++	struct _carl9170_tx_superframe *super;
++	int tmp;
++
++	super = (void *) skb->data;
++
++	tmp = (super->s.ampdu_settings & CARL9170_TX_SUPER_AMPDU_DENSITY) <<
++		CARL9170_TX_SUPER_AMPDU_DENSITY_S;
++
++	/*
++	 * If you haven't noticed carl9170_tx_prepare has already filled
++	 * in all ampdu spacing & factor parameters.
++	 * Now it's the time to check whenever the settings have to be
++	 * updated by the firmware, or if everything is still the same.
++	 *
++	 * There's no sane way to handle different density values with
++	 * this hardware, so we may as well just do the compare in the
++	 * driver.
++	 */
++
++	if (tmp != ar->current_density) {
++		ar->current_density = tmp;
++		super->s.ampdu_settings |=
++			CARL9170_TX_SUPER_AMPDU_COMMIT_DENSITY;
++	}
++
++	tmp = (super->s.ampdu_settings & CARL9170_TX_SUPER_AMPDU_FACTOR) <<
++		CARL9170_TX_SUPER_AMPDU_FACTOR_S;
++
++	if (tmp != ar->current_factor) {
++		ar->current_factor = tmp;
++		super->s.ampdu_settings |=
++			CARL9170_TX_SUPER_AMPDU_COMMIT_FACTOR;
++	}
++}
++
++static bool carl9170_tx_rate_check(struct ar9170 *ar, struct sk_buff *_dest,
++				   struct sk_buff *_src)
++{
++	struct _carl9170_tx_superframe *dest, *src;
++
++	dest = (void *) _dest->data;
++	src = (void *) _src->data;
++
++	/*
++	 * The mac80211 rate control algorithm expects that all MPDUs in
++	 * an AMPDU share the same tx vectors.
++	 * This is not really obvious right now, because the hardware
++	 * does the AMPDU setup according to its own rulebook.
++	 * Our nicely assembled, strictly monotonic increasing mpdu
++	 * chains will be broken up, mashed back together...
++	 */
++
++	return (dest->f.phy_control == src->f.phy_control);
++}
++
++static void carl9170_tx_ampdu(struct ar9170 *ar)
++{
++	struct sk_buff_head agg;
++	struct carl9170_sta_tid *tid_info;
++	struct sk_buff *skb, *first;
++	unsigned int i = 0, done_ampdus = 0;
++	u16 seq, queue, tmpssn;
++
++	atomic_inc(&ar->tx_ampdu_scheduler);
++	ar->tx_ampdu_schedule = false;
++
++	if (atomic_read(&ar->tx_ampdu_upload))
++		return;
++
++	if (!ar->tx_ampdu_list_len)
++		return;
++
++	__skb_queue_head_init(&agg);
++
++	rcu_read_lock();
++	tid_info = rcu_dereference(ar->tx_ampdu_iter);
++	if (WARN_ON_ONCE(!tid_info)) {
++		rcu_read_unlock();
++		return;
++	}
++
++retry:
++	list_for_each_entry_continue_rcu(tid_info, &ar->tx_ampdu_list, list) {
++		i++;
++
++		if (tid_info->state < CARL9170_TID_STATE_PROGRESS)
++			continue;
++
++		queue = TID_TO_WME_AC(tid_info->tid);
++
++		spin_lock_bh(&tid_info->lock);
++		if (tid_info->state != CARL9170_TID_STATE_XMIT) {
++			first = skb_peek(&tid_info->queue);
++			if (first) {
++				struct ieee80211_tx_info *txinfo;
++				struct carl9170_tx_info *arinfo;
++
++				txinfo = IEEE80211_SKB_CB(first);
++				arinfo = (void *) txinfo->rate_driver_data;
++
++				if (time_is_after_jiffies(arinfo->timeout +
++				    msecs_to_jiffies(CARL9170_QUEUE_TIMEOUT))
++				    == true)
++					goto processed;
++
++				/*
++				 * We've been waiting for the frame which
++				 * matches "snx" (start sequence of the
++				 * next aggregate) for some time now.
++				 *
++				 * But it never arrived. Therefore
++				 * jump to the next available frame
++				 * and kick-start the transmission.
++				 *
++				 * Note: This might induce odd latency
++				 * spikes because the receiver will be
++				 * waiting for the lost frame too.
++				 */
++				ar->tx_ampdu_timeout++;
++
++				tid_info->snx = carl9170_get_seq(first);
++				tid_info->state = CARL9170_TID_STATE_XMIT;
++			} else {
++				goto processed;
++			}
++		}
++
++		tid_info->counter++;
++		first = skb_peek(&tid_info->queue);
++		tmpssn = carl9170_get_seq(first);
++		seq = tid_info->snx;
++
++		if (unlikely(tmpssn != seq)) {
++			tid_info->state = CARL9170_TID_STATE_IDLE;
++
++			goto processed;
++		}
++
++		while ((skb = skb_peek(&tid_info->queue))) {
++			/* strict 0, 1, ..., n - 1, n frame sequence order */
++			if (unlikely(carl9170_get_seq(skb) != seq))
++				break;
++
++			/* don't upload more than AMPDU FACTOR allows. */
++			if (unlikely(SEQ_DIFF(tid_info->snx, tid_info->bsn) >=
++			    (tid_info->max - 1)))
++				break;
++
++			if (!carl9170_tx_rate_check(ar, skb, first))
++				break;
++
++			atomic_inc(&ar->tx_ampdu_upload);
++			tid_info->snx = seq = SEQ_NEXT(seq);
++			__skb_unlink(skb, &tid_info->queue);
++
++			__skb_queue_tail(&agg, skb);
++
++			if (skb_queue_len(&agg) >= CARL9170_NUM_TX_AGG_MAX)
++				break;
++		}
++
++		if (skb_queue_empty(&tid_info->queue) ||
++		    carl9170_get_seq(skb_peek(&tid_info->queue)) !=
++		    tid_info->snx) {
++			/*
++			 * stop TID, if A-MPDU frames are still missing,
++			 * or whenever the queue is empty.
++			 */
++
++			tid_info->state = CARL9170_TID_STATE_IDLE;
++		}
++		done_ampdus++;
++
++processed:
++		spin_unlock_bh(&tid_info->lock);
++
++		if (skb_queue_empty(&agg))
++			continue;
++
++		/* apply ampdu spacing & factor settings */
++		carl9170_set_ampdu_params(ar, skb_peek(&agg));
++
++		/* set aggregation push bit */
++		carl9170_set_immba(ar, skb_peek_tail(&agg));
++
++		spin_lock_bh(&ar->tx_pending[queue].lock);
++		skb_queue_splice_tail_init(&agg, &ar->tx_pending[queue]);
++		spin_unlock_bh(&ar->tx_pending[queue].lock);
++		ar->tx_schedule = true;
++	}
++	if ((done_ampdus++ == 0) && (i++ == 0))
++		goto retry;
++
++	rcu_assign_pointer(ar->tx_ampdu_iter, tid_info);
++	rcu_read_unlock();
++}
++
++static struct sk_buff *carl9170_tx_pick_skb(struct ar9170 *ar,
++					    struct sk_buff_head *queue)
++{
++	struct sk_buff *skb;
++	struct ieee80211_tx_info *info;
++	struct carl9170_tx_info *arinfo;
++
++	BUILD_BUG_ON(sizeof(*arinfo) > sizeof(info->rate_driver_data));
++
++	spin_lock_bh(&queue->lock);
++	skb = skb_peek(queue);
++	if (unlikely(!skb))
++		goto err_unlock;
++
++	if (carl9170_alloc_dev_space(ar, skb))
++		goto err_unlock;
++
++	__skb_unlink(skb, queue);
++	spin_unlock_bh(&queue->lock);
++
++	info = IEEE80211_SKB_CB(skb);
++	arinfo = (void *) info->rate_driver_data;
++
++	arinfo->timeout = jiffies;
++
++	/*
++	 * increase ref count to "2".
++	 * Ref counting is the easiest way to solve the race between
++	 * the the urb's completion routine: carl9170_tx_callback and
++	 * wlan tx status functions: carl9170_tx_status/janitor.
++	 */
++	carl9170_tx_get_skb(skb);
++
++	return skb;
++
++err_unlock:
++	spin_unlock_bh(&queue->lock);
++	return NULL;
++}
++
++void carl9170_tx_drop(struct ar9170 *ar, struct sk_buff *skb)
++{
++	struct _carl9170_tx_superframe *super;
++	uint8_t q = 0;
++
++	ar->tx_dropped++;
++
++	super = (void *)skb->data;
++	SET_VAL(CARL9170_TX_SUPER_MISC_QUEUE, q,
++		ar9170_qmap[carl9170_get_queue(ar, skb)]);
++	__carl9170_tx_process_status(ar, super->s.cookie, q);
++}
++
++static void carl9170_tx(struct ar9170 *ar)
++{
++	struct sk_buff *skb;
++	unsigned int i, q;
++	bool schedule_garbagecollector = false;
++
++	ar->tx_schedule = false;
++
++	if (unlikely(!IS_STARTED(ar)))
++		return;
++
++	carl9170_usb_handle_tx_err(ar);
++
++	for (i = 0; i < ar->hw->queues; i++) {
++		while (!skb_queue_empty(&ar->tx_pending[i])) {
++			skb = carl9170_tx_pick_skb(ar, &ar->tx_pending[i]);
++			if (unlikely(!skb))
++				break;
++
++			atomic_inc(&ar->tx_total_pending);
++
++			q = __carl9170_get_queue(ar, i);
++			/*
++			 * NB: tx_status[i] vs. tx_status[q],
++			 * TODO: Move into pick_skb or alloc_dev_space.
++			 */
++			skb_queue_tail(&ar->tx_status[q], skb);
++
++			carl9170_usb_tx(ar, skb);
++			schedule_garbagecollector = true;
++		}
++	}
++
++	if (!schedule_garbagecollector)
++		return;
++
++	ieee80211_queue_delayed_work(ar->hw, &ar->tx_janitor,
++		msecs_to_jiffies(CARL9170_TX_TIMEOUT));
++}
++
++static bool carl9170_tx_ampdu_queue(struct ar9170 *ar,
++	struct ieee80211_sta *sta, struct sk_buff *skb)
++{
++	struct carl9170_sta_info *sta_info;
++	struct carl9170_sta_tid *agg;
++	struct sk_buff *iter;
++	unsigned int max;
++	u16 tid, seq, qseq, off;
++	bool run = false;
++
++	tid = carl9170_get_tid(skb);
++	seq = carl9170_get_seq(skb);
++	sta_info = (void *) sta->drv_priv;
++
++	rcu_read_lock();
++	agg = rcu_dereference(sta_info->agg[tid]);
++	max = sta_info->ampdu_max_len;
++
++	if (!agg)
++		goto err_unlock_rcu;
++
++	spin_lock_bh(&agg->lock);
++	if (unlikely(agg->state < CARL9170_TID_STATE_IDLE))
++		goto err_unlock;
++
++	/* check if sequence is within the BA window */
++	if (unlikely(!BAW_WITHIN(agg->bsn, CARL9170_BAW_BITS, seq)))
++		goto err_unlock;
++
++	if (WARN_ON_ONCE(!BAW_WITHIN(agg->snx, CARL9170_BAW_BITS, seq)))
++		goto err_unlock;
++
++	off = SEQ_DIFF(seq, agg->bsn);
++	if (WARN_ON_ONCE(test_and_set_bit(off, agg->bitmap)))
++		goto err_unlock;
++
++	if (likely(BAW_WITHIN(agg->hsn, CARL9170_BAW_BITS, seq))) {
++		__skb_queue_tail(&agg->queue, skb);
++		agg->hsn = seq;
++		goto queued;
++	}
++
++	skb_queue_reverse_walk(&agg->queue, iter) {
++		qseq = carl9170_get_seq(iter);
++
++		if (BAW_WITHIN(qseq, CARL9170_BAW_BITS, seq)) {
++			__skb_queue_after(&agg->queue, iter, skb);
++			goto queued;
++		}
++	}
++
++	__skb_queue_head(&agg->queue, skb);
++queued:
++
++	if (unlikely(agg->state != CARL9170_TID_STATE_XMIT)) {
++		if (agg->snx == carl9170_get_seq(skb_peek(&agg->queue))) {
++			agg->state = CARL9170_TID_STATE_XMIT;
++			run = true;
++		}
++	}
++
++	spin_unlock_bh(&agg->lock);
++	rcu_read_unlock();
++
++	return run;
++
++err_unlock:
++	spin_unlock_bh(&agg->lock);
++
++err_unlock_rcu:
++	rcu_read_unlock();
++	carl9170_tx_status(ar, skb, false);
++	ar->tx_dropped++;
++	return false;
++}
++
++int carl9170_op_tx(struct ieee80211_hw *hw, struct sk_buff *skb)
++{
++	struct ar9170 *ar = hw->priv;
++	struct ieee80211_tx_info *info;
++	struct ieee80211_sta *sta;
++	bool run;
++
++	if (unlikely(!IS_STARTED(ar)))
++		goto err_free;
++
++	info = IEEE80211_SKB_CB(skb);
++	sta = info->control.sta;
++
++	if (unlikely(carl9170_tx_prepare(ar, skb)))
++		goto err_free;
++
++	carl9170_tx_accounting(ar, skb);
++	/*
++	 * from now on, one has to use carl9170_tx_status to free
++	 * all ressouces which are associated with the frame.
++	 */
++
++	if (info->flags & IEEE80211_TX_CTL_AMPDU) {
++		if (WARN_ON_ONCE(!sta))
++			goto err_free;
++
++		run = carl9170_tx_ampdu_queue(ar, sta, skb);
++		if (run)
++			carl9170_tx_ampdu(ar);
++
++	} else {
++		unsigned int queue = skb_get_queue_mapping(skb);
++
++		skb_queue_tail(&ar->tx_pending[queue], skb);
++	}
++
++	carl9170_tx(ar);
++	return NETDEV_TX_OK;
++
++err_free:
++	ar->tx_dropped++;
++	dev_kfree_skb_any(skb);
++	return NETDEV_TX_OK;
++}
++
++void carl9170_tx_scheduler(struct ar9170 *ar)
++{
++
++	if (ar->tx_ampdu_schedule)
++		carl9170_tx_ampdu(ar);
++
++	if (ar->tx_schedule)
++		carl9170_tx(ar);
++}
+--- /dev/null
++++ b/drivers/net/wireless/ath/carl9170/usb.c
+@@ -0,0 +1,1137 @@
++/*
++ * Atheros CARL9170 driver
++ *
++ * USB - frontend
++ *
++ * Copyright 2008, Johannes Berg <johannes@sipsolutions.net>
++ * Copyright 2009, 2010, Christian Lamparter <chunkeey@googlemail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; see the file COPYING.  If not, see
++ * http://www.gnu.org/licenses/.
++ *
++ * This file incorporates work covered by the following copyright and
++ * permission notice:
++ *    Copyright (c) 2007-2008 Atheros Communications, Inc.
++ *
++ *    Permission to use, copy, modify, and/or distribute this software for any
++ *    purpose with or without fee is hereby granted, provided that the above
++ *    copyright notice and this permission notice appear in all copies.
++ *
++ *    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ *    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ *    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ *    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ *    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ *    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ *    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/usb.h>
++#include <linux/firmware.h>
++#include <linux/etherdevice.h>
++#include <linux/device.h>
++#include <net/mac80211.h>
++#include "carl9170.h"
++#include "cmd.h"
++#include "hw.h"
++#include "fwcmd.h"
++
++MODULE_AUTHOR("Johannes Berg <johannes@sipsolutions.net>");
++MODULE_AUTHOR("Christian Lamparter <chunkeey@googlemail.com>");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Atheros AR9170 802.11n USB wireless");
++MODULE_FIRMWARE(CARL9170FW_NAME);
++MODULE_ALIAS("ar9170usb");
++MODULE_ALIAS("arusb_lnx");
++
++/*
++ * Note:
++ *
++ * Always update our wiki's device list (located at:
++ * http://wireless.kernel.org/en/users/Drivers/ar9170/devices ),
++ * whenever you add a new device.
++ */
++static struct usb_device_id carl9170_usb_ids[] = {
++	/* Atheros 9170 */
++	{ USB_DEVICE(0x0cf3, 0x9170) },
++	/* Atheros TG121N */
++	{ USB_DEVICE(0x0cf3, 0x1001) },
++	/* TP-Link TL-WN821N v2 */
++	{ USB_DEVICE(0x0cf3, 0x1002), .driver_info = CARL9170_WPS_BUTTON |
++		 CARL9170_ONE_LED },
++	/* 3Com Dual Band 802.11n USB Adapter */
++	{ USB_DEVICE(0x0cf3, 0x1010) },
++	/* H3C Dual Band 802.11n USB Adapter */
++	{ USB_DEVICE(0x0cf3, 0x1011) },
++	/* Cace Airpcap NX */
++	{ USB_DEVICE(0xcace, 0x0300) },
++	/* D-Link DWA 160 A1 */
++	{ USB_DEVICE(0x07d1, 0x3c10) },
++	/* D-Link DWA 160 A2 */
++	{ USB_DEVICE(0x07d1, 0x3a09) },
++	/* Netgear WNA1000 */
++	{ USB_DEVICE(0x0846, 0x9040) },
++	/* Netgear WNDA3100 */
++	{ USB_DEVICE(0x0846, 0x9010) },
++	/* Netgear WN111 v2 */
++	{ USB_DEVICE(0x0846, 0x9001), .driver_info = CARL9170_ONE_LED },
++	/* Zydas ZD1221 */
++	{ USB_DEVICE(0x0ace, 0x1221) },
++	/* Proxim ORiNOCO 802.11n USB */
++	{ USB_DEVICE(0x1435, 0x0804) },
++	/* WNC Generic 11n USB Dongle */
++	{ USB_DEVICE(0x1435, 0x0326) },
++	/* ZyXEL NWD271N */
++	{ USB_DEVICE(0x0586, 0x3417) },
++	/* Z-Com UB81 BG */
++	{ USB_DEVICE(0x0cde, 0x0023) },
++	/* Z-Com UB82 ABG */
++	{ USB_DEVICE(0x0cde, 0x0026) },
++	/* Sphairon Homelink 1202 */
++	{ USB_DEVICE(0x0cde, 0x0027) },
++	/* Arcadyan WN7512 */
++	{ USB_DEVICE(0x083a, 0xf522) },
++	/* Planex GWUS300 */
++	{ USB_DEVICE(0x2019, 0x5304) },
++	/* IO-Data WNGDNUS2 */
++	{ USB_DEVICE(0x04bb, 0x093f) },
++	/* NEC WL300NU-G */
++	{ USB_DEVICE(0x0409, 0x0249) },
++	/* AVM FRITZ!WLAN USB Stick N */
++	{ USB_DEVICE(0x057c, 0x8401) },
++	/* AVM FRITZ!WLAN USB Stick N 2.4 */
++	{ USB_DEVICE(0x057c, 0x8402) },
++	/* Qwest/Actiontec 802AIN Wireless N USB Network Adapter */
++	{ USB_DEVICE(0x1668, 0x1200) },
++
++	/* terminate */
++	{}
++};
++MODULE_DEVICE_TABLE(usb, carl9170_usb_ids);
++
++static void carl9170_usb_submit_data_urb(struct ar9170 *ar)
++{
++	struct urb *urb;
++	int err;
++
++	if (atomic_inc_return(&ar->tx_anch_urbs) > AR9170_NUM_TX_URBS)
++		goto err_acc;
++
++	urb = usb_get_from_anchor(&ar->tx_wait);
++	if (!urb)
++		goto err_acc;
++
++	usb_anchor_urb(urb, &ar->tx_anch);
++
++	err = usb_submit_urb(urb, GFP_ATOMIC);
++	if (unlikely(err)) {
++		if (net_ratelimit()) {
++			dev_err(&ar->udev->dev, "tx submit failed (%d)\n",
++				urb->status);
++		}
++
++		usb_unanchor_urb(urb);
++		usb_anchor_urb(urb, &ar->tx_err);
++	}
++
++	usb_free_urb(urb);
++
++	if (likely(err == 0))
++		return;
++
++err_acc:
++	atomic_dec(&ar->tx_anch_urbs);
++}
++
++static void carl9170_usb_tx_data_complete(struct urb *urb)
++{
++	struct ar9170 *ar = (struct ar9170 *)
++	      usb_get_intfdata(usb_ifnum_to_if(urb->dev, 0));
++
++	if (WARN_ON_ONCE(!ar)) {
++		dev_kfree_skb_irq(urb->context);
++		return;
++	}
++
++	atomic_dec(&ar->tx_anch_urbs);
++
++	switch (urb->status) {
++	/* everything is fine */
++	case 0:
++		carl9170_tx_callback(ar, (void *)urb->context);
++		break;
++
++	/* disconnect */
++	case -ENOENT:
++	case -ECONNRESET:
++	case -ENODEV:
++	case -ESHUTDOWN:
++		/*
++		 * Defer the frame clean-up to the tasklet worker.
++		 * This is necessary, because carl9170_tx_drop
++		 * does not work in an irqsave context.
++		 */
++		usb_anchor_urb(urb, &ar->tx_err);
++		return;
++
++	/* a random transmission error has occurred? */
++	default:
++		if (net_ratelimit()) {
++			dev_err(&ar->udev->dev, "tx failed (%d)\n",
++				urb->status);
++		}
++
++		usb_anchor_urb(urb, &ar->tx_err);
++		break;
++	}
++
++	if (likely(IS_STARTED(ar)))
++		carl9170_usb_submit_data_urb(ar);
++}
++
++static int carl9170_usb_submit_cmd_urb(struct ar9170 *ar)
++{
++	struct urb *urb;
++	int err;
++
++	if (atomic_inc_return(&ar->tx_cmd_urbs) != 1) {
++		atomic_dec(&ar->tx_cmd_urbs);
++		return 0;
++	}
++
++	urb = usb_get_from_anchor(&ar->tx_cmd);
++	if (!urb) {
++		atomic_dec(&ar->tx_cmd_urbs);
++		return 0;
++	}
++
++	usb_anchor_urb(urb, &ar->tx_anch);
++	err = usb_submit_urb(urb, GFP_ATOMIC);
++	if (unlikely(err)) {
++		usb_unanchor_urb(urb);
++		atomic_dec(&ar->tx_cmd_urbs);
++	}
++	usb_free_urb(urb);
++
++	return err;
++}
++
++static void carl9170_usb_cmd_complete(struct urb *urb)
++{
++	struct ar9170 *ar = urb->context;
++	int err = 0;
++
++	if (WARN_ON_ONCE(!ar))
++		return;
++
++	atomic_dec(&ar->tx_cmd_urbs);
++
++	switch (urb->status) {
++	/* everything is fine */
++	case 0:
++		break;
++
++	/* disconnect */
++	case -ENOENT:
++	case -ECONNRESET:
++	case -ENODEV:
++	case -ESHUTDOWN:
++		return;
++
++	default:
++		err = urb->status;
++		break;
++	}
++
++	if (!IS_INITIALIZED(ar))
++		return;
++
++	if (err)
++		dev_err(&ar->udev->dev, "submit cmd cb failed (%d).\n", err);
++
++	err = carl9170_usb_submit_cmd_urb(ar);
++	if (err)
++		dev_err(&ar->udev->dev, "submit cmd failed (%d).\n", err);
++}
++
++static void carl9170_usb_rx_irq_complete(struct urb *urb)
++{
++	struct ar9170 *ar = urb->context;
++
++	if (WARN_ON_ONCE(!ar))
++		return;
++
++	switch (urb->status) {
++	/* everything is fine */
++	case 0:
++		break;
++
++	/* disconnect */
++	case -ENOENT:
++	case -ECONNRESET:
++	case -ENODEV:
++	case -ESHUTDOWN:
++		return;
++
++	default:
++		goto resubmit;
++	}
++
++	carl9170_handle_command_response(ar, urb->transfer_buffer,
++					 urb->actual_length);
++
++resubmit:
++	usb_anchor_urb(urb, &ar->rx_anch);
++	if (unlikely(usb_submit_urb(urb, GFP_ATOMIC)))
++		usb_unanchor_urb(urb);
++}
++
++static int carl9170_usb_submit_rx_urb(struct ar9170 *ar, gfp_t gfp)
++{
++	struct urb *urb;
++	int err = 0, runs = 0;
++
++	while ((atomic_read(&ar->rx_anch_urbs) < AR9170_NUM_RX_URBS) &&
++		(runs++ < AR9170_NUM_RX_URBS)) {
++		err = -ENOSPC;
++		urb = usb_get_from_anchor(&ar->rx_pool);
++		if (urb) {
++			usb_anchor_urb(urb, &ar->rx_anch);
++			err = usb_submit_urb(urb, gfp);
++			if (unlikely(err)) {
++				usb_unanchor_urb(urb);
++				usb_anchor_urb(urb, &ar->rx_pool);
++			} else {
++				atomic_dec(&ar->rx_pool_urbs);
++				atomic_inc(&ar->rx_anch_urbs);
++			}
++			usb_free_urb(urb);
++		}
++	}
++
++	return err;
++}
++
++static void carl9170_usb_rx_work(struct ar9170 *ar)
++{
++	struct urb *urb;
++	int i;
++
++	for (i = 0; i < AR9170_NUM_RX_URBS_POOL; i++) {
++		urb = usb_get_from_anchor(&ar->rx_work);
++		if (!urb)
++			break;
++
++		atomic_dec(&ar->rx_work_urbs);
++		if (IS_INITIALIZED(ar)) {
++			carl9170_rx(ar, urb->transfer_buffer,
++				    urb->actual_length);
++		}
++
++		usb_anchor_urb(urb, &ar->rx_pool);
++		atomic_inc(&ar->rx_pool_urbs);
++
++		usb_free_urb(urb);
++
++		carl9170_usb_submit_rx_urb(ar, GFP_ATOMIC);
++	}
++}
++
++void carl9170_usb_handle_tx_err(struct ar9170 *ar)
++{
++	struct urb *urb;
++
++	while ((urb = usb_get_from_anchor(&ar->tx_err))) {
++		struct sk_buff *skb = (void *)urb->context;
++
++		carl9170_tx_drop(ar, skb);
++		carl9170_tx_callback(ar, skb);
++		usb_free_urb(urb);
++	}
++}
++
++static void carl9170_usb_tasklet(unsigned long data)
++{
++	struct ar9170 *ar = (struct ar9170 *) data;
++
++	carl9170_usb_rx_work(ar);
++
++	/*
++	 * Strictly speaking: The tx scheduler is not part of the USB system.
++	 * But the rx worker returns frames back to the mac80211-stack and
++	 * this is the _perfect_ place to generate the next transmissions.
++	 */
++	if (IS_STARTED(ar))
++		carl9170_tx_scheduler(ar);
++}
++
++static void carl9170_usb_rx_complete(struct urb *urb)
++{
++	struct ar9170 *ar = (struct ar9170 *)urb->context;
++	int err;
++
++	if (WARN_ON_ONCE(!ar))
++		return;
++
++	atomic_dec(&ar->rx_anch_urbs);
++
++	switch (urb->status) {
++	case 0:
++		/* rx path */
++		usb_anchor_urb(urb, &ar->rx_work);
++		atomic_inc(&ar->rx_work_urbs);
++		break;
++
++	case -ENOENT:
++	case -ECONNRESET:
++	case -ENODEV:
++	case -ESHUTDOWN:
++		/* handle disconnect events*/
++		return;
++
++	default:
++		/* handle all other errors */
++		usb_anchor_urb(urb, &ar->rx_pool);
++		atomic_inc(&ar->rx_pool_urbs);
++		break;
++	}
++
++	err = carl9170_usb_submit_rx_urb(ar, GFP_ATOMIC);
++	if (unlikely(err)) {
++		/*
++		 * usb_submit_rx_urb reported a problem.
++		 * In case this is due to a rx buffer shortage,
++		 * elevate the tasklet worker priority to
++		 * the highest available level.
++		 */
++		tasklet_hi_schedule(&ar->usb_tasklet);
++
++		if (atomic_read(&ar->rx_anch_urbs) == 0) {
++			/*
++			 * The system is too slow to cope with
++			 * the enormous workload. We have simply
++			 * run out of active rx urbs and this
++			 * unfortunatly leads to an unpredictable
++			 * device.
++			 */
++
++			carl9170_restart(ar, CARL9170_RR_SLOW_SYSTEM);
++		}
++	} else {
++		/*
++		 * Using anything less than _high_ priority absolutely
++		 * kills the rx performance my UP-System...
++		 */
++		tasklet_hi_schedule(&ar->usb_tasklet);
++	}
++}
++
++static struct urb *carl9170_usb_alloc_rx_urb(struct ar9170 *ar, gfp_t gfp)
++{
++	struct urb *urb;
++	void *buf;
++
++	buf = kmalloc(ar->fw.rx_size, gfp);
++	if (!buf)
++		return NULL;
++
++	urb = usb_alloc_urb(0, gfp);
++	if (!urb) {
++		kfree(buf);
++		return NULL;
++	}
++
++	usb_fill_bulk_urb(urb, ar->udev, usb_rcvbulkpipe(ar->udev,
++			  AR9170_USB_EP_RX), buf, ar->fw.rx_size,
++			  carl9170_usb_rx_complete, ar);
++
++	urb->transfer_flags |= URB_FREE_BUFFER;
++
++	return urb;
++}
++
++static int carl9170_usb_send_rx_irq_urb(struct ar9170 *ar)
++{
++	struct urb *urb = NULL;
++	void *ibuf;
++	int err = -ENOMEM;
++
++	urb = usb_alloc_urb(0, GFP_KERNEL);
++	if (!urb)
++		goto out;
++
++	ibuf = kmalloc(AR9170_USB_EP_CTRL_MAX, GFP_KERNEL);
++	if (!ibuf)
++		goto out;
++
++	usb_fill_int_urb(urb, ar->udev, usb_rcvintpipe(ar->udev,
++			 AR9170_USB_EP_IRQ), ibuf, AR9170_USB_EP_CTRL_MAX,
++			 carl9170_usb_rx_irq_complete, ar, 1);
++
++	urb->transfer_flags |= URB_FREE_BUFFER;
++
++	usb_anchor_urb(urb, &ar->rx_anch);
++	err = usb_submit_urb(urb, GFP_KERNEL);
++	if (err)
++		usb_unanchor_urb(urb);
++
++out:
++	usb_free_urb(urb);
++	return err;
++}
++
++static int carl9170_usb_init_rx_bulk_urbs(struct ar9170 *ar)
++{
++	struct urb *urb;
++	int i, err = -EINVAL;
++
++	/*
++	 * The driver actively maintains a second shadow
++	 * pool for inactive, but fully-prepared rx urbs.
++	 *
++	 * The pool should help the driver to master huge
++	 * workload spikes without running the risk of
++	 * undersupplying the hardware or wasting time by
++	 * processing rx data (streams) inside the urb
++	 * completion (hardirq context).
++	 */
++	for (i = 0; i < AR9170_NUM_RX_URBS_POOL; i++) {
++		urb = carl9170_usb_alloc_rx_urb(ar, GFP_KERNEL);
++		if (!urb) {
++			err = -ENOMEM;
++			goto err_out;
++		}
++
++		usb_anchor_urb(urb, &ar->rx_pool);
++		atomic_inc(&ar->rx_pool_urbs);
++		usb_free_urb(urb);
++	}
++
++	err = carl9170_usb_submit_rx_urb(ar, GFP_KERNEL);
++	if (err)
++		goto err_out;
++
++	/* the device now waiting for the firmware. */
++	carl9170_set_state_when(ar, CARL9170_STOPPED, CARL9170_IDLE);
++	return 0;
++
++err_out:
++
++	usb_scuttle_anchored_urbs(&ar->rx_pool);
++	usb_scuttle_anchored_urbs(&ar->rx_work);
++	usb_kill_anchored_urbs(&ar->rx_anch);
++	return err;
++}
++
++static int carl9170_usb_flush(struct ar9170 *ar)
++{
++	struct urb *urb;
++	int ret, err = 0;
++
++	while ((urb = usb_get_from_anchor(&ar->tx_wait))) {
++		struct sk_buff *skb = (void *)urb->context;
++		carl9170_tx_drop(ar, skb);
++		carl9170_tx_callback(ar, skb);
++		usb_free_urb(urb);
++	}
++
++	ret = usb_wait_anchor_empty_timeout(&ar->tx_cmd, HZ);
++	if (ret == 0)
++		err = -ETIMEDOUT;
++
++	/* lets wait a while until the tx - queues are dried out */
++	ret = usb_wait_anchor_empty_timeout(&ar->tx_anch, HZ);
++	if (ret == 0)
++		err = -ETIMEDOUT;
++
++	usb_kill_anchored_urbs(&ar->tx_anch);
++	carl9170_usb_handle_tx_err(ar);
++
++	return err;
++}
++
++static void carl9170_usb_cancel_urbs(struct ar9170 *ar)
++{
++	int err;
++
++	carl9170_set_state(ar, CARL9170_UNKNOWN_STATE);
++
++	err = carl9170_usb_flush(ar);
++	if (err)
++		dev_err(&ar->udev->dev, "stuck tx urbs!\n");
++
++	usb_poison_anchored_urbs(&ar->tx_anch);
++	carl9170_usb_handle_tx_err(ar);
++	usb_poison_anchored_urbs(&ar->rx_anch);
++
++	tasklet_kill(&ar->usb_tasklet);
++
++	usb_scuttle_anchored_urbs(&ar->rx_work);
++	usb_scuttle_anchored_urbs(&ar->rx_pool);
++	usb_scuttle_anchored_urbs(&ar->tx_cmd);
++}
++
++int __carl9170_exec_cmd(struct ar9170 *ar, struct carl9170_cmd *cmd,
++			const bool free_buf)
++{
++	struct urb *urb;
++
++	if (!IS_INITIALIZED(ar))
++		return -EPERM;
++
++	if (WARN_ON(cmd->hdr.len > CARL9170_MAX_CMD_LEN - 4))
++		return -EINVAL;
++
++	urb = usb_alloc_urb(0, GFP_ATOMIC);
++	if (!urb)
++		return -ENOMEM;
++
++	usb_fill_int_urb(urb, ar->udev, usb_sndintpipe(ar->udev,
++		AR9170_USB_EP_CMD), cmd, cmd->hdr.len + 4,
++		carl9170_usb_cmd_complete, ar, 1);
++
++	urb->transfer_flags |= URB_ZERO_PACKET;
++
++	if (free_buf)
++		urb->transfer_flags |= URB_FREE_BUFFER;
++
++	usb_anchor_urb(urb, &ar->tx_cmd);
++	usb_free_urb(urb);
++
++	return carl9170_usb_submit_cmd_urb(ar);
++}
++
++int carl9170_exec_cmd(struct ar9170 *ar, const enum carl9170_cmd_oids cmd,
++	unsigned int plen, void *payload, unsigned int outlen, void *out)
++{
++	int err = -ENOMEM;
++
++	if (!IS_ACCEPTING_CMD(ar))
++		return -EIO;
++
++	if (!(cmd & CARL9170_CMD_ASYNC_FLAG))
++		might_sleep();
++
++	ar->cmd.hdr.len = plen;
++	ar->cmd.hdr.cmd = cmd;
++	/* writing multiple regs fills this buffer already */
++	if (plen && payload != (u8 *)(ar->cmd.data))
++		memcpy(ar->cmd.data, payload, plen);
++
++	spin_lock_bh(&ar->cmd_lock);
++	ar->readbuf = (u8 *)out;
++	ar->readlen = outlen;
++	spin_unlock_bh(&ar->cmd_lock);
++
++	err = __carl9170_exec_cmd(ar, &ar->cmd, false);
++
++	if (!(cmd & CARL9170_CMD_ASYNC_FLAG)) {
++		err = wait_for_completion_timeout(&ar->cmd_wait, HZ);
++		if (err == 0) {
++			err = -ETIMEDOUT;
++			goto err_unbuf;
++		}
++
++		if (ar->readlen != outlen) {
++			err = -EMSGSIZE;
++			goto err_unbuf;
++		}
++	}
++
++	return 0;
++
++err_unbuf:
++	/* Maybe the device was removed in the moment we were waiting? */
++	if (IS_STARTED(ar)) {
++		dev_err(&ar->udev->dev, "no command feedback "
++			"received (%d).\n", err);
++
++		/* provide some maybe useful debug information */
++		print_hex_dump_bytes("carl9170 cmd: ", DUMP_PREFIX_NONE,
++				     &ar->cmd, plen + 4);
++
++		carl9170_restart(ar, CARL9170_RR_COMMAND_TIMEOUT);
++	}
++
++	/* invalidate to avoid completing the next command prematurely */
++	spin_lock_bh(&ar->cmd_lock);
++	ar->readbuf = NULL;
++	ar->readlen = 0;
++	spin_unlock_bh(&ar->cmd_lock);
++
++	return err;
++}
++
++void carl9170_usb_tx(struct ar9170 *ar, struct sk_buff *skb)
++{
++	struct urb *urb;
++	struct ar9170_stream *tx_stream;
++	void *data;
++	unsigned int len;
++
++	if (!IS_STARTED(ar))
++		goto err_drop;
++
++	urb = usb_alloc_urb(0, GFP_ATOMIC);
++	if (!urb)
++		goto err_drop;
++
++	if (ar->fw.tx_stream) {
++		tx_stream = (void *) (skb->data - sizeof(*tx_stream));
++
++		len = skb->len + sizeof(*tx_stream);
++		tx_stream->length = cpu_to_le16(len);
++		tx_stream->tag = cpu_to_le16(AR9170_TX_STREAM_TAG);
++		data = tx_stream;
++	} else {
++		data = skb->data;
++		len = skb->len;
++	}
++
++	usb_fill_bulk_urb(urb, ar->udev, usb_sndbulkpipe(ar->udev,
++		AR9170_USB_EP_TX), data, len,
++		carl9170_usb_tx_data_complete, skb);
++
++	urb->transfer_flags |= URB_ZERO_PACKET;
++
++	usb_anchor_urb(urb, &ar->tx_wait);
++
++	usb_free_urb(urb);
++
++	carl9170_usb_submit_data_urb(ar);
++	return;
++
++err_drop:
++	carl9170_tx_drop(ar, skb);
++	carl9170_tx_callback(ar, skb);
++}
++
++static void carl9170_release_firmware(struct ar9170 *ar)
++{
++	if (ar->fw.fw) {
++		release_firmware(ar->fw.fw);
++		memset(&ar->fw, 0, sizeof(ar->fw));
++	}
++}
++
++void carl9170_usb_stop(struct ar9170 *ar)
++{
++	int ret;
++
++	carl9170_set_state_when(ar, CARL9170_IDLE, CARL9170_STOPPED);
++
++	ret = carl9170_usb_flush(ar);
++	if (ret)
++		dev_err(&ar->udev->dev, "kill pending tx urbs.\n");
++
++	usb_poison_anchored_urbs(&ar->tx_anch);
++	carl9170_usb_handle_tx_err(ar);
++
++	/* kill any pending command */
++	spin_lock_bh(&ar->cmd_lock);
++	ar->readlen = 0;
++	spin_unlock_bh(&ar->cmd_lock);
++	complete_all(&ar->cmd_wait);
++
++	/* This is required to prevent an early completion on _start */
++	INIT_COMPLETION(ar->cmd_wait);
++
++	/*
++	 * Note:
++	 * So far we freed all tx urbs, but we won't dare to touch any rx urbs.
++	 * Else we would end up with a unresponsive device...
++	 */
++}
++
++int carl9170_usb_open(struct ar9170 *ar)
++{
++	usb_unpoison_anchored_urbs(&ar->tx_anch);
++
++	carl9170_set_state_when(ar, CARL9170_STOPPED, CARL9170_IDLE);
++	return 0;
++}
++
++static int carl9170_usb_load_firmware(struct ar9170 *ar)
++{
++	const u8 *data;
++	u8 *buf;
++	unsigned int transfer;
++	size_t len;
++	u32 addr;
++	int err = 0;
++
++	buf = kmalloc(4096, GFP_KERNEL);
++	if (!buf) {
++		err = -ENOMEM;
++		goto err_out;
++	}
++
++	data = ar->fw.fw->data;
++	len = ar->fw.fw->size;
++	addr = ar->fw.address;
++
++	/* this removes the miniboot image */
++	data += ar->fw.offset;
++	len -= ar->fw.offset;
++
++	while (len) {
++		transfer = min_t(unsigned int, len, 4096u);
++		memcpy(buf, data, transfer);
++
++		err = usb_control_msg(ar->udev, usb_sndctrlpipe(ar->udev, 0),
++				      0x30 /* FW DL */, 0x40 | USB_DIR_OUT,
++				      addr >> 8, 0, buf, transfer, 100);
++
++		if (err < 0) {
++			kfree(buf);
++			goto err_out;
++		}
++
++		len -= transfer;
++		data += transfer;
++		addr += transfer;
++	}
++	kfree(buf);
++
++	err = usb_control_msg(ar->udev, usb_sndctrlpipe(ar->udev, 0),
++			      0x31 /* FW DL COMPLETE */,
++			      0x40 | USB_DIR_OUT, 0, 0, NULL, 0, 200);
++
++	if (wait_for_completion_timeout(&ar->fw_boot_wait, HZ) == 0) {
++		err = -ETIMEDOUT;
++		goto err_out;
++	}
++
++	err = carl9170_echo_test(ar, 0x4a110123);
++	if (err)
++		goto err_out;
++
++	/* firmware restarts cmd counter */
++	ar->cmd_seq = -1;
++
++	return 0;
++
++err_out:
++	dev_err(&ar->udev->dev, "firmware upload failed (%d).\n", err);
++	return err;
++}
++
++int carl9170_usb_restart(struct ar9170 *ar)
++{
++	int err = 0;
++
++	if (ar->intf->condition != USB_INTERFACE_BOUND)
++		return 0;
++
++	/* Disable command response sequence counter. */
++	ar->cmd_seq = -2;
++
++	err = carl9170_reboot(ar);
++
++	carl9170_usb_stop(ar);
++
++	carl9170_set_state(ar, CARL9170_UNKNOWN_STATE);
++
++	if (err)
++		goto err_out;
++
++	tasklet_schedule(&ar->usb_tasklet);
++
++	/* The reboot procedure can take quite a while to complete. */
++	msleep(1100);
++
++	err = carl9170_usb_open(ar);
++	if (err)
++		goto err_out;
++
++	err = carl9170_usb_load_firmware(ar);
++	if (err)
++		goto err_out;
++
++	return 0;
++
++err_out:
++	carl9170_usb_cancel_urbs(ar);
++	return err;
++}
++
++void carl9170_usb_reset(struct ar9170 *ar)
++{
++	/*
++	 * This is the last resort to get the device going again
++	 * without any *user replugging action*.
++	 *
++	 * But there is a catch: usb_reset really is like a physical
++	 * *reconnect*. The mac80211 state will be lost in the process.
++	 * Therefore a userspace application, which is monitoring
++	 * the link must step in.
++	 */
++	carl9170_usb_cancel_urbs(ar);
++
++	carl9170_usb_stop(ar);
++
++	usb_queue_reset_device(ar->intf);
++}
++
++static int carl9170_usb_init_device(struct ar9170 *ar)
++{
++	int err;
++
++	err = carl9170_usb_send_rx_irq_urb(ar);
++	if (err)
++		goto err_out;
++
++	err = carl9170_usb_init_rx_bulk_urbs(ar);
++	if (err)
++		goto err_unrx;
++
++	mutex_lock(&ar->mutex);
++	err = carl9170_usb_load_firmware(ar);
++	mutex_unlock(&ar->mutex);
++	if (err)
++		goto err_unrx;
++
++	return 0;
++
++err_unrx:
++	carl9170_usb_cancel_urbs(ar);
++
++err_out:
++	return err;
++}
++
++static void carl9170_usb_firmware_failed(struct ar9170 *ar)
++{
++	struct device *parent = ar->udev->dev.parent;
++	struct usb_device *udev;
++
++	/*
++	 * Store a copy of the usb_device pointer locally.
++	 * This is because device_release_driver initiates
++	 * carl9170_usb_disconnect, which in turn frees our
++	 * driver context (ar).
++	 */
++	udev = ar->udev;
++
++	complete(&ar->fw_load_wait);
++
++	/* unbind anything failed */
++	if (parent)
++		device_lock(parent);
++
++	device_release_driver(&udev->dev);
++	if (parent)
++		device_unlock(parent);
++
++	usb_put_dev(udev);
++}
++
++static void carl9170_usb_firmware_finish(struct ar9170 *ar)
++{
++	int err;
++
++	err = carl9170_parse_firmware(ar);
++	if (err)
++		goto err_freefw;
++
++	err = carl9170_usb_init_device(ar);
++	if (err)
++		goto err_freefw;
++
++	err = carl9170_usb_open(ar);
++	if (err)
++		goto err_unrx;
++
++	err = carl9170_register(ar);
++
++	carl9170_usb_stop(ar);
++	if (err)
++		goto err_unrx;
++
++	complete(&ar->fw_load_wait);
++	usb_put_dev(ar->udev);
++	return;
++
++err_unrx:
++	carl9170_usb_cancel_urbs(ar);
++
++err_freefw:
++	carl9170_release_firmware(ar);
++	carl9170_usb_firmware_failed(ar);
++}
++
++static void carl9170_usb_firmware_step2(const struct firmware *fw,
++					void *context)
++{
++	struct ar9170 *ar = context;
++
++	if (fw) {
++		ar->fw.fw = fw;
++		carl9170_usb_firmware_finish(ar);
++		return;
++	}
++
++	dev_err(&ar->udev->dev, "firmware not found.\n");
++	carl9170_usb_firmware_failed(ar);
++}
++
++static int carl9170_usb_probe(struct usb_interface *intf,
++			      const struct usb_device_id *id)
++{
++	struct ar9170 *ar;
++	struct usb_device *udev;
++	int err;
++
++	err = usb_reset_device(interface_to_usbdev(intf));
++	if (err)
++		return err;
++
++	ar = carl9170_alloc(sizeof(*ar));
++	if (IS_ERR(ar))
++		return PTR_ERR(ar);
++
++	udev = interface_to_usbdev(intf);
++	usb_get_dev(udev);
++	ar->udev = udev;
++	ar->intf = intf;
++	ar->features = id->driver_info;
++
++	usb_set_intfdata(intf, ar);
++	SET_IEEE80211_DEV(ar->hw, &intf->dev);
++
++	init_usb_anchor(&ar->rx_anch);
++	init_usb_anchor(&ar->rx_pool);
++	init_usb_anchor(&ar->rx_work);
++	init_usb_anchor(&ar->tx_wait);
++	init_usb_anchor(&ar->tx_anch);
++	init_usb_anchor(&ar->tx_cmd);
++	init_usb_anchor(&ar->tx_err);
++	init_completion(&ar->cmd_wait);
++	init_completion(&ar->fw_boot_wait);
++	init_completion(&ar->fw_load_wait);
++	tasklet_init(&ar->usb_tasklet, carl9170_usb_tasklet,
++		     (unsigned long)ar);
++
++	atomic_set(&ar->tx_cmd_urbs, 0);
++	atomic_set(&ar->tx_anch_urbs, 0);
++	atomic_set(&ar->rx_work_urbs, 0);
++	atomic_set(&ar->rx_anch_urbs, 0);
++	atomic_set(&ar->rx_pool_urbs, 0);
++	ar->cmd_seq = -2;
++
++	usb_get_dev(ar->udev);
++
++	carl9170_set_state(ar, CARL9170_STOPPED);
++
++	return request_firmware_nowait(THIS_MODULE, 1, CARL9170FW_NAME,
++		&ar->udev->dev, GFP_KERNEL, ar, carl9170_usb_firmware_step2);
++}
++
++static void carl9170_usb_disconnect(struct usb_interface *intf)
++{
++	struct ar9170 *ar = usb_get_intfdata(intf);
++	struct usb_device *udev;
++
++	if (WARN_ON(!ar))
++		return;
++
++	udev = ar->udev;
++	wait_for_completion(&ar->fw_load_wait);
++
++	if (IS_INITIALIZED(ar)) {
++		carl9170_reboot(ar);
++		carl9170_usb_stop(ar);
++	}
++
++	carl9170_usb_cancel_urbs(ar);
++	carl9170_unregister(ar);
++
++	usb_set_intfdata(intf, NULL);
++
++	carl9170_release_firmware(ar);
++	carl9170_free(ar);
++	usb_put_dev(udev);
++}
++
++#ifdef CONFIG_PM
++static int carl9170_usb_suspend(struct usb_interface *intf,
++				pm_message_t message)
++{
++	struct ar9170 *ar = usb_get_intfdata(intf);
++
++	if (!ar)
++		return -ENODEV;
++
++	carl9170_usb_cancel_urbs(ar);
++
++	/*
++	 * firmware automatically reboots for usb suspend.
++	 */
++
++	return 0;
++}
++
++static int carl9170_usb_resume(struct usb_interface *intf)
++{
++	struct ar9170 *ar = usb_get_intfdata(intf);
++	int err;
++
++	if (!ar)
++		return -ENODEV;
++
++	usb_unpoison_anchored_urbs(&ar->rx_anch);
++
++	err = carl9170_usb_init_device(ar);
++	if (err)
++		goto err_unrx;
++
++	err = carl9170_usb_open(ar);
++	if (err)
++		goto err_unrx;
++
++	return 0;
++
++err_unrx:
++	carl9170_usb_cancel_urbs(ar);
++
++	return err;
++}
++#endif /* CONFIG_PM */
++
++static struct usb_driver carl9170_driver = {
++	.name = KBUILD_MODNAME,
++	.probe = carl9170_usb_probe,
++	.disconnect = carl9170_usb_disconnect,
++	.id_table = carl9170_usb_ids,
++	.soft_unbind = 1,
++#ifdef CONFIG_PM
++	.suspend = carl9170_usb_suspend,
++	.resume = carl9170_usb_resume,
++#endif /* CONFIG_PM */
++};
++
++static int __init carl9170_usb_init(void)
++{
++	return usb_register(&carl9170_driver);
++}
++
++static void __exit carl9170_usb_exit(void)
++{
++	usb_deregister(&carl9170_driver);
++}
++
++module_init(carl9170_usb_init);
++module_exit(carl9170_usb_exit);
