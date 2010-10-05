@@ -62,7 +62,7 @@
  PATCHLEVEL = 6
  SUBLEVEL = 36
 -EXTRAVERSION = -rc6
-+EXTRAVERSION = -rc6-git2
++EXTRAVERSION = -rc6-git3
  NAME = Sheep on Meth
  
  # *DOCUMENTATION*
@@ -170,6 +170,114 @@
  	mn10300_icache_inv();
  }
  EXPORT_SYMBOL(flush_icache_range);
+--- a/arch/powerpc/platforms/512x/clock.c
++++ b/arch/powerpc/platforms/512x/clock.c
+@@ -57,7 +57,7 @@ static struct clk *mpc5121_clk_get(struc
+ 	int id_match = 0;
+ 
+ 	if (dev == NULL || id == NULL)
+-		return NULL;
++		return clk;
+ 
+ 	mutex_lock(&clocks_mutex);
+ 	list_for_each_entry(p, &clocks, node) {
+--- a/arch/powerpc/platforms/52xx/efika.c
++++ b/arch/powerpc/platforms/52xx/efika.c
+@@ -99,7 +99,7 @@ static void __init efika_pcisetup(void)
+ 	if (bus_range == NULL || len < 2 * sizeof(int)) {
+ 		printk(KERN_WARNING EFIKA_PLATFORM_NAME
+ 		       ": Can't get bus-range for %s\n", pcictrl->full_name);
+-		return;
++		goto out_put;
+ 	}
+ 
+ 	if (bus_range[1] == bus_range[0])
+@@ -111,12 +111,12 @@ static void __init efika_pcisetup(void)
+ 	printk(" controlled by %s\n", pcictrl->full_name);
+ 	printk("\n");
+ 
+-	hose = pcibios_alloc_controller(of_node_get(pcictrl));
++	hose = pcibios_alloc_controller(pcictrl);
+ 	if (!hose) {
+ 		printk(KERN_WARNING EFIKA_PLATFORM_NAME
+ 		       ": Can't allocate PCI controller structure for %s\n",
+ 		       pcictrl->full_name);
+-		return;
++		goto out_put;
+ 	}
+ 
+ 	hose->first_busno = bus_range[0];
+@@ -124,6 +124,9 @@ static void __init efika_pcisetup(void)
+ 	hose->ops = &rtas_pci_ops;
+ 
+ 	pci_process_bridge_OF_ranges(hose, pcictrl, 0);
++	return;
++out_put:
++	of_node_put(pcictrl);
+ }
+ 
+ #else
+--- a/arch/powerpc/platforms/52xx/mpc52xx_common.c
++++ b/arch/powerpc/platforms/52xx/mpc52xx_common.c
+@@ -325,12 +325,16 @@ int mpc5200_psc_ac97_gpio_reset(int psc_
+ 	clrbits32(&simple_gpio->simple_dvo, sync | out);
+ 	clrbits8(&wkup_gpio->wkup_dvo, reset);
+ 
+-	/* wait at lease 1 us */
+-	udelay(2);
++	/* wait for 1 us */
++	udelay(1);
+ 
+ 	/* Deassert reset */
+ 	setbits8(&wkup_gpio->wkup_dvo, reset);
+ 
++	/* wait at least 200ns */
++	/* 7 ~= (200ns * timebase) / ns2sec */
++	__delay(7);
++
+ 	/* Restore pin-muxing */
+ 	out_be32(&simple_gpio->port_config, mux);
+ 
+--- a/arch/um/drivers/net_kern.c
++++ b/arch/um/drivers/net_kern.c
+@@ -255,18 +255,6 @@ static void uml_net_tx_timeout(struct ne
+ 	netif_wake_queue(dev);
+ }
+ 
+-static int uml_net_set_mac(struct net_device *dev, void *addr)
+-{
+-	struct uml_net_private *lp = netdev_priv(dev);
+-	struct sockaddr *hwaddr = addr;
+-
+-	spin_lock_irq(&lp->lock);
+-	eth_mac_addr(dev, hwaddr->sa_data);
+-	spin_unlock_irq(&lp->lock);
+-
+-	return 0;
+-}
+-
+ static int uml_net_change_mtu(struct net_device *dev, int new_mtu)
+ {
+ 	dev->mtu = new_mtu;
+@@ -373,7 +361,7 @@ static const struct net_device_ops uml_n
+ 	.ndo_start_xmit 	= uml_net_start_xmit,
+ 	.ndo_set_multicast_list = uml_net_set_multicast_list,
+ 	.ndo_tx_timeout 	= uml_net_tx_timeout,
+-	.ndo_set_mac_address	= uml_net_set_mac,
++	.ndo_set_mac_address	= eth_mac_addr,
+ 	.ndo_change_mtu 	= uml_net_change_mtu,
+ 	.ndo_validate_addr	= eth_validate_addr,
+ };
+@@ -472,7 +460,8 @@ static void eth_configure(int n, void *i
+ 	    ((*transport->user->init)(&lp->user, dev) != 0))
+ 		goto out_unregister;
+ 
+-	eth_mac_addr(dev, device->mac);
++	/* don't use eth_mac_addr, it will not work here */
++	memcpy(dev->dev_addr, device->mac, ETH_ALEN);
+ 	dev->mtu = transport->user->mtu;
+ 	dev->netdev_ops = &uml_netdev_ops;
+ 	dev->ethtool_ops = &uml_net_ethtool_ops;
 --- a/arch/x86/kernel/acpi/cstate.c
 +++ b/arch/x86/kernel/acpi/cstate.c
 @@ -61,7 +61,7 @@ struct cstate_entry {
@@ -226,6 +334,37 @@
 +extern void get_cpu_cap(struct cpuinfo_x86 *c);
  
  #endif
+--- a/arch/x86/kernel/cpu/cpufreq/pcc-cpufreq.c
++++ b/arch/x86/kernel/cpu/cpufreq/pcc-cpufreq.c
+@@ -368,16 +368,22 @@ static int __init pcc_cpufreq_do_osc(acp
+ 		return -ENODEV;
+ 
+ 	out_obj = output.pointer;
+-	if (out_obj->type != ACPI_TYPE_BUFFER)
+-		return -ENODEV;
++	if (out_obj->type != ACPI_TYPE_BUFFER) {
++		ret = -ENODEV;
++		goto out_free;
++	}
+ 
+ 	errors = *((u32 *)out_obj->buffer.pointer) & ~(1 << 0);
+-	if (errors)
+-		return -ENODEV;
++	if (errors) {
++		ret = -ENODEV;
++		goto out_free;
++	}
+ 
+ 	supported = *((u32 *)(out_obj->buffer.pointer + 4));
+-	if (!(supported & 0x1))
+-		return -ENODEV;
++	if (!(supported & 0x1)) {
++		ret = -ENODEV;
++		goto out_free;
++	}
+ 
+ out_free:
+ 	kfree(output.pointer);
 --- a/arch/x86/kernel/cpu/intel.c
 +++ b/arch/x86/kernel/cpu/intel.c
 @@ -39,6 +39,7 @@ static void __cpuinit early_init_intel(s
@@ -1029,6 +1168,29 @@
  	.mmap = i830_mmap_buffers,
  	.fasync = drm_fasync,
  };
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1787,9 +1787,9 @@ unsigned long i915_chipset_val(struct dr
+ 		}
+ 	}
+ 
+-	div_u64(diff, diff1);
++	diff = div_u64(diff, diff1);
+ 	ret = ((m * diff) + c);
+-	div_u64(ret, 10);
++	ret = div_u64(ret, 10);
+ 
+ 	dev_priv->last_count1 = total_count;
+ 	dev_priv->last_time1 = now;
+@@ -1858,7 +1858,7 @@ void i915_update_gfx_val(struct drm_i915
+ 
+ 	/* More magic constants... */
+ 	diff = diff * 1181;
+-	div_u64(diff, diffms * 10);
++	diff = div_u64(diff, diffms * 10);
+ 	dev_priv->gfx_power = diff;
+ }
+ 
 --- a/drivers/gpu/drm/i915/i915_gem.c
 +++ b/drivers/gpu/drm/i915/i915_gem.c
 @@ -136,14 +136,12 @@ i915_gem_create_ioctl(struct drm_device
@@ -1048,6 +1210,333 @@
  	args->handle = handle;
  	return 0;
  }
+@@ -471,14 +469,17 @@ i915_gem_pread_ioctl(struct drm_device *
+ 		return -ENOENT;
+ 	obj_priv = to_intel_bo(obj);
+ 
+-	/* Bounds check source.
+-	 *
+-	 * XXX: This could use review for overflow issues...
+-	 */
+-	if (args->offset > obj->size || args->size > obj->size ||
+-	    args->offset + args->size > obj->size) {
+-		drm_gem_object_unreference_unlocked(obj);
+-		return -EINVAL;
++	/* Bounds check source.  */
++	if (args->offset > obj->size || args->size > obj->size - args->offset) {
++		ret = -EINVAL;
++		goto err;
++	}
++
++	if (!access_ok(VERIFY_WRITE,
++		       (char __user *)(uintptr_t)args->data_ptr,
++		       args->size)) {
++		ret = -EFAULT;
++		goto err;
+ 	}
+ 
+ 	if (i915_gem_object_needs_bit17_swizzle(obj)) {
+@@ -490,8 +491,8 @@ i915_gem_pread_ioctl(struct drm_device *
+ 							file_priv);
+ 	}
+ 
++err:
+ 	drm_gem_object_unreference_unlocked(obj);
+-
+ 	return ret;
+ }
+ 
+@@ -580,8 +581,6 @@ i915_gem_gtt_pwrite_fast(struct drm_devi
+ 
+ 	user_data = (char __user *) (uintptr_t) args->data_ptr;
+ 	remain = args->size;
+-	if (!access_ok(VERIFY_READ, user_data, remain))
+-		return -EFAULT;
+ 
+ 
+ 	mutex_lock(&dev->struct_mutex);
+@@ -934,14 +933,17 @@ i915_gem_pwrite_ioctl(struct drm_device
+ 		return -ENOENT;
+ 	obj_priv = to_intel_bo(obj);
+ 
+-	/* Bounds check destination.
+-	 *
+-	 * XXX: This could use review for overflow issues...
+-	 */
+-	if (args->offset > obj->size || args->size > obj->size ||
+-	    args->offset + args->size > obj->size) {
+-		drm_gem_object_unreference_unlocked(obj);
+-		return -EINVAL;
++	/* Bounds check destination. */
++	if (args->offset > obj->size || args->size > obj->size - args->offset) {
++		ret = -EINVAL;
++		goto err;
++	}
++
++	if (!access_ok(VERIFY_READ,
++		       (char __user *)(uintptr_t)args->data_ptr,
++		       args->size)) {
++		ret = -EFAULT;
++		goto err;
+ 	}
+ 
+ 	/* We can only do the GTT pwrite on untiled buffers, as otherwise
+@@ -975,8 +977,8 @@ i915_gem_pwrite_ioctl(struct drm_device
+ 		DRM_INFO("pwrite failed %d\n", ret);
+ #endif
+ 
++err:
+ 	drm_gem_object_unreference_unlocked(obj);
+-
+ 	return ret;
+ }
+ 
+@@ -3258,6 +3260,8 @@ i915_gem_object_pin_and_relocate(struct
+ 				  (int) reloc->offset,
+ 				  reloc->read_domains,
+ 				  reloc->write_domain);
++			drm_gem_object_unreference(target_obj);
++			i915_gem_object_unpin(obj);
+ 			return -EINVAL;
+ 		}
+ 		if (reloc->write_domain & I915_GEM_DOMAIN_CPU ||
+--- a/drivers/gpu/drm/i915/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/i915_gem_evict.c
+@@ -93,7 +93,7 @@ i915_gem_evict_something(struct drm_devi
+ {
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+ 	struct list_head eviction_list, unwind_list;
+-	struct drm_i915_gem_object *obj_priv, *tmp_obj_priv;
++	struct drm_i915_gem_object *obj_priv;
+ 	struct list_head *render_iter, *bsd_iter;
+ 	int ret = 0;
+ 
+@@ -175,39 +175,34 @@ i915_gem_evict_something(struct drm_devi
+ 	return -ENOSPC;
+ 
+ found:
++	/* drm_mm doesn't allow any other other operations while
++	 * scanning, therefore store to be evicted objects on a
++	 * temporary list. */
+ 	INIT_LIST_HEAD(&eviction_list);
+-	list_for_each_entry_safe(obj_priv, tmp_obj_priv,
+-				 &unwind_list, evict_list) {
++	while (!list_empty(&unwind_list)) {
++		obj_priv = list_first_entry(&unwind_list,
++					    struct drm_i915_gem_object,
++					    evict_list);
+ 		if (drm_mm_scan_remove_block(obj_priv->gtt_space)) {
+-			/* drm_mm doesn't allow any other other operations while
+-			 * scanning, therefore store to be evicted objects on a
+-			 * temporary list. */
+ 			list_move(&obj_priv->evict_list, &eviction_list);
+-		} else
+-			drm_gem_object_unreference(&obj_priv->base);
++			continue;
++		}
++		list_del(&obj_priv->evict_list);
++		drm_gem_object_unreference(&obj_priv->base);
+ 	}
+ 
+ 	/* Unbinding will emit any required flushes */
+-	list_for_each_entry_safe(obj_priv, tmp_obj_priv,
+-				 &eviction_list, evict_list) {
+-#if WATCH_LRU
+-		DRM_INFO("%s: evicting %p\n", __func__, &obj_priv->base);
+-#endif
+-		ret = i915_gem_object_unbind(&obj_priv->base);
+-		if (ret)
+-			return ret;
+-
++	while (!list_empty(&eviction_list)) {
++		obj_priv = list_first_entry(&eviction_list,
++					    struct drm_i915_gem_object,
++					    evict_list);
++		if (ret == 0)
++			ret = i915_gem_object_unbind(&obj_priv->base);
++		list_del(&obj_priv->evict_list);
+ 		drm_gem_object_unreference(&obj_priv->base);
+ 	}
+ 
+-	/* The just created free hole should be on the top of the free stack
+-	 * maintained by drm_mm, so this BUG_ON actually executes in O(1).
+-	 * Furthermore all accessed data has just recently been used, so it
+-	 * should be really fast, too. */
+-	BUG_ON(!drm_mm_search_free(&dev_priv->mm.gtt_space, min_size,
+-				   alignment, 0));
+-
+-	return 0;
++	return ret;
+ }
+ 
+ int
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -1013,8 +1013,8 @@ void intel_wait_for_vblank(struct drm_de
+ 		DRM_DEBUG_KMS("vblank wait timed out\n");
+ }
+ 
+-/**
+- * intel_wait_for_vblank_off - wait for vblank after disabling a pipe
++/*
++ * intel_wait_for_pipe_off - wait for pipe to turn off
+  * @dev: drm device
+  * @pipe: pipe to wait for
+  *
+@@ -1022,25 +1022,39 @@ void intel_wait_for_vblank(struct drm_de
+  * spinning on the vblank interrupt status bit, since we won't actually
+  * see an interrupt when the pipe is disabled.
+  *
+- * So this function waits for the display line value to settle (it
+- * usually ends up stopping at the start of the next frame).
++ * On Gen4 and above:
++ *   wait for the pipe register state bit to turn off
++ *
++ * Otherwise:
++ *   wait for the display line value to settle (it usually
++ *   ends up stopping at the start of the next frame).
++ *  
+  */
+-void intel_wait_for_vblank_off(struct drm_device *dev, int pipe)
++static void intel_wait_for_pipe_off(struct drm_device *dev, int pipe)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	int pipedsl_reg = (pipe == 0 ? PIPEADSL : PIPEBDSL);
+-	unsigned long timeout = jiffies + msecs_to_jiffies(100);
+-	u32 last_line;
+-
+-	/* Wait for the display line to settle */
+-	do {
+-		last_line = I915_READ(pipedsl_reg) & DSL_LINEMASK;
+-		mdelay(5);
+-	} while (((I915_READ(pipedsl_reg) & DSL_LINEMASK) != last_line) &&
+-		 time_after(timeout, jiffies));
+ 
+-	if (time_after(jiffies, timeout))
+-		DRM_DEBUG_KMS("vblank wait timed out\n");
++	if (INTEL_INFO(dev)->gen >= 4) {
++		int pipeconf_reg = (pipe == 0 ? PIPEACONF : PIPEBCONF);
++
++		/* Wait for the Pipe State to go off */
++		if (wait_for((I915_READ(pipeconf_reg) & I965_PIPECONF_ACTIVE) == 0,
++			     100, 0))
++			DRM_DEBUG_KMS("pipe_off wait timed out\n");
++	} else {
++		u32 last_line;
++		int pipedsl_reg = (pipe == 0 ? PIPEADSL : PIPEBDSL);
++		unsigned long timeout = jiffies + msecs_to_jiffies(100);
++
++		/* Wait for the display line to settle */
++		do {
++			last_line = I915_READ(pipedsl_reg) & DSL_LINEMASK;
++			mdelay(5);
++		} while (((I915_READ(pipedsl_reg) & DSL_LINEMASK) != last_line) &&
++			 time_after(timeout, jiffies));
++		if (time_after(jiffies, timeout))
++			DRM_DEBUG_KMS("pipe_off wait timed out\n");
++	}
+ }
+ 
+ /* Parameters have changed, update FBC info */
+@@ -2328,13 +2342,13 @@ static void i9xx_crtc_dpms(struct drm_cr
+ 			I915_READ(dspbase_reg);
+ 		}
+ 
+-		/* Wait for vblank for the disable to take effect */
+-		intel_wait_for_vblank_off(dev, pipe);
+-
+ 		/* Don't disable pipe A or pipe A PLLs if needed */
+ 		if (pipeconf_reg == PIPEACONF &&
+-		    (dev_priv->quirks & QUIRK_PIPEA_FORCE))
++		    (dev_priv->quirks & QUIRK_PIPEA_FORCE)) {
++			/* Wait for vblank for the disable to take effect */
++			intel_wait_for_vblank(dev, pipe);
+ 			goto skip_pipe_off;
++		}
+ 
+ 		/* Next, disable display pipes */
+ 		temp = I915_READ(pipeconf_reg);
+@@ -2343,8 +2357,8 @@ static void i9xx_crtc_dpms(struct drm_cr
+ 			I915_READ(pipeconf_reg);
+ 		}
+ 
+-		/* Wait for vblank for the disable to take effect. */
+-		intel_wait_for_vblank_off(dev, pipe);
++		/* Wait for the pipe to turn off */
++		intel_wait_for_pipe_off(dev, pipe);
+ 
+ 		temp = I915_READ(dpll_reg);
+ 		if ((temp & DPLL_VCO_ENABLE) != 0) {
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -1138,18 +1138,14 @@ static bool
+ intel_dp_set_link_train(struct intel_dp *intel_dp,
+ 			uint32_t dp_reg_value,
+ 			uint8_t dp_train_pat,
+-			uint8_t train_set[4],
+-			bool first)
++			uint8_t train_set[4])
+ {
+ 	struct drm_device *dev = intel_dp->base.enc.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct intel_crtc *intel_crtc = to_intel_crtc(intel_dp->base.enc.crtc);
+ 	int ret;
+ 
+ 	I915_WRITE(intel_dp->output_reg, dp_reg_value);
+ 	POSTING_READ(intel_dp->output_reg);
+-	if (first)
+-		intel_wait_for_vblank(dev, intel_crtc->pipe);
+ 
+ 	intel_dp_aux_native_write_1(intel_dp,
+ 				    DP_TRAINING_PATTERN_SET,
+@@ -1174,10 +1170,15 @@ intel_dp_link_train(struct intel_dp *int
+ 	uint8_t voltage;
+ 	bool clock_recovery = false;
+ 	bool channel_eq = false;
+-	bool first = true;
+ 	int tries;
+ 	u32 reg;
+ 	uint32_t DP = intel_dp->DP;
++	struct intel_crtc *intel_crtc = to_intel_crtc(intel_dp->base.enc.crtc);
++
++	/* Enable output, wait for it to become active */
++	I915_WRITE(intel_dp->output_reg, intel_dp->DP);
++	POSTING_READ(intel_dp->output_reg);
++	intel_wait_for_vblank(dev, intel_crtc->pipe);
+ 
+ 	/* Write the link configuration data */
+ 	intel_dp_aux_native_write(intel_dp, DP_LINK_BW_SET,
+@@ -1210,9 +1211,8 @@ intel_dp_link_train(struct intel_dp *int
+ 			reg = DP | DP_LINK_TRAIN_PAT_1;
+ 
+ 		if (!intel_dp_set_link_train(intel_dp, reg,
+-					     DP_TRAINING_PATTERN_1, train_set, first))
++					     DP_TRAINING_PATTERN_1, train_set))
+ 			break;
+-		first = false;
+ 		/* Set training pattern 1 */
+ 
+ 		udelay(100);
+@@ -1266,8 +1266,7 @@ intel_dp_link_train(struct intel_dp *int
+ 
+ 		/* channel eq pattern */
+ 		if (!intel_dp_set_link_train(intel_dp, reg,
+-					     DP_TRAINING_PATTERN_2, train_set,
+-					     false))
++					     DP_TRAINING_PATTERN_2, train_set))
+ 			break;
+ 
+ 		udelay(400);
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -229,7 +229,6 @@ extern struct drm_display_mode *intel_cr
+ 						    struct drm_crtc *crtc);
+ int intel_get_pipe_from_crtc_id(struct drm_device *dev, void *data,
+ 				struct drm_file *file_priv);
+-extern void intel_wait_for_vblank_off(struct drm_device *dev, int pipe);
+ extern void intel_wait_for_vblank(struct drm_device *dev, int pipe);
+ extern struct drm_crtc *intel_get_crtc_from_pipe(struct drm_device *dev, int pipe);
+ extern struct drm_crtc *intel_get_load_detect_pipe(struct intel_encoder *intel_encoder,
 --- a/drivers/gpu/drm/i915/intel_fb.c
 +++ b/drivers/gpu/drm/i915/intel_fb.c
 @@ -237,8 +237,10 @@ int intel_fbdev_destroy(struct drm_devic
@@ -1664,6 +2153,104 @@
  	vmw_resource_activate(res, vmw_hw_surface_destroy);
  	return 0;
  }
+--- a/drivers/hwmon/f71882fg.c
++++ b/drivers/hwmon/f71882fg.c
+@@ -111,7 +111,7 @@ static struct platform_device *f71882fg_
+ /* Super-I/O Function prototypes */
+ static inline int superio_inb(int base, int reg);
+ static inline int superio_inw(int base, int reg);
+-static inline void superio_enter(int base);
++static inline int superio_enter(int base);
+ static inline void superio_select(int base, int ld);
+ static inline void superio_exit(int base);
+ 
+@@ -861,11 +861,20 @@ static int superio_inw(int base, int reg
+ 	return val;
+ }
+ 
+-static inline void superio_enter(int base)
++static inline int superio_enter(int base)
+ {
++	/* Don't step on other drivers' I/O space by accident */
++	if (!request_muxed_region(base, 2, DRVNAME)) {
++		printk(KERN_ERR DRVNAME ": I/O address 0x%04x already in use\n",
++				base);
++		return -EBUSY;
++	}
++
+ 	/* according to the datasheet the key must be send twice! */
+ 	outb(SIO_UNLOCK_KEY, base);
+ 	outb(SIO_UNLOCK_KEY, base);
++
++	return 0;
+ }
+ 
+ static inline void superio_select(int base, int ld)
+@@ -877,6 +886,7 @@ static inline void superio_select(int ba
+ static inline void superio_exit(int base)
+ {
+ 	outb(SIO_LOCK_KEY, base);
++	release_region(base, 2);
+ }
+ 
+ static inline int fan_from_reg(u16 reg)
+@@ -2175,21 +2185,15 @@ static int f71882fg_remove(struct platfo
+ static int __init f71882fg_find(int sioaddr, unsigned short *address,
+ 	struct f71882fg_sio_data *sio_data)
+ {
+-	int err = -ENODEV;
+ 	u16 devid;
+-
+-	/* Don't step on other drivers' I/O space by accident */
+-	if (!request_region(sioaddr, 2, DRVNAME)) {
+-		printk(KERN_ERR DRVNAME ": I/O address 0x%04x already in use\n",
+-				(int)sioaddr);
+-		return -EBUSY;
+-	}
+-
+-	superio_enter(sioaddr);
++	int err = superio_enter(sioaddr);
++	if (err)
++		return err;
+ 
+ 	devid = superio_inw(sioaddr, SIO_REG_MANID);
+ 	if (devid != SIO_FINTEK_ID) {
+ 		pr_debug(DRVNAME ": Not a Fintek device\n");
++		err = -ENODEV;
+ 		goto exit;
+ 	}
+ 
+@@ -2213,6 +2217,7 @@ static int __init f71882fg_find(int sioa
+ 	default:
+ 		printk(KERN_INFO DRVNAME ": Unsupported Fintek device: %04x\n",
+ 		       (unsigned int)devid);
++		err = -ENODEV;
+ 		goto exit;
+ 	}
+ 
+@@ -2223,12 +2228,14 @@ static int __init f71882fg_find(int sioa
+ 
+ 	if (!(superio_inb(sioaddr, SIO_REG_ENABLE) & 0x01)) {
+ 		printk(KERN_WARNING DRVNAME ": Device not activated\n");
++		err = -ENODEV;
+ 		goto exit;
+ 	}
+ 
+ 	*address = superio_inw(sioaddr, SIO_REG_ADDR);
+ 	if (*address == 0) {
+ 		printk(KERN_WARNING DRVNAME ": Base address not set\n");
++		err = -ENODEV;
+ 		goto exit;
+ 	}
+ 	*address &= ~(REGION_LENGTH - 1);	/* Ignore 3 LSB */
+@@ -2239,7 +2246,6 @@ static int __init f71882fg_find(int sioa
+ 		(int)superio_inb(sioaddr, SIO_REG_DEVREV));
+ exit:
+ 	superio_exit(sioaddr);
+-	release_region(sioaddr, 2);
+ 	return err;
+ }
+ 
 --- a/drivers/i2c/busses/i2c-davinci.c
 +++ b/drivers/i2c/busses/i2c-davinci.c
 @@ -357,9 +357,6 @@ i2c_davinci_xfer_msg(struct i2c_adapter
@@ -1837,6 +2424,28 @@
  
  	dma_unmap_single(&info->pdev->dev, dma_addr, len, dir);
  	return 0;
+--- a/drivers/net/wireless/iwlwifi/iwl-agn-lib.c
++++ b/drivers/net/wireless/iwlwifi/iwl-agn-lib.c
+@@ -1411,7 +1411,7 @@ void iwlagn_request_scan(struct iwl_priv
+ 	clear_bit(STATUS_SCAN_HW, &priv->status);
+ 	clear_bit(STATUS_SCANNING, &priv->status);
+ 	/* inform mac80211 scan aborted */
+-	queue_work(priv->workqueue, &priv->scan_completed);
++	queue_work(priv->workqueue, &priv->abort_scan);
+ }
+ 
+ int iwlagn_manage_ibss_station(struct iwl_priv *priv,
+--- a/drivers/net/wireless/iwlwifi/iwl3945-base.c
++++ b/drivers/net/wireless/iwlwifi/iwl3945-base.c
+@@ -3018,7 +3018,7 @@ void iwl3945_request_scan(struct iwl_pri
+ 	clear_bit(STATUS_SCANNING, &priv->status);
+ 
+ 	/* inform mac80211 scan aborted */
+-	queue_work(priv->workqueue, &priv->scan_completed);
++	queue_work(priv->workqueue, &priv->abort_scan);
+ }
+ 
+ static void iwl3945_bg_restart(struct work_struct *data)
 --- a/drivers/pci/quirks.c
 +++ b/drivers/pci/quirks.c
 @@ -163,6 +163,26 @@ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_NE
@@ -1886,6 +2495,60 @@
  #include <linux/init.h>
  #include <linux/console.h>
  #include <linux/sysrq.h>
+--- a/drivers/spi/spi.c
++++ b/drivers/spi/spi.c
+@@ -23,6 +23,7 @@
+ #include <linux/init.h>
+ #include <linux/cache.h>
+ #include <linux/mutex.h>
++#include <linux/of_device.h>
+ #include <linux/slab.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/spi/spi.h>
+@@ -86,6 +87,10 @@ static int spi_match_device(struct devic
+ 	const struct spi_device	*spi = to_spi_device(dev);
+ 	const struct spi_driver	*sdrv = to_spi_driver(drv);
+ 
++	/* Attempt an OF style match */
++	if (of_driver_match_device(dev, drv))
++		return 1;
++
+ 	if (sdrv->id_table)
+ 		return !!spi_match_id(sdrv->id_table, spi);
+ 
+--- a/drivers/spi/spi_gpio.c
++++ b/drivers/spi/spi_gpio.c
+@@ -350,7 +350,7 @@ static int __init spi_gpio_probe(struct
+ 	spi_gpio->bitbang.master = spi_master_get(master);
+ 	spi_gpio->bitbang.chipselect = spi_gpio_chipselect;
+ 
+-	if ((master_flags & (SPI_MASTER_NO_RX | SPI_MASTER_NO_RX)) == 0) {
++	if ((master_flags & (SPI_MASTER_NO_TX | SPI_MASTER_NO_RX)) == 0) {
+ 		spi_gpio->bitbang.txrx_word[SPI_MODE_0] = spi_gpio_txrx_word_mode0;
+ 		spi_gpio->bitbang.txrx_word[SPI_MODE_1] = spi_gpio_txrx_word_mode1;
+ 		spi_gpio->bitbang.txrx_word[SPI_MODE_2] = spi_gpio_txrx_word_mode2;
+--- a/drivers/spi/spi_mpc8xxx.c
++++ b/drivers/spi/spi_mpc8xxx.c
+@@ -408,11 +408,17 @@ static void mpc8xxx_spi_cpm_bufs_start(s
+ 
+ 	xfer_ofs = mspi->xfer_in_progress->len - mspi->count;
+ 
+-	out_be32(&rx_bd->cbd_bufaddr, mspi->rx_dma + xfer_ofs);
++	if (mspi->rx_dma == mspi->dma_dummy_rx)
++		out_be32(&rx_bd->cbd_bufaddr, mspi->rx_dma);
++	else
++		out_be32(&rx_bd->cbd_bufaddr, mspi->rx_dma + xfer_ofs);
+ 	out_be16(&rx_bd->cbd_datlen, 0);
+ 	out_be16(&rx_bd->cbd_sc, BD_SC_EMPTY | BD_SC_INTRPT | BD_SC_WRAP);
+ 
+-	out_be32(&tx_bd->cbd_bufaddr, mspi->tx_dma + xfer_ofs);
++	if (mspi->tx_dma == mspi->dma_dummy_tx)
++		out_be32(&tx_bd->cbd_bufaddr, mspi->tx_dma);
++	else
++		out_be32(&tx_bd->cbd_bufaddr, mspi->tx_dma + xfer_ofs);
+ 	out_be16(&tx_bd->cbd_datlen, xfer_len);
+ 	out_be16(&tx_bd->cbd_sc, BD_SC_READY | BD_SC_INTRPT | BD_SC_WRAP |
+ 				 BD_SC_LAST);
 --- a/fs/cifs/cifssmb.c
 +++ b/fs/cifs/cifssmb.c
 @@ -232,7 +232,7 @@ static int
@@ -2318,6 +2981,203 @@
  
  		tail->next->prev = tail;
  		tail = tail->next;
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -712,7 +712,7 @@ static int write_protect_page(struct vm_
+ 	if (!ptep)
+ 		goto out;
+ 
+-	if (pte_write(*ptep)) {
++	if (pte_write(*ptep) || pte_dirty(*ptep)) {
+ 		pte_t entry;
+ 
+ 		swapped = PageSwapCache(page);
+@@ -735,7 +735,9 @@ static int write_protect_page(struct vm_
+ 			set_pte_at(mm, addr, ptep, entry);
+ 			goto out_unlock;
+ 		}
+-		entry = pte_wrprotect(entry);
++		if (pte_dirty(entry))
++			set_page_dirty(page);
++		entry = pte_mkclean(pte_wrprotect(entry));
+ 		set_pte_at_notify(mm, addr, ptep, entry);
+ 	}
+ 	*orig_pte = *ptep;
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -381,7 +381,13 @@ vma_address(struct page *page, struct vm
+ unsigned long page_address_in_vma(struct page *page, struct vm_area_struct *vma)
+ {
+ 	if (PageAnon(page)) {
+-		if (vma->anon_vma->root != page_anon_vma(page)->root)
++		struct anon_vma *page__anon_vma = page_anon_vma(page);
++		/*
++		 * Note: swapoff's unuse_vma() is more efficient with this
++		 * check, and needs it to match anon_vma when KSM is active.
++		 */
++		if (!vma->anon_vma || !page__anon_vma ||
++		    vma->anon_vma->root != page__anon_vma->root)
+ 			return -EFAULT;
+ 	} else if (page->mapping && !(vma->vm_flags & VM_NONLINEAR)) {
+ 		if (!vma->vm_file ||
+--- a/net/8021q/vlan_core.c
++++ b/net/8021q/vlan_core.c
+@@ -24,8 +24,11 @@ int __vlan_hwaccel_rx(struct sk_buff *sk
+ 
+ 	if (vlan_dev)
+ 		skb->dev = vlan_dev;
+-	else if (vlan_id)
+-		goto drop;
++	else if (vlan_id) {
++		if (!(skb->dev->flags & IFF_PROMISC))
++			goto drop;
++		skb->pkt_type = PACKET_OTHERHOST;
++	}
+ 
+ 	return (polling ? netif_receive_skb(skb) : netif_rx(skb));
+ 
+@@ -102,8 +105,11 @@ vlan_gro_common(struct napi_struct *napi
+ 
+ 	if (vlan_dev)
+ 		skb->dev = vlan_dev;
+-	else if (vlan_id)
+-		goto drop;
++	else if (vlan_id) {
++		if (!(skb->dev->flags & IFF_PROMISC))
++			goto drop;
++		skb->pkt_type = PACKET_OTHERHOST;
++	}
+ 
+ 	for (p = napi->gro_list; p; p = p->next) {
+ 		NAPI_GRO_CB(p)->same_flow =
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@ -217,6 +217,7 @@ config NET_IPIP
+ 
+ config NET_IPGRE
+ 	tristate "IP: GRE tunnels over IP"
++	depends on IPV6 || IPV6=n
+ 	help
+ 	  Tunneling means encapsulating data of one protocol type within
+ 	  another protocol and sending it over a channel that understands the
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -135,13 +135,16 @@ static void tcp_mtu_probing(struct inet_
+ 
+ /* This function calculates a "timeout" which is equivalent to the timeout of a
+  * TCP connection after "boundary" unsuccessful, exponentially backed-off
+- * retransmissions with an initial RTO of TCP_RTO_MIN.
++ * retransmissions with an initial RTO of TCP_RTO_MIN or TCP_TIMEOUT_INIT if
++ * syn_set flag is set.
+  */
+ static bool retransmits_timed_out(struct sock *sk,
+-				  unsigned int boundary)
++				  unsigned int boundary,
++				  bool syn_set)
+ {
+ 	unsigned int timeout, linear_backoff_thresh;
+ 	unsigned int start_ts;
++	unsigned int rto_base = syn_set ? TCP_TIMEOUT_INIT : TCP_RTO_MIN;
+ 
+ 	if (!inet_csk(sk)->icsk_retransmits)
+ 		return false;
+@@ -151,12 +154,12 @@ static bool retransmits_timed_out(struct
+ 	else
+ 		start_ts = tcp_sk(sk)->retrans_stamp;
+ 
+-	linear_backoff_thresh = ilog2(TCP_RTO_MAX/TCP_RTO_MIN);
++	linear_backoff_thresh = ilog2(TCP_RTO_MAX/rto_base);
+ 
+ 	if (boundary <= linear_backoff_thresh)
+-		timeout = ((2 << boundary) - 1) * TCP_RTO_MIN;
++		timeout = ((2 << boundary) - 1) * rto_base;
+ 	else
+-		timeout = ((2 << linear_backoff_thresh) - 1) * TCP_RTO_MIN +
++		timeout = ((2 << linear_backoff_thresh) - 1) * rto_base +
+ 			  (boundary - linear_backoff_thresh) * TCP_RTO_MAX;
+ 
+ 	return (tcp_time_stamp - start_ts) >= timeout;
+@@ -167,14 +170,15 @@ static int tcp_write_timeout(struct sock
+ {
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
+ 	int retry_until;
+-	bool do_reset;
++	bool do_reset, syn_set = 0;
+ 
+ 	if ((1 << sk->sk_state) & (TCPF_SYN_SENT | TCPF_SYN_RECV)) {
+ 		if (icsk->icsk_retransmits)
+ 			dst_negative_advice(sk);
+ 		retry_until = icsk->icsk_syn_retries ? : sysctl_tcp_syn_retries;
++		syn_set = 1;
+ 	} else {
+-		if (retransmits_timed_out(sk, sysctl_tcp_retries1)) {
++		if (retransmits_timed_out(sk, sysctl_tcp_retries1, 0)) {
+ 			/* Black hole detection */
+ 			tcp_mtu_probing(icsk, sk);
+ 
+@@ -187,14 +191,14 @@ static int tcp_write_timeout(struct sock
+ 
+ 			retry_until = tcp_orphan_retries(sk, alive);
+ 			do_reset = alive ||
+-				   !retransmits_timed_out(sk, retry_until);
++				   !retransmits_timed_out(sk, retry_until, 0);
+ 
+ 			if (tcp_out_of_resources(sk, do_reset))
+ 				return 1;
+ 		}
+ 	}
+ 
+-	if (retransmits_timed_out(sk, retry_until)) {
++	if (retransmits_timed_out(sk, retry_until, syn_set)) {
+ 		/* Has it gone just too far? */
+ 		tcp_write_err(sk);
+ 		return 1;
+@@ -436,7 +440,7 @@ out_reset_timer:
+ 		icsk->icsk_rto = min(icsk->icsk_rto << 1, TCP_RTO_MAX);
+ 	}
+ 	inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS, icsk->icsk_rto, TCP_RTO_MAX);
+-	if (retransmits_timed_out(sk, sysctl_tcp_retries1 + 1))
++	if (retransmits_timed_out(sk, sysctl_tcp_retries1 + 1, 0))
+ 		__sk_dst_reset(sk);
+ 
+ out:;
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -2199,9 +2199,6 @@ static void ieee80211_rx_cooked_monitor(
+ 	struct net_device *prev_dev = NULL;
+ 	struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
+ 
+-	if (status->flag & RX_FLAG_INTERNAL_CMTR)
+-		goto out_free_skb;
+-
+ 	if (skb_headroom(skb) < sizeof(*rthdr) &&
+ 	    pskb_expand_head(skb, sizeof(*rthdr), 0, GFP_ATOMIC))
+ 		goto out_free_skb;
+@@ -2260,7 +2257,6 @@ static void ieee80211_rx_cooked_monitor(
+ 	} else
+ 		goto out_free_skb;
+ 
+-	status->flag |= RX_FLAG_INTERNAL_CMTR;
+ 	return;
+ 
+  out_free_skb:
+--- a/net/phonet/pep.c
++++ b/net/phonet/pep.c
+@@ -225,12 +225,13 @@ static void pipe_grant_credits(struct so
+ static int pipe_rcv_status(struct sock *sk, struct sk_buff *skb)
+ {
+ 	struct pep_sock *pn = pep_sk(sk);
+-	struct pnpipehdr *hdr = pnp_hdr(skb);
++	struct pnpipehdr *hdr;
+ 	int wake = 0;
+ 
+ 	if (!pskb_may_pull(skb, sizeof(*hdr) + 4))
+ 		return -EINVAL;
+ 
++	hdr = pnp_hdr(skb);
+ 	if (hdr->data[0] != PN_PEP_TYPE_COMMON) {
+ 		LIMIT_NETDEBUG(KERN_DEBUG"Phonet unknown PEP type: %u\n",
+ 				(unsigned)hdr->data[0]);
 --- a/samples/kfifo/dma-example.c
 +++ b/samples/kfifo/dma-example.c
 @@ -24,6 +24,7 @@ static int __init example_init(void)
@@ -2371,3 +3231,35 @@
  		printk(KERN_INFO
  		"sg[%d] -> "
  		"page_link 0x%.8lx offset 0x%.8x length 0x%.8x\n",
+--- a/sound/core/control.c
++++ b/sound/core/control.c
+@@ -31,6 +31,7 @@
+ 
+ /* max number of user-defined controls */
+ #define MAX_USER_CONTROLS	32
++#define MAX_CONTROL_COUNT	1028
+ 
+ struct snd_kctl_ioctl {
+ 	struct list_head list;		/* list of all ioctls */
+@@ -195,6 +196,10 @@ static struct snd_kcontrol *snd_ctl_new(
+ 	
+ 	if (snd_BUG_ON(!control || !control->count))
+ 		return NULL;
++
++	if (control->count > MAX_CONTROL_COUNT)
++		return NULL;
++
+ 	kctl = kzalloc(sizeof(*kctl) + sizeof(struct snd_kcontrol_volatile) * control->count, GFP_KERNEL);
+ 	if (kctl == NULL) {
+ 		snd_printk(KERN_ERR "Cannot allocate control instance\n");
+--- a/sound/i2c/other/ak4xxx-adda.c
++++ b/sound/i2c/other/ak4xxx-adda.c
+@@ -900,7 +900,7 @@ static int proc_init(struct snd_akm4xxx
+ 	return 0;
+ }
+ #else /* !CONFIG_PROC_FS */
+-static int proc_init(struct snd_akm4xxx *ak) {}
++static int proc_init(struct snd_akm4xxx *ak) { return 0; }
+ #endif
+ 
+ int snd_akm4xxx_build_controls(struct snd_akm4xxx *ak)
