@@ -1,0 +1,1798 @@
+--- a/Documentation/vm/page-types.c
++++ b/Documentation/vm/page-types.c
+@@ -478,7 +478,7 @@ static void prepare_hwpoison_fd(void)
+ 	}
+ 
+ 	if (opt_unpoison && !hwpoison_forget_fd) {
+-		sprintf(buf, "%s/renew-pfn", hwpoison_debug_fs);
++		sprintf(buf, "%s/unpoison-pfn", hwpoison_debug_fs);
+ 		hwpoison_forget_fd = checked_open(buf, O_WRONLY);
+ 	}
+ }
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -969,6 +969,16 @@ L:	linux-samsung-soc@vger.kernel.org (mo
+ S:	Maintained
+ F:	arch/arm/mach-s5p*/
+ 
++ARM/SAMSUNG S5P SERIES FIMC SUPPORT
++M:	Kyungmin Park <kyungmin.park@samsung.com>
++M:	Sylwester Nawrocki <s.nawrocki@samsung.com>
++L:	linux-arm-kernel@lists.infradead.org
++L:	linux-media@vger.kernel.org
++S:	Maintained
++F:	arch/arm/plat-s5p/dev-fimc*
++F:	arch/arm/plat-samsung/include/plat/*fimc*
++F:	drivers/media/video/s5p-fimc/
++
+ ARM/SHMOBILE ARM ARCHITECTURE
+ M:	Paul Mundt <lethal@linux-sh.org>
+ M:	Magnus Damm <magnus.damm@gmail.com>
+@@ -2535,7 +2545,7 @@ S:	Supported
+ F:	drivers/scsi/gdt*
+ 
+ GENERIC GPIO I2C DRIVER
+-M:	Haavard Skinnemoen <hskinnemoen@atmel.com>
++M:	Haavard Skinnemoen <hskinnemoen@gmail.com>
+ S:	Supported
+ F:	drivers/i2c/busses/i2c-gpio.c
+ F:	include/linux/i2c-gpio.h
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 36
+-EXTRAVERSION = -rc7
++EXTRAVERSION = -rc7-git1
+ NAME = Sheep on Meth
+ 
+ # *DOCUMENTATION*
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -938,6 +938,7 @@ int elv_register_queue(struct request_qu
+ 			}
+ 		}
+ 		kobject_uevent(&e->kobj, KOBJ_ADD);
++		e->registered = 1;
+ 	}
+ 	return error;
+ }
+@@ -947,6 +948,7 @@ static void __elv_unregister_queue(struc
+ {
+ 	kobject_uevent(&e->kobj, KOBJ_REMOVE);
+ 	kobject_del(&e->kobj);
++	e->registered = 0;
+ }
+ 
+ void elv_unregister_queue(struct request_queue *q)
+@@ -1042,11 +1044,13 @@ static int elevator_switch(struct reques
+ 
+ 	spin_unlock_irq(q->queue_lock);
+ 
+-	__elv_unregister_queue(old_elevator);
++	if (old_elevator->registered) {
++		__elv_unregister_queue(old_elevator);
+ 
+-	err = elv_register_queue(q);
+-	if (err)
+-		goto fail_register;
++		err = elv_register_queue(q);
++		if (err)
++			goto fail_register;
++	}
+ 
+ 	/*
+ 	 * finally exit old elevator and turn off BYPASS.
+--- a/drivers/gpu/drm/i915/intel_fb.c
++++ b/drivers/gpu/drm/i915/intel_fb.c
+@@ -238,8 +238,8 @@ int intel_fbdev_destroy(struct drm_devic
+ 
+ 	drm_framebuffer_cleanup(&ifb->base);
+ 	if (ifb->obj) {
+-		drm_gem_object_handle_unreference(ifb->obj);
+ 		drm_gem_object_unreference(ifb->obj);
++		ifb->obj = NULL;
+ 	}
+ 
+ 	return 0;
+--- a/drivers/gpu/drm/nouveau/nouveau_fbcon.c
++++ b/drivers/gpu/drm/nouveau/nouveau_fbcon.c
+@@ -352,7 +352,6 @@ nouveau_fbcon_destroy(struct drm_device
+ 
+ 	if (nouveau_fb->nvbo) {
+ 		nouveau_bo_unmap(nouveau_fb->nvbo);
+-		drm_gem_object_handle_unreference_unlocked(nouveau_fb->nvbo->gem);
+ 		drm_gem_object_unreference_unlocked(nouveau_fb->nvbo->gem);
+ 		nouveau_fb->nvbo = NULL;
+ 	}
+--- a/drivers/gpu/drm/nouveau/nouveau_notifier.c
++++ b/drivers/gpu/drm/nouveau/nouveau_notifier.c
+@@ -79,7 +79,6 @@ nouveau_notifier_takedown_channel(struct
+ 	mutex_lock(&dev->struct_mutex);
+ 	nouveau_bo_unpin(chan->notifier_bo);
+ 	mutex_unlock(&dev->struct_mutex);
+-	drm_gem_object_handle_unreference_unlocked(chan->notifier_bo->gem);
+ 	drm_gem_object_unreference_unlocked(chan->notifier_bo->gem);
+ 	drm_mm_takedown(&chan->notifier_heap);
+ }
+--- a/drivers/gpu/drm/radeon/radeon_fb.c
++++ b/drivers/gpu/drm/radeon/radeon_fb.c
+@@ -97,7 +97,6 @@ static void radeonfb_destroy_pinned_obje
+ 		radeon_bo_unpin(rbo);
+ 		radeon_bo_unreserve(rbo);
+ 	}
+-	drm_gem_object_handle_unreference(gobj);
+ 	drm_gem_object_unreference_unlocked(gobj);
+ }
+ 
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -442,6 +442,43 @@ out_err:
+ }
+ 
+ /**
++ * Call bo::reserved and with the lru lock held.
++ * Will release GPU memory type usage on destruction.
++ * This is the place to put in driver specific hooks.
++ * Will release the bo::reserved lock and the
++ * lru lock on exit.
++ */
++
++static void ttm_bo_cleanup_memtype_use(struct ttm_buffer_object *bo)
++{
++	struct ttm_bo_global *glob = bo->glob;
++
++	if (bo->ttm) {
++
++		/**
++		 * Release the lru_lock, since we don't want to have
++		 * an atomic requirement on ttm_tt[unbind|destroy].
++		 */
++
++		spin_unlock(&glob->lru_lock);
++		ttm_tt_unbind(bo->ttm);
++		ttm_tt_destroy(bo->ttm);
++		bo->ttm = NULL;
++		spin_lock(&glob->lru_lock);
++	}
++
++	if (bo->mem.mm_node) {
++		drm_mm_put_block(bo->mem.mm_node);
++		bo->mem.mm_node = NULL;
++	}
++
++	atomic_set(&bo->reserved, 0);
++	wake_up_all(&bo->event_queue);
++	spin_unlock(&glob->lru_lock);
++}
++
++
++/**
+  * If bo idle, remove from delayed- and lru lists, and unref.
+  * If not idle, and already on delayed list, do nothing.
+  * If not idle, and not on delayed list, put on delayed list,
+@@ -456,6 +493,7 @@ static int ttm_bo_cleanup_refs(struct tt
+ 	int ret;
+ 
+ 	spin_lock(&bo->lock);
++retry:
+ 	(void) ttm_bo_wait(bo, false, false, !remove_all);
+ 
+ 	if (!bo->sync_obj) {
+@@ -464,31 +502,52 @@ static int ttm_bo_cleanup_refs(struct tt
+ 		spin_unlock(&bo->lock);
+ 
+ 		spin_lock(&glob->lru_lock);
+-		put_count = ttm_bo_del_from_lru(bo);
++		ret = ttm_bo_reserve_locked(bo, false, !remove_all, false, 0);
+ 
+-		ret = ttm_bo_reserve_locked(bo, false, false, false, 0);
+-		BUG_ON(ret);
+-		if (bo->ttm)
+-			ttm_tt_unbind(bo->ttm);
++		/**
++		 * Someone else has the object reserved. Bail and retry.
++		 */
++
++		if (unlikely(ret == -EBUSY)) {
++			spin_unlock(&glob->lru_lock);
++			spin_lock(&bo->lock);
++			goto requeue;
++		}
++
++		/**
++		 * We can re-check for sync object without taking
++		 * the bo::lock since setting the sync object requires
++		 * also bo::reserved. A busy object at this point may
++		 * be caused by another thread starting an accelerated
++		 * eviction.
++		 */
++
++		if (unlikely(bo->sync_obj)) {
++			atomic_set(&bo->reserved, 0);
++			wake_up_all(&bo->event_queue);
++			spin_unlock(&glob->lru_lock);
++			spin_lock(&bo->lock);
++			if (remove_all)
++				goto retry;
++			else
++				goto requeue;
++		}
++
++		put_count = ttm_bo_del_from_lru(bo);
+ 
+ 		if (!list_empty(&bo->ddestroy)) {
+ 			list_del_init(&bo->ddestroy);
+ 			++put_count;
+ 		}
+-		if (bo->mem.mm_node) {
+-			drm_mm_put_block(bo->mem.mm_node);
+-			bo->mem.mm_node = NULL;
+-		}
+-		spin_unlock(&glob->lru_lock);
+ 
+-		atomic_set(&bo->reserved, 0);
++		ttm_bo_cleanup_memtype_use(bo);
+ 
+ 		while (put_count--)
+ 			kref_put(&bo->list_kref, ttm_bo_ref_bug);
+ 
+ 		return 0;
+ 	}
+-
++requeue:
+ 	spin_lock(&glob->lru_lock);
+ 	if (list_empty(&bo->ddestroy)) {
+ 		void *sync_obj = bo->sync_obj;
+--- a/drivers/i2c/busses/i2c-cpm.c
++++ b/drivers/i2c/busses/i2c-cpm.c
+@@ -677,6 +677,11 @@ static int __devinit cpm_i2c_probe(struc
+ 	dev_dbg(&ofdev->dev, "hw routines for %s registered.\n",
+ 		cpm->adap.name);
+ 
++	/*
++	 * register OF I2C devices
++	 */
++	of_i2c_register_devices(&cpm->adap);
++
+ 	return 0;
+ out_shut:
+ 	cpm_i2c_shutdown(cpm);
+--- a/drivers/i2c/busses/i2c-ibm_iic.c
++++ b/drivers/i2c/busses/i2c-ibm_iic.c
+@@ -761,6 +761,9 @@ static int __devinit iic_probe(struct pl
+ 	dev_info(&ofdev->dev, "using %s mode\n",
+ 		 dev->fast_mode ? "fast (400 kHz)" : "standard (100 kHz)");
+ 
++	/* Now register all the child nodes */
++	of_i2c_register_devices(adap);
++
+ 	return 0;
+ 
+ error_cleanup:
+--- a/drivers/i2c/busses/i2c-mpc.c
++++ b/drivers/i2c/busses/i2c-mpc.c
+@@ -632,6 +632,7 @@ static int __devinit fsl_i2c_probe(struc
+ 		dev_err(i2c->dev, "failed to add adapter\n");
+ 		goto fail_add;
+ 	}
++	of_i2c_register_devices(&i2c->adap);
+ 
+ 	return result;
+ 
+--- a/drivers/i2c/busses/i2c-pca-isa.c
++++ b/drivers/i2c/busses/i2c-pca-isa.c
+@@ -71,8 +71,8 @@ static int pca_isa_readbyte(void *pd, in
+ 
+ static int pca_isa_waitforcompletion(void *pd)
+ {
+-	long ret = ~0;
+ 	unsigned long timeout;
++	long ret;
+ 
+ 	if (irq > -1) {
+ 		ret = wait_event_timeout(pca_wait,
+@@ -81,11 +81,15 @@ static int pca_isa_waitforcompletion(voi
+ 	} else {
+ 		/* Do polling */
+ 		timeout = jiffies + pca_isa_ops.timeout;
+-		while (((pca_isa_readbyte(pd, I2C_PCA_CON)
+-				& I2C_PCA_CON_SI) == 0)
+-				&& (ret = time_before(jiffies, timeout)))
++		do {
++			ret = time_before(jiffies, timeout);
++			if (pca_isa_readbyte(pd, I2C_PCA_CON)
++					& I2C_PCA_CON_SI)
++				break;
+ 			udelay(100);
++		} while (ret);
+ 	}
++
+ 	return ret > 0;
+ }
+ 
+--- a/drivers/i2c/busses/i2c-pca-platform.c
++++ b/drivers/i2c/busses/i2c-pca-platform.c
+@@ -80,8 +80,8 @@ static void i2c_pca_pf_writebyte32(void
+ static int i2c_pca_pf_waitforcompletion(void *pd)
+ {
+ 	struct i2c_pca_pf_data *i2c = pd;
+-	long ret = ~0;
+ 	unsigned long timeout;
++	long ret;
+ 
+ 	if (i2c->irq) {
+ 		ret = wait_event_timeout(i2c->wait,
+@@ -90,10 +90,13 @@ static int i2c_pca_pf_waitforcompletion(
+ 	} else {
+ 		/* Do polling */
+ 		timeout = jiffies + i2c->adap.timeout;
+-		while (((i2c->algo_data.read_byte(i2c, I2C_PCA_CON)
+-				& I2C_PCA_CON_SI) == 0)
+-				&& (ret = time_before(jiffies, timeout)))
++		do {
++			ret = time_before(jiffies, timeout);
++			if (i2c->algo_data.read_byte(i2c, I2C_PCA_CON)
++					& I2C_PCA_CON_SI)
++				break;
+ 			udelay(100);
++		} while (ret);
+ 	}
+ 
+ 	return ret > 0;
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@ -32,7 +32,6 @@
+ #include <linux/init.h>
+ #include <linux/idr.h>
+ #include <linux/mutex.h>
+-#include <linux/of_i2c.h>
+ #include <linux/of_device.h>
+ #include <linux/completion.h>
+ #include <linux/hardirq.h>
+@@ -197,11 +196,12 @@ static int i2c_device_pm_suspend(struct
+ {
+ 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+ 
+-	if (pm_runtime_suspended(dev))
+-		return 0;
+-
+-	if (pm)
+-		return pm->suspend ? pm->suspend(dev) : 0;
++	if (pm) {
++		if (pm_runtime_suspended(dev))
++			return 0;
++		else
++			return pm->suspend ? pm->suspend(dev) : 0;
++	}
+ 
+ 	return i2c_legacy_suspend(dev, PMSG_SUSPEND);
+ }
+@@ -216,12 +216,6 @@ static int i2c_device_pm_resume(struct d
+ 	else
+ 		ret = i2c_legacy_resume(dev);
+ 
+-	if (!ret) {
+-		pm_runtime_disable(dev);
+-		pm_runtime_set_active(dev);
+-		pm_runtime_enable(dev);
+-	}
+-
+ 	return ret;
+ }
+ 
+@@ -229,11 +223,12 @@ static int i2c_device_pm_freeze(struct d
+ {
+ 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+ 
+-	if (pm_runtime_suspended(dev))
+-		return 0;
+-
+-	if (pm)
+-		return pm->freeze ? pm->freeze(dev) : 0;
++	if (pm) {
++		if (pm_runtime_suspended(dev))
++			return 0;
++		else
++			return pm->freeze ? pm->freeze(dev) : 0;
++	}
+ 
+ 	return i2c_legacy_suspend(dev, PMSG_FREEZE);
+ }
+@@ -242,11 +237,12 @@ static int i2c_device_pm_thaw(struct dev
+ {
+ 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+ 
+-	if (pm_runtime_suspended(dev))
+-		return 0;
+-
+-	if (pm)
+-		return pm->thaw ? pm->thaw(dev) : 0;
++	if (pm) {
++		if (pm_runtime_suspended(dev))
++			return 0;
++		else
++			return pm->thaw ? pm->thaw(dev) : 0;
++	}
+ 
+ 	return i2c_legacy_resume(dev);
+ }
+@@ -255,11 +251,12 @@ static int i2c_device_pm_poweroff(struct
+ {
+ 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+ 
+-	if (pm_runtime_suspended(dev))
+-		return 0;
+-
+-	if (pm)
+-		return pm->poweroff ? pm->poweroff(dev) : 0;
++	if (pm) {
++		if (pm_runtime_suspended(dev))
++			return 0;
++		else
++			return pm->poweroff ? pm->poweroff(dev) : 0;
++	}
+ 
+ 	return i2c_legacy_suspend(dev, PMSG_HIBERNATE);
+ }
+@@ -876,9 +873,6 @@ static int i2c_register_adapter(struct i
+ 	if (adap->nr < __i2c_first_dynamic_bus_num)
+ 		i2c_scan_static_board_info(adap);
+ 
+-	/* Register devices from the device tree */
+-	of_i2c_register_devices(adap);
+-
+ 	/* Notify drivers */
+ 	mutex_lock(&core_lock);
+ 	bus_for_each_drv(&i2c_bus_type, NULL, adap, __process_new_adapter);
+--- a/drivers/input/joydev.c
++++ b/drivers/input/joydev.c
+@@ -483,6 +483,9 @@ static int joydev_handle_JSIOCSAXMAP(str
+ 
+ 	memcpy(joydev->abspam, abspam, len);
+ 
++	for (i = 0; i < joydev->nabs; i++)
++		joydev->absmap[joydev->abspam[i]] = i;
++
+  out:
+ 	kfree(abspam);
+ 	return retval;
+--- a/drivers/input/misc/uinput.c
++++ b/drivers/input/misc/uinput.c
+@@ -404,6 +404,13 @@ static int uinput_setup_device(struct ui
+ 		retval = uinput_validate_absbits(dev);
+ 		if (retval < 0)
+ 			goto exit;
++		if (test_bit(ABS_MT_SLOT, dev->absbit)) {
++			int nslot = input_abs_get_max(dev, ABS_MT_SLOT) + 1;
++			input_mt_create_slots(dev, nslot);
++			input_set_events_per_packet(dev, 6 * nslot);
++		} else if (test_bit(ABS_MT_POSITION_X, dev->absbit)) {
++			input_set_events_per_packet(dev, 60);
++		}
+ 	}
+ 
+ 	udev->state = UIST_SETUP_COMPLETE;
+--- a/drivers/input/tablet/wacom_sys.c
++++ b/drivers/input/tablet/wacom_sys.c
+@@ -103,27 +103,26 @@ static void wacom_sys_irq(struct urb *ur
+ static int wacom_open(struct input_dev *dev)
+ {
+ 	struct wacom *wacom = input_get_drvdata(dev);
++	int retval = 0;
+ 
+-	mutex_lock(&wacom->lock);
+-
+-	wacom->irq->dev = wacom->usbdev;
+-
+-	if (usb_autopm_get_interface(wacom->intf) < 0) {
+-		mutex_unlock(&wacom->lock);
++	if (usb_autopm_get_interface(wacom->intf) < 0)
+ 		return -EIO;
+-	}
++
++	mutex_lock(&wacom->lock);
+ 
+ 	if (usb_submit_urb(wacom->irq, GFP_KERNEL)) {
+-		usb_autopm_put_interface(wacom->intf);
+-		mutex_unlock(&wacom->lock);
+-		return -EIO;
++		retval = -EIO;
++		goto out;
+ 	}
+ 
+ 	wacom->open = true;
+ 	wacom->intf->needs_remote_wakeup = 1;
+ 
++out:
+ 	mutex_unlock(&wacom->lock);
+-	return 0;
++	if (retval)
++		usb_autopm_put_interface(wacom->intf);
++	return retval;
+ }
+ 
+ static void wacom_close(struct input_dev *dev)
+@@ -135,6 +134,8 @@ static void wacom_close(struct input_dev
+ 	wacom->open = false;
+ 	wacom->intf->needs_remote_wakeup = 0;
+ 	mutex_unlock(&wacom->lock);
++
++	usb_autopm_put_interface(wacom->intf);
+ }
+ 
+ static int wacom_parse_hid(struct usb_interface *intf, struct hid_descriptor *hid_desc,
+--- a/drivers/md/bitmap.c
++++ b/drivers/md/bitmap.c
+@@ -1000,10 +1000,11 @@ static int bitmap_init_from_disk(struct
+ 				page = bitmap->sb_page;
+ 				offset = sizeof(bitmap_super_t);
+ 				if (!file)
+-					read_sb_page(bitmap->mddev,
+-						     bitmap->mddev->bitmap_info.offset,
+-						     page,
+-						     index, count);
++					page = read_sb_page(
++						bitmap->mddev,
++						bitmap->mddev->bitmap_info.offset,
++						page,
++						index, count);
+ 			} else if (file) {
+ 				page = read_page(file, index, bitmap, count);
+ 				offset = 0;
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -1839,7 +1839,9 @@ static sector_t sync_request(mddev_t *md
+ 
+ 		/* take from bio_init */
+ 		bio->bi_next = NULL;
++		bio->bi_flags &= ~(BIO_POOL_MASK-1);
+ 		bio->bi_flags |= 1 << BIO_UPTODATE;
++		bio->bi_comp_cpu = -1;
+ 		bio->bi_rw = READ;
+ 		bio->bi_vcnt = 0;
+ 		bio->bi_idx = 0;
+@@ -1912,7 +1914,7 @@ static sector_t sync_request(mddev_t *md
+ 			    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
+ 				break;
+ 			BUG_ON(sync_blocks < (PAGE_SIZE>>9));
+-			if (len > (sync_blocks<<9))
++			if ((len >> 9) > sync_blocks)
+ 				len = sync_blocks<<9;
+ 		}
+ 
+--- a/drivers/media/IR/ir-keytable.c
++++ b/drivers/media/IR/ir-keytable.c
+@@ -319,7 +319,7 @@ static void ir_timer_keyup(unsigned long
+ 	 * a keyup event might follow immediately after the keydown.
+ 	 */
+ 	spin_lock_irqsave(&ir->keylock, flags);
+-	if (time_is_after_eq_jiffies(ir->keyup_jiffies))
++	if (time_is_before_eq_jiffies(ir->keyup_jiffies))
+ 		ir_keyup(ir);
+ 	spin_unlock_irqrestore(&ir->keylock, flags);
+ }
+@@ -510,6 +510,13 @@ int __ir_input_register(struct input_dev
+ 		   (ir_dev->props && ir_dev->props->driver_type == RC_DRIVER_IR_RAW) ?
+ 			" in raw mode" : "");
+ 
++	/*
++	 * Default delay of 250ms is too short for some protocols, expecially
++	 * since the timeout is currently set to 250ms. Increase it to 500ms,
++	 * to avoid wrong repetition of the keycodes.
++	 */
++	input_dev->rep[REP_DELAY] = 500;
++
+ 	return 0;
+ 
+ out_event:
+--- a/drivers/media/IR/ir-lirc-codec.c
++++ b/drivers/media/IR/ir-lirc-codec.c
+@@ -267,7 +267,7 @@ static int ir_lirc_register(struct input
+ 			features |= LIRC_CAN_SET_SEND_CARRIER;
+ 
+ 		if (ir_dev->props->s_tx_duty_cycle)
+-			features |= LIRC_CAN_SET_REC_DUTY_CYCLE;
++			features |= LIRC_CAN_SET_SEND_DUTY_CYCLE;
+ 	}
+ 
+ 	if (ir_dev->props->s_rx_carrier_range)
+--- a/drivers/media/IR/ir-raw-event.c
++++ b/drivers/media/IR/ir-raw-event.c
+@@ -279,9 +279,11 @@ int ir_raw_event_register(struct input_d
+ 			"rc%u",  (unsigned int)ir->devno);
+ 
+ 	if (IS_ERR(ir->raw->thread)) {
++		int ret = PTR_ERR(ir->raw->thread);
++
+ 		kfree(ir->raw);
+ 		ir->raw = NULL;
+-		return PTR_ERR(ir->raw->thread);
++		return ret;
+ 	}
+ 
+ 	mutex_lock(&ir_raw_handler_lock);
+--- a/drivers/media/IR/ir-sysfs.c
++++ b/drivers/media/IR/ir-sysfs.c
+@@ -67,13 +67,14 @@ static ssize_t show_protocols(struct dev
+ 	char *tmp = buf;
+ 	int i;
+ 
+-	if (ir_dev->props->driver_type == RC_DRIVER_SCANCODE) {
++	if (ir_dev->props && ir_dev->props->driver_type == RC_DRIVER_SCANCODE) {
+ 		enabled = ir_dev->rc_tab.ir_type;
+ 		allowed = ir_dev->props->allowed_protos;
+-	} else {
++	} else if (ir_dev->raw) {
+ 		enabled = ir_dev->raw->enabled_protocols;
+ 		allowed = ir_raw_get_allowed_protocols();
+-	}
++	} else
++		return sprintf(tmp, "[builtin]\n");
+ 
+ 	IR_dprintk(1, "allowed - 0x%llx, enabled - 0x%llx\n",
+ 		   (long long)allowed,
+@@ -121,10 +122,14 @@ static ssize_t store_protocols(struct de
+ 	int rc, i, count = 0;
+ 	unsigned long flags;
+ 
+-	if (ir_dev->props->driver_type == RC_DRIVER_SCANCODE)
++	if (ir_dev->props && ir_dev->props->driver_type == RC_DRIVER_SCANCODE)
+ 		type = ir_dev->rc_tab.ir_type;
+-	else
++	else if (ir_dev->raw)
+ 		type = ir_dev->raw->enabled_protocols;
++	else {
++		IR_dprintk(1, "Protocol switching not supported\n");
++		return -EINVAL;
++	}
+ 
+ 	while ((tmp = strsep((char **) &data, " \n")) != NULL) {
+ 		if (!*tmp)
+@@ -185,7 +190,7 @@ static ssize_t store_protocols(struct de
+ 		}
+ 	}
+ 
+-	if (ir_dev->props->driver_type == RC_DRIVER_SCANCODE) {
++	if (ir_dev->props && ir_dev->props->driver_type == RC_DRIVER_SCANCODE) {
+ 		spin_lock_irqsave(&ir_dev->rc_tab.lock, flags);
+ 		ir_dev->rc_tab.ir_type = type;
+ 		spin_unlock_irqrestore(&ir_dev->rc_tab.lock, flags);
+--- a/drivers/media/IR/keymaps/rc-rc6-mce.c
++++ b/drivers/media/IR/keymaps/rc-rc6-mce.c
+@@ -19,6 +19,7 @@ static struct ir_scancode rc6_mce[] = {
+ 
+ 	{ 0x800f0416, KEY_PLAY },
+ 	{ 0x800f0418, KEY_PAUSE },
++	{ 0x800f046e, KEY_PLAYPAUSE },
+ 	{ 0x800f0419, KEY_STOP },
+ 	{ 0x800f0417, KEY_RECORD },
+ 
+@@ -37,6 +38,8 @@ static struct ir_scancode rc6_mce[] = {
+ 	{ 0x800f0411, KEY_VOLUMEDOWN },
+ 	{ 0x800f0412, KEY_CHANNELUP },
+ 	{ 0x800f0413, KEY_CHANNELDOWN },
++	{ 0x800f043a, KEY_BRIGHTNESSUP },
++	{ 0x800f0480, KEY_BRIGHTNESSDOWN },
+ 
+ 	{ 0x800f0401, KEY_NUMERIC_1 },
+ 	{ 0x800f0402, KEY_NUMERIC_2 },
+--- a/drivers/media/IR/mceusb.c
++++ b/drivers/media/IR/mceusb.c
+@@ -120,6 +120,10 @@ static struct usb_device_id mceusb_dev_t
+ 	{ USB_DEVICE(VENDOR_PHILIPS, 0x0613) },
+ 	/* Philips eHome Infrared Transceiver */
+ 	{ USB_DEVICE(VENDOR_PHILIPS, 0x0815) },
++	/* Philips/Spinel plus IR transceiver for ASUS */
++	{ USB_DEVICE(VENDOR_PHILIPS, 0x206c) },
++	/* Philips/Spinel plus IR transceiver for ASUS */
++	{ USB_DEVICE(VENDOR_PHILIPS, 0x2088) },
+ 	/* Realtek MCE IR Receiver */
+ 	{ USB_DEVICE(VENDOR_REALTEK, 0x0161) },
+ 	/* SMK/Toshiba G83C0004D410 */
+--- a/drivers/media/dvb/dvb-usb/dib0700_core.c
++++ b/drivers/media/dvb/dvb-usb/dib0700_core.c
+@@ -673,9 +673,6 @@ static int dib0700_probe(struct usb_inte
+ 			else
+ 				dev->props.rc.core.bulk_mode = false;
+ 
+-			/* Need a higher delay, to avoid wrong repeat */
+-			dev->rc_input_dev->rep[REP_DELAY] = 500;
+-
+ 			dib0700_rc_setup(dev);
+ 
+ 			return 0;
+--- a/drivers/media/dvb/dvb-usb/dib0700_devices.c
++++ b/drivers/media/dvb/dvb-usb/dib0700_devices.c
+@@ -940,6 +940,58 @@ static int stk7070p_frontend_attach(stru
+ 	return adap->fe == NULL ? -ENODEV : 0;
+ }
+ 
++/* STK7770P */
++static struct dib7000p_config dib7770p_dib7000p_config = {
++	.output_mpeg2_in_188_bytes = 1,
++
++	.agc_config_count = 1,
++	.agc = &dib7070_agc_config,
++	.bw  = &dib7070_bw_config_12_mhz,
++	.tuner_is_baseband = 1,
++	.spur_protect = 1,
++
++	.gpio_dir = DIB7000P_GPIO_DEFAULT_DIRECTIONS,
++	.gpio_val = DIB7000P_GPIO_DEFAULT_VALUES,
++	.gpio_pwm_pos = DIB7000P_GPIO_DEFAULT_PWM_POS,
++
++	.hostbus_diversity = 1,
++	.enable_current_mirror = 1,
++	.disable_sample_and_hold = 0,
++};
++
++static int stk7770p_frontend_attach(struct dvb_usb_adapter *adap)
++{
++	struct usb_device_descriptor *p = &adap->dev->udev->descriptor;
++	if (p->idVendor  == cpu_to_le16(USB_VID_PINNACLE) &&
++	    p->idProduct == cpu_to_le16(USB_PID_PINNACLE_PCTV72E))
++		dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 0);
++	else
++		dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
++	msleep(10);
++	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
++	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
++	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
++	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
++
++	dib0700_ctrl_clock(adap->dev, 72, 1);
++
++	msleep(10);
++	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
++	msleep(10);
++	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
++
++	if (dib7000p_i2c_enumeration(&adap->dev->i2c_adap, 1, 18,
++				     &dib7770p_dib7000p_config) != 0) {
++		err("%s: dib7000p_i2c_enumeration failed.  Cannot continue\n",
++		    __func__);
++		return -ENODEV;
++	}
++
++	adap->fe = dvb_attach(dib7000p_attach, &adap->dev->i2c_adap, 0x80,
++		&dib7770p_dib7000p_config);
++	return adap->fe == NULL ? -ENODEV : 0;
++}
++
+ /* DIB807x generic */
+ static struct dibx000_agc_config dib807x_agc_config[2] = {
+ 	{
+@@ -1781,7 +1833,7 @@ struct usb_device_id dib0700_usb_id_tabl
+ /* 60 */{ USB_DEVICE(USB_VID_TERRATEC,	USB_PID_TERRATEC_CINERGY_T_XXS_2) },
+ 	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_STK807XPVR) },
+ 	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_STK807XP) },
+-	{ USB_DEVICE(USB_VID_PIXELVIEW, USB_PID_PIXELVIEW_SBTVD) },
++	{ USB_DEVICE_VER(USB_VID_PIXELVIEW, USB_PID_PIXELVIEW_SBTVD, 0x000, 0x3f00) },
+ 	{ USB_DEVICE(USB_VID_EVOLUTEPC, USB_PID_TVWAY_PLUS) },
+ /* 65 */{ USB_DEVICE(USB_VID_PINNACLE,	USB_PID_PINNACLE_PCTV73ESE) },
+ 	{ USB_DEVICE(USB_VID_PINNACLE,	USB_PID_PINNACLE_PCTV282E) },
+@@ -2406,7 +2458,7 @@ struct dvb_usb_device_properties dib0700
+ 				.pid_filter_count = 32,
+ 				.pid_filter       = stk70x0p_pid_filter,
+ 				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
+-				.frontend_attach  = stk7070p_frontend_attach,
++				.frontend_attach  = stk7770p_frontend_attach,
+ 				.tuner_attach     = dib7770p_tuner_attach,
+ 
+ 				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
+--- a/drivers/media/dvb/dvb-usb/opera1.c
++++ b/drivers/media/dvb/dvb-usb/opera1.c
+@@ -483,9 +483,7 @@ static int opera1_xilinx_load_firmware(s
+ 		}
+ 	}
+ 	kfree(p);
+-	if (fw) {
+-		release_firmware(fw);
+-	}
++	release_firmware(fw);
+ 	return ret;
+ }
+ 
+--- a/drivers/media/dvb/frontends/dib7000p.c
++++ b/drivers/media/dvb/frontends/dib7000p.c
+@@ -260,6 +260,9 @@ static void dib7000p_set_adc_state(struc
+ 
+ //	dprintk( "908: %x, 909: %x\n", reg_908, reg_909);
+ 
++	reg_909 |= (state->cfg.disable_sample_and_hold & 1) << 4;
++	reg_908 |= (state->cfg.enable_current_mirror & 1) << 7;
++
+ 	dib7000p_write_word(state, 908, reg_908);
+ 	dib7000p_write_word(state, 909, reg_909);
+ }
+@@ -778,7 +781,10 @@ static void dib7000p_set_channel(struct
+ 		default:
+ 		case GUARD_INTERVAL_1_32: value *= 1; break;
+ 	}
+-	state->div_sync_wait = (value * 3) / 2 + 32; // add 50% SFN margin + compensate for one DVSY-fifo TODO
++	if (state->cfg.diversity_delay == 0)
++		state->div_sync_wait = (value * 3) / 2 + 48; // add 50% SFN margin + compensate for one DVSY-fifo
++	else
++		state->div_sync_wait = (value * 3) / 2 + state->cfg.diversity_delay; // add 50% SFN margin + compensate for one DVSY-fifo
+ 
+ 	/* deactive the possibility of diversity reception if extended interleaver */
+ 	state->div_force_off = !1 && ch->u.ofdm.transmission_mode != TRANSMISSION_MODE_8K;
+--- a/drivers/media/dvb/frontends/dib7000p.h
++++ b/drivers/media/dvb/frontends/dib7000p.h
+@@ -33,6 +33,11 @@ struct dib7000p_config {
+ 	int (*agc_control) (struct dvb_frontend *, u8 before);
+ 
+ 	u8 output_mode;
++	u8 disable_sample_and_hold : 1;
++
++	u8 enable_current_mirror : 1;
++	u8 diversity_delay;
++
+ };
+ 
+ #define DEFAULT_DIB7000P_I2C_ADDRESS 18
+--- a/drivers/media/dvb/siano/smscoreapi.c
++++ b/drivers/media/dvb/siano/smscoreapi.c
+@@ -1098,33 +1098,26 @@ EXPORT_SYMBOL_GPL(smscore_onresponse);
+  *
+  * @return pointer to descriptor on success, NULL on error.
+  */
+-struct smscore_buffer_t *smscore_getbuffer(struct smscore_device_t *coredev)
++
++struct smscore_buffer_t *get_entry(struct smscore_device_t *coredev)
+ {
+ 	struct smscore_buffer_t *cb = NULL;
+ 	unsigned long flags;
+ 
+-	DEFINE_WAIT(wait);
+-
+ 	spin_lock_irqsave(&coredev->bufferslock, flags);
+-
+-	/* This function must return a valid buffer, since the buffer list is
+-	 * finite, we check that there is an available buffer, if not, we wait
+-	 * until such buffer become available.
+-	 */
+-
+-	prepare_to_wait(&coredev->buffer_mng_waitq, &wait, TASK_INTERRUPTIBLE);
+-	if (list_empty(&coredev->buffers)) {
+-		spin_unlock_irqrestore(&coredev->bufferslock, flags);
+-		schedule();
+-		spin_lock_irqsave(&coredev->bufferslock, flags);
++	if (!list_empty(&coredev->buffers)) {
++		cb = (struct smscore_buffer_t *) coredev->buffers.next;
++		list_del(&cb->entry);
+ 	}
++	spin_unlock_irqrestore(&coredev->bufferslock, flags);
++	return cb;
++}
+ 
+-	finish_wait(&coredev->buffer_mng_waitq, &wait);
+-
+-	cb = (struct smscore_buffer_t *) coredev->buffers.next;
+-	list_del(&cb->entry);
++struct smscore_buffer_t *smscore_getbuffer(struct smscore_device_t *coredev)
++{
++	struct smscore_buffer_t *cb = NULL;
+ 
+-	spin_unlock_irqrestore(&coredev->bufferslock, flags);
++	wait_event(coredev->buffer_mng_waitq, (cb = get_entry(coredev)));
+ 
+ 	return cb;
+ }
+--- a/drivers/media/radio/si470x/radio-si470x-i2c.c
++++ b/drivers/media/radio/si470x/radio-si470x-i2c.c
+@@ -395,7 +395,7 @@ static int __devinit si470x_i2c_probe(st
+ 	radio->registers[POWERCFG] = POWERCFG_ENABLE;
+ 	if (si470x_set_register(radio, POWERCFG) < 0) {
+ 		retval = -EIO;
+-		goto err_all;
++		goto err_video;
+ 	}
+ 	msleep(110);
+ 
+--- a/drivers/media/video/cx231xx/Makefile
++++ b/drivers/media/video/cx231xx/Makefile
+@@ -11,4 +11,5 @@ EXTRA_CFLAGS += -Idrivers/media/video
+ EXTRA_CFLAGS += -Idrivers/media/common/tuners
+ EXTRA_CFLAGS += -Idrivers/media/dvb/dvb-core
+ EXTRA_CFLAGS += -Idrivers/media/dvb/frontends
++EXTRA_CFLAGS += -Idrivers/media/dvb/dvb-usb
+ 
+--- a/drivers/media/video/cx231xx/cx231xx-cards.c
++++ b/drivers/media/video/cx231xx/cx231xx-cards.c
+@@ -32,6 +32,7 @@
+ #include <media/v4l2-chip-ident.h>
+ 
+ #include <media/cx25840.h>
++#include "dvb-usb-ids.h"
+ #include "xc5000.h"
+ 
+ #include "cx231xx.h"
+@@ -175,6 +176,8 @@ struct usb_device_id cx231xx_id_table[]
+ 	 .driver_info = CX231XX_BOARD_CNXT_RDE_250},
+ 	{USB_DEVICE(0x0572, 0x58A1),
+ 	 .driver_info = CX231XX_BOARD_CNXT_RDU_250},
++	{USB_DEVICE_VER(USB_VID_PIXELVIEW, USB_PID_PIXELVIEW_SBTVD, 0x4000,0x4fff),
++	 .driver_info = CX231XX_BOARD_UNKNOWN},
+ 	{},
+ };
+ 
+@@ -226,14 +229,16 @@ void cx231xx_pre_card_setup(struct cx231
+ 		     dev->board.name, dev->model);
+ 
+ 	/* set the direction for GPIO pins */
+-	cx231xx_set_gpio_direction(dev, dev->board.tuner_gpio->bit, 1);
+-	cx231xx_set_gpio_value(dev, dev->board.tuner_gpio->bit, 1);
+-	cx231xx_set_gpio_direction(dev, dev->board.tuner_sif_gpio, 1);
++	if (dev->board.tuner_gpio) {
++		cx231xx_set_gpio_direction(dev, dev->board.tuner_gpio->bit, 1);
++		cx231xx_set_gpio_value(dev, dev->board.tuner_gpio->bit, 1);
++		cx231xx_set_gpio_direction(dev, dev->board.tuner_sif_gpio, 1);
+ 
+-	/* request some modules if any required */
++		/* request some modules if any required */
+ 
+-	/* reset the Tuner */
+-	cx231xx_gpio_set(dev, dev->board.tuner_gpio);
++		/* reset the Tuner */
++		cx231xx_gpio_set(dev, dev->board.tuner_gpio);
++	}
+ 
+ 	/* set the mode to Analog mode initially */
+ 	cx231xx_set_mode(dev, CX231XX_ANALOG_MODE);
+--- a/drivers/media/video/cx25840/cx25840-core.c
++++ b/drivers/media/video/cx25840/cx25840-core.c
+@@ -1996,7 +1996,7 @@ static int cx25840_probe(struct i2c_clie
+ 
+ 		state->volume = v4l2_ctrl_new_std(&state->hdl,
+ 			&cx25840_audio_ctrl_ops, V4L2_CID_AUDIO_VOLUME,
+-			0, 65335, 65535 / 100, default_volume);
++			0, 65535, 65535 / 100, default_volume);
+ 		state->mute = v4l2_ctrl_new_std(&state->hdl,
+ 			&cx25840_audio_ctrl_ops, V4L2_CID_AUDIO_MUTE,
+ 			0, 1, 1, 0);
+--- a/drivers/media/video/cx88/Kconfig
++++ b/drivers/media/video/cx88/Kconfig
+@@ -17,7 +17,7 @@ config VIDEO_CX88
+ 
+ config VIDEO_CX88_ALSA
+ 	tristate "Conexant 2388x DMA audio support"
+-	depends on VIDEO_CX88 && SND && EXPERIMENTAL
++	depends on VIDEO_CX88 && SND
+ 	select SND_PCM
+ 	---help---
+ 	  This is a video4linux driver for direct (DMA) audio on
+--- a/drivers/media/video/gspca/gspca.c
++++ b/drivers/media/video/gspca/gspca.c
+@@ -223,6 +223,7 @@ static int alloc_and_submit_int_urb(stru
+ 		usb_rcvintpipe(dev, ep->bEndpointAddress),
+ 		buffer, buffer_len,
+ 		int_irq, (void *)gspca_dev, interval);
++	urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+ 	gspca_dev->int_urb = urb;
+ 	ret = usb_submit_urb(urb, GFP_KERNEL);
+ 	if (ret < 0) {
+--- a/drivers/media/video/gspca/sn9c20x.c
++++ b/drivers/media/video/gspca/sn9c20x.c
+@@ -2357,8 +2357,7 @@ static void sd_pkt_scan(struct gspca_dev
+ 			    (data[33] << 10);
+ 		avg_lum >>= 9;
+ 		atomic_set(&sd->avg_lum, avg_lum);
+-		gspca_frame_add(gspca_dev, LAST_PACKET,
+-				data, len);
++		gspca_frame_add(gspca_dev, LAST_PACKET, NULL, 0);
+ 		return;
+ 	}
+ 	if (gspca_dev->last_packet_type == LAST_PACKET) {
+--- a/drivers/media/video/ivtv/ivtvfb.c
++++ b/drivers/media/video/ivtv/ivtvfb.c
+@@ -466,6 +466,8 @@ static int ivtvfb_ioctl(struct fb_info *
+ 			struct fb_vblank vblank;
+ 			u32 trace;
+ 
++			memset(&vblank, 0, sizeof(struct fb_vblank));
++
+ 			vblank.flags = FB_VBLANK_HAVE_COUNT |FB_VBLANK_HAVE_VCOUNT |
+ 					FB_VBLANK_HAVE_VSYNC;
+ 			trace = read_reg(IVTV_REG_DEC_LINE_FIELD) >> 16;
+--- a/drivers/media/video/mem2mem_testdev.c
++++ b/drivers/media/video/mem2mem_testdev.c
+@@ -239,7 +239,7 @@ static int device_process(struct m2mtest
+ 		return -EFAULT;
+ 	}
+ 
+-	if (in_buf->vb.size < out_buf->vb.size) {
++	if (in_buf->vb.size > out_buf->vb.size) {
+ 		v4l2_err(&dev->v4l2_dev, "Output buffer is too small\n");
+ 		return -EINVAL;
+ 	}
+@@ -1014,6 +1014,7 @@ static int m2mtest_remove(struct platfor
+ 	v4l2_m2m_release(dev->m2m_dev);
+ 	del_timer_sync(&dev->timer);
+ 	video_unregister_device(dev->vfd);
++	video_device_release(dev->vfd);
+ 	v4l2_device_unregister(&dev->v4l2_dev);
+ 	kfree(dev);
+ 
+--- a/drivers/media/video/mt9m111.c
++++ b/drivers/media/video/mt9m111.c
+@@ -447,6 +447,9 @@ static int mt9m111_s_crop(struct v4l2_su
+ 	dev_dbg(&client->dev, "%s left=%d, top=%d, width=%d, height=%d\n",
+ 		__func__, rect.left, rect.top, rect.width, rect.height);
+ 
++	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
++		return -EINVAL;
++
+ 	ret = mt9m111_make_rect(client, &rect);
+ 	if (!ret)
+ 		mt9m111->rect = rect;
+@@ -466,12 +469,14 @@ static int mt9m111_g_crop(struct v4l2_su
+ 
+ static int mt9m111_cropcap(struct v4l2_subdev *sd, struct v4l2_cropcap *a)
+ {
++	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
++		return -EINVAL;
++
+ 	a->bounds.left			= MT9M111_MIN_DARK_COLS;
+ 	a->bounds.top			= MT9M111_MIN_DARK_ROWS;
+ 	a->bounds.width			= MT9M111_MAX_WIDTH;
+ 	a->bounds.height		= MT9M111_MAX_HEIGHT;
+ 	a->defrect			= a->bounds;
+-	a->type				= V4L2_BUF_TYPE_VIDEO_CAPTURE;
+ 	a->pixelaspect.numerator	= 1;
+ 	a->pixelaspect.denominator	= 1;
+ 
+@@ -487,6 +492,7 @@ static int mt9m111_g_fmt(struct v4l2_sub
+ 	mf->width	= mt9m111->rect.width;
+ 	mf->height	= mt9m111->rect.height;
+ 	mf->code	= mt9m111->fmt->code;
++	mf->colorspace	= mt9m111->fmt->colorspace;
+ 	mf->field	= V4L2_FIELD_NONE;
+ 
+ 	return 0;
+--- a/drivers/media/video/mt9v022.c
++++ b/drivers/media/video/mt9v022.c
+@@ -402,9 +402,6 @@ static int mt9v022_s_fmt(struct v4l2_sub
+ 		if (mt9v022->model != V4L2_IDENT_MT9V022IX7ATC)
+ 			return -EINVAL;
+ 		break;
+-	case 0:
+-		/* No format change, only geometry */
+-		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+--- a/drivers/media/video/mx2_camera.c
++++ b/drivers/media/video/mx2_camera.c
+@@ -378,6 +378,9 @@ static void mx25_camera_frame_done(struc
+ 
+ 	spin_lock_irqsave(&pcdev->lock, flags);
+ 
++	if (*fb_active == NULL)
++		goto out;
++
+ 	vb = &(*fb_active)->vb;
+ 	dev_dbg(pcdev->dev, "%s (vb=0x%p) 0x%08lx %d\n", __func__,
+ 		vb, vb->baddr, vb->bsize);
+@@ -402,6 +405,7 @@ static void mx25_camera_frame_done(struc
+ 
+ 	*fb_active = buf;
+ 
++out:
+ 	spin_unlock_irqrestore(&pcdev->lock, flags);
+ }
+ 
+--- a/drivers/media/video/pvrusb2/pvrusb2-ctrl.c
++++ b/drivers/media/video/pvrusb2/pvrusb2-ctrl.c
+@@ -513,7 +513,7 @@ int pvr2_ctrl_sym_to_value(struct pvr2_c
+ 			if (ret >= 0) {
+ 				ret = pvr2_ctrl_range_check(cptr,*valptr);
+ 			}
+-			if (maskptr) *maskptr = ~0;
++			*maskptr = ~0;
+ 		} else if (cptr->info->type == pvr2_ctl_bool) {
+ 			ret = parse_token(ptr,len,valptr,boolNames,
+ 					  ARRAY_SIZE(boolNames));
+@@ -522,7 +522,7 @@ int pvr2_ctrl_sym_to_value(struct pvr2_c
+ 			} else if (ret == 0) {
+ 				*valptr = (*valptr & 1) ? !0 : 0;
+ 			}
+-			if (maskptr) *maskptr = 1;
++			*maskptr = 1;
+ 		} else if (cptr->info->type == pvr2_ctl_enum) {
+ 			ret = parse_token(
+ 				ptr,len,valptr,
+@@ -531,7 +531,7 @@ int pvr2_ctrl_sym_to_value(struct pvr2_c
+ 			if (ret >= 0) {
+ 				ret = pvr2_ctrl_range_check(cptr,*valptr);
+ 			}
+-			if (maskptr) *maskptr = ~0;
++			*maskptr = ~0;
+ 		} else if (cptr->info->type == pvr2_ctl_bitmask) {
+ 			ret = parse_tlist(
+ 				ptr,len,maskptr,valptr,
+--- a/drivers/media/video/s5p-fimc/fimc-core.c
++++ b/drivers/media/video/s5p-fimc/fimc-core.c
+@@ -393,6 +393,37 @@ static void fimc_set_yuv_order(struct fi
+ 	dbg("ctx->out_order_1p= %d", ctx->out_order_1p);
+ }
+ 
++static void fimc_prepare_dma_offset(struct fimc_ctx *ctx, struct fimc_frame *f)
++{
++	struct samsung_fimc_variant *variant = ctx->fimc_dev->variant;
++
++	f->dma_offset.y_h = f->offs_h;
++	if (!variant->pix_hoff)
++		f->dma_offset.y_h *= (f->fmt->depth >> 3);
++
++	f->dma_offset.y_v = f->offs_v;
++
++	f->dma_offset.cb_h = f->offs_h;
++	f->dma_offset.cb_v = f->offs_v;
++
++	f->dma_offset.cr_h = f->offs_h;
++	f->dma_offset.cr_v = f->offs_v;
++
++	if (!variant->pix_hoff) {
++		if (f->fmt->planes_cnt == 3) {
++			f->dma_offset.cb_h >>= 1;
++			f->dma_offset.cr_h >>= 1;
++		}
++		if (f->fmt->color == S5P_FIMC_YCBCR420) {
++			f->dma_offset.cb_v >>= 1;
++			f->dma_offset.cr_v >>= 1;
++		}
++	}
++
++	dbg("in_offset: color= %d, y_h= %d, y_v= %d",
++	    f->fmt->color, f->dma_offset.y_h, f->dma_offset.y_v);
++}
++
+ /**
+  * fimc_prepare_config - check dimensions, operation and color mode
+  *			 and pre-calculate offset and the scaling coefficients.
+@@ -406,7 +437,6 @@ static int fimc_prepare_config(struct fi
+ {
+ 	struct fimc_frame *s_frame, *d_frame;
+ 	struct fimc_vid_buffer *buf = NULL;
+-	struct samsung_fimc_variant *variant = ctx->fimc_dev->variant;
+ 	int ret = 0;
+ 
+ 	s_frame = &ctx->s_frame;
+@@ -419,61 +449,16 @@ static int fimc_prepare_config(struct fi
+ 			swap(d_frame->width, d_frame->height);
+ 		}
+ 
+-		/* Prepare the output offset ratios for scaler. */
+-		d_frame->dma_offset.y_h = d_frame->offs_h;
+-		if (!variant->pix_hoff)
+-			d_frame->dma_offset.y_h *= (d_frame->fmt->depth >> 3);
+-
+-		d_frame->dma_offset.y_v = d_frame->offs_v;
+-
+-		d_frame->dma_offset.cb_h = d_frame->offs_h;
+-		d_frame->dma_offset.cb_v = d_frame->offs_v;
+-
+-		d_frame->dma_offset.cr_h = d_frame->offs_h;
+-		d_frame->dma_offset.cr_v = d_frame->offs_v;
+-
+-		if (!variant->pix_hoff && d_frame->fmt->planes_cnt == 3) {
+-			d_frame->dma_offset.cb_h >>= 1;
+-			d_frame->dma_offset.cb_v >>= 1;
+-			d_frame->dma_offset.cr_h >>= 1;
+-			d_frame->dma_offset.cr_v >>= 1;
+-		}
++		/* Prepare the DMA offset ratios for scaler. */
++		fimc_prepare_dma_offset(ctx, &ctx->s_frame);
++		fimc_prepare_dma_offset(ctx, &ctx->d_frame);
+ 
+-		dbg("out offset: color= %d, y_h= %d, y_v= %d",
+-			d_frame->fmt->color,
+-			d_frame->dma_offset.y_h, d_frame->dma_offset.y_v);
+-
+-		/* Prepare the input offset ratios for scaler. */
+-		s_frame->dma_offset.y_h = s_frame->offs_h;
+-		if (!variant->pix_hoff)
+-			s_frame->dma_offset.y_h *= (s_frame->fmt->depth >> 3);
+-		s_frame->dma_offset.y_v = s_frame->offs_v;
+-
+-		s_frame->dma_offset.cb_h = s_frame->offs_h;
+-		s_frame->dma_offset.cb_v = s_frame->offs_v;
+-
+-		s_frame->dma_offset.cr_h = s_frame->offs_h;
+-		s_frame->dma_offset.cr_v = s_frame->offs_v;
+-
+-		if (!variant->pix_hoff && s_frame->fmt->planes_cnt == 3) {
+-			s_frame->dma_offset.cb_h >>= 1;
+-			s_frame->dma_offset.cb_v >>= 1;
+-			s_frame->dma_offset.cr_h >>= 1;
+-			s_frame->dma_offset.cr_v >>= 1;
+-		}
+-
+-		dbg("in offset: color= %d, y_h= %d, y_v= %d",
+-			s_frame->fmt->color, s_frame->dma_offset.y_h,
+-			s_frame->dma_offset.y_v);
+-
+-		fimc_set_yuv_order(ctx);
+-
+-		/* Check against the scaler ratio. */
+ 		if (s_frame->height > (SCALER_MAX_VRATIO * d_frame->height) ||
+ 		    s_frame->width > (SCALER_MAX_HRATIO * d_frame->width)) {
+ 			err("out of scaler range");
+ 			return -EINVAL;
+ 		}
++		fimc_set_yuv_order(ctx);
+ 	}
+ 
+ 	/* Input DMA mode is not allowed when the scaler is disabled. */
+@@ -822,7 +807,8 @@ static int fimc_m2m_s_fmt(struct file *f
+ 	} else {
+ 		v4l2_err(&ctx->fimc_dev->m2m.v4l2_dev,
+ 			 "Wrong buffer/video queue type (%d)\n", f->type);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto s_fmt_out;
+ 	}
+ 
+ 	pix = &f->fmt.pix;
+@@ -1414,8 +1400,10 @@ static int fimc_probe(struct platform_de
+ 	}
+ 
+ 	fimc->work_queue = create_workqueue(dev_name(&fimc->pdev->dev));
+-	if (!fimc->work_queue)
++	if (!fimc->work_queue) {
++		ret = -ENOMEM;
+ 		goto err_irq;
++	}
+ 
+ 	ret = fimc_register_m2m_device(fimc);
+ 	if (ret)
+@@ -1492,6 +1480,7 @@ static struct samsung_fimc_variant fimc2
+ };
+ 
+ static struct samsung_fimc_variant fimc01_variant_s5pv210 = {
++	.pix_hoff	= 1,
+ 	.has_inp_rot	= 1,
+ 	.has_out_rot	= 1,
+ 	.min_inp_pixsize = 16,
+@@ -1506,6 +1495,7 @@ static struct samsung_fimc_variant fimc0
+ };
+ 
+ static struct samsung_fimc_variant fimc2_variant_s5pv210 = {
++	.pix_hoff	 = 1,
+ 	.min_inp_pixsize = 16,
+ 	.min_out_pixsize = 32,
+ 
+--- a/drivers/media/video/saa7134/saa7134-cards.c
++++ b/drivers/media/video/saa7134/saa7134-cards.c
+@@ -4323,13 +4323,13 @@ struct saa7134_board saa7134_boards[] =
+ 	},
+ 	[SAA7134_BOARD_BEHOLD_COLUMBUS_TVFM] = {
+ 		/*       Beholder Intl. Ltd. 2008      */
+-		/*Dmitry Belimov <d.belimov@gmail.com> */
+-		.name           = "Beholder BeholdTV Columbus TVFM",
++		/* Dmitry Belimov <d.belimov@gmail.com> */
++		.name           = "Beholder BeholdTV Columbus TV/FM",
+ 		.audio_clock    = 0x00187de7,
+ 		.tuner_type     = TUNER_ALPS_TSBE5_PAL,
+-		.radio_type     = UNSET,
+-		.tuner_addr     = ADDR_UNSET,
+-		.radio_addr     = ADDR_UNSET,
++		.radio_type     = TUNER_TEA5767,
++		.tuner_addr     = 0xc2 >> 1,
++		.radio_addr     = 0xc0 >> 1,
+ 		.tda9887_conf   = TDA9887_PRESENT,
+ 		.gpiomask       = 0x000A8004,
+ 		.inputs         = {{
+--- a/drivers/media/video/saa7164/saa7164-buffer.c
++++ b/drivers/media/video/saa7164/saa7164-buffer.c
+@@ -136,10 +136,11 @@ ret:
+ int saa7164_buffer_dealloc(struct saa7164_tsport *port,
+ 	struct saa7164_buffer *buf)
+ {
+-	struct saa7164_dev *dev = port->dev;
++	struct saa7164_dev *dev;
+ 
+-	if ((buf == 0) || (port == 0))
++	if (!buf || !port)
+ 		return SAA_ERR_BAD_PARAMETER;
++	dev = port->dev;
+ 
+ 	dprintk(DBGLVL_BUF, "%s() deallocating buffer @ 0x%p\n", __func__, buf);
+ 
+--- a/drivers/media/video/uvc/uvc_driver.c
++++ b/drivers/media/video/uvc/uvc_driver.c
+@@ -486,6 +486,12 @@ static int uvc_parse_format(struct uvc_d
+ 			    max(frame->dwFrameInterval[0],
+ 				frame->dwDefaultFrameInterval));
+ 
++		if (dev->quirks & UVC_QUIRK_RESTRICT_FRAME_RATE) {
++			frame->bFrameIntervalType = 1;
++			frame->dwFrameInterval[0] =
++				frame->dwDefaultFrameInterval;
++		}
++
+ 		uvc_trace(UVC_TRACE_DESCR, "- %ux%u (%u.%u fps)\n",
+ 			frame->wWidth, frame->wHeight,
+ 			10000000/frame->dwDefaultFrameInterval,
+@@ -2026,6 +2032,15 @@ static struct usb_device_id uvc_ids[] =
+ 	  .bInterfaceClass	= USB_CLASS_VENDOR_SPEC,
+ 	  .bInterfaceSubClass	= 1,
+ 	  .bInterfaceProtocol	= 0 },
++	/* Chicony CNF7129 (Asus EEE 100HE) */
++	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
++				| USB_DEVICE_ID_MATCH_INT_INFO,
++	  .idVendor		= 0x04f2,
++	  .idProduct		= 0xb071,
++	  .bInterfaceClass	= USB_CLASS_VIDEO,
++	  .bInterfaceSubClass	= 1,
++	  .bInterfaceProtocol	= 0,
++	  .driver_info		= UVC_QUIRK_RESTRICT_FRAME_RATE },
+ 	/* Alcor Micro AU3820 (Future Boy PC USB Webcam) */
+ 	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+ 				| USB_DEVICE_ID_MATCH_INT_INFO,
+@@ -2091,6 +2106,15 @@ static struct usb_device_id uvc_ids[] =
+ 	  .bInterfaceProtocol	= 0,
+ 	  .driver_info		= UVC_QUIRK_PROBE_MINMAX
+ 				| UVC_QUIRK_PROBE_DEF },
++	/* IMC Networks (Medion Akoya) */
++	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
++				| USB_DEVICE_ID_MATCH_INT_INFO,
++	  .idVendor		= 0x13d3,
++	  .idProduct		= 0x5103,
++	  .bInterfaceClass	= USB_CLASS_VIDEO,
++	  .bInterfaceSubClass	= 1,
++	  .bInterfaceProtocol	= 0,
++	  .driver_info		= UVC_QUIRK_STREAM_NO_FID },
+ 	/* Syntek (HP Spartan) */
+ 	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+ 				| USB_DEVICE_ID_MATCH_INT_INFO,
+--- a/drivers/media/video/uvc/uvcvideo.h
++++ b/drivers/media/video/uvc/uvcvideo.h
+@@ -182,6 +182,7 @@ struct uvc_xu_control {
+ #define UVC_QUIRK_IGNORE_SELECTOR_UNIT	0x00000020
+ #define UVC_QUIRK_FIX_BANDWIDTH		0x00000080
+ #define UVC_QUIRK_PROBE_DEF		0x00000100
++#define UVC_QUIRK_RESTRICT_FRAME_RATE	0x00000200
+ 
+ /* Format flags */
+ #define UVC_FMT_FLAG_COMPRESSED		0x00000001
+--- a/drivers/media/video/videobuf-dma-contig.c
++++ b/drivers/media/video/videobuf-dma-contig.c
+@@ -393,8 +393,10 @@ void videobuf_dma_contig_free(struct vid
+ 	}
+ 
+ 	/* read() method */
+-	dma_free_coherent(q->dev, mem->size, mem->vaddr, mem->dma_handle);
+-	mem->vaddr = NULL;
++	if (mem->vaddr) {
++		dma_free_coherent(q->dev, mem->size, mem->vaddr, mem->dma_handle);
++		mem->vaddr = NULL;
++	}
+ }
+ EXPORT_SYMBOL_GPL(videobuf_dma_contig_free);
+ 
+--- a/drivers/media/video/videobuf-dma-sg.c
++++ b/drivers/media/video/videobuf-dma-sg.c
+@@ -94,7 +94,7 @@ err:
+  * must free the memory.
+  */
+ static struct scatterlist *videobuf_pages_to_sg(struct page **pages,
+-						int nr_pages, int offset)
++					int nr_pages, int offset, size_t size)
+ {
+ 	struct scatterlist *sglist;
+ 	int i;
+@@ -110,12 +110,14 @@ static struct scatterlist *videobuf_page
+ 		/* DMA to highmem pages might not work */
+ 		goto highmem;
+ 	sg_set_page(&sglist[0], pages[0], PAGE_SIZE - offset, offset);
++	size -= PAGE_SIZE - offset;
+ 	for (i = 1; i < nr_pages; i++) {
+ 		if (NULL == pages[i])
+ 			goto nopage;
+ 		if (PageHighMem(pages[i]))
+ 			goto highmem;
+-		sg_set_page(&sglist[i], pages[i], PAGE_SIZE, 0);
++		sg_set_page(&sglist[i], pages[i], min(PAGE_SIZE, size), 0);
++		size -= min(PAGE_SIZE, size);
+ 	}
+ 	return sglist;
+ 
+@@ -170,7 +172,8 @@ static int videobuf_dma_init_user_locked
+ 
+ 	first = (data          & PAGE_MASK) >> PAGE_SHIFT;
+ 	last  = ((data+size-1) & PAGE_MASK) >> PAGE_SHIFT;
+-	dma->offset   = data & ~PAGE_MASK;
++	dma->offset = data & ~PAGE_MASK;
++	dma->size = size;
+ 	dma->nr_pages = last-first+1;
+ 	dma->pages = kmalloc(dma->nr_pages * sizeof(struct page *), GFP_KERNEL);
+ 	if (NULL == dma->pages)
+@@ -252,7 +255,7 @@ int videobuf_dma_map(struct device *dev,
+ 
+ 	if (dma->pages) {
+ 		dma->sglist = videobuf_pages_to_sg(dma->pages, dma->nr_pages,
+-						   dma->offset);
++						   dma->offset, dma->size);
+ 	}
+ 	if (dma->vaddr) {
+ 		dma->sglist = videobuf_vmalloc_to_sg(dma->vaddr,
+--- a/drivers/misc/bh1780gli.c
++++ b/drivers/misc/bh1780gli.c
+@@ -190,7 +190,6 @@ static int __devexit bh1780_remove(struc
+ 
+ 	ddata = i2c_get_clientdata(client);
+ 	sysfs_remove_group(&client->dev.kobj, &bh1780_attr_group);
+-	i2c_set_clientdata(client, NULL);
+ 	kfree(ddata);
+ 
+ 	return 0;
+--- a/drivers/regulator/ad5398.c
++++ b/drivers/regulator/ad5398.c
+@@ -256,7 +256,6 @@ static int __devexit ad5398_remove(struc
+ 
+ 	regulator_unregister(chip->rdev);
+ 	kfree(chip);
+-	i2c_set_clientdata(client, NULL);
+ 
+ 	return 0;
+ }
+--- a/drivers/regulator/isl6271a-regulator.c
++++ b/drivers/regulator/isl6271a-regulator.c
+@@ -191,8 +191,6 @@ static int __devexit isl6271a_remove(str
+ 	struct isl_pmic *pmic = i2c_get_clientdata(i2c);
+ 	int i;
+ 
+-	i2c_set_clientdata(i2c, NULL);
+-
+ 	for (i = 0; i < 3; i++)
+ 		regulator_unregister(pmic->rdev[i]);
+ 
+--- a/drivers/rtc/rtc-ds3232.c
++++ b/drivers/rtc/rtc-ds3232.c
+@@ -268,7 +268,6 @@ out_irq:
+ 		free_irq(client->irq, client);
+ 
+ out_free:
+-	i2c_set_clientdata(client, NULL);
+ 	kfree(ds3232);
+ 	return ret;
+ }
+@@ -287,7 +286,6 @@ static int __devexit ds3232_remove(struc
+ 	}
+ 
+ 	rtc_device_unregister(ds3232->rtc);
+-	i2c_set_clientdata(client, NULL);
+ 	kfree(ds3232);
+ 	return 0;
+ }
+--- a/drivers/staging/tm6000/Kconfig
++++ b/drivers/staging/tm6000/Kconfig
+@@ -1,6 +1,6 @@
+ config VIDEO_TM6000
+ 	tristate "TV Master TM5600/6000/6010 driver"
+-	depends on VIDEO_DEV && I2C && INPUT && USB && EXPERIMENTAL
++	depends on VIDEO_DEV && I2C && INPUT && IR_CORE && USB && EXPERIMENTAL
+ 	select VIDEO_TUNER
+ 	select MEDIA_TUNER_XC2028
+ 	select MEDIA_TUNER_XC5000
+--- a/drivers/staging/tm6000/tm6000-input.c
++++ b/drivers/staging/tm6000/tm6000-input.c
+@@ -46,7 +46,7 @@ MODULE_PARM_DESC(enable_ir, "enable ir (
+ 	}
+ 
+ struct tm6000_ir_poll_result {
+-	u8 rc_data[4];
++	u16 rc_data;
+ };
+ 
+ struct tm6000_IR {
+@@ -60,9 +60,9 @@ struct tm6000_IR {
+ 	int			polling;
+ 	struct delayed_work	work;
+ 	u8			wait:1;
++	u8			key:1;
+ 	struct urb		*int_urb;
+ 	u8			*urb_data;
+-	u8			key:1;
+ 
+ 	int (*get_key) (struct tm6000_IR *, struct tm6000_ir_poll_result *);
+ 
+@@ -122,13 +122,14 @@ static void tm6000_ir_urb_received(struc
+ 
+ 	if (urb->status != 0)
+ 		printk(KERN_INFO "not ready\n");
+-	else if (urb->actual_length > 0)
++	else if (urb->actual_length > 0) {
+ 		memcpy(ir->urb_data, urb->transfer_buffer, urb->actual_length);
+ 
+-	dprintk("data %02x %02x %02x %02x\n", ir->urb_data[0],
+-	ir->urb_data[1], ir->urb_data[2], ir->urb_data[3]);
++		dprintk("data %02x %02x %02x %02x\n", ir->urb_data[0],
++			ir->urb_data[1], ir->urb_data[2], ir->urb_data[3]);
+ 
+-	ir->key = 1;
++		ir->key = 1;
++	}
+ 
+ 	rc = usb_submit_urb(urb, GFP_ATOMIC);
+ }
+@@ -140,30 +141,47 @@ static int default_polling_getkey(struct
+ 	int rc;
+ 	u8 buf[2];
+ 
+-	if (ir->wait && !&dev->int_in) {
+-		poll_result->rc_data[0] = 0xff;
++	if (ir->wait && !&dev->int_in)
+ 		return 0;
+-	}
+ 
+ 	if (&dev->int_in) {
+-		poll_result->rc_data[0] = ir->urb_data[0];
+-		poll_result->rc_data[1] = ir->urb_data[1];
++		if (ir->ir.ir_type == IR_TYPE_RC5)
++			poll_result->rc_data = ir->urb_data[0];
++		else
++			poll_result->rc_data = ir->urb_data[0] | ir->urb_data[1] << 8;
+ 	} else {
+ 		tm6000_set_reg(dev, REQ_04_EN_DISABLE_MCU_INT, 2, 0);
+ 		msleep(10);
+ 		tm6000_set_reg(dev, REQ_04_EN_DISABLE_MCU_INT, 2, 1);
+ 		msleep(10);
+ 
+-		rc = tm6000_read_write_usb(dev, USB_DIR_IN | USB_TYPE_VENDOR |
+-		 USB_RECIP_DEVICE, REQ_02_GET_IR_CODE, 0, 0, buf, 1);
+-
+-		msleep(10);
+-
+-		dprintk("read data=%02x\n", buf[0]);
+-		if (rc < 0)
+-			return rc;
+-
+-		poll_result->rc_data[0] = buf[0];
++		if (ir->ir.ir_type == IR_TYPE_RC5) {
++			rc = tm6000_read_write_usb(dev, USB_DIR_IN |
++				USB_TYPE_VENDOR | USB_RECIP_DEVICE,
++				REQ_02_GET_IR_CODE, 0, 0, buf, 1);
++
++			msleep(10);
++
++			dprintk("read data=%02x\n", buf[0]);
++			if (rc < 0)
++				return rc;
++
++			poll_result->rc_data = buf[0];
++		} else {
++			rc = tm6000_read_write_usb(dev, USB_DIR_IN |
++				USB_TYPE_VENDOR | USB_RECIP_DEVICE,
++				REQ_02_GET_IR_CODE, 0, 0, buf, 2);
++
++			msleep(10);
++
++			dprintk("read data=%04x\n", buf[0] | buf[1] << 8);
++			if (rc < 0)
++				return rc;
++
++			poll_result->rc_data = buf[0] | buf[1] << 8;
++		}
++		if ((poll_result->rc_data & 0x00ff) != 0xff)
++			ir->key = 1;
+ 	}
+ 	return 0;
+ }
+@@ -180,12 +198,11 @@ static void tm6000_ir_handle_key(struct
+ 		return;
+ 	}
+ 
+-	dprintk("ir->get_key result data=%02x %02x\n",
+-		poll_result.rc_data[0], poll_result.rc_data[1]);
++	dprintk("ir->get_key result data=%04x\n", poll_result.rc_data);
+ 
+-	if (poll_result.rc_data[0] != 0xff && ir->key == 1) {
++	if (ir->key) {
+ 		ir_input_keydown(ir->input->input_dev, &ir->ir,
+-			poll_result.rc_data[0] | poll_result.rc_data[1] << 8);
++				(u32)poll_result.rc_data);
+ 
+ 		ir_input_nokey(ir->input->input_dev, &ir->ir);
+ 		ir->key = 0;
+--- a/fs/xfs/linux-2.6/xfs_sync.c
++++ b/fs/xfs/linux-2.6/xfs_sync.c
+@@ -668,14 +668,11 @@ xfs_inode_set_reclaim_tag(
+ 	xfs_perag_put(pag);
+ }
+ 
+-void
+-__xfs_inode_clear_reclaim_tag(
+-	xfs_mount_t	*mp,
++STATIC void
++__xfs_inode_clear_reclaim(
+ 	xfs_perag_t	*pag,
+ 	xfs_inode_t	*ip)
+ {
+-	radix_tree_tag_clear(&pag->pag_ici_root,
+-			XFS_INO_TO_AGINO(mp, ip->i_ino), XFS_ICI_RECLAIM_TAG);
+ 	pag->pag_ici_reclaimable--;
+ 	if (!pag->pag_ici_reclaimable) {
+ 		/* clear the reclaim tag from the perag radix tree */
+@@ -689,6 +686,17 @@ __xfs_inode_clear_reclaim_tag(
+ 	}
+ }
+ 
++void
++__xfs_inode_clear_reclaim_tag(
++	xfs_mount_t	*mp,
++	xfs_perag_t	*pag,
++	xfs_inode_t	*ip)
++{
++	radix_tree_tag_clear(&pag->pag_ici_root,
++			XFS_INO_TO_AGINO(mp, ip->i_ino), XFS_ICI_RECLAIM_TAG);
++	__xfs_inode_clear_reclaim(pag, ip);
++}
++
+ /*
+  * Inodes in different states need to be treated differently, and the return
+  * value of xfs_iflush is not sufficient to get this right. The following table
+@@ -838,6 +846,7 @@ reclaim:
+ 	if (!radix_tree_delete(&pag->pag_ici_root,
+ 				XFS_INO_TO_AGINO(ip->i_mount, ip->i_ino)))
+ 		ASSERT(0);
++	__xfs_inode_clear_reclaim(pag, ip);
+ 	write_unlock(&pag->pag_ici_lock);
+ 
+ 	/*
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -246,9 +246,11 @@ struct ttm_buffer_object {
+ 
+ 	atomic_t reserved;
+ 
+-
+ 	/**
+ 	 * Members protected by the bo::lock
++	 * In addition, setting sync_obj to anything else
++	 * than NULL requires bo::reserved to be held. This allows for
++	 * checking NULL while reserved but not holding bo::lock.
+ 	 */
+ 
+ 	void *sync_obj_arg;
+--- a/include/linux/elevator.h
++++ b/include/linux/elevator.h
+@@ -93,6 +93,7 @@ struct elevator_queue
+ 	struct elevator_type *elevator_type;
+ 	struct mutex sysfs_lock;
+ 	struct hlist_head *hash;
++	unsigned int registered:1;
+ };
+ 
+ /*
+--- a/include/media/videobuf-dma-sg.h
++++ b/include/media/videobuf-dma-sg.h
+@@ -48,6 +48,7 @@ struct videobuf_dmabuf {
+ 
+ 	/* for userland buffer */
+ 	int                 offset;
++	size_t		    size;
+ 	struct page         **pages;
+ 
+ 	/* for kernel buffers */
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -2215,6 +2215,14 @@ int copy_siginfo_to_user(siginfo_t __use
+ #ifdef __ARCH_SI_TRAPNO
+ 		err |= __put_user(from->si_trapno, &to->si_trapno);
+ #endif
++#ifdef BUS_MCEERR_AO
++		/* 
++		 * Other callers might not initialize the si_lsb field,
++	 	 * so check explicitely for the right codes here.
++		 */
++		if (from->si_code == BUS_MCEERR_AR || from->si_code == BUS_MCEERR_AO)
++			err |= __put_user(from->si_addr_lsb, &to->si_addr_lsb);
++#endif
+ 		break;
+ 	case __SI_CHLD:
+ 		err |= __put_user(from->si_pid, &to->si_pid);
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -2485,7 +2485,7 @@ static int __do_proc_doulongvec_minmax(v
+ 		kbuf[left] = 0;
+ 	}
+ 
+-	for (; left && vleft--; i++, min++, max++, first=0) {
++	for (; left && vleft--; i++, first = 0) {
+ 		unsigned long val;
+ 
+ 		if (write) {
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -3587,9 +3587,13 @@ unlock:
+ 
+ static void mem_cgroup_threshold(struct mem_cgroup *memcg)
+ {
+-	__mem_cgroup_threshold(memcg, false);
+-	if (do_swap_account)
+-		__mem_cgroup_threshold(memcg, true);
++	while (memcg) {
++		__mem_cgroup_threshold(memcg, false);
++		if (do_swap_account)
++			__mem_cgroup_threshold(memcg, true);
++
++		memcg = parent_mem_cgroup(memcg);
++	}
+ }
+ 
+ static int compare_thresholds(const void *a, const void *b)
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -183,7 +183,7 @@ EXPORT_SYMBOL_GPL(hwpoison_filter);
+  * signal.
+  */
+ static int kill_proc_ao(struct task_struct *t, unsigned long addr, int trapno,
+-			unsigned long pfn)
++			unsigned long pfn, struct page *page)
+ {
+ 	struct siginfo si;
+ 	int ret;
+@@ -198,7 +198,7 @@ static int kill_proc_ao(struct task_stru
+ #ifdef __ARCH_SI_TRAPNO
+ 	si.si_trapno = trapno;
+ #endif
+-	si.si_addr_lsb = PAGE_SHIFT;
++	si.si_addr_lsb = compound_order(compound_head(page)) + PAGE_SHIFT;
+ 	/*
+ 	 * Don't use force here, it's convenient if the signal
+ 	 * can be temporarily blocked.
+@@ -235,7 +235,7 @@ void shake_page(struct page *p, int acce
+ 		int nr;
+ 		do {
+ 			nr = shrink_slab(1000, GFP_KERNEL, 1000);
+-			if (page_count(p) == 0)
++			if (page_count(p) == 1)
+ 				break;
+ 		} while (nr > 10);
+ 	}
+@@ -327,7 +327,7 @@ static void add_to_kill(struct task_stru
+  * wrong earlier.
+  */
+ static void kill_procs_ao(struct list_head *to_kill, int doit, int trapno,
+-			  int fail, unsigned long pfn)
++			  int fail, struct page *page, unsigned long pfn)
+ {
+ 	struct to_kill *tk, *next;
+ 
+@@ -352,7 +352,7 @@ static void kill_procs_ao(struct list_he
+ 			 * process anyways.
+ 			 */
+ 			else if (kill_proc_ao(tk->tsk, tk->addr, trapno,
+-					      pfn) < 0)
++					      pfn, page) < 0)
+ 				printk(KERN_ERR
+ 		"MCE %#lx: Cannot send advisory machine check signal to %s:%d\n",
+ 					pfn, tk->tsk->comm, tk->tsk->pid);
+@@ -928,7 +928,7 @@ static int hwpoison_user_mappings(struct
+ 	 * any accesses to the poisoned memory.
+ 	 */
+ 	kill_procs_ao(&tokill, !!PageDirty(hpage), trapno,
+-		      ret != SWAP_SUCCESS, pfn);
++		      ret != SWAP_SUCCESS, p, pfn);
+ 
+ 	return ret;
+ }
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -5182,9 +5182,9 @@ void *__init alloc_large_system_hash(con
+ 	if (!table)
+ 		panic("Failed to allocate %s hash table\n", tablename);
+ 
+-	printk(KERN_INFO "%s hash table entries: %d (order: %d, %lu bytes)\n",
++	printk(KERN_INFO "%s hash table entries: %ld (order: %d, %lu bytes)\n",
+ 	       tablename,
+-	       (1U << log2qty),
++	       (1UL << log2qty),
+ 	       ilog2(size) - PAGE_SHIFT,
+ 	       size);
+ 
