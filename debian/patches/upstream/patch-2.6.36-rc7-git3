@@ -1017,6 +1017,31 @@
  
  INTEL PRO/WIRELESS 2100 NETWORK CONNECTION SUPPORT
  L:	linux-wireless@vger.kernel.org
+@@ -5008,6 +5030,12 @@ F:	drivers/media/common/saa7146*
+ F:	drivers/media/video/*7146*
+ F:	include/media/*7146*
+ 
++SAMSUNG AUDIO (ASoC) DRIVERS
++M:	Jassi Brar <jassi.brar@samsung.com>
++L:	alsa-devel@alsa-project.org (moderated for non-subscribers)
++S:	Supported
++F:	sound/soc/s3c24xx
++
+ TLG2300 VIDEO4LINUX-2 DRIVER
+ M:	Huang Shijie <shijie8@gmail.com>
+ M:	Kang Yong <kangyong@telegent.com>
+@@ -6450,8 +6478,10 @@ F:	include/linux/wm97xx.h
+ WOLFSON MICROELECTRONICS DRIVERS
+ M:	Mark Brown <broonie@opensource.wolfsonmicro.com>
+ M:	Ian Lartey <ian@opensource.wolfsonmicro.com>
++M:	Dimitris Papastamos <dp@opensource.wolfsonmicro.com>
++T:	git git://opensource.wolfsonmicro.com/linux-2.6-asoc
+ T:	git git://opensource.wolfsonmicro.com/linux-2.6-audioplus
+-W:	http://opensource.wolfsonmicro.com/node/8
++W:	http://opensource.wolfsonmicro.com/content/linux-drivers-wolfson-devices
+ S:	Supported
+ F:	Documentation/hwmon/wm83??
+ F:	drivers/leds/leds-wm83*.c
 --- a/Makefile
 +++ b/Makefile
 @@ -1,7 +1,7 @@
@@ -1024,7 +1049,7 @@
  PATCHLEVEL = 6
  SUBLEVEL = 36
 -EXTRAVERSION = -rc7
-+EXTRAVERSION = -rc7-git2
++EXTRAVERSION = -rc7-git3
  NAME = Sheep on Meth
  
  # *DOCUMENTATION*
@@ -1716,6 +1741,20 @@
  }
  
  static int wacom_parse_hid(struct usb_interface *intf, struct hid_descriptor *hid_desc,
+--- a/drivers/input/tablet/wacom_wac.c
++++ b/drivers/input/tablet/wacom_wac.c
+@@ -442,8 +442,10 @@ static void wacom_intuos_general(struct
+ 	/* general pen packet */
+ 	if ((data[1] & 0xb8) == 0xa0) {
+ 		t = (data[6] << 2) | ((data[7] >> 6) & 3);
+-		if (features->type >= INTUOS4S && features->type <= INTUOS4L)
++		if ((features->type >= INTUOS4S && features->type <= INTUOS4L) ||
++		    features->type == WACOM_21UX2) {
+ 			t = (t << 1) | (data[1] & 1);
++		}
+ 		input_report_abs(input, ABS_PRESSURE, t);
+ 		input_report_abs(input, ABS_TILT_X,
+ 				((data[7] << 1) & 0x7e) | (data[8] >> 7));
 --- a/drivers/isdn/sc/interrupt.c
 +++ b/drivers/isdn/sc/interrupt.c
 @@ -112,11 +112,19 @@ irqreturn_t interrupt_handler(int dummy,
@@ -2758,6 +2797,277 @@
  }
  
  static int32_t ath9k_hw_ani_get_listen_time(struct ath_hw *ah)
+--- a/drivers/platform/x86/intel_ips.c
++++ b/drivers/platform/x86/intel_ips.c
+@@ -51,7 +51,6 @@
+  * TODO:
+  *   - handle CPU hotplug
+  *   - provide turbo enable/disable api
+- *   - make sure we can write turbo enable/disable reg based on MISC_EN
+  *
+  * Related documents:
+  *   - CDI 403777, 403778 - Auburndale EDS vol 1 & 2
+@@ -230,7 +229,7 @@
+ #define THM_TC2		0xac
+ #define THM_DTV		0xb0
+ #define THM_ITV		0xd8
+-#define   ITV_ME_SEQNO_MASK 0x000f0000 /* ME should update every ~200ms */
++#define   ITV_ME_SEQNO_MASK 0x00ff0000 /* ME should update every ~200ms */
+ #define   ITV_ME_SEQNO_SHIFT (16)
+ #define   ITV_MCH_TEMP_MASK 0x0000ff00
+ #define   ITV_MCH_TEMP_SHIFT (8)
+@@ -325,6 +324,7 @@ struct ips_driver {
+ 	bool gpu_preferred;
+ 	bool poll_turbo_status;
+ 	bool second_cpu;
++	bool turbo_toggle_allowed;
+ 	struct ips_mcp_limits *limits;
+ 
+ 	/* Optional MCH interfaces for if i915 is in use */
+@@ -415,7 +415,7 @@ static void ips_cpu_lower(struct ips_dri
+ 	new_limit = cur_limit - 8; /* 1W decrease */
+ 
+ 	/* Clamp to SKU TDP limit */
+-	if (((new_limit * 10) / 8) < (ips->orig_turbo_limit & TURBO_TDP_MASK))
++	if (new_limit  < (ips->orig_turbo_limit & TURBO_TDP_MASK))
+ 		new_limit = ips->orig_turbo_limit & TURBO_TDP_MASK;
+ 
+ 	thm_writew(THM_MPCPC, (new_limit * 10) / 8);
+@@ -461,7 +461,8 @@ static void ips_enable_cpu_turbo(struct
+ 	if (ips->__cpu_turbo_on)
+ 		return;
+ 
+-	on_each_cpu(do_enable_cpu_turbo, ips, 1);
++	if (ips->turbo_toggle_allowed)
++		on_each_cpu(do_enable_cpu_turbo, ips, 1);
+ 
+ 	ips->__cpu_turbo_on = true;
+ }
+@@ -498,7 +499,8 @@ static void ips_disable_cpu_turbo(struct
+ 	if (!ips->__cpu_turbo_on)
+ 		return;
+ 
+-	on_each_cpu(do_disable_cpu_turbo, ips, 1);
++	if (ips->turbo_toggle_allowed)
++		on_each_cpu(do_disable_cpu_turbo, ips, 1);
+ 
+ 	ips->__cpu_turbo_on = false;
+ }
+@@ -598,17 +600,29 @@ static bool mcp_exceeded(struct ips_driv
+ {
+ 	unsigned long flags;
+ 	bool ret = false;
++	u32 temp_limit;
++	u32 avg_power;
++	const char *msg = "MCP limit exceeded: ";
+ 
+ 	spin_lock_irqsave(&ips->turbo_status_lock, flags);
+-	if (ips->mcp_avg_temp > (ips->mcp_temp_limit * 100))
+-		ret = true;
+-	if (ips->cpu_avg_power + ips->mch_avg_power > ips->mcp_power_limit)
++
++	temp_limit = ips->mcp_temp_limit * 100;
++	if (ips->mcp_avg_temp > temp_limit) {
++		dev_info(&ips->dev->dev,
++			"%sAvg temp %u, limit %u\n", msg, ips->mcp_avg_temp,
++			temp_limit);
+ 		ret = true;
+-	spin_unlock_irqrestore(&ips->turbo_status_lock, flags);
++	}
+ 
+-	if (ret)
++	avg_power = ips->cpu_avg_power + ips->mch_avg_power;
++	if (avg_power > ips->mcp_power_limit) {
+ 		dev_info(&ips->dev->dev,
+-			 "MCP power or thermal limit exceeded\n");
++			"%sAvg power %u, limit %u\n", msg, avg_power,
++			ips->mcp_power_limit);
++		ret = true;
++	}
++
++	spin_unlock_irqrestore(&ips->turbo_status_lock, flags);
+ 
+ 	return ret;
+ }
+@@ -663,6 +677,27 @@ static bool mch_exceeded(struct ips_driv
+ }
+ 
+ /**
++ * verify_limits - verify BIOS provided limits
++ * @ips: IPS structure
++ *
++ * BIOS can optionally provide non-default limits for power and temp.  Check
++ * them here and use the defaults if the BIOS values are not provided or
++ * are otherwise unusable.
++ */
++static void verify_limits(struct ips_driver *ips)
++{
++	if (ips->mcp_power_limit < ips->limits->mcp_power_limit ||
++	    ips->mcp_power_limit > 35000)
++		ips->mcp_power_limit = ips->limits->mcp_power_limit;
++
++	if (ips->mcp_temp_limit < ips->limits->core_temp_limit ||
++	    ips->mcp_temp_limit < ips->limits->mch_temp_limit ||
++	    ips->mcp_temp_limit > 150)
++		ips->mcp_temp_limit = min(ips->limits->core_temp_limit,
++					  ips->limits->mch_temp_limit);
++}
++
++/**
+  * update_turbo_limits - get various limits & settings from regs
+  * @ips: IPS driver struct
+  *
+@@ -680,12 +715,21 @@ static void update_turbo_limits(struct i
+ 	u32 hts = thm_readl(THM_HTS);
+ 
+ 	ips->cpu_turbo_enabled = !(hts & HTS_PCTD_DIS);
+-	ips->gpu_turbo_enabled = !(hts & HTS_GTD_DIS);
++	/* 
++	 * Disable turbo for now, until we can figure out why the power figures
++	 * are wrong
++	 */
++	ips->cpu_turbo_enabled = false;
++
++	if (ips->gpu_busy)
++		ips->gpu_turbo_enabled = !(hts & HTS_GTD_DIS);
++
+ 	ips->core_power_limit = thm_readw(THM_MPCPC);
+ 	ips->mch_power_limit = thm_readw(THM_MMGPC);
+ 	ips->mcp_temp_limit = thm_readw(THM_PTL);
+ 	ips->mcp_power_limit = thm_readw(THM_MPPC);
+ 
++	verify_limits(ips);
+ 	/* Ignore BIOS CPU vs GPU pref */
+ }
+ 
+@@ -858,7 +902,7 @@ static u32 get_cpu_power(struct ips_driv
+ 	ret = (ret * 1000) / 65535;
+ 	*last = val;
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static const u16 temp_decay_factor = 2;
+@@ -940,7 +984,6 @@ static int ips_monitor(void *data)
+ 		kfree(mch_samples);
+ 		kfree(cpu_samples);
+ 		kfree(mchp_samples);
+-		kthread_stop(ips->adjust);
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -948,7 +991,7 @@ static int ips_monitor(void *data)
+ 		ITV_ME_SEQNO_SHIFT;
+ 	seqno_timestamp = get_jiffies_64();
+ 
+-	old_cpu_power = thm_readl(THM_CEC) / 65535;
++	old_cpu_power = thm_readl(THM_CEC);
+ 	schedule_timeout_interruptible(msecs_to_jiffies(IPS_SAMPLE_PERIOD));
+ 
+ 	/* Collect an initial average */
+@@ -1150,11 +1193,18 @@ static irqreturn_t ips_irq_handler(int i
+ 				STS_GPL_SHIFT;
+ 			/* ignore EC CPU vs GPU pref */
+ 			ips->cpu_turbo_enabled = !(sts & STS_PCTD_DIS);
+-			ips->gpu_turbo_enabled = !(sts & STS_GTD_DIS);
++			/* 
++			 * Disable turbo for now, until we can figure
++			 * out why the power figures are wrong
++			 */
++			ips->cpu_turbo_enabled = false;
++			if (ips->gpu_busy)
++				ips->gpu_turbo_enabled = !(sts & STS_GTD_DIS);
+ 			ips->mcp_temp_limit = (sts & STS_PTL_MASK) >>
+ 				STS_PTL_SHIFT;
+ 			ips->mcp_power_limit = (tc1 & STS_PPL_MASK) >>
+ 				STS_PPL_SHIFT;
++			verify_limits(ips);
+ 			spin_unlock(&ips->turbo_status_lock);
+ 
+ 			thm_writeb(THM_SEC, SEC_ACK);
+@@ -1333,8 +1383,10 @@ static struct ips_mcp_limits *ips_detect
+ 	 * turbo manually or we'll get an illegal MSR access, even though
+ 	 * turbo will still be available.
+ 	 */
+-	if (!(misc_en & IA32_MISC_TURBO_EN))
+-		; /* add turbo MSR write allowed flag if necessary */
++	if (misc_en & IA32_MISC_TURBO_EN)
++		ips->turbo_toggle_allowed = true;
++	else
++		ips->turbo_toggle_allowed = false;
+ 
+ 	if (strstr(boot_cpu_data.x86_model_id, "CPU       M"))
+ 		limits = &ips_sv_limits;
+@@ -1351,9 +1403,10 @@ static struct ips_mcp_limits *ips_detect
+ 	tdp = turbo_power & TURBO_TDP_MASK;
+ 
+ 	/* Sanity check TDP against CPU */
+-	if (limits->mcp_power_limit != (tdp / 8) * 1000) {
+-		dev_warn(&ips->dev->dev, "Warning: CPU TDP doesn't match expected value (found %d, expected %d)\n",
+-			 tdp / 8, limits->mcp_power_limit / 1000);
++	if (limits->core_power_limit != (tdp / 8) * 1000) {
++		dev_info(&ips->dev->dev, "CPU TDP doesn't match expected value (found %d, expected %d)\n",
++			 tdp / 8, limits->core_power_limit / 1000);
++		limits->core_power_limit = (tdp / 8) * 1000;
+ 	}
+ 
+ out:
+@@ -1390,7 +1443,7 @@ static bool ips_get_i915_syms(struct ips
+ 	return true;
+ 
+ out_put_busy:
+-	symbol_put(i915_gpu_turbo_disable);
++	symbol_put(i915_gpu_busy);
+ out_put_lower:
+ 	symbol_put(i915_gpu_lower);
+ out_put_raise:
+@@ -1532,22 +1585,27 @@ static int ips_probe(struct pci_dev *dev
+ 	/* Save turbo limits & ratios */
+ 	rdmsrl(TURBO_POWER_CURRENT_LIMIT, ips->orig_turbo_limit);
+ 
+-	ips_enable_cpu_turbo(ips);
+-	ips->cpu_turbo_enabled = true;
++	ips_disable_cpu_turbo(ips);
++	ips->cpu_turbo_enabled = false;
+ 
+-	/* Set up the work queue and monitor/adjust threads */
+-	ips->monitor = kthread_run(ips_monitor, ips, "ips-monitor");
+-	if (IS_ERR(ips->monitor)) {
++	/* Create thermal adjust thread */
++	ips->adjust = kthread_create(ips_adjust, ips, "ips-adjust");
++	if (IS_ERR(ips->adjust)) {
+ 		dev_err(&dev->dev,
+-			"failed to create thermal monitor thread, aborting\n");
++			"failed to create thermal adjust thread, aborting\n");
+ 		ret = -ENOMEM;
+ 		goto error_free_irq;
++
+ 	}
+ 
+-	ips->adjust = kthread_create(ips_adjust, ips, "ips-adjust");
+-	if (IS_ERR(ips->adjust)) {
++	/*
++	 * Set up the work queue and monitor thread. The monitor thread
++	 * will wake up ips_adjust thread.
++	 */
++	ips->monitor = kthread_run(ips_monitor, ips, "ips-monitor");
++	if (IS_ERR(ips->monitor)) {
+ 		dev_err(&dev->dev,
+-			"failed to create thermal adjust thread, aborting\n");
++			"failed to create thermal monitor thread, aborting\n");
+ 		ret = -ENOMEM;
+ 		goto error_thread_cleanup;
+ 	}
+@@ -1566,7 +1624,7 @@ static int ips_probe(struct pci_dev *dev
+ 	return ret;
+ 
+ error_thread_cleanup:
+-	kthread_stop(ips->monitor);
++	kthread_stop(ips->adjust);
+ error_free_irq:
+ 	free_irq(ips->dev->irq, ips);
+ error_unmap:
 --- a/drivers/regulator/ad5398.c
 +++ b/drivers/regulator/ad5398.c
 @@ -256,7 +256,6 @@ static int __devexit ad5398_remove(struc
@@ -3752,3 +4062,99 @@
  		/* Save current address so we can work with it */
  		memcpy(&to, sa_addr, af->sockaddr_len);
  
+--- a/scripts/kconfig/conf.c
++++ b/scripts/kconfig/conf.c
+@@ -427,7 +427,7 @@ static void check_conf(struct menu *menu
+ 				if (sym->name && !sym_is_choice_value(sym)) {
+ 					printf("CONFIG_%s\n", sym->name);
+ 				}
+-			} else {
++			} else if (input_mode != oldnoconfig) {
+ 				if (!conf_cnt++)
+ 					printf(_("*\n* Restart config...\n*\n"));
+ 				rootEntry = menu_get_parent_menu(menu);
+--- a/scripts/kconfig/expr.h
++++ b/scripts/kconfig/expr.h
+@@ -165,7 +165,6 @@ struct menu {
+ 	struct symbol *sym;
+ 	struct property *prompt;
+ 	struct expr *dep;
+-	struct expr *dir_dep;
+ 	unsigned int flags;
+ 	char *help;
+ 	struct file *file;
+--- a/scripts/kconfig/menu.c
++++ b/scripts/kconfig/menu.c
+@@ -107,7 +107,6 @@ static struct expr *menu_check_dep(struc
+ void menu_add_dep(struct expr *dep)
+ {
+ 	current_entry->dep = expr_alloc_and(current_entry->dep, menu_check_dep(dep));
+-	current_entry->dir_dep = current_entry->dep;
+ }
+ 
+ void menu_set_type(int type)
+@@ -291,10 +290,6 @@ void menu_finalize(struct menu *parent)
+ 		for (menu = parent->list; menu; menu = menu->next)
+ 			menu_finalize(menu);
+ 	} else if (sym) {
+-		/* ignore inherited dependencies for dir_dep */
+-		sym->dir_dep.expr = expr_transform(expr_copy(parent->dir_dep));
+-		sym->dir_dep.expr = expr_eliminate_dups(sym->dir_dep.expr);
+-
+ 		basedep = parent->prompt ? parent->prompt->visible.expr : NULL;
+ 		basedep = expr_trans_compare(basedep, E_UNEQUAL, &symbol_no);
+ 		basedep = expr_eliminate_dups(expr_transform(basedep));
+@@ -325,6 +320,8 @@ void menu_finalize(struct menu *parent)
+ 			parent->next = last_menu->next;
+ 			last_menu->next = NULL;
+ 		}
++
++		sym->dir_dep.expr = parent->dep;
+ 	}
+ 	for (menu = parent->list; menu; menu = menu->next) {
+ 		if (sym && sym_is_choice(sym) &&
+--- a/scripts/kconfig/symbol.c
++++ b/scripts/kconfig/symbol.c
+@@ -350,6 +350,7 @@ void sym_calc_value(struct symbol *sym)
+ 				}
+ 			}
+ 		calc_newval:
++#if 0
+ 			if (sym->dir_dep.tri == no && sym->rev_dep.tri != no) {
+ 				fprintf(stderr, "warning: (");
+ 				expr_fprint(sym->rev_dep.expr, stderr);
+@@ -358,6 +359,7 @@ void sym_calc_value(struct symbol *sym)
+ 				expr_fprint(sym->dir_dep.expr, stderr);
+ 				fprintf(stderr, ")\n");
+ 			}
++#endif
+ 			newval.tri = EXPR_OR(newval.tri, sym->rev_dep.tri);
+ 		}
+ 		if (newval.tri == mod && sym_get_type(sym) == S_BOOLEAN)
+--- a/sound/oss/soundcard.c
++++ b/sound/oss/soundcard.c
+@@ -391,11 +391,11 @@ static long sound_ioctl(struct file *fil
+ 	case SND_DEV_DSP:
+ 	case SND_DEV_DSP16:
+ 	case SND_DEV_AUDIO:
+-		return audio_ioctl(dev, file, cmd, p);
++		ret = audio_ioctl(dev, file, cmd, p);
+ 		break;
+ 
+ 	case SND_DEV_MIDIN:
+-		return MIDIbuf_ioctl(dev, file, cmd, p);
++		ret = MIDIbuf_ioctl(dev, file, cmd, p);
+ 		break;
+ 
+ 	}
+--- a/sound/pci/hda/patch_sigmatel.c
++++ b/sound/pci/hda/patch_sigmatel.c
+@@ -1747,6 +1747,8 @@ static struct snd_pci_quirk stac92hd71bx
+ 		      "HP dv6", STAC_HP_DV5),
+ 	SND_PCI_QUIRK(PCI_VENDOR_ID_HP, 0x3061,
+ 		      "HP dv6", STAC_HP_DV5), /* HP dv6-1110ax */
++	SND_PCI_QUIRK(PCI_VENDOR_ID_HP, 0x363e,
++		      "HP DV6", STAC_HP_DV5),
+ 	SND_PCI_QUIRK_MASK(PCI_VENDOR_ID_HP, 0xfff0, 0x7010,
+ 		      "HP", STAC_HP_DV5),
+ 	SND_PCI_QUIRK(PCI_VENDOR_ID_DELL, 0x0233,
