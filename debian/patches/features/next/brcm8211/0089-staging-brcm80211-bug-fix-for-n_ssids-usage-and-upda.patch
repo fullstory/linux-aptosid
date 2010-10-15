@@ -1,0 +1,171 @@
+commit 93ad12cf1a8c3be46d66581a7acaa1c7fce590e2
+Author: nohee ko <noheek@broadcom.com>
+Date:   Tue Oct 5 18:05:04 2010 -0700
+
+    staging: brcm80211: bug fix for n_ssids usage and update drv_info
+    
+    -update drv_info so it's visible in "ethtool -i" output
+    -remove n_ssids usage. Fixes nullptr deref bug seen before.
+    
+    Signed-off-by: Grant Grundler <grundler@chromium.org>
+    Acked-by: Nohee Ko <noheek@broadcom.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+--- a/drivers/staging/brcm80211/brcmfmac/dhd_linux.c
++++ b/drivers/staging/brcm80211/brcmfmac/dhd_linux.c
+@@ -27,14 +27,14 @@
+ #include <linux/skbuff.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
++#include <linux/mmc/sdio_func.h>
+ #include <linux/random.h>
+ #include <linux/spinlock.h>
+ #include <linux/ethtool.h>
+ #include <linux/fcntl.h>
+ #include <linux/fs.h>
+ 
+-#include <asm/uaccess.h>
+-#include <asm/unaligned.h>
++#include <linux/uaccess.h>
+ #include <bcmutils.h>
+ #include <bcmendian.h>
+ 
+@@ -185,6 +185,8 @@ MODULE_DESCRIPTION("Broadcom 802.11n wir
+ MODULE_SUPPORTED_DEVICE("Broadcom 802.11n WLAN fullmac cards");
+ MODULE_LICENSE("Dual BSD/GPL");
+ 
++#define DRV_MODULE_NAME "brcmfmac"
++
+ /* Linux wireless extension support */
+ #if defined(CONFIG_WIRELESS_EXT)
+ #include <wl_iw.h>
+@@ -1511,8 +1513,10 @@ static void dhd_ethtool_get_drvinfo(stru
+ {
+ 	dhd_info_t *dhd = *(dhd_info_t **) netdev_priv(net);
+ 
+-	sprintf(info->driver, "wl");
++	sprintf(info->driver, DRV_MODULE_NAME);
+ 	sprintf(info->version, "%lu", dhd->pub.drv_version);
++	sprintf(info->fw_version, "%s", wl_cfg80211_get_fwname());
++	sprintf(info->bus_info, "%s", dev_name(&wl_cfg80211_get_sdio_func()->dev));
+ }
+ 
+ struct ethtool_ops dhd_ethtool_ops = {
+--- a/drivers/staging/brcm80211/brcmfmac/wl_cfg80211.c
++++ b/drivers/staging/brcm80211/brcmfmac/wl_cfg80211.c
+@@ -151,7 +151,7 @@ static int32 wl_notify_mic_status(struct
+ /*
+ ** register/deregister sdio function
+ */
+-static struct sdio_func *wl_sdio_func(void);
++struct sdio_func *wl_cfg80211_get_sdio_func(void);
+ static void wl_clear_sdio_func(void);
+ 
+ /*
+@@ -754,7 +754,6 @@ __wl_cfg80211_scan(struct wiphy *wiphy,
+ 	struct wl_priv *wl = ndev_to_wl(ndev);
+ 	struct cfg80211_ssid *ssids;
+ 	struct wl_scan_req *sr = wl_to_sr(wl);
+-	uint32 n_ssids;
+ 	bool iscan_req;
+ 	bool spec_scan;
+ 	int32 err = 0;
+@@ -773,8 +772,7 @@ __wl_cfg80211_scan(struct wiphy *wiphy,
+ 	spec_scan = FALSE;
+ 	if (request) {		/* scan bss */
+ 		ssids = request->ssids;
+-		n_ssids = min(request->n_ssids, WL_NUM_SCAN_MAX);
+-		if (wl->iscan_on && n_ssids && !ssids->ssid_len) {	/* for
++		if (wl->iscan_on && (!ssids || !ssids->ssid_len)) {	/* for
+ 							 * specific scan,
+ 							 * ssids->ssid_len has
+ 							 * non-zero(ssid string)
+@@ -788,7 +786,6 @@ __wl_cfg80211_scan(struct wiphy *wiphy,
+ 	} else {		/* scan in ibss */
+ 		/* we don't do iscan in ibss */
+ 		ssids = this_ssid;
+-		n_ssids = 1;
+ 	}
+ 	wl->scan_request = request;
+ 	set_bit(WL_STATUS_SCANNING, &wl->status);
+@@ -798,24 +795,18 @@ __wl_cfg80211_scan(struct wiphy *wiphy,
+ 		else
+ 			goto scan_out;
+ 	} else {
+-		WL_DBG(("n_ssid (%d), ssid \"%s\", ssid_len (%d)\n",
+-			n_ssids, ssids->ssid, ssids->ssid_len));
++		WL_DBG(("ssid \"%s\", ssid_len (%d)\n",
++			ssids->ssid, ssids->ssid_len));
+ 		memset(&sr->ssid, 0, sizeof(sr->ssid));
+-		if (n_ssids) {
+-			sr->ssid.SSID_len =
++		sr->ssid.SSID_len =
+ 			    MIN(sizeof(sr->ssid.SSID), ssids->ssid_len);
+-			if (sr->ssid.SSID_len) {
+-				memcpy(sr->ssid.SSID, ssids->ssid,
+-				       sr->ssid.SSID_len);
+-				sr->ssid.SSID_len = htod32(sr->ssid.SSID_len);
+-				WL_DBG(("Specific scan ssid=\"%s\" len=%d\n",
++		if (sr->ssid.SSID_len) {
++			memcpy(sr->ssid.SSID, ssids->ssid, sr->ssid.SSID_len);
++			sr->ssid.SSID_len = htod32(sr->ssid.SSID_len);
++			WL_DBG(("Specific scan ssid=\"%s\" len=%d\n",
+ 					sr->ssid.SSID, sr->ssid.SSID_len));
+-				spec_scan = TRUE;
+-			} else {
+-				WL_DBG(("Broadcast scan\n"));
+-			}
++			spec_scan = TRUE;
+ 		} else {
+-			/* broadcast scan */
+ 			WL_DBG(("Broadcast scan\n"));
+ 		}
+ 		WL_DBG(("sr->ssid.SSID_len (%d)\n", sr->ssid.SSID_len));
+@@ -3078,8 +3069,8 @@ int32 wl_cfg80211_attach(struct net_devi
+ 		WL_ERR(("wl_cfg80211_dev is invalid\n"));
+ 		return -ENOMEM;
+ 	}
+-	WL_DBG(("func %p\n", wl_sdio_func()));
+-	wdev = wl_alloc_wdev(sizeof(struct wl_iface), &wl_sdio_func()->dev);
++	WL_DBG(("func %p\n", wl_cfg80211_get_sdio_func()));
++	wdev = wl_alloc_wdev(sizeof(struct wl_iface), &wl_cfg80211_get_sdio_func()->dev);
+ 	if (unlikely(IS_ERR(wdev)))
+ 		return -ENOMEM;
+ 
+@@ -3242,7 +3233,7 @@ static void wl_clear_sdio_func(void)
+ 	cfg80211_sdio_func = NULL;
+ }
+ 
+-static struct sdio_func *wl_sdio_func(void)
++struct sdio_func *wl_cfg80211_get_sdio_func(void)
+ {
+ 	return cfg80211_sdio_func;
+ }
+@@ -3964,7 +3955,7 @@ void *wl_cfg80211_request_fw(s8 *file_na
+ 		if (unlikely
+ 		    (err =
+ 		     request_firmware(&wl->fw->fw_entry, file_name,
+-				      &wl_sdio_func()->dev))) {
++				      &wl_cfg80211_get_sdio_func()->dev))) {
+ 			WL_ERR(("Could not download fw (%d)\n", err));
+ 			goto req_fw_out;
+ 		}
+@@ -3978,7 +3969,7 @@ void *wl_cfg80211_request_fw(s8 *file_na
+ 		if (unlikely
+ 		    (err =
+ 		     request_firmware(&wl->fw->fw_entry, file_name,
+-				      &wl_sdio_func()->dev))) {
++				      &wl_cfg80211_get_sdio_func()->dev))) {
+ 			WL_ERR(("Could not download nvram (%d)\n", err));
+ 			goto req_fw_out;
+ 		}
+--- a/drivers/staging/brcm80211/brcmfmac/wl_cfg80211.h
++++ b/drivers/staging/brcm80211/brcmfmac/wl_cfg80211.h
+@@ -366,6 +366,7 @@ extern void wl_cfg80211_detach(void);
+ extern void wl_cfg80211_event(struct net_device *ndev, const wl_event_msg_t *e,
+ 			      void *data);
+ extern void wl_cfg80211_sdio_func(void *func);	/* set sdio function info */
++extern struct sdio_func *wl_cfg80211_get_sdio_func(void);	/* set sdio function info */
+ extern int32 wl_cfg80211_up(void);	/* dongle up */
+ extern int32 wl_cfg80211_down(void);	/* dongle down */
+ extern void wl_cfg80211_dbg_level(uint32 level);	/* set dongle
