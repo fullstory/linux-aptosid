@@ -1,0 +1,317 @@
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 36
+-EXTRAVERSION = -rc8
++EXTRAVERSION = -rc8-git2
+ NAME = Flesh-Eating Bats with Fangs
+ 
+ # *DOCUMENTATION*
+--- a/arch/um/drivers/hostaudio_kern.c
++++ b/arch/um/drivers/hostaudio_kern.c
+@@ -40,6 +40,11 @@ static char *mixer = HOSTAUDIO_DEV_MIXER
+ "    This is used to specify the host mixer device to the hostaudio driver.\n"\
+ "    The default is \"" HOSTAUDIO_DEV_MIXER "\".\n\n"
+ 
++module_param(dsp, charp, 0644);
++MODULE_PARM_DESC(dsp, DSP_HELP);
++module_param(mixer, charp, 0644);
++MODULE_PARM_DESC(mixer, MIXER_HELP);
++
+ #ifndef MODULE
+ static int set_dsp(char *name, int *add)
+ {
+@@ -56,15 +61,6 @@ static int set_mixer(char *name, int *ad
+ }
+ 
+ __uml_setup("mixer=", set_mixer, "mixer=<mixer device>\n" MIXER_HELP);
+-
+-#else /*MODULE*/
+-
+-module_param(dsp, charp, 0644);
+-MODULE_PARM_DESC(dsp, DSP_HELP);
+-
+-module_param(mixer, charp, 0644);
+-MODULE_PARM_DESC(mixer, MIXER_HELP);
+-
+ #endif
+ 
+ /* /dev/dsp file operations */
+--- a/arch/um/drivers/ubd_kern.c
++++ b/arch/um/drivers/ubd_kern.c
+@@ -163,6 +163,7 @@ struct ubd {
+ 	struct scatterlist sg[MAX_SG];
+ 	struct request *request;
+ 	int start_sg, end_sg;
++	sector_t rq_pos;
+ };
+ 
+ #define DEFAULT_COW { \
+@@ -187,6 +188,7 @@ struct ubd {
+ 	.request =		NULL, \
+ 	.start_sg =		0, \
+ 	.end_sg =		0, \
++	.rq_pos =		0, \
+ }
+ 
+ /* Protected by ubd_lock */
+@@ -1228,7 +1230,6 @@ static void do_ubd_request(struct reques
+ {
+ 	struct io_thread_req *io_req;
+ 	struct request *req;
+-	sector_t sector;
+ 	int n;
+ 
+ 	while(1){
+@@ -1239,12 +1240,12 @@ static void do_ubd_request(struct reques
+ 				return;
+ 
+ 			dev->request = req;
++			dev->rq_pos = blk_rq_pos(req);
+ 			dev->start_sg = 0;
+ 			dev->end_sg = blk_rq_map_sg(q, req, dev->sg);
+ 		}
+ 
+ 		req = dev->request;
+-		sector = blk_rq_pos(req);
+ 		while(dev->start_sg < dev->end_sg){
+ 			struct scatterlist *sg = &dev->sg[dev->start_sg];
+ 
+@@ -1256,10 +1257,9 @@ static void do_ubd_request(struct reques
+ 				return;
+ 			}
+ 			prepare_request(req, io_req,
+-					(unsigned long long)sector << 9,
++					(unsigned long long)dev->rq_pos << 9,
+ 					sg->offset, sg->length, sg_page(sg));
+ 
+-			sector += sg->length >> 9;
+ 			n = os_write_file(thread_fd, &io_req,
+ 					  sizeof(struct io_thread_req *));
+ 			if(n != sizeof(struct io_thread_req *)){
+@@ -1272,6 +1272,7 @@ static void do_ubd_request(struct reques
+ 				return;
+ 			}
+ 
++			dev->rq_pos += sg->length >> 9;
+ 			dev->start_sg++;
+ 		}
+ 		dev->end_sg = 0;
+--- a/drivers/block/ps3disk.c
++++ b/drivers/block/ps3disk.c
+@@ -113,7 +113,7 @@ static void ps3disk_scatter_gather(struc
+ 			memcpy(buf, dev->bounce_buf+offset, size);
+ 		offset += size;
+ 		flush_kernel_dcache_page(bvec->bv_page);
+-		bvec_kunmap_irq(bvec, &flags);
++		bvec_kunmap_irq(buf, &flags);
+ 		i++;
+ 	}
+ }
+--- a/drivers/hid/hid-cando.c
++++ b/drivers/hid/hid-cando.c
+@@ -237,6 +237,8 @@ static const struct hid_device_id cando_
+ 			USB_DEVICE_ID_CANDO_MULTI_TOUCH) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_CANDO,
+ 			USB_DEVICE_ID_CANDO_MULTI_TOUCH_11_6) },
++	{ HID_USB_DEVICE(USB_VENDOR_ID_CANDO,
++		USB_DEVICE_ID_CANDO_MULTI_TOUCH_15_6) },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(hid, cando_devices);
+--- a/drivers/hid/hid-core.c
++++ b/drivers/hid/hid-core.c
+@@ -1292,6 +1292,7 @@ static const struct hid_device_id hid_bl
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_BTC, USB_DEVICE_ID_BTC_EMPREX_REMOTE_2) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_CANDO, USB_DEVICE_ID_CANDO_MULTI_TOUCH) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_CANDO, USB_DEVICE_ID_CANDO_MULTI_TOUCH_11_6) },
++	{ HID_USB_DEVICE(USB_VENDOR_ID_CANDO, USB_DEVICE_ID_CANDO_MULTI_TOUCH_15_6) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_CHERRY, USB_DEVICE_ID_CHERRY_CYMOTION) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_CHERRY, USB_DEVICE_ID_CHERRY_CYMOTION_SOLAR) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_CHICONY, USB_DEVICE_ID_CHICONY_TACTICAL_PAD) },
+--- a/drivers/hid/hid-ids.h
++++ b/drivers/hid/hid-ids.h
+@@ -134,6 +134,7 @@
+ #define USB_VENDOR_ID_CANDO		0x2087
+ #define USB_DEVICE_ID_CANDO_MULTI_TOUCH	0x0a01
+ #define USB_DEVICE_ID_CANDO_MULTI_TOUCH_11_6 0x0b03
++#define USB_DEVICE_ID_CANDO_MULTI_TOUCH_15_6 0x0f01
+ 
+ #define USB_VENDOR_ID_CH		0x068e
+ #define USB_DEVICE_ID_CH_PRO_PEDALS	0x00f2
+@@ -503,6 +504,7 @@
+ 
+ #define USB_VENDOR_ID_TURBOX		0x062a
+ #define USB_DEVICE_ID_TURBOX_KEYBOARD	0x0201
++#define USB_DEVICE_ID_TURBOX_TOUCHSCREEN_MOSART	0x7100
+ 
+ #define USB_VENDOR_ID_TWINHAN		0x6253
+ #define USB_DEVICE_ID_TWINHAN_IR_REMOTE	0x0100
+--- a/drivers/hid/hidraw.c
++++ b/drivers/hid/hidraw.c
+@@ -109,6 +109,12 @@ static ssize_t hidraw_write(struct file
+ 	int ret = 0;
+ 
+ 	mutex_lock(&minors_lock);
++
++	if (!hidraw_table[minor]) {
++		ret = -ENODEV;
++		goto out;
++	}
++
+ 	dev = hidraw_table[minor]->hid;
+ 
+ 	if (!dev->hid_output_raw_report) {
+@@ -244,6 +250,10 @@ static long hidraw_ioctl(struct file *fi
+ 
+ 	mutex_lock(&minors_lock);
+ 	dev = hidraw_table[minor];
++	if (!dev) {
++		ret = -ENODEV;
++		goto out;
++	}
+ 
+ 	switch (cmd) {
+ 		case HIDIOCGRDESCSIZE:
+@@ -317,6 +327,7 @@ static long hidraw_ioctl(struct file *fi
+ 
+ 		ret = -ENOTTY;
+ 	}
++out:
+ 	mutex_unlock(&minors_lock);
+ 	return ret;
+ }
+--- a/drivers/hid/usbhid/hid-quirks.c
++++ b/drivers/hid/usbhid/hid-quirks.c
+@@ -36,6 +36,7 @@ static const struct hid_blacklist {
+ 	{ USB_VENDOR_ID_DWAV, USB_DEVICE_ID_EGALAX_TOUCHCONTROLLER, HID_QUIRK_MULTI_INPUT | HID_QUIRK_NOGET },
+ 	{ USB_VENDOR_ID_DWAV, USB_DEVICE_ID_DWAV_EGALAX_MULTITOUCH, HID_QUIRK_MULTI_INPUT },
+ 	{ USB_VENDOR_ID_MOJO, USB_DEVICE_ID_RETRO_ADAPTER, HID_QUIRK_MULTI_INPUT },
++	{ USB_VENDOR_ID_TURBOX, USB_DEVICE_ID_TURBOX_TOUCHSCREEN_MOSART, HID_QUIRK_MULTI_INPUT },
+ 	{ USB_VENDOR_ID_HAPP, USB_DEVICE_ID_UGCI_DRIVING, HID_QUIRK_BADPAD | HID_QUIRK_MULTI_INPUT },
+ 	{ USB_VENDOR_ID_HAPP, USB_DEVICE_ID_UGCI_FLYING, HID_QUIRK_BADPAD | HID_QUIRK_MULTI_INPUT },
+ 	{ USB_VENDOR_ID_HAPP, USB_DEVICE_ID_UGCI_FIGHTING, HID_QUIRK_BADPAD | HID_QUIRK_MULTI_INPUT },
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -1631,6 +1631,19 @@ int mmc_suspend_host(struct mmc_host *ho
+ 	if (host->bus_ops && !host->bus_dead) {
+ 		if (host->bus_ops->suspend)
+ 			err = host->bus_ops->suspend(host);
++		if (err == -ENOSYS || !host->bus_ops->resume) {
++			/*
++			 * We simply "remove" the card in this case.
++			 * It will be redetected on resume.
++			 */
++			if (host->bus_ops->remove)
++				host->bus_ops->remove(host);
++			mmc_claim_host(host);
++			mmc_detach_bus(host);
++			mmc_release_host(host);
++			host->pm_flags = 0;
++			err = 0;
++		}
+ 	}
+ 	mmc_bus_put(host);
+ 
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -2024,6 +2024,7 @@ int dump_write(struct file *file, const
+ {
+ 	return access_ok(VERIFY_READ, addr, nr) && file->f_op->write(file, addr, nr, &file->f_pos) == nr;
+ }
++EXPORT_SYMBOL(dump_write);
+ 
+ int dump_seek(struct file *file, loff_t off)
+ {
+@@ -2052,3 +2053,4 @@ int dump_seek(struct file *file, loff_t
+ 	}
+ 	return ret;
+ }
++EXPORT_SYMBOL(dump_seek);
+--- a/include/linux/types.h
++++ b/include/linux/types.h
+@@ -121,7 +121,15 @@ typedef		__u64		u_int64_t;
+ typedef		__s64		int64_t;
+ #endif
+ 
+-/* this is a special 64bit data type that is 8-byte aligned */
++/*
++ * aligned_u64 should be used in defining kernel<->userspace ABIs to avoid
++ * common 32/64-bit compat problems.
++ * 64-bit values align to 4-byte boundaries on x86_32 (and possibly other
++ * architectures) and to 8-byte boundaries on 64-bit architetures.  The new
++ * aligned_64 type enforces 8-byte alignment so that structs containing
++ * aligned_64 values have the same alignment on 32-bit and 64-bit architectures.
++ * No conversions are necessary between 32-bit user-space and a 64-bit kernel.
++ */
+ #define aligned_u64 __u64 __attribute__((aligned(8)))
+ #define aligned_be64 __be64 __attribute__((aligned(8)))
+ #define aligned_le64 __le64 __attribute__((aligned(8)))
+@@ -178,6 +186,11 @@ typedef __u64 __bitwise __be64;
+ typedef __u16 __bitwise __sum16;
+ typedef __u32 __bitwise __wsum;
+ 
++/* this is a special 64bit data type that is 8-byte aligned */
++#define __aligned_u64 __u64 __attribute__((aligned(8)))
++#define __aligned_be64 __be64 __attribute__((aligned(8)))
++#define __aligned_le64 __le64 __attribute__((aligned(8)))
++
+ #ifdef __KERNEL__
+ typedef unsigned __bitwise__ gfp_t;
+ typedef unsigned __bitwise__ fmode_t;
+--- a/kernel/hrtimer.c
++++ b/kernel/hrtimer.c
+@@ -931,6 +931,7 @@ static inline int
+ remove_hrtimer(struct hrtimer *timer, struct hrtimer_clock_base *base)
+ {
+ 	if (hrtimer_is_queued(timer)) {
++		unsigned long state;
+ 		int reprogram;
+ 
+ 		/*
+@@ -944,8 +945,13 @@ remove_hrtimer(struct hrtimer *timer, st
+ 		debug_deactivate(timer);
+ 		timer_stats_hrtimer_clear_start_info(timer);
+ 		reprogram = base->cpu_base == &__get_cpu_var(hrtimer_bases);
+-		__remove_hrtimer(timer, base, HRTIMER_STATE_INACTIVE,
+-				 reprogram);
++		/*
++		 * We must preserve the CALLBACK state flag here,
++		 * otherwise we could move the timer base in
++		 * switch_hrtimer_base.
++		 */
++		state = timer->state & HRTIMER_STATE_CALLBACK;
++		__remove_hrtimer(timer, base, state, reprogram);
+ 		return 1;
+ 	}
+ 	return 0;
+@@ -1231,6 +1237,9 @@ static void __run_hrtimer(struct hrtimer
+ 		BUG_ON(timer->state != HRTIMER_STATE_CALLBACK);
+ 		enqueue_hrtimer(timer, base);
+ 	}
++
++	WARN_ON_ONCE(!(timer->state & HRTIMER_STATE_CALLBACK));
++
+ 	timer->state &= ~HRTIMER_STATE_CALLBACK;
+ }
+ 
+--- a/kernel/sysctl_check.c
++++ b/kernel/sysctl_check.c
+@@ -143,15 +143,6 @@ int sysctl_check_table(struct nsproxy *n
+ 				if (!table->maxlen)
+ 					set_fail(&fail, table, "No maxlen");
+ 			}
+-			if ((table->proc_handler == proc_doulongvec_minmax) ||
+-			    (table->proc_handler == proc_doulongvec_ms_jiffies_minmax)) {
+-				if (table->maxlen > sizeof (unsigned long)) {
+-					if (!table->extra1)
+-						set_fail(&fail, table, "No min");
+-					if (!table->extra2)
+-						set_fail(&fail, table, "No max");
+-				}
+-			}
+ #ifdef CONFIG_PROC_SYSCTL
+ 			if (table->procname && !table->proc_handler)
+ 				set_fail(&fail, table, "No proc_handler");
