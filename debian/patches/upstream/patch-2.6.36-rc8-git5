@@ -1,0 +1,1174 @@
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 36
+-EXTRAVERSION = -rc8
++EXTRAVERSION = -rc8-git5
+ NAME = Flesh-Eating Bats with Fangs
+ 
+ # *DOCUMENTATION*
+--- a/arch/m32r/include/asm/elf.h
++++ b/arch/m32r/include/asm/elf.h
+@@ -82,9 +82,9 @@ typedef elf_fpreg_t elf_fpregset_t;
+  * These are used to set parameters in the core dumps.
+  */
+ #define ELF_CLASS	ELFCLASS32
+-#if defined(__LITTLE_ENDIAN)
++#if defined(__LITTLE_ENDIAN__)
+ #define ELF_DATA	ELFDATA2LSB
+-#elif defined(__BIG_ENDIAN)
++#elif defined(__BIG_ENDIAN__)
+ #define ELF_DATA	ELFDATA2MSB
+ #else
+ #error no endian defined
+--- /dev/null
++++ b/arch/m32r/kernel/.gitignore
+@@ -0,0 +1 @@
++vmlinux.lds
+--- a/arch/m32r/kernel/signal.c
++++ b/arch/m32r/kernel/signal.c
+@@ -28,6 +28,8 @@
+ 
+ #define DEBUG_SIG 0
+ 
++#define _BLOCKABLE (~(sigmask(SIGKILL) | sigmask(SIGSTOP)))
++
+ asmlinkage int
+ sys_sigaltstack(const stack_t __user *uss, stack_t __user *uoss,
+ 		unsigned long r2, unsigned long r3, unsigned long r4,
+@@ -254,7 +256,7 @@ give_sigsegv:
+ static int prev_insn(struct pt_regs *regs)
+ {
+ 	u16 inst;
+-	if (get_user(&inst, (u16 __user *)(regs->bpc - 2)))
++	if (get_user(inst, (u16 __user *)(regs->bpc - 2)))
+ 		return -EFAULT;
+ 	if ((inst & 0xfff0) == 0x10f0)	/* trap ? */
+ 		regs->bpc -= 2;
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -881,11 +881,15 @@ config NO_IOPORT
+ config GENERIC_ISA_DMA
+ 	bool
+ 	select ZONE_DMA if GENERIC_ISA_DMA_SUPPORT_BROKEN=n
++	select ISA_DMA_API
+ 
+ config GENERIC_ISA_DMA_SUPPORT_BROKEN
+ 	bool
+ 	select GENERIC_ISA_DMA
+ 
++config ISA_DMA_API
++	bool
++
+ config GENERIC_GPIO
+ 	bool
+ 
+--- a/arch/mips/boot/compressed/Makefile
++++ b/arch/mips/boot/compressed/Makefile
+@@ -105,4 +105,4 @@ OBJCOPYFLAGS_vmlinuz.srec := $(OBJCOPYFL
+ vmlinuz.srec: vmlinuz
+ 	$(call cmd,objcopy)
+ 
+-clean-files := $(objtree)/vmlinuz.*
++clean-files := $(objtree)/vmlinuz $(objtree)/vmlinuz.{32,ecoff,bin,srec}
+--- a/arch/mips/include/asm/fcntl.h
++++ b/arch/mips/include/asm/fcntl.h
+@@ -56,6 +56,7 @@
+  */
+ 
+ #ifdef CONFIG_32BIT
++#include <linux/types.h>
+ 
+ struct flock {
+ 	short	l_type;
+--- a/arch/mips/kernel/branch.c
++++ b/arch/mips/kernel/branch.c
+@@ -40,7 +40,6 @@ int __compute_return_epc(struct pt_regs
+ 		return -EFAULT;
+ 	}
+ 
+-	regs->regs[0] = 0;
+ 	switch (insn.i_format.opcode) {
+ 	/*
+ 	 * jr and jalr are in r_format format.
+--- a/arch/mips/kernel/ptrace.c
++++ b/arch/mips/kernel/ptrace.c
+@@ -536,7 +536,7 @@ asmlinkage void do_syscall_trace(struct
+ {
+ 	/* do the secure computing check first */
+ 	if (!entryexit)
+-		secure_computing(regs->regs[0]);
++		secure_computing(regs->regs[2]);
+ 
+ 	if (unlikely(current->audit_context) && entryexit)
+ 		audit_syscall_exit(AUDITSC_RESULT(regs->regs[2]),
+@@ -565,7 +565,7 @@ asmlinkage void do_syscall_trace(struct
+ 
+ out:
+ 	if (unlikely(current->audit_context) && !entryexit)
+-		audit_syscall_entry(audit_arch(), regs->regs[0],
++		audit_syscall_entry(audit_arch(), regs->regs[2],
+ 				    regs->regs[4], regs->regs[5],
+ 				    regs->regs[6], regs->regs[7]);
+ }
+--- a/arch/mips/kernel/scall32-o32.S
++++ b/arch/mips/kernel/scall32-o32.S
+@@ -63,9 +63,9 @@ stack_done:
+ 	sw	t0, PT_R7(sp)		# set error flag
+ 	beqz	t0, 1f
+ 
++	lw	t1, PT_R2(sp)		# syscall number
+ 	negu	v0			# error
+-	sw	v0, PT_R0(sp)		# set flag for syscall
+-					# restarting
++	sw	t1, PT_R0(sp)		# save it for syscall restarting
+ 1:	sw	v0, PT_R2(sp)		# result
+ 
+ o32_syscall_exit:
+@@ -104,9 +104,9 @@ syscall_trace_entry:
+ 	sw	t0, PT_R7(sp)		# set error flag
+ 	beqz	t0, 1f
+ 
++	lw	t1, PT_R2(sp)		# syscall number
+ 	negu	v0			# error
+-	sw	v0, PT_R0(sp)		# set flag for syscall
+-					# restarting
++	sw	t1, PT_R0(sp)		# save it for syscall restarting
+ 1:	sw	v0, PT_R2(sp)		# result
+ 
+ 	j	syscall_exit
+@@ -169,8 +169,7 @@ stackargs:
+ 	 * We probably should handle this case a bit more drastic.
+ 	 */
+ bad_stack:
+-	negu	v0				# error
+-	sw	v0, PT_R0(sp)
++	li	v0, EFAULT
+ 	sw	v0, PT_R2(sp)
+ 	li	t0, 1				# set error flag
+ 	sw	t0, PT_R7(sp)
+--- a/arch/mips/kernel/scall64-64.S
++++ b/arch/mips/kernel/scall64-64.S
+@@ -66,9 +66,9 @@ NESTED(handle_sys64, PT_SIZE, sp)
+ 	sd	t0, PT_R7(sp)		# set error flag
+ 	beqz	t0, 1f
+ 
++	ld	t1, PT_R2(sp)		# syscall number
+ 	dnegu	v0			# error
+-	sd	v0, PT_R0(sp)		# set flag for syscall
+-					# restarting
++	sd	t1, PT_R0(sp)		# save it for syscall restarting
+ 1:	sd	v0, PT_R2(sp)		# result
+ 
+ n64_syscall_exit:
+@@ -109,8 +109,9 @@ syscall_trace_entry:
+ 	sd	t0, PT_R7(sp)		# set error flag
+ 	beqz	t0, 1f
+ 
++	ld	t1, PT_R2(sp)		# syscall number
+ 	dnegu	v0			# error
+-	sd	v0, PT_R0(sp)		# set flag for syscall restarting
++	sd	t1, PT_R0(sp)		# save it for syscall restarting
+ 1:	sd	v0, PT_R2(sp)		# result
+ 
+ 	j	syscall_exit
+--- a/arch/mips/kernel/scall64-n32.S
++++ b/arch/mips/kernel/scall64-n32.S
+@@ -65,8 +65,9 @@ NESTED(handle_sysn32, PT_SIZE, sp)
+ 	sd	t0, PT_R7(sp)		# set error flag
+ 	beqz	t0, 1f
+ 
++	ld	t1, PT_R2(sp)		# syscall number
+ 	dnegu	v0			# error
+-	sd	v0, PT_R0(sp)		# set flag for syscall restarting
++	sd	t1, PT_R0(sp)		# save it for syscall restarting
+ 1:	sd	v0, PT_R2(sp)		# result
+ 
+ 	local_irq_disable		# make sure need_resched and
+@@ -106,8 +107,9 @@ n32_syscall_trace_entry:
+ 	sd	t0, PT_R7(sp)		# set error flag
+ 	beqz	t0, 1f
+ 
++	ld	t1, PT_R2(sp)		# syscall number
+ 	dnegu	v0			# error
+-	sd	v0, PT_R0(sp)		# set flag for syscall restarting
++	sd	t1, PT_R0(sp)		# save it for syscall restarting
+ 1:	sd	v0, PT_R2(sp)		# result
+ 
+ 	j	syscall_exit
+--- a/arch/mips/kernel/scall64-o32.S
++++ b/arch/mips/kernel/scall64-o32.S
+@@ -93,8 +93,9 @@ NESTED(handle_sys, PT_SIZE, sp)
+ 	sd	t0, PT_R7(sp)		# set error flag
+ 	beqz	t0, 1f
+ 
++	ld	t1, PT_R2(sp)		# syscall number
+ 	dnegu	v0			# error
+-	sd	v0, PT_R0(sp)		# flag for syscall restarting
++	sd	t1, PT_R0(sp)		# save it for syscall restarting
+ 1:	sd	v0, PT_R2(sp)		# result
+ 
+ o32_syscall_exit:
+@@ -142,8 +143,9 @@ trace_a_syscall:
+ 	sd	t0, PT_R7(sp)		# set error flag
+ 	beqz	t0, 1f
+ 
++	ld	t1, PT_R2(sp)		# syscall number
+ 	dnegu	v0			# error
+-	sd	v0, PT_R0(sp)		# set flag for syscall restarting
++	sd	t1, PT_R0(sp)		# save it for syscall restarting
+ 1:	sd	v0, PT_R2(sp)		# result
+ 
+ 	j	syscall_exit
+@@ -154,8 +156,7 @@ trace_a_syscall:
+ 	 * The stackpointer for a call with more than 4 arguments is bad.
+ 	 */
+ bad_stack:
+-	dnegu	v0			# error
+-	sd	v0, PT_R0(sp)
++	li	v0, EFAULT
+ 	sd	v0, PT_R2(sp)
+ 	li	t0, 1			# set error flag
+ 	sd	t0, PT_R7(sp)
+--- a/arch/mips/kernel/signal.c
++++ b/arch/mips/kernel/signal.c
+@@ -390,7 +390,6 @@ asmlinkage void sys_rt_sigreturn(nabi_no
+ {
+ 	struct rt_sigframe __user *frame;
+ 	sigset_t set;
+-	stack_t st;
+ 	int sig;
+ 
+ 	frame = (struct rt_sigframe __user *) regs.regs[29];
+@@ -411,11 +410,9 @@ asmlinkage void sys_rt_sigreturn(nabi_no
+ 	else if (sig)
+ 		force_sig(sig, current);
+ 
+-	if (__copy_from_user(&st, &frame->rs_uc.uc_stack, sizeof(st)))
+-		goto badframe;
+ 	/* It is more difficult to avoid calling this function than to
+ 	   call it and ignore errors.  */
+-	do_sigaltstack((stack_t __user *)&st, NULL, regs.regs[29]);
++	do_sigaltstack(&frame->rs_uc.uc_stack, NULL, regs.regs[29]);
+ 
+ 	/*
+ 	 * Don't let your children do this ...
+@@ -550,23 +547,26 @@ static int handle_signal(unsigned long s
+ 	struct mips_abi *abi = current->thread.abi;
+ 	void *vdso = current->mm->context.vdso;
+ 
+-	switch(regs->regs[0]) {
+-	case ERESTART_RESTARTBLOCK:
+-	case ERESTARTNOHAND:
+-		regs->regs[2] = EINTR;
+-		break;
+-	case ERESTARTSYS:
+-		if (!(ka->sa.sa_flags & SA_RESTART)) {
++	if (regs->regs[0]) {
++		switch(regs->regs[2]) {
++		case ERESTART_RESTARTBLOCK:
++		case ERESTARTNOHAND:
+ 			regs->regs[2] = EINTR;
+ 			break;
++		case ERESTARTSYS:
++			if (!(ka->sa.sa_flags & SA_RESTART)) {
++				regs->regs[2] = EINTR;
++				break;
++			}
++		/* fallthrough */
++		case ERESTARTNOINTR:
++			regs->regs[7] = regs->regs[26];
++			regs->regs[2] = regs->regs[0];
++			regs->cp0_epc -= 4;
+ 		}
+-	/* fallthrough */
+-	case ERESTARTNOINTR:		/* Userland will reload $v0.  */
+-		regs->regs[7] = regs->regs[26];
+-		regs->cp0_epc -= 8;
+-	}
+ 
+-	regs->regs[0] = 0;		/* Don't deal with this again.  */
++		regs->regs[0] = 0;		/* Don't deal with this again.  */
++	}
+ 
+ 	if (sig_uses_siginfo(ka))
+ 		ret = abi->setup_rt_frame(vdso + abi->rt_signal_return_offset,
+@@ -575,6 +575,9 @@ static int handle_signal(unsigned long s
+ 		ret = abi->setup_frame(vdso + abi->signal_return_offset,
+ 				       ka, regs, sig, oldset);
+ 
++	if (ret)
++		return ret;
++
+ 	spin_lock_irq(&current->sighand->siglock);
+ 	sigorsets(&current->blocked, &current->blocked, &ka->sa.sa_mask);
+ 	if (!(ka->sa.sa_flags & SA_NODEFER))
+@@ -622,17 +625,13 @@ static void do_signal(struct pt_regs *re
+ 		return;
+ 	}
+ 
+-	/*
+-	 * Who's code doesn't conform to the restartable syscall convention
+-	 * dies here!!!  The li instruction, a single machine instruction,
+-	 * must directly be followed by the syscall instruction.
+-	 */
+ 	if (regs->regs[0]) {
+ 		if (regs->regs[2] == ERESTARTNOHAND ||
+ 		    regs->regs[2] == ERESTARTSYS ||
+ 		    regs->regs[2] == ERESTARTNOINTR) {
++			regs->regs[2] = regs->regs[0];
+ 			regs->regs[7] = regs->regs[26];
+-			regs->cp0_epc -= 8;
++			regs->cp0_epc -= 4;
+ 		}
+ 		if (regs->regs[2] == ERESTART_RESTARTBLOCK) {
+ 			regs->regs[2] = current->thread.abi->restart;
+--- a/arch/mips/kernel/signal_n32.c
++++ b/arch/mips/kernel/signal_n32.c
+@@ -109,6 +109,7 @@ asmlinkage int sysn32_rt_sigsuspend(nabi
+ asmlinkage void sysn32_rt_sigreturn(nabi_no_regargs struct pt_regs regs)
+ {
+ 	struct rt_sigframe_n32 __user *frame;
++	mm_segment_t old_fs;
+ 	sigset_t set;
+ 	stack_t st;
+ 	s32 sp;
+@@ -143,7 +144,11 @@ asmlinkage void sysn32_rt_sigreturn(nabi
+ 
+ 	/* It is more difficult to avoid calling this function than to
+ 	   call it and ignore errors.  */
++	old_fs = get_fs();
++	set_fs(KERNEL_DS);
+ 	do_sigaltstack((stack_t __user *)&st, NULL, regs.regs[29]);
++	set_fs(old_fs);
++
+ 
+ 	/*
+ 	 * Don't let your children do this ...
+--- a/arch/mips/kernel/unaligned.c
++++ b/arch/mips/kernel/unaligned.c
+@@ -109,8 +109,6 @@ static void emulate_load_store_insn(stru
+ 	unsigned long value;
+ 	unsigned int res;
+ 
+-	regs->regs[0] = 0;
+-
+ 	/*
+ 	 * This load never faults.
+ 	 */
+--- a/arch/um/drivers/hostaudio_kern.c
++++ b/arch/um/drivers/hostaudio_kern.c
+@@ -40,6 +40,11 @@ static char *mixer = HOSTAUDIO_DEV_MIXER
+ "    This is used to specify the host mixer device to the hostaudio driver.\n"\
+ "    The default is \"" HOSTAUDIO_DEV_MIXER "\".\n\n"
+ 
++module_param(dsp, charp, 0644);
++MODULE_PARM_DESC(dsp, DSP_HELP);
++module_param(mixer, charp, 0644);
++MODULE_PARM_DESC(mixer, MIXER_HELP);
++
+ #ifndef MODULE
+ static int set_dsp(char *name, int *add)
+ {
+@@ -56,15 +61,6 @@ static int set_mixer(char *name, int *ad
+ }
+ 
+ __uml_setup("mixer=", set_mixer, "mixer=<mixer device>\n" MIXER_HELP);
+-
+-#else /*MODULE*/
+-
+-module_param(dsp, charp, 0644);
+-MODULE_PARM_DESC(dsp, DSP_HELP);
+-
+-module_param(mixer, charp, 0644);
+-MODULE_PARM_DESC(mixer, MIXER_HELP);
+-
+ #endif
+ 
+ /* /dev/dsp file operations */
+--- a/arch/um/drivers/ubd_kern.c
++++ b/arch/um/drivers/ubd_kern.c
+@@ -163,6 +163,7 @@ struct ubd {
+ 	struct scatterlist sg[MAX_SG];
+ 	struct request *request;
+ 	int start_sg, end_sg;
++	sector_t rq_pos;
+ };
+ 
+ #define DEFAULT_COW { \
+@@ -187,6 +188,7 @@ struct ubd {
+ 	.request =		NULL, \
+ 	.start_sg =		0, \
+ 	.end_sg =		0, \
++	.rq_pos =		0, \
+ }
+ 
+ /* Protected by ubd_lock */
+@@ -1228,7 +1230,6 @@ static void do_ubd_request(struct reques
+ {
+ 	struct io_thread_req *io_req;
+ 	struct request *req;
+-	sector_t sector;
+ 	int n;
+ 
+ 	while(1){
+@@ -1239,12 +1240,12 @@ static void do_ubd_request(struct reques
+ 				return;
+ 
+ 			dev->request = req;
++			dev->rq_pos = blk_rq_pos(req);
+ 			dev->start_sg = 0;
+ 			dev->end_sg = blk_rq_map_sg(q, req, dev->sg);
+ 		}
+ 
+ 		req = dev->request;
+-		sector = blk_rq_pos(req);
+ 		while(dev->start_sg < dev->end_sg){
+ 			struct scatterlist *sg = &dev->sg[dev->start_sg];
+ 
+@@ -1256,10 +1257,9 @@ static void do_ubd_request(struct reques
+ 				return;
+ 			}
+ 			prepare_request(req, io_req,
+-					(unsigned long long)sector << 9,
++					(unsigned long long)dev->rq_pos << 9,
+ 					sg->offset, sg->length, sg_page(sg));
+ 
+-			sector += sg->length >> 9;
+ 			n = os_write_file(thread_fd, &io_req,
+ 					  sizeof(struct io_thread_req *));
+ 			if(n != sizeof(struct io_thread_req *)){
+@@ -1272,6 +1272,7 @@ static void do_ubd_request(struct reques
+ 				return;
+ 			}
+ 
++			dev->rq_pos += sg->length >> 9;
+ 			dev->start_sg++;
+ 		}
+ 		dev->end_sg = 0;
+--- a/drivers/block/ps3disk.c
++++ b/drivers/block/ps3disk.c
+@@ -113,7 +113,7 @@ static void ps3disk_scatter_gather(struc
+ 			memcpy(buf, dev->bounce_buf+offset, size);
+ 		offset += size;
+ 		flush_kernel_dcache_page(bvec->bv_page);
+-		bvec_kunmap_irq(bvec, &flags);
++		bvec_kunmap_irq(buf, &flags);
+ 		i++;
+ 	}
+ }
+--- a/drivers/firewire/ohci.c
++++ b/drivers/firewire/ohci.c
+@@ -2840,7 +2840,7 @@ static int __devinit pci_probe(struct pc
+ 			       const struct pci_device_id *ent)
+ {
+ 	struct fw_ohci *ohci;
+-	u32 bus_options, max_receive, link_speed, version, link_enh;
++	u32 bus_options, max_receive, link_speed, version;
+ 	u64 guid;
+ 	int i, err, n_ir, n_it;
+ 	size_t size;
+@@ -2894,23 +2894,6 @@ static int __devinit pci_probe(struct pc
+ 	if (param_quirks)
+ 		ohci->quirks = param_quirks;
+ 
+-	/* TI OHCI-Lynx and compatible: set recommended configuration bits. */
+-	if (dev->vendor == PCI_VENDOR_ID_TI) {
+-		pci_read_config_dword(dev, PCI_CFG_TI_LinkEnh, &link_enh);
+-
+-		/* adjust latency of ATx FIFO: use 1.7 KB threshold */
+-		link_enh &= ~TI_LinkEnh_atx_thresh_mask;
+-		link_enh |= TI_LinkEnh_atx_thresh_1_7K;
+-
+-		/* use priority arbitration for asynchronous responses */
+-		link_enh |= TI_LinkEnh_enab_unfair;
+-
+-		/* required for aPhyEnhanceEnable to work */
+-		link_enh |= TI_LinkEnh_enab_accel;
+-
+-		pci_write_config_dword(dev, PCI_CFG_TI_LinkEnh, link_enh);
+-	}
+-
+ 	ar_context_init(&ohci->ar_request_ctx, ohci,
+ 			OHCI1394_AsReqRcvContextControlSet);
+ 
+--- a/drivers/firewire/ohci.h
++++ b/drivers/firewire/ohci.h
+@@ -155,12 +155,4 @@
+ 
+ #define OHCI1394_phy_tcode		0xe
+ 
+-/* TI extensions */
+-
+-#define PCI_CFG_TI_LinkEnh		0xf4
+-#define  TI_LinkEnh_enab_accel		0x00000002
+-#define  TI_LinkEnh_enab_unfair		0x00000080
+-#define  TI_LinkEnh_atx_thresh_mask	0x00003000
+-#define  TI_LinkEnh_atx_thresh_1_7K	0x00001000
+-
+ #endif /* _FIREWIRE_OHCI_H */
+--- a/drivers/gpu/drm/radeon/radeon_cursor.c
++++ b/drivers/gpu/drm/radeon/radeon_cursor.c
+@@ -203,6 +203,7 @@ int radeon_crtc_cursor_move(struct drm_c
+ 	struct radeon_crtc *radeon_crtc = to_radeon_crtc(crtc);
+ 	struct radeon_device *rdev = crtc->dev->dev_private;
+ 	int xorigin = 0, yorigin = 0;
++	int w = radeon_crtc->cursor_width;
+ 
+ 	if (x < 0)
+ 		xorigin = -x + 1;
+@@ -213,22 +214,7 @@ int radeon_crtc_cursor_move(struct drm_c
+ 	if (yorigin >= CURSOR_HEIGHT)
+ 		yorigin = CURSOR_HEIGHT - 1;
+ 
+-	radeon_lock_cursor(crtc, true);
+-	if (ASIC_IS_DCE4(rdev)) {
+-		/* cursors are offset into the total surface */
+-		x += crtc->x;
+-		y += crtc->y;
+-		DRM_DEBUG("x %d y %d c->x %d c->y %d\n", x, y, crtc->x, crtc->y);
+-
+-		/* XXX: check if evergreen has the same issues as avivo chips */
+-		WREG32(EVERGREEN_CUR_POSITION + radeon_crtc->crtc_offset,
+-		       ((xorigin ? 0 : x) << 16) |
+-		       (yorigin ? 0 : y));
+-		WREG32(EVERGREEN_CUR_HOT_SPOT + radeon_crtc->crtc_offset, (xorigin << 16) | yorigin);
+-		WREG32(EVERGREEN_CUR_SIZE + radeon_crtc->crtc_offset,
+-		       ((radeon_crtc->cursor_width - 1) << 16) | (radeon_crtc->cursor_height - 1));
+-	} else if (ASIC_IS_AVIVO(rdev)) {
+-		int w = radeon_crtc->cursor_width;
++	if (ASIC_IS_AVIVO(rdev)) {
+ 		int i = 0;
+ 		struct drm_crtc *crtc_p;
+ 
+@@ -260,7 +246,17 @@ int radeon_crtc_cursor_move(struct drm_c
+ 			if (w <= 0)
+ 				w = 1;
+ 		}
++	}
+ 
++	radeon_lock_cursor(crtc, true);
++	if (ASIC_IS_DCE4(rdev)) {
++		WREG32(EVERGREEN_CUR_POSITION + radeon_crtc->crtc_offset,
++		       ((xorigin ? 0 : x) << 16) |
++		       (yorigin ? 0 : y));
++		WREG32(EVERGREEN_CUR_HOT_SPOT + radeon_crtc->crtc_offset, (xorigin << 16) | yorigin);
++		WREG32(EVERGREEN_CUR_SIZE + radeon_crtc->crtc_offset,
++		       ((w - 1) << 16) | (radeon_crtc->cursor_height - 1));
++	} else if (ASIC_IS_AVIVO(rdev)) {
+ 		WREG32(AVIVO_D1CUR_POSITION + radeon_crtc->crtc_offset,
+ 			     ((xorigin ? 0 : x) << 16) |
+ 			     (yorigin ? 0 : y));
+--- a/drivers/hid/hid-cando.c
++++ b/drivers/hid/hid-cando.c
+@@ -237,6 +237,8 @@ static const struct hid_device_id cando_
+ 			USB_DEVICE_ID_CANDO_MULTI_TOUCH) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_CANDO,
+ 			USB_DEVICE_ID_CANDO_MULTI_TOUCH_11_6) },
++	{ HID_USB_DEVICE(USB_VENDOR_ID_CANDO,
++		USB_DEVICE_ID_CANDO_MULTI_TOUCH_15_6) },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(hid, cando_devices);
+--- a/drivers/hid/hid-core.c
++++ b/drivers/hid/hid-core.c
+@@ -1292,6 +1292,7 @@ static const struct hid_device_id hid_bl
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_BTC, USB_DEVICE_ID_BTC_EMPREX_REMOTE_2) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_CANDO, USB_DEVICE_ID_CANDO_MULTI_TOUCH) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_CANDO, USB_DEVICE_ID_CANDO_MULTI_TOUCH_11_6) },
++	{ HID_USB_DEVICE(USB_VENDOR_ID_CANDO, USB_DEVICE_ID_CANDO_MULTI_TOUCH_15_6) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_CHERRY, USB_DEVICE_ID_CHERRY_CYMOTION) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_CHERRY, USB_DEVICE_ID_CHERRY_CYMOTION_SOLAR) },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_CHICONY, USB_DEVICE_ID_CHICONY_TACTICAL_PAD) },
+--- a/drivers/hid/hid-ids.h
++++ b/drivers/hid/hid-ids.h
+@@ -134,6 +134,7 @@
+ #define USB_VENDOR_ID_CANDO		0x2087
+ #define USB_DEVICE_ID_CANDO_MULTI_TOUCH	0x0a01
+ #define USB_DEVICE_ID_CANDO_MULTI_TOUCH_11_6 0x0b03
++#define USB_DEVICE_ID_CANDO_MULTI_TOUCH_15_6 0x0f01
+ 
+ #define USB_VENDOR_ID_CH		0x068e
+ #define USB_DEVICE_ID_CH_PRO_PEDALS	0x00f2
+@@ -503,6 +504,7 @@
+ 
+ #define USB_VENDOR_ID_TURBOX		0x062a
+ #define USB_DEVICE_ID_TURBOX_KEYBOARD	0x0201
++#define USB_DEVICE_ID_TURBOX_TOUCHSCREEN_MOSART	0x7100
+ 
+ #define USB_VENDOR_ID_TWINHAN		0x6253
+ #define USB_DEVICE_ID_TWINHAN_IR_REMOTE	0x0100
+--- a/drivers/hid/hidraw.c
++++ b/drivers/hid/hidraw.c
+@@ -109,6 +109,12 @@ static ssize_t hidraw_write(struct file
+ 	int ret = 0;
+ 
+ 	mutex_lock(&minors_lock);
++
++	if (!hidraw_table[minor]) {
++		ret = -ENODEV;
++		goto out;
++	}
++
+ 	dev = hidraw_table[minor]->hid;
+ 
+ 	if (!dev->hid_output_raw_report) {
+@@ -244,6 +250,10 @@ static long hidraw_ioctl(struct file *fi
+ 
+ 	mutex_lock(&minors_lock);
+ 	dev = hidraw_table[minor];
++	if (!dev) {
++		ret = -ENODEV;
++		goto out;
++	}
+ 
+ 	switch (cmd) {
+ 		case HIDIOCGRDESCSIZE:
+@@ -317,6 +327,7 @@ static long hidraw_ioctl(struct file *fi
+ 
+ 		ret = -ENOTTY;
+ 	}
++out:
+ 	mutex_unlock(&minors_lock);
+ 	return ret;
+ }
+--- a/drivers/hid/usbhid/hid-quirks.c
++++ b/drivers/hid/usbhid/hid-quirks.c
+@@ -36,6 +36,7 @@ static const struct hid_blacklist {
+ 	{ USB_VENDOR_ID_DWAV, USB_DEVICE_ID_EGALAX_TOUCHCONTROLLER, HID_QUIRK_MULTI_INPUT | HID_QUIRK_NOGET },
+ 	{ USB_VENDOR_ID_DWAV, USB_DEVICE_ID_DWAV_EGALAX_MULTITOUCH, HID_QUIRK_MULTI_INPUT },
+ 	{ USB_VENDOR_ID_MOJO, USB_DEVICE_ID_RETRO_ADAPTER, HID_QUIRK_MULTI_INPUT },
++	{ USB_VENDOR_ID_TURBOX, USB_DEVICE_ID_TURBOX_TOUCHSCREEN_MOSART, HID_QUIRK_MULTI_INPUT },
+ 	{ USB_VENDOR_ID_HAPP, USB_DEVICE_ID_UGCI_DRIVING, HID_QUIRK_BADPAD | HID_QUIRK_MULTI_INPUT },
+ 	{ USB_VENDOR_ID_HAPP, USB_DEVICE_ID_UGCI_FLYING, HID_QUIRK_BADPAD | HID_QUIRK_MULTI_INPUT },
+ 	{ USB_VENDOR_ID_HAPP, USB_DEVICE_ID_UGCI_FIGHTING, HID_QUIRK_BADPAD | HID_QUIRK_MULTI_INPUT },
+--- a/drivers/i2c/busses/i2c-davinci.c
++++ b/drivers/i2c/busses/i2c-davinci.c
+@@ -331,21 +331,16 @@ i2c_davinci_xfer_msg(struct i2c_adapter
+ 	INIT_COMPLETION(dev->cmd_complete);
+ 	dev->cmd_err = 0;
+ 
+-	/* Take I2C out of reset, configure it as master and set the
+-	 * start bit */
+-	flag = DAVINCI_I2C_MDR_IRS | DAVINCI_I2C_MDR_MST | DAVINCI_I2C_MDR_STT;
++	/* Take I2C out of reset and configure it as master */
++	flag = DAVINCI_I2C_MDR_IRS | DAVINCI_I2C_MDR_MST;
+ 
+ 	/* if the slave address is ten bit address, enable XA bit */
+ 	if (msg->flags & I2C_M_TEN)
+ 		flag |= DAVINCI_I2C_MDR_XA;
+ 	if (!(msg->flags & I2C_M_RD))
+ 		flag |= DAVINCI_I2C_MDR_TRX;
+-	if (stop)
+-		flag |= DAVINCI_I2C_MDR_STP;
+-	if (msg->len == 0) {
++	if (msg->len == 0)
+ 		flag |= DAVINCI_I2C_MDR_RM;
+-		flag &= ~DAVINCI_I2C_MDR_STP;
+-	}
+ 
+ 	/* Enable receive or transmit interrupts */
+ 	w = davinci_i2c_read_reg(dev, DAVINCI_I2C_IMR_REG);
+@@ -358,17 +353,28 @@ i2c_davinci_xfer_msg(struct i2c_adapter
+ 	dev->terminate = 0;
+ 
+ 	/*
++	 * Write mode register first as needed for correct behaviour
++	 * on OMAP-L138, but don't set STT yet to avoid a race with XRDY
++	 * occuring before we have loaded DXR
++	 */
++	davinci_i2c_write_reg(dev, DAVINCI_I2C_MDR_REG, flag);
++
++	/*
+ 	 * First byte should be set here, not after interrupt,
+ 	 * because transmit-data-ready interrupt can come before
+ 	 * NACK-interrupt during sending of previous message and
+ 	 * ICDXR may have wrong data
++	 * It also saves us one interrupt, slightly faster
+ 	 */
+ 	if ((!(msg->flags & I2C_M_RD)) && dev->buf_len) {
+ 		davinci_i2c_write_reg(dev, DAVINCI_I2C_DXR_REG, *dev->buf++);
+ 		dev->buf_len--;
+ 	}
+ 
+-	/* write the data into mode register; start transmitting */
++	/* Set STT to begin transmit now DXR is loaded */
++	flag |= DAVINCI_I2C_MDR_STT;
++	if (stop && msg->len != 0)
++		flag |= DAVINCI_I2C_MDR_STP;
+ 	davinci_i2c_write_reg(dev, DAVINCI_I2C_MDR_REG, flag);
+ 
+ 	r = wait_for_completion_interruptible_timeout(&dev->cmd_complete,
+--- a/drivers/i2c/busses/i2c-imx.c
++++ b/drivers/i2c/busses/i2c-imx.c
+@@ -159,15 +159,9 @@ static int i2c_imx_bus_busy(struct imx_i
+ 
+ static int i2c_imx_trx_complete(struct imx_i2c_struct *i2c_imx)
+ {
+-	int result;
+-
+-	result = wait_event_interruptible_timeout(i2c_imx->queue,
+-		i2c_imx->i2csr & I2SR_IIF, HZ / 10);
++	wait_event_timeout(i2c_imx->queue, i2c_imx->i2csr & I2SR_IIF, HZ / 10);
+ 
+-	if (unlikely(result < 0)) {
+-		dev_dbg(&i2c_imx->adapter.dev, "<%s> result < 0\n", __func__);
+-		return result;
+-	} else if (unlikely(!(i2c_imx->i2csr & I2SR_IIF))) {
++	if (unlikely(!(i2c_imx->i2csr & I2SR_IIF))) {
+ 		dev_dbg(&i2c_imx->adapter.dev, "<%s> Timeout\n", __func__);
+ 		return -ETIMEDOUT;
+ 	}
+@@ -295,7 +289,7 @@ static irqreturn_t i2c_imx_isr(int irq,
+ 		i2c_imx->i2csr = temp;
+ 		temp &= ~I2SR_IIF;
+ 		writeb(temp, i2c_imx->base + IMX_I2C_I2SR);
+-		wake_up_interruptible(&i2c_imx->queue);
++		wake_up(&i2c_imx->queue);
+ 		return IRQ_HANDLED;
+ 	}
+ 
+--- a/drivers/input/evdev.c
++++ b/drivers/input/evdev.c
+@@ -669,6 +669,9 @@ static long evdev_do_ioctl(struct file *
+ 
+ 		if ((_IOC_NR(cmd) & ~ABS_MAX) == _IOC_NR(EVIOCGABS(0))) {
+ 
++			if (!dev->absinfo)
++				return -EINVAL;
++
+ 			t = _IOC_NR(cmd) & ABS_MAX;
+ 			abs = dev->absinfo[t];
+ 
+@@ -680,10 +683,13 @@ static long evdev_do_ioctl(struct file *
+ 		}
+ 	}
+ 
+-	if (_IOC_DIR(cmd) == _IOC_READ) {
++	if (_IOC_DIR(cmd) == _IOC_WRITE) {
+ 
+ 		if ((_IOC_NR(cmd) & ~ABS_MAX) == _IOC_NR(EVIOCSABS(0))) {
+ 
++			if (!dev->absinfo)
++				return -EINVAL;
++
+ 			t = _IOC_NR(cmd) & ABS_MAX;
+ 
+ 			if (copy_from_user(&abs, p, min_t(size_t,
+--- a/drivers/media/video/v4l2-compat-ioctl32.c
++++ b/drivers/media/video/v4l2-compat-ioctl32.c
+@@ -193,17 +193,24 @@ static int put_video_window32(struct vid
+ struct video_code32 {
+ 	char		loadwhat[16];	/* name or tag of file being passed */
+ 	compat_int_t	datasize;
+-	unsigned char	*data;
++	compat_uptr_t	data;
+ };
+ 
+-static int get_microcode32(struct video_code *kp, struct video_code32 __user *up)
++static struct video_code __user *get_microcode32(struct video_code32 *kp)
+ {
+-	if (!access_ok(VERIFY_READ, up, sizeof(struct video_code32)) ||
+-		copy_from_user(kp->loadwhat, up->loadwhat, sizeof(up->loadwhat)) ||
+-		get_user(kp->datasize, &up->datasize) ||
+-		copy_from_user(kp->data, up->data, up->datasize))
+-			return -EFAULT;
+-	return 0;
++	struct video_code __user *up;
++
++	up = compat_alloc_user_space(sizeof(*up));
++
++	/*
++	 * NOTE! We don't actually care if these fail. If the
++	 * user address is invalid, the native ioctl will do
++	 * the error handling for us
++	 */
++	(void) copy_to_user(up->loadwhat, kp->loadwhat, sizeof(up->loadwhat));
++	(void) put_user(kp->datasize, &up->datasize);
++	(void) put_user(compat_ptr(kp->data), &up->data);
++	return up;
+ }
+ 
+ #define VIDIOCGTUNER32		_IOWR('v', 4, struct video_tuner32)
+@@ -739,7 +746,7 @@ static long do_video_ioctl(struct file *
+ 		struct video_tuner vt;
+ 		struct video_buffer vb;
+ 		struct video_window vw;
+-		struct video_code vc;
++		struct video_code32 vc;
+ 		struct video_audio va;
+ #endif
+ 		struct v4l2_format v2f;
+@@ -818,8 +825,11 @@ static long do_video_ioctl(struct file *
+ 		break;
+ 
+ 	case VIDIOCSMICROCODE:
+-		err = get_microcode32(&karg.vc, up);
+-		compatible_arg = 0;
++		/* Copy the 32-bit "video_code32" to kernel space */
++		if (copy_from_user(&karg.vc, up, sizeof(karg.vc)))
++			return -EFAULT;
++		/* Convert the 32-bit version to a 64-bit version in user space */
++		up = get_microcode32(&karg.vc);
+ 		break;
+ 
+ 	case VIDIOCSFREQ:
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -1631,6 +1631,19 @@ int mmc_suspend_host(struct mmc_host *ho
+ 	if (host->bus_ops && !host->bus_dead) {
+ 		if (host->bus_ops->suspend)
+ 			err = host->bus_ops->suspend(host);
++		if (err == -ENOSYS || !host->bus_ops->resume) {
++			/*
++			 * We simply "remove" the card in this case.
++			 * It will be redetected on resume.
++			 */
++			if (host->bus_ops->remove)
++				host->bus_ops->remove(host);
++			mmc_claim_host(host);
++			mmc_detach_bus(host);
++			mmc_release_host(host);
++			host->pm_flags = 0;
++			err = 0;
++		}
+ 	}
+ 	mmc_bus_put(host);
+ 
+--- a/drivers/mtd/nand/mxc_nand.c
++++ b/drivers/mtd/nand/mxc_nand.c
+@@ -30,6 +30,8 @@
+ #include <linux/clk.h>
+ #include <linux/err.h>
+ #include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/completion.h>
+ 
+ #include <asm/mach/flash.h>
+ #include <mach/mxc_nand.h>
+@@ -151,7 +153,7 @@ struct mxc_nand_host {
+ 	int			irq;
+ 	int			eccsize;
+ 
+-	wait_queue_head_t	irq_waitq;
++	struct completion	op_completion;
+ 
+ 	uint8_t			*data_buf;
+ 	unsigned int		buf_start;
+@@ -164,6 +166,7 @@ struct mxc_nand_host {
+ 	void			(*send_read_id)(struct mxc_nand_host *);
+ 	uint16_t		(*get_dev_status)(struct mxc_nand_host *);
+ 	int			(*check_int)(struct mxc_nand_host *);
++	void			(*irq_control)(struct mxc_nand_host *, int);
+ };
+ 
+ /* OOB placement block for use with hardware ecc generation */
+@@ -216,9 +219,12 @@ static irqreturn_t mxc_nfc_irq(int irq,
+ {
+ 	struct mxc_nand_host *host = dev_id;
+ 
+-	disable_irq_nosync(irq);
++	if (!host->check_int(host))
++		return IRQ_NONE;
+ 
+-	wake_up(&host->irq_waitq);
++	host->irq_control(host, 0);
++
++	complete(&host->op_completion);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -245,11 +251,54 @@ static int check_int_v1_v2(struct mxc_na
+ 	if (!(tmp & NFC_V1_V2_CONFIG2_INT))
+ 		return 0;
+ 
+-	writew(tmp & ~NFC_V1_V2_CONFIG2_INT, NFC_V1_V2_CONFIG2);
++	if (!cpu_is_mx21())
++		writew(tmp & ~NFC_V1_V2_CONFIG2_INT, NFC_V1_V2_CONFIG2);
+ 
+ 	return 1;
+ }
+ 
++/*
++ * It has been observed that the i.MX21 cannot read the CONFIG2:INT bit
++ * if interrupts are masked (CONFIG1:INT_MSK is set). To handle this, the
++ * driver can enable/disable the irq line rather than simply masking the
++ * interrupts.
++ */
++static void irq_control_mx21(struct mxc_nand_host *host, int activate)
++{
++	if (activate)
++		enable_irq(host->irq);
++	else
++		disable_irq_nosync(host->irq);
++}
++
++static void irq_control_v1_v2(struct mxc_nand_host *host, int activate)
++{
++	uint16_t tmp;
++
++	tmp = readw(NFC_V1_V2_CONFIG1);
++
++	if (activate)
++		tmp &= ~NFC_V1_V2_CONFIG1_INT_MSK;
++	else
++		tmp |= NFC_V1_V2_CONFIG1_INT_MSK;
++
++	writew(tmp, NFC_V1_V2_CONFIG1);
++}
++
++static void irq_control_v3(struct mxc_nand_host *host, int activate)
++{
++	uint32_t tmp;
++
++	tmp = readl(NFC_V3_CONFIG2);
++
++	if (activate)
++		tmp &= ~NFC_V3_CONFIG2_INT_MSK;
++	else
++		tmp |= NFC_V3_CONFIG2_INT_MSK;
++
++	writel(tmp, NFC_V3_CONFIG2);
++}
++
+ /* This function polls the NANDFC to wait for the basic operation to
+  * complete by checking the INT bit of config2 register.
+  */
+@@ -259,10 +308,9 @@ static void wait_op_done(struct mxc_nand
+ 
+ 	if (useirq) {
+ 		if (!host->check_int(host)) {
+-
+-			enable_irq(host->irq);
+-
+-			wait_event(host->irq_waitq, host->check_int(host));
++			INIT_COMPLETION(host->op_completion);
++			host->irq_control(host, 1);
++			wait_for_completion(&host->op_completion);
+ 		}
+ 	} else {
+ 		while (max_retries-- > 0) {
+@@ -799,6 +847,7 @@ static void preset_v3(struct mtd_info *m
+ 		NFC_V3_CONFIG2_2CMD_PHASES |
+ 		NFC_V3_CONFIG2_SPAS(mtd->oobsize >> 1) |
+ 		NFC_V3_CONFIG2_ST_CMD(0x70) |
++		NFC_V3_CONFIG2_INT_MSK |
+ 		NFC_V3_CONFIG2_NUM_ADDR_PHASE0;
+ 
+ 	if (chip->ecc.mode == NAND_ECC_HW)
+@@ -1024,6 +1073,10 @@ static int __init mxcnd_probe(struct pla
+ 		host->send_read_id = send_read_id_v1_v2;
+ 		host->get_dev_status = get_dev_status_v1_v2;
+ 		host->check_int = check_int_v1_v2;
++		if (cpu_is_mx21())
++			host->irq_control = irq_control_mx21;
++		else
++			host->irq_control = irq_control_v1_v2;
+ 	}
+ 
+ 	if (nfc_is_v21()) {
+@@ -1062,6 +1115,7 @@ static int __init mxcnd_probe(struct pla
+ 		host->send_read_id = send_read_id_v3;
+ 		host->check_int = check_int_v3;
+ 		host->get_dev_status = get_dev_status_v3;
++		host->irq_control = irq_control_v3;
+ 		oob_smallpage = &nandv2_hw_eccoob_smallpage;
+ 		oob_largepage = &nandv2_hw_eccoob_largepage;
+ 	} else
+@@ -1093,14 +1147,34 @@ static int __init mxcnd_probe(struct pla
+ 		this->options |= NAND_USE_FLASH_BBT;
+ 	}
+ 
+-	init_waitqueue_head(&host->irq_waitq);
++	init_completion(&host->op_completion);
+ 
+ 	host->irq = platform_get_irq(pdev, 0);
+ 
++	/*
++	 * mask the interrupt. For i.MX21 explicitely call
++	 * irq_control_v1_v2 to use the mask bit. We can't call
++	 * disable_irq_nosync() for an interrupt we do not own yet.
++	 */
++	if (cpu_is_mx21())
++		irq_control_v1_v2(host, 0);
++	else
++		host->irq_control(host, 0);
++
+ 	err = request_irq(host->irq, mxc_nfc_irq, IRQF_DISABLED, DRIVER_NAME, host);
+ 	if (err)
+ 		goto eirq;
+ 
++	host->irq_control(host, 0);
++
++	/*
++	 * Now that the interrupt is disabled make sure the interrupt
++	 * mask bit is cleared on i.MX21. Otherwise we can't read
++	 * the interrupt status bit on this machine.
++	 */
++	if (cpu_is_mx21())
++		irq_control_v1_v2(host, 1);
++
+ 	/* first scan to find the device and get the page size */
+ 	if (nand_scan_ident(mtd, 1, NULL)) {
+ 		err = -ENXIO;
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -2024,6 +2024,7 @@ int dump_write(struct file *file, const
+ {
+ 	return access_ok(VERIFY_READ, addr, nr) && file->f_op->write(file, addr, nr, &file->f_pos) == nr;
+ }
++EXPORT_SYMBOL(dump_write);
+ 
+ int dump_seek(struct file *file, loff_t off)
+ {
+@@ -2052,3 +2053,4 @@ int dump_seek(struct file *file, loff_t
+ 	}
+ 	return ret;
+ }
++EXPORT_SYMBOL(dump_seek);
+--- a/include/linux/types.h
++++ b/include/linux/types.h
+@@ -121,7 +121,15 @@ typedef		__u64		u_int64_t;
+ typedef		__s64		int64_t;
+ #endif
+ 
+-/* this is a special 64bit data type that is 8-byte aligned */
++/*
++ * aligned_u64 should be used in defining kernel<->userspace ABIs to avoid
++ * common 32/64-bit compat problems.
++ * 64-bit values align to 4-byte boundaries on x86_32 (and possibly other
++ * architectures) and to 8-byte boundaries on 64-bit architetures.  The new
++ * aligned_64 type enforces 8-byte alignment so that structs containing
++ * aligned_64 values have the same alignment on 32-bit and 64-bit architectures.
++ * No conversions are necessary between 32-bit user-space and a 64-bit kernel.
++ */
+ #define aligned_u64 __u64 __attribute__((aligned(8)))
+ #define aligned_be64 __be64 __attribute__((aligned(8)))
+ #define aligned_le64 __le64 __attribute__((aligned(8)))
+@@ -178,6 +186,11 @@ typedef __u64 __bitwise __be64;
+ typedef __u16 __bitwise __sum16;
+ typedef __u32 __bitwise __wsum;
+ 
++/* this is a special 64bit data type that is 8-byte aligned */
++#define __aligned_u64 __u64 __attribute__((aligned(8)))
++#define __aligned_be64 __be64 __attribute__((aligned(8)))
++#define __aligned_le64 __le64 __attribute__((aligned(8)))
++
+ #ifdef __KERNEL__
+ typedef unsigned __bitwise__ gfp_t;
+ typedef unsigned __bitwise__ fmode_t;
+--- a/kernel/hrtimer.c
++++ b/kernel/hrtimer.c
+@@ -931,6 +931,7 @@ static inline int
+ remove_hrtimer(struct hrtimer *timer, struct hrtimer_clock_base *base)
+ {
+ 	if (hrtimer_is_queued(timer)) {
++		unsigned long state;
+ 		int reprogram;
+ 
+ 		/*
+@@ -944,8 +945,13 @@ remove_hrtimer(struct hrtimer *timer, st
+ 		debug_deactivate(timer);
+ 		timer_stats_hrtimer_clear_start_info(timer);
+ 		reprogram = base->cpu_base == &__get_cpu_var(hrtimer_bases);
+-		__remove_hrtimer(timer, base, HRTIMER_STATE_INACTIVE,
+-				 reprogram);
++		/*
++		 * We must preserve the CALLBACK state flag here,
++		 * otherwise we could move the timer base in
++		 * switch_hrtimer_base.
++		 */
++		state = timer->state & HRTIMER_STATE_CALLBACK;
++		__remove_hrtimer(timer, base, state, reprogram);
+ 		return 1;
+ 	}
+ 	return 0;
+@@ -1231,6 +1237,9 @@ static void __run_hrtimer(struct hrtimer
+ 		BUG_ON(timer->state != HRTIMER_STATE_CALLBACK);
+ 		enqueue_hrtimer(timer, base);
+ 	}
++
++	WARN_ON_ONCE(!(timer->state & HRTIMER_STATE_CALLBACK));
++
+ 	timer->state &= ~HRTIMER_STATE_CALLBACK;
+ }
+ 
+--- a/kernel/sysctl_check.c
++++ b/kernel/sysctl_check.c
+@@ -143,15 +143,6 @@ int sysctl_check_table(struct nsproxy *n
+ 				if (!table->maxlen)
+ 					set_fail(&fail, table, "No maxlen");
+ 			}
+-			if ((table->proc_handler == proc_doulongvec_minmax) ||
+-			    (table->proc_handler == proc_doulongvec_ms_jiffies_minmax)) {
+-				if (table->maxlen > sizeof (unsigned long)) {
+-					if (!table->extra1)
+-						set_fail(&fail, table, "No min");
+-					if (!table->extra2)
+-						set_fail(&fail, table, "No max");
+-				}
+-			}
+ #ifdef CONFIG_PROC_SYSCTL
+ 			if (table->procname && !table->proc_handler)
+ 				set_fail(&fail, table, "No proc_handler");
+--- a/net/rds/page.c
++++ b/net/rds/page.c
+@@ -57,30 +57,17 @@ int rds_page_copy_user(struct page *page
+ 	unsigned long ret;
+ 	void *addr;
+ 
+-	if (to_user)
++	addr = kmap(page);
++	if (to_user) {
+ 		rds_stats_add(s_copy_to_user, bytes);
+-	else
++		ret = copy_to_user(ptr, addr + offset, bytes);
++	} else {
+ 		rds_stats_add(s_copy_from_user, bytes);
+-
+-	addr = kmap_atomic(page, KM_USER0);
+-	if (to_user)
+-		ret = __copy_to_user_inatomic(ptr, addr + offset, bytes);
+-	else
+-		ret = __copy_from_user_inatomic(addr + offset, ptr, bytes);
+-	kunmap_atomic(addr, KM_USER0);
+-
+-	if (ret) {
+-		addr = kmap(page);
+-		if (to_user)
+-			ret = copy_to_user(ptr, addr + offset, bytes);
+-		else
+-			ret = copy_from_user(addr + offset, ptr, bytes);
+-		kunmap(page);
+-		if (ret)
+-			return -EFAULT;
++		ret = copy_from_user(addr + offset, ptr, bytes);
+ 	}
++	kunmap(page);
+ 
+-	return 0;
++	return ret ? -EFAULT : 0;
+ }
+ EXPORT_SYMBOL_GPL(rds_page_copy_user);
+ 
+--- a/sound/core/rawmidi.c
++++ b/sound/core/rawmidi.c
+@@ -535,13 +535,15 @@ static int snd_rawmidi_release(struct in
+ {
+ 	struct snd_rawmidi_file *rfile;
+ 	struct snd_rawmidi *rmidi;
++	struct module *module;
+ 
+ 	rfile = file->private_data;
+ 	rmidi = rfile->rmidi;
+ 	rawmidi_release_priv(rfile);
+ 	kfree(rfile);
++	module = rmidi->card->module;
+ 	snd_card_file_remove(rmidi->card, file);
+-	module_put(rmidi->card->module);
++	module_put(module);
+ 	return 0;
+ }
+ 
