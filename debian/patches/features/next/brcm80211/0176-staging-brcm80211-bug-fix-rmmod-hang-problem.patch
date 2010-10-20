@@ -1,0 +1,167 @@
+commit af73713642c1c02e5afefb0f807f406e835c0b7f
+Author: nohee ko <noheek@broadcom.com>
+Date:   Tue Oct 12 13:33:29 2010 -0700
+
+    staging: brcm80211: bug fix- rmmod hang problem
+    
+    Bug fix - rmmod hang problem.
+    Can keep both of kthread & down_interruptible.
+    And in the meantime, can terminate the threads
+    properly during rmmod process.
+    
+    Signed-off-by: Nohee Ko <noheek@broadcom.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+--- a/drivers/staging/brcm80211/brcmfmac/dhd_linux.c
++++ b/drivers/staging/brcm80211/brcmfmac/dhd_linux.c
+@@ -938,6 +938,8 @@ static int _dhd_sysioc_thread(void *data
+ 	bool in_ap = false;
+ #endif
+ 
++	allow_signal(SIGTERM);
++
+ 	while (down_interruptible(&dhd->sysioc_sem) == 0) {
+ 		if (kthread_should_stop())
+ 			break;
+@@ -1295,6 +1297,7 @@ static int dhd_watchdog_thread(void *dat
+ 	}
+ #endif				/* DHD_SCHED */
+ 
++	allow_signal(SIGTERM);
+ 	/* Run until signal received */
+ 	while (1) {
+ 		if (kthread_should_stop())
+@@ -1360,6 +1363,7 @@ static int dhd_dpc_thread(void *data)
+ 	}
+ #endif				/* DHD_SCHED */
+ 
++	allow_signal(SIGTERM);
+ 	/* Run until signal received */
+ 	while (1) {
+ 		if (kthread_should_stop())
+@@ -2336,17 +2340,20 @@ void dhd_detach(dhd_pub_t *dhdp)
+ 			}
+ 
+ 			if (dhd->watchdog_tsk) {
++				KILL_PROC(dhd->watchdog_tsk->pid, SIGTERM);
+ 				kthread_stop(dhd->watchdog_tsk);
+ 				dhd->watchdog_tsk = NULL;
+ 			}
+ 
+ 			if (dhd->dpc_tsk) {
++				KILL_PROC(dhd->dpc_tsk->pid, SIGTERM);
+ 				kthread_stop(dhd->dpc_tsk);
+ 				dhd->dpc_tsk = NULL;
+ 			} else
+ 				tasklet_kill(&dhd->tasklet);
+ 
+ 			if (dhd->sysioc_tsk) {
++				KILL_PROC(dhd->sysioc_tsk->pid, SIGTERM);
+ 				kthread_stop(dhd->sysioc_tsk);
+ 				dhd->sysioc_tsk = NULL;
+ 			}
+--- a/drivers/staging/brcm80211/brcmfmac/wl_cfg80211.c
++++ b/drivers/staging/brcm80211/brcmfmac/wl_cfg80211.c
+@@ -2849,6 +2849,7 @@ static s32 wl_create_event_handler(struc
+ static void wl_destroy_event_handler(struct wl_priv *wl)
+ {
+ 	if (wl->event_tsk) {
++		KILL_PROC(wl->event_tsk->pid, SIGTERM);
+ 		kthread_stop(wl->event_tsk);
+ 		wl->event_tsk = NULL;
+ 	}
+@@ -2860,6 +2861,7 @@ static void wl_term_iscan(struct wl_priv
+ 
+ 	if (wl->iscan_on && iscan->tsk) {
+ 		iscan->state = WL_ISCAN_STATE_IDLE;
++		KILL_PROC(iscan->tsk->pid, SIGTERM);
+ 		kthread_stop(iscan->tsk);
+ 		iscan->tsk = NULL;
+ 	}
+@@ -2994,6 +2996,7 @@ static s32 wl_iscan_thread(void *data)
+ 	int err = 0;
+ 
+ 	sched_setscheduler(current, SCHED_FIFO, &param);
++	allow_signal(SIGTERM);
+ 	status = WL_SCAN_RESULTS_PARTIAL;
+ 	while (likely(!down_interruptible(&iscan->sync))) {
+ 		if (kthread_should_stop())
+@@ -3015,6 +3018,7 @@ static s32 wl_iscan_thread(void *data)
+ 		del_timer_sync(&iscan->timer);
+ 		iscan->timer_on = 0;
+ 	}
++	WL_DBG(("%s was terminated\n", __func__));
+ 
+ 	return 0;
+ }
+@@ -3215,6 +3219,7 @@ static s32 wl_event_handler(void *data)
+ 	struct wl_event_q *e;
+ 
+ 	sched_setscheduler(current, SCHED_FIFO, &param);
++	allow_signal(SIGTERM);
+ 	while (likely(!down_interruptible(&wl->event_sync))) {
+ 		if (kthread_should_stop())
+ 			break;
+@@ -3232,6 +3237,7 @@ static s32 wl_event_handler(void *data)
+ 		}
+ 		wl_put_event(e);
+ 	}
++	WL_DBG(("%s was terminated\n", __func__));
+ 	return 0;
+ }
+ 
+@@ -3799,7 +3805,14 @@ static s32 __wl_cfg80211_down(struct wl_
+ 	if (wl->scan_request) {
+ 		cfg80211_scan_done(wl->scan_request, true);	/* true
+ 								 means abort */
+-		wl_set_mpc(ndev, 1);
++		/* wl_set_mpc(wl_to_ndev(wl), 1); */	/* BUG
++						* this operation cannot help
++						* but here because sdio
++						* is already down through
++						* rmmod process.
++						* Need to figure out how to
++						* address this issue
++						*/
+ 		wl->scan_request = NULL;
+ 	}
+ 	clear_bit(WL_STATUS_READY, &wl->status);
+--- a/drivers/staging/brcm80211/brcmfmac/wl_iw.c
++++ b/drivers/staging/brcm80211/brcmfmac/wl_iw.c
+@@ -1177,6 +1177,7 @@ static int _iscan_sysioc_thread(void *da
+ 	iscan_info_t *iscan = (iscan_info_t *) data;
+ 	static bool iscan_pass_abort = false;
+ 
++	allow_signal(SIGTERM);
+ 	status = WL_SCAN_RESULTS_PARTIAL;
+ 	while (down_interruptible(&iscan->sysioc_sem) == 0) {
+ 		if (kthread_should_stop())
+@@ -3744,6 +3745,7 @@ void wl_iw_detach(void)
+ 	if (!iscan)
+ 		return;
+ 	if (iscan->sysioc_tsk) {
++		KILL_PROC(iscan->sysioc_tsk->pid, SIGTERM);
+ 		kthread_stop(iscan->sysioc_tsk);
+ 		iscan->sysioc_tsk = NULL;
+ 	}
+--- a/drivers/staging/brcm80211/include/linuxver.h
++++ b/drivers/staging/brcm80211/include/linuxver.h
+@@ -35,14 +35,11 @@
+ #undef IP_TOS
+ #include <asm/io.h>
+ 
+-#define KILL_PROC(nr, sig) \
++#define KILL_PROC(pid, sig) \
+ 	do { \
+ 		struct task_struct *tsk; \
+-		struct pid *pid;    \
+-		pid = find_get_pid((pid_t)nr);    \
+-		tsk = pid_task(pid, PIDTYPE_PID);    \
+-		if (tsk) \
+-			send_sig(sig, tsk, 1); \
++		tsk = pid_task(find_vpid(pid), PIDTYPE_PID);    \
++		if (tsk)			\
++			send_sig(sig, tsk, 1);	\
+ 	} while (0)
+-
+ #endif				/* _linuxver_h_ */
