@@ -1,0 +1,1873 @@
+--- a/Documentation/filesystems/Locking
++++ b/Documentation/filesystems/Locking
+@@ -18,7 +18,6 @@ prototypes:
+ 	char *(*d_dname)((struct dentry *dentry, char *buffer, int buflen);
+ 
+ locking rules:
+-	none have BKL
+ 		dcache_lock	rename_lock	->d_lock	may block
+ d_revalidate:	no		no		no		yes
+ d_hash		no		no		no		yes
+@@ -42,18 +41,23 @@ ata *);
+ 	int (*rename) (struct inode *, struct dentry *,
+ 			struct inode *, struct dentry *);
+ 	int (*readlink) (struct dentry *, char __user *,int);
+-	int (*follow_link) (struct dentry *, struct nameidata *);
++	void * (*follow_link) (struct dentry *, struct nameidata *);
++	void (*put_link) (struct dentry *, struct nameidata *, void *);
+ 	void (*truncate) (struct inode *);
+ 	int (*permission) (struct inode *, int, struct nameidata *);
++	int (*check_acl)(struct inode *, int);
+ 	int (*setattr) (struct dentry *, struct iattr *);
+ 	int (*getattr) (struct vfsmount *, struct dentry *, struct kstat *);
+ 	int (*setxattr) (struct dentry *, const char *,const void *,size_t,int);
+ 	ssize_t (*getxattr) (struct dentry *, const char *, void *, size_t);
+ 	ssize_t (*listxattr) (struct dentry *, char *, size_t);
+ 	int (*removexattr) (struct dentry *, const char *);
++	void (*truncate_range)(struct inode *, loff_t, loff_t);
++	long (*fallocate)(struct inode *inode, int mode, loff_t offset, loff_t len);
++	int (*fiemap)(struct inode *, struct fiemap_extent_info *, u64 start, u64 len);
+ 
+ locking rules:
+-	all may block, none have BKL
++	all may block
+ 		i_mutex(inode)
+ lookup:		yes
+ create:		yes
+@@ -66,19 +70,24 @@ rmdir:		yes (both)	(see below)
+ rename:		yes (all)	(see below)
+ readlink:	no
+ follow_link:	no
++put_link:	no
+ truncate:	yes		(see below)
+ setattr:	yes
+ permission:	no
++check_acl:	no
+ getattr:	no
+ setxattr:	yes
+ getxattr:	no
+ listxattr:	no
+ removexattr:	yes
++truncate_range:	yes
++fallocate:	no
++fiemap:		no
+ 	Additionally, ->rmdir(), ->unlink() and ->rename() have ->i_mutex on
+ victim.
+ 	cross-directory ->rename() has (per-superblock) ->s_vfs_rename_sem.
+ 	->truncate() is never called directly - it's a callback, not a
+-method. It's called by vmtruncate() - library function normally used by
++method. It's called by vmtruncate() - deprecated library function used by
+ ->setattr(). Locking information above applies to that call (i.e. is
+ inherited from ->setattr() - vmtruncate() is used when ATTR_SIZE had been
+ passed).
+@@ -91,7 +100,7 @@ prototypes:
+ 	struct inode *(*alloc_inode)(struct super_block *sb);
+ 	void (*destroy_inode)(struct inode *);
+ 	void (*dirty_inode) (struct inode *);
+-	int (*write_inode) (struct inode *, int);
++	int (*write_inode) (struct inode *, struct writeback_control *wbc);
+ 	int (*drop_inode) (struct inode *);
+ 	void (*evict_inode) (struct inode *);
+ 	void (*put_super) (struct super_block *);
+@@ -105,10 +114,11 @@ prototypes:
+ 	int (*show_options)(struct seq_file *, struct vfsmount *);
+ 	ssize_t (*quota_read)(struct super_block *, int, char *, size_t, loff_t);
+ 	ssize_t (*quota_write)(struct super_block *, int, const char *, size_t, loff_t);
++	int (*bdev_try_to_free_page)(struct super_block*, struct page*, gfp_t);
++	int (*trim_fs) (struct super_block *, struct fstrim_range *);
+ 
+ locking rules:
+ 	All may block [not true, see below]
+-	None have BKL
+ 			s_umount
+ alloc_inode:
+ destroy_inode:
+@@ -127,6 +137,8 @@ umount_begin:		no
+ show_options:		no		(namespace_sem)
+ quota_read:		no		(see below)
+ quota_write:		no		(see below)
++bdev_try_to_free_page:	no		(see below)
++trim_fs:		no
+ 
+ ->statfs() has s_umount (shared) when called by ustat(2) (native or
+ compat), but that's an accident of bad API; s_umount is used to pin
+@@ -139,19 +151,25 @@ be the only ones operating on the quota
+ dqio_sem) (unless an admin really wants to screw up something and
+ writes to quota files with quotas on). For other details about locking
+ see also dquot_operations section.
++->bdev_try_to_free_page is called from the ->releasepage handler of
++the block device inode.  See there for more details.
+ 
+ --------------------------- file_system_type ---------------------------
+ prototypes:
+ 	int (*get_sb) (struct file_system_type *, int,
+ 		       const char *, void *, struct vfsmount *);
++	struct dentry *(*mount) (struct file_system_type *, int,
++		       const char *, void *);
+ 	void (*kill_sb) (struct super_block *);
+ locking rules:
+-		may block	BKL
+-get_sb		yes		no
+-kill_sb		yes		no
++		may block
++get_sb		yes
++mount		yes
++kill_sb		yes
+ 
+ ->get_sb() returns error or 0 with locked superblock attached to the vfsmount
+ (exclusive on ->s_umount).
++->mount() returns ERR_PTR or the root dentry.
+ ->kill_sb() takes a write-locked superblock, does all shutdown work on it,
+ unlocks and drops the reference.
+ 
+@@ -176,27 +194,35 @@ prototypes:
+ 	void (*freepage)(struct page *);
+ 	int (*direct_IO)(int, struct kiocb *, const struct iovec *iov,
+ 			loff_t offset, unsigned long nr_segs);
+-	int (*launder_page) (struct page *);
++	int (*get_xip_mem)(struct address_space *, pgoff_t, int, void **,
++				unsigned long *);
++	int (*migratepage)(struct address_space *, struct page *, struct page *);
++	int (*launder_page)(struct page *);
++	int (*is_partially_uptodate)(struct page *, read_descriptor_t *, unsigned long);
++	int (*error_remove_page)(struct address_space *, struct page *);
+ 
+ locking rules:
+ 	All except set_page_dirty and freepage may block
+ 
+-			BKL	PageLocked(page)	i_mutex
+-writepage:		no	yes, unlocks (see below)
+-readpage:		no	yes, unlocks
+-sync_page:		no	maybe
+-writepages:		no
+-set_page_dirty		no	no
+-readpages:		no
+-write_begin:		no	locks the page		yes
+-write_end:		no	yes, unlocks		yes
+-perform_write:		no	n/a			yes
+-bmap:			no
+-invalidatepage:		no	yes
+-releasepage:		no	yes
+-freepage:		no	yes
+-direct_IO:		no
+-launder_page:		no	yes
++			PageLocked(page)	i_mutex
++writepage:		yes, unlocks (see below)
++readpage:		yes, unlocks
++sync_page:		maybe
++writepages:
++set_page_dirty		no
++readpages:
++write_begin:		locks the page		yes
++write_end:		yes, unlocks		yes
++bmap:
++invalidatepage:		yes
++releasepage:		yes
++freepage:		yes
++direct_IO:
++get_xip_mem:					maybe
++migratepage:		yes (both)
++launder_page:		yes
++is_partially_uptodate:	yes
++error_remove_page:	yes
+ 
+ 	->write_begin(), ->write_end(), ->sync_page() and ->readpage()
+ may be called from the request handler (/dev/loop).
+@@ -276,9 +302,8 @@ under spinlock (it cannot block) and is
+ not locked.
+ 
+ 	->bmap() is currently used by legacy ioctl() (FIBMAP) provided by some
+-filesystems and by the swapper. The latter will eventually go away. All
+-instances do not actually need the BKL. Please, keep it that way and don't
+-breed new callers.
++filesystems and by the swapper. The latter will eventually go away.  Please,
++keep it that way and don't breed new callers.
+ 
+ 	->invalidatepage() is called when the filesystem must attempt to drop
+ some or all of the buffers from the page when it is being truncated.  It
+@@ -299,47 +324,37 @@ cleaned, or an error value if not. Note
+ getting mapped back in and redirtied, it needs to be kept locked
+ across the entire operation.
+ 
+-	Note: currently almost all instances of address_space methods are
+-using BKL for internal serialization and that's one of the worst sources
+-of contention. Normally they are calling library functions (in fs/buffer.c)
+-and pass foo_get_block() as a callback (on local block-based filesystems,
+-indeed). BKL is not needed for library stuff and is usually taken by
+-foo_get_block(). It's an overkill, since block bitmaps can be protected by
+-internal fs locking and real critical areas are much smaller than the areas
+-filesystems protect now.
+-
+ ----------------------- file_lock_operations ------------------------------
+ prototypes:
+-	void (*fl_insert)(struct file_lock *);	/* lock insertion callback */
+-	void (*fl_remove)(struct file_lock *);	/* lock removal callback */
+ 	void (*fl_copy_lock)(struct file_lock *, struct file_lock *);
+ 	void (*fl_release_private)(struct file_lock *);
+ 
+ 
+ locking rules:
+-			BKL	may block
+-fl_insert:		yes	no
+-fl_remove:		yes	no
+-fl_copy_lock:		yes	no
+-fl_release_private:	yes	yes
++			file_lock_lock	may block
++fl_copy_lock:		yes		no
++fl_release_private:	maybe		no
+ 
+ ----------------------- lock_manager_operations ---------------------------
+ prototypes:
+ 	int (*fl_compare_owner)(struct file_lock *, struct file_lock *);
+ 	void (*fl_notify)(struct file_lock *);  /* unblock callback */
++	int (*fl_grant)(struct file_lock *, struct file_lock *, int);
+ 	void (*fl_release_private)(struct file_lock *);
+ 	void (*fl_break)(struct file_lock *); /* break_lease callback */
++	int (*fl_mylease)(struct file_lock *, struct file_lock *);
++	int (*fl_change)(struct file_lock **, int);
+ 
+ locking rules:
+-			BKL	may block
+-fl_compare_owner:	yes	no
+-fl_notify:		yes	no
+-fl_release_private:	yes	yes
+-fl_break:		yes	no
+-
+-	Currently only NFSD and NLM provide instances of this class. None of the
+-them block. If you have out-of-tree instances - please, show up. Locking
+-in that area will change.
++			file_lock_lock	may block
++fl_compare_owner:	yes		no
++fl_notify:		yes		no
++fl_grant:		no		no
++fl_release_private:	maybe		no
++fl_break:		yes		no
++fl_mylease:		yes		no
++fl_change		yes		no
++
+ --------------------------- buffer_head -----------------------------------
+ prototypes:
+ 	void (*b_end_io)(struct buffer_head *bh, int uptodate);
+@@ -364,17 +379,17 @@ prototypes:
+ 	void (*swap_slot_free_notify) (struct block_device *, unsigned long);
+ 
+ locking rules:
+-			BKL	bd_mutex
+-open:			no	yes
+-release:		no	yes
+-ioctl:			no	no
+-compat_ioctl:		no	no
+-direct_access:		no	no
+-media_changed:		no	no
+-unlock_native_capacity:	no	no
+-revalidate_disk:	no	no
+-getgeo:			no	no
+-swap_slot_free_notify:	no	no	(see below)
++			bd_mutex
++open:			yes
++release:		yes
++ioctl:			no
++compat_ioctl:		no
++direct_access:		no
++media_changed:		no
++unlock_native_capacity:	no
++revalidate_disk:	no
++getgeo:			no
++swap_slot_free_notify:	no	(see below)
+ 
+ media_changed, unlock_native_capacity and revalidate_disk are called only from
+ check_disk_change().
+@@ -413,34 +428,21 @@ prototypes:
+ 	unsigned long (*get_unmapped_area)(struct file *, unsigned long,
+ 			unsigned long, unsigned long, unsigned long);
+ 	int (*check_flags)(int);
++	int (*flock) (struct file *, int, struct file_lock *);
++	ssize_t (*splice_write)(struct pipe_inode_info *, struct file *, loff_t *,
++			size_t, unsigned int);
++	ssize_t (*splice_read)(struct file *, loff_t *, struct pipe_inode_info *,
++			size_t, unsigned int);
++	int (*setlease)(struct file *, long, struct file_lock **);
+ };
+ 
+ locking rules:
+-	All may block.
+-			BKL
+-llseek:			no	(see below)
+-read:			no
+-aio_read:		no
+-write:			no
+-aio_write:		no
+-readdir: 		no
+-poll:			no
+-unlocked_ioctl:		no
+-compat_ioctl:		no
+-mmap:			no
+-open:			no
+-flush:			no
+-release:		no
+-fsync:			no	(see below)
+-aio_fsync:		no
+-fasync:			no
+-lock:			yes
+-readv:			no
+-writev:			no
+-sendfile:		no
+-sendpage:		no
+-get_unmapped_area:	no
+-check_flags:		no
++	All may block except for ->setlease.
++	No VFS locks held on entry except for ->fsync and ->setlease.
++
++->fsync() has i_mutex on inode.
++
++->setlease has the file_list_lock held and must not sleep.
+ 
+ ->llseek() locking has moved from llseek to the individual llseek
+ implementations.  If your fs is not using generic_file_llseek, you
+@@ -450,17 +452,10 @@ mutex or just to use i_size_read() inste
+ Note: this does not protect the file->f_pos against concurrent modifications
+ since this is something the userspace has to take care about.
+ 
+-Note: ext2_release() was *the* source of contention on fs-intensive
+-loads and dropping BKL on ->release() helps to get rid of that (we still
+-grab BKL for cases when we close a file that had been opened r/w, but that
+-can and should be done using the internal locking with smaller critical areas).
+-Current worst offender is ext2_get_block()...
+-
+-->fasync() is called without BKL protection, and is responsible for
+-maintaining the FASYNC bit in filp->f_flags.  Most instances call
+-fasync_helper(), which does that maintenance, so it's not normally
+-something one needs to worry about.  Return values > 0 will be mapped to
+-zero in the VFS layer.
++->fasync() is responsible for maintaining the FASYNC bit in filp->f_flags.
++Most instances call fasync_helper(), which does that maintenance, so it's
++not normally something one needs to worry about.  Return values > 0 will be
++mapped to zero in the VFS layer.
+ 
+ ->readdir() and ->ioctl() on directories must be changed. Ideally we would
+ move ->readdir() to inode_operations and use a separate method for directory
+@@ -471,8 +466,6 @@ components. And there are other reasons
+ ->read on directories probably must go away - we should just enforce -EISDIR
+ in sys_read() and friends.
+ 
+-->fsync() has i_mutex on inode.
+-
+ --------------------------- dquot_operations -------------------------------
+ prototypes:
+ 	int (*write_dquot) (struct dquot *);
+@@ -507,12 +500,12 @@ prototypes:
+ 	int (*access)(struct vm_area_struct *, unsigned long, void*, int, int);
+ 
+ locking rules:
+-		BKL	mmap_sem	PageLocked(page)
+-open:		no	yes
+-close:		no	yes
+-fault:		no	yes		can return with page locked
+-page_mkwrite:	no	yes		can return with page locked
+-access:		no	yes
++		mmap_sem	PageLocked(page)
++open:		yes
++close:		yes
++fault:		yes		can return with page locked
++page_mkwrite:	yes		can return with page locked
++access:		yes
+ 
+ 	->fault() is called when a previously not present pte is about
+ to be faulted in. The filesystem must find and return the page associated
+@@ -539,6 +532,3 @@ VM_IO | VM_PFNMAP VMAs.
+ 
+ (if you break something or notice that it is broken and do not fix it yourself
+ - at least put it here)
+-
+-ipc/shm.c::shm_delete() - may need BKL.
+-->read() and ->write() in many drivers are (probably) missing BKL.
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 37
+-EXTRAVERSION = -rc8
++EXTRAVERSION = -rc8-git2
+ NAME = Flesh-Eating Bats with Fangs
+ 
+ # *DOCUMENTATION*
+--- a/arch/x86/kvm/i8259.c
++++ b/arch/x86/kvm/i8259.c
+@@ -575,6 +575,8 @@ struct kvm_pic *kvm_create_pic(struct kv
+ 	s->pics[1].elcr_mask = 0xde;
+ 	s->pics[0].pics_state = s;
+ 	s->pics[1].pics_state = s;
++	s->pics[0].isr_ack = 0xff;
++	s->pics[1].isr_ack = 0xff;
+ 
+ 	/*
+ 	 * Initialize PIO device
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -2394,7 +2394,8 @@ static int mmu_alloc_direct_roots(struct
+ 			ASSERT(!VALID_PAGE(root));
+ 			spin_lock(&vcpu->kvm->mmu_lock);
+ 			kvm_mmu_free_some_pages(vcpu);
+-			sp = kvm_mmu_get_page(vcpu, i << 30, i << 30,
++			sp = kvm_mmu_get_page(vcpu, i << (30 - PAGE_SHIFT),
++					      i << 30,
+ 					      PT32_ROOT_LEVEL, 1, ACC_ALL,
+ 					      NULL);
+ 			root = __pa(sp->spt);
+--- a/drivers/gpu/drm/i915/dvo_ch7017.c
++++ b/drivers/gpu/drm/i915/dvo_ch7017.c
+@@ -242,7 +242,7 @@ fail:
+ 
+ static enum drm_connector_status ch7017_detect(struct intel_dvo_device *dvo)
+ {
+-	return connector_status_unknown;
++	return connector_status_connected;
+ }
+ 
+ static enum drm_mode_status ch7017_mode_valid(struct intel_dvo_device *dvo,
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -34,6 +34,7 @@
+ #include "i915_drm.h"
+ #include "i915_drv.h"
+ #include "i915_trace.h"
++#include "../../../platform/x86/intel_ips.h"
+ #include <linux/pci.h>
+ #include <linux/vgaarb.h>
+ #include <linux/acpi.h>
+@@ -1871,6 +1872,26 @@ out_unlock:
+ EXPORT_SYMBOL_GPL(i915_gpu_turbo_disable);
+ 
+ /**
++ * Tells the intel_ips driver that the i915 driver is now loaded, if
++ * IPS got loaded first.
++ *
++ * This awkward dance is so that neither module has to depend on the
++ * other in order for IPS to do the appropriate communication of
++ * GPU turbo limits to i915.
++ */
++static void
++ips_ping_for_i915_load(void)
++{
++	void (*link)(void);
++
++	link = symbol_get(ips_link_to_i915_driver);
++	if (link) {
++		link();
++		symbol_put(ips_link_to_i915_driver);
++	}
++}
++
++/**
+  * i915_driver_load - setup chip and create an initial config
+  * @dev: DRM device
+  * @flags: startup flags
+@@ -2075,6 +2096,8 @@ int i915_driver_load(struct drm_device *
+ 	dev_priv->mchdev_lock = &mchdev_lock;
+ 	spin_unlock(&mchdev_lock);
+ 
++	ips_ping_for_i915_load();
++
+ 	return 0;
+ 
+ out_workqueue_free:
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -2471,6 +2471,9 @@
+ # define MARIUNIT_CLOCK_GATE_DISABLE		(1 << 18)
+ # define SVSMUNIT_CLOCK_GATE_DISABLE		(1 << 1)
+ 
++#define PCH_3DCGDIS1		0x46024
++# define VFMUNIT_CLOCK_GATE_DISABLE		(1 << 11)
++
+ #define FDI_PLL_FREQ_CTL        0x46030
+ #define  FDI_PLL_FREQ_CHANGE_REQUEST    (1<<24)
+ #define  FDI_PLL_FREQ_LOCK_LIMIT_MASK   0xfff00
+@@ -2588,6 +2591,13 @@
+ #define ILK_DISPLAY_CHICKEN2	0x42004
+ #define  ILK_DPARB_GATE	(1<<22)
+ #define  ILK_VSDPFD_FULL	(1<<21)
++#define ILK_DISPLAY_CHICKEN_FUSES	0x42014
++#define  ILK_INTERNAL_GRAPHICS_DISABLE	(1<<31)
++#define  ILK_INTERNAL_DISPLAY_DISABLE	(1<<30)
++#define  ILK_DISPLAY_DEBUG_DISABLE	(1<<29)
++#define  ILK_HDCP_DISABLE		(1<<25)
++#define  ILK_eDP_A_DISABLE		(1<<24)
++#define  ILK_DESKTOP			(1<<23)
+ #define ILK_DSPCLK_GATE		0x42020
+ #define  ILK_DPARB_CLK_GATE	(1<<5)
+ /* According to spec this bit 7/8/9 of 0x42020 should be set to enable FBC */
+--- a/drivers/gpu/drm/i915/intel_bios.c
++++ b/drivers/gpu/drm/i915/intel_bios.c
+@@ -270,7 +270,7 @@ parse_general_features(struct drm_i915_p
+ 					general->ssc_freq ? 66 : 48;
+ 			else if (IS_GEN5(dev) || IS_GEN6(dev))
+ 				dev_priv->lvds_ssc_freq =
+-					general->ssc_freq ? 120 : 100;
++					general->ssc_freq ? 100 : 120;
+ 			else
+ 				dev_priv->lvds_ssc_freq =
+ 					general->ssc_freq ? 100 : 96;
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5379,6 +5379,23 @@ static int intel_encoder_clones(struct d
+ 	return index_mask;
+ }
+ 
++static bool has_edp_a(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (!IS_MOBILE(dev))
++		return false;
++
++	if ((I915_READ(DP_A) & DP_DETECTED) == 0)
++		return false;
++
++	if (IS_GEN5(dev) &&
++	    (I915_READ(ILK_DISPLAY_CHICKEN_FUSES) & ILK_eDP_A_DISABLE))
++		return false;
++
++	return true;
++}
++
+ static void intel_setup_outputs(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -5396,7 +5413,7 @@ static void intel_setup_outputs(struct d
+ 	if (HAS_PCH_SPLIT(dev)) {
+ 		dpd_is_edp = intel_dpd_is_edp(dev);
+ 
+-		if (IS_MOBILE(dev) && (I915_READ(DP_A) & DP_DETECTED))
++		if (has_edp_a(dev))
+ 			intel_dp_init(dev, DP_A);
+ 
+ 		if (dpd_is_edp && (I915_READ(PCH_DP_D) & DP_DETECTED))
+@@ -5825,6 +5842,8 @@ void intel_init_clock_gating(struct drm_
+ 			I915_WRITE(PCH_3DCGDIS0,
+ 				   MARIUNIT_CLOCK_GATE_DISABLE |
+ 				   SVSMUNIT_CLOCK_GATE_DISABLE);
++			I915_WRITE(PCH_3DCGDIS1,
++				   VFMUNIT_CLOCK_GATE_DISABLE);
+ 		}
+ 
+ 		I915_WRITE(PCH_DSPCLK_GATE_D, dspclk_gate);
+--- a/drivers/gpu/drm/i915/intel_sdvo.c
++++ b/drivers/gpu/drm/i915/intel_sdvo.c
+@@ -2040,13 +2040,14 @@ intel_sdvo_dvi_init(struct intel_sdvo *i
+ 					   SDVO_COLORIMETRY_RGB256);
+ 		connector->connector_type = DRM_MODE_CONNECTOR_HDMIA;
+ 
+-		intel_sdvo_add_hdmi_properties(intel_sdvo_connector);
+ 		intel_sdvo->is_hdmi = true;
+ 	}
+ 	intel_sdvo->base.clone_mask = ((1 << INTEL_SDVO_NON_TV_CLONE_BIT) |
+ 				       (1 << INTEL_ANALOG_CLONE_BIT));
+ 
+ 	intel_sdvo_connector_init(intel_sdvo_connector, intel_sdvo);
++	if (intel_sdvo->is_hdmi)
++		intel_sdvo_add_hdmi_properties(intel_sdvo_connector);
+ 
+ 	return true;
+ }
+--- a/drivers/platform/x86/intel_ips.c
++++ b/drivers/platform/x86/intel_ips.c
+@@ -75,6 +75,7 @@
+ #include <drm/i915_drm.h>
+ #include <asm/msr.h>
+ #include <asm/processor.h>
++#include "intel_ips.h"
+ 
+ #define PCI_DEVICE_ID_INTEL_THERMAL_SENSOR 0x3b32
+ 
+@@ -245,6 +246,7 @@
+ #define thm_writel(off, val) writel((val), ips->regmap + (off))
+ 
+ static const int IPS_ADJUST_PERIOD = 5000; /* ms */
++static bool late_i915_load = false;
+ 
+ /* For initial average collection */
+ static const int IPS_SAMPLE_PERIOD = 200; /* ms */
+@@ -339,6 +341,9 @@ struct ips_driver {
+ 	u64 orig_turbo_ratios;
+ };
+ 
++static bool
++ips_gpu_turbo_enabled(struct ips_driver *ips);
++
+ /**
+  * ips_cpu_busy - is CPU busy?
+  * @ips: IPS driver struct
+@@ -517,7 +522,7 @@ static void ips_disable_cpu_turbo(struct
+  */
+ static bool ips_gpu_busy(struct ips_driver *ips)
+ {
+-	if (!ips->gpu_turbo_enabled)
++	if (!ips_gpu_turbo_enabled(ips))
+ 		return false;
+ 
+ 	return ips->gpu_busy();
+@@ -532,7 +537,7 @@ static bool ips_gpu_busy(struct ips_driv
+  */
+ static void ips_gpu_raise(struct ips_driver *ips)
+ {
+-	if (!ips->gpu_turbo_enabled)
++	if (!ips_gpu_turbo_enabled(ips))
+ 		return;
+ 
+ 	if (!ips->gpu_raise())
+@@ -549,7 +554,7 @@ static void ips_gpu_raise(struct ips_dri
+  */
+ static void ips_gpu_lower(struct ips_driver *ips)
+ {
+-	if (!ips->gpu_turbo_enabled)
++	if (!ips_gpu_turbo_enabled(ips))
+ 		return;
+ 
+ 	if (!ips->gpu_lower())
+@@ -1454,6 +1459,31 @@ out_err:
+ 	return false;
+ }
+ 
++static bool
++ips_gpu_turbo_enabled(struct ips_driver *ips)
++{
++	if (!ips->gpu_busy && late_i915_load) {
++		if (ips_get_i915_syms(ips)) {
++			dev_info(&ips->dev->dev,
++				 "i915 driver attached, reenabling gpu turbo\n");
++			ips->gpu_turbo_enabled = !(thm_readl(THM_HTS) & HTS_GTD_DIS);
++		}
++	}
++
++	return ips->gpu_turbo_enabled;
++}
++
++void
++ips_link_to_i915_driver()
++{
++	/* We can't cleanly get at the various ips_driver structs from
++	 * this caller (the i915 driver), so just set a flag saying
++	 * that it's time to try getting the symbols again.
++	 */
++	late_i915_load = true;
++}
++EXPORT_SYMBOL_GPL(ips_link_to_i915_driver);
++
+ static DEFINE_PCI_DEVICE_TABLE(ips_id_table) = {
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL,
+ 		     PCI_DEVICE_ID_INTEL_THERMAL_SENSOR), },
+--- /dev/null
++++ b/drivers/platform/x86/intel_ips.h
+@@ -0,0 +1,21 @@
++/*
++ * Copyright (c) 2010 Intel Corporation
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * The full GNU General Public License is included in this distribution in
++ * the file called "COPYING".
++ */
++
++void ips_link_to_i915_driver(void);
+--- a/drivers/spi/coldfire_qspi.c
++++ b/drivers/spi/coldfire_qspi.c
+@@ -317,7 +317,7 @@ static void mcfqspi_work(struct work_str
+ 		msg = container_of(mcfqspi->msgq.next, struct spi_message,
+ 				   queue);
+ 
+-		list_del_init(&mcfqspi->msgq);
++		list_del_init(&msg->queue);
+ 		spin_unlock_irqrestore(&mcfqspi->lock, flags);
+ 
+ 		spi = msg->spi;
+--- a/drivers/spi/omap2_mcspi.c
++++ b/drivers/spi/omap2_mcspi.c
+@@ -1305,10 +1305,49 @@ static int __exit omap2_mcspi_remove(str
+ /* work with hotplug and coldplug */
+ MODULE_ALIAS("platform:omap2_mcspi");
+ 
++#ifdef	CONFIG_SUSPEND
++/*
++ * When SPI wake up from off-mode, CS is in activate state. If it was in
++ * unactive state when driver was suspend, then force it to unactive state at
++ * wake up.
++ */
++static int omap2_mcspi_resume(struct device *dev)
++{
++	struct spi_master	*master = dev_get_drvdata(dev);
++	struct omap2_mcspi	*mcspi = spi_master_get_devdata(master);
++	struct omap2_mcspi_cs *cs;
++
++	omap2_mcspi_enable_clocks(mcspi);
++	list_for_each_entry(cs, &omap2_mcspi_ctx[master->bus_num - 1].cs,
++			    node) {
++		if ((cs->chconf0 & OMAP2_MCSPI_CHCONF_FORCE) == 0) {
++
++			/*
++			 * We need to toggle CS state for OMAP take this
++			 * change in account.
++			 */
++			MOD_REG_BIT(cs->chconf0, OMAP2_MCSPI_CHCONF_FORCE, 1);
++			__raw_writel(cs->chconf0, cs->base + OMAP2_MCSPI_CHCONF0);
++			MOD_REG_BIT(cs->chconf0, OMAP2_MCSPI_CHCONF_FORCE, 0);
++			__raw_writel(cs->chconf0, cs->base + OMAP2_MCSPI_CHCONF0);
++		}
++	}
++	omap2_mcspi_disable_clocks(mcspi);
++	return 0;
++}
++#else
++#define	omap2_mcspi_resume	NULL
++#endif
++
++static const struct dev_pm_ops omap2_mcspi_pm_ops = {
++	.resume = omap2_mcspi_resume,
++};
++
+ static struct platform_driver omap2_mcspi_driver = {
+ 	.driver = {
+ 		.name =		"omap2_mcspi",
+ 		.owner =	THIS_MODULE,
++		.pm =		&omap2_mcspi_pm_ops
+ 	},
+ 	.remove =	__exit_p(omap2_mcspi_remove),
+ };
+--- a/drivers/staging/zram/zram_drv.c
++++ b/drivers/staging/zram/zram_drv.c
+@@ -435,12 +435,6 @@ static int zram_make_request(struct requ
+ 	int ret = 0;
+ 	struct zram *zram = queue->queuedata;
+ 
+-	if (unlikely(!zram->init_done)) {
+-		set_bit(BIO_UPTODATE, &bio->bi_flags);
+-		bio_endio(bio, 0);
+-		return 0;
+-	}
+-
+ 	if (!valid_io_request(zram, bio)) {
+ 		zram_stat64_inc(zram, &zram->stats.invalid_io);
+ 		bio_io_error(bio);
+--- a/kernel/user.c
++++ b/kernel/user.c
+@@ -158,6 +158,7 @@ struct user_struct *alloc_uid(struct use
+ 		spin_lock_irq(&uidhash_lock);
+ 		up = uid_hash_find(uid, hashent);
+ 		if (up) {
++			put_user_ns(ns);
+ 			key_put(new->uid_keyring);
+ 			key_put(new->session_keyring);
+ 			kmem_cache_free(uid_cachep, new);
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -1925,19 +1925,18 @@ again:
+ 
+ 		rcu_read_lock();
+ 		p = rcu_dereference(mm->owner);
+-		VM_BUG_ON(!p);
+ 		/*
+-		 * because we don't have task_lock(), "p" can exit while
+-		 * we're here. In that case, "mem" can point to root
+-		 * cgroup but never be NULL. (and task_struct itself is freed
+-		 * by RCU, cgroup itself is RCU safe.) Then, we have small
+-		 * risk here to get wrong cgroup. But such kind of mis-account
+-		 * by race always happens because we don't have cgroup_mutex().
+-		 * It's overkill and we allow that small race, here.
++		 * Because we don't have task_lock(), "p" can exit.
++		 * In that case, "mem" can point to root or p can be NULL with
++		 * race with swapoff. Then, we have small risk of mis-accouning.
++		 * But such kind of mis-account by race always happens because
++		 * we don't have cgroup_mutex(). It's overkill and we allo that
++		 * small race, here.
++		 * (*) swapoff at el will charge against mm-struct not against
++		 * task-struct. So, mm->owner can be NULL.
+ 		 */
+ 		mem = mem_cgroup_from_task(p);
+-		VM_BUG_ON(!mem);
+-		if (mem_cgroup_is_root(mem)) {
++		if (!mem || mem_cgroup_is_root(mem)) {
+ 			rcu_read_unlock();
+ 			goto done;
+ 		}
+--- a/scripts/kconfig/menu.c
++++ b/scripts/kconfig/menu.c
+@@ -140,6 +140,20 @@ struct property *menu_add_prop(enum prop
+ 		}
+ 		if (current_entry->prompt && current_entry != &rootmenu)
+ 			prop_warn(prop, "prompt redefined");
++
++		/* Apply all upper menus' visibilities to actual prompts. */
++		if(type == P_PROMPT) {
++			struct menu *menu = current_entry;
++
++			while ((menu = menu->parent) != NULL) {
++				if (!menu->visibility)
++					continue;
++				prop->visible.expr
++					= expr_alloc_and(prop->visible.expr,
++							 menu->visibility);
++			}
++		}
++
+ 		current_entry->prompt = prop;
+ 	}
+ 	prop->text = prompt;
+--- a/sound/oss/soundcard.c
++++ b/sound/oss/soundcard.c
+@@ -87,7 +87,7 @@ int *load_mixer_volumes(char *name, int
+ 	int             i, n;
+ 
+ 	for (i = 0; i < num_mixer_volumes; i++) {
+-		if (strcmp(name, mixer_vols[i].name) == 0) {
++		if (strncmp(name, mixer_vols[i].name, 32) == 0) {
+ 			if (present)
+ 				mixer_vols[i].num = i;
+ 			return mixer_vols[i].levels;
+@@ -99,7 +99,7 @@ int *load_mixer_volumes(char *name, int
+ 	}
+ 	n = num_mixer_volumes++;
+ 
+-	strcpy(mixer_vols[n].name, name);
++	strncpy(mixer_vols[n].name, name, 32);
+ 
+ 	if (present)
+ 		mixer_vols[n].num = n;
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@ -2300,6 +2300,7 @@ static struct snd_pci_quirk position_fix
+ 	SND_PCI_QUIRK(0x1028, 0x01cc, "Dell D820", POS_FIX_LPIB),
+ 	SND_PCI_QUIRK(0x1028, 0x01de, "Dell Precision 390", POS_FIX_LPIB),
+ 	SND_PCI_QUIRK(0x1028, 0x01f6, "Dell Latitude 131L", POS_FIX_LPIB),
++	SND_PCI_QUIRK(0x1028, 0x0470, "Dell Inspiron 1120", POS_FIX_LPIB),
+ 	SND_PCI_QUIRK(0x103c, 0x306d, "HP dv3", POS_FIX_LPIB),
+ 	SND_PCI_QUIRK(0x1043, 0x813d, "ASUS P5AD2", POS_FIX_LPIB),
+ 	SND_PCI_QUIRK(0x1043, 0x81b3, "ASUS", POS_FIX_LPIB),
+--- a/sound/soc/codecs/max98088.c
++++ b/sound/soc/codecs/max98088.c
+@@ -40,7 +40,6 @@ struct max98088_cdata {
+ };
+ 
+ struct max98088_priv {
+-       u8 reg_cache[M98088_REG_CNT];
+        enum max98088_type devtype;
+        void *control_data;
+        struct max98088_pdata *pdata;
+@@ -1588,7 +1587,7 @@ static int max98088_dai2_set_fmt(struct
+ 
+ static void max98088_sync_cache(struct snd_soc_codec *codec)
+ {
+-       struct max98088_priv *max98088 = snd_soc_codec_get_drvdata(codec);
++       u16 *reg_cache = codec->reg_cache;
+        int i;
+ 
+        if (!codec->cache_sync)
+@@ -1599,14 +1598,14 @@ static void max98088_sync_cache(struct s
+        /* write back cached values if they're writeable and
+         * different from the hardware default.
+         */
+-       for (i = 1; i < ARRAY_SIZE(max98088->reg_cache); i++) {
++       for (i = 1; i < codec->driver->reg_cache_size; i++) {
+                if (!max98088_access[i].writable)
+                        continue;
+ 
+-               if (max98088->reg_cache[i] == max98088_reg[i])
++               if (reg_cache[i] == max98088_reg[i])
+                        continue;
+ 
+-               snd_soc_write(codec, i, max98088->reg_cache[i]);
++               snd_soc_write(codec, i, reg_cache[i]);
+        }
+ 
+        codec->cache_sync = 0;
+@@ -1951,7 +1950,6 @@ static int max98088_probe(struct snd_soc
+        int ret = 0;
+ 
+        codec->cache_sync = 1;
+-       memcpy(codec->reg_cache, max98088_reg, sizeof(max98088_reg));
+ 
+        ret = snd_soc_codec_set_cache_io(codec, 8, 8, SND_SOC_I2C);
+        if (ret != 0) {
+--- a/sound/soc/codecs/wm8523.c
++++ b/sound/soc/codecs/wm8523.c
+@@ -41,7 +41,6 @@ static const char *wm8523_supply_names[W
+ /* codec private data */
+ struct wm8523_priv {
+ 	enum snd_soc_control_type control_type;
+-	u16 reg_cache[WM8523_REGISTER_COUNT];
+ 	struct regulator_bulk_data supplies[WM8523_NUM_SUPPLIES];
+ 	unsigned int sysclk;
+ 	unsigned int rate_constraint_list[WM8523_NUM_RATES];
+@@ -314,6 +313,7 @@ static int wm8523_set_bias_level(struct
+ 				 enum snd_soc_bias_level level)
+ {
+ 	struct wm8523_priv *wm8523 = snd_soc_codec_get_drvdata(codec);
++	u16 *reg_cache = codec->reg_cache;
+ 	int ret, i;
+ 
+ 	switch (level) {
+@@ -344,7 +344,7 @@ static int wm8523_set_bias_level(struct
+ 			/* Sync back default/cached values */
+ 			for (i = WM8523_AIF_CTRL1;
+ 			     i < WM8523_MAX_REGISTER; i++)
+-				snd_soc_write(codec, i, wm8523->reg_cache[i]);
++				snd_soc_write(codec, i, reg_cache[i]);
+ 
+ 
+ 			msleep(100);
+@@ -414,6 +414,7 @@ static int wm8523_resume(struct snd_soc_
+ static int wm8523_probe(struct snd_soc_codec *codec)
+ {
+ 	struct wm8523_priv *wm8523 = snd_soc_codec_get_drvdata(codec);
++	u16 *reg_cache = codec->reg_cache;
+ 	int ret, i;
+ 
+ 	codec->hw_write = (hw_write_t)i2c_master_send;
+@@ -470,8 +471,8 @@ static int wm8523_probe(struct snd_soc_c
+ 	}
+ 
+ 	/* Change some default settings - latch VU and enable ZC */
+-	wm8523->reg_cache[WM8523_DAC_GAINR] |= WM8523_DACR_VU;
+-	wm8523->reg_cache[WM8523_DAC_CTRL3] |= WM8523_ZC;
++	reg_cache[WM8523_DAC_GAINR] |= WM8523_DACR_VU;
++	reg_cache[WM8523_DAC_CTRL3] |= WM8523_ZC;
+ 
+ 	wm8523_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
+ 
+--- a/sound/soc/codecs/wm8741.c
++++ b/sound/soc/codecs/wm8741.c
+@@ -41,7 +41,6 @@ static const char *wm8741_supply_names[W
+ /* codec private data */
+ struct wm8741_priv {
+ 	enum snd_soc_control_type control_type;
+-	u16 reg_cache[WM8741_REGISTER_COUNT];
+ 	struct regulator_bulk_data supplies[WM8741_NUM_SUPPLIES];
+ 	unsigned int sysclk;
+ 	struct snd_pcm_hw_constraint_list *sysclk_constraints;
+@@ -422,6 +421,7 @@ static int wm8741_resume(struct snd_soc_
+ static int wm8741_probe(struct snd_soc_codec *codec)
+ {
+ 	struct wm8741_priv *wm8741 = snd_soc_codec_get_drvdata(codec);
++	u16 *reg_cache = codec->reg_cache;
+ 	int ret = 0;
+ 
+ 	ret = snd_soc_codec_set_cache_io(codec, 7, 9, wm8741->control_type);
+@@ -437,10 +437,10 @@ static int wm8741_probe(struct snd_soc_c
+ 	}
+ 
+ 	/* Change some default settings - latch VU */
+-	wm8741->reg_cache[WM8741_DACLLSB_ATTENUATION] |= WM8741_UPDATELL;
+-	wm8741->reg_cache[WM8741_DACLMSB_ATTENUATION] |= WM8741_UPDATELM;
+-	wm8741->reg_cache[WM8741_DACRLSB_ATTENUATION] |= WM8741_UPDATERL;
+-	wm8741->reg_cache[WM8741_DACRLSB_ATTENUATION] |= WM8741_UPDATERM;
++	reg_cache[WM8741_DACLLSB_ATTENUATION] |= WM8741_UPDATELL;
++	reg_cache[WM8741_DACLMSB_ATTENUATION] |= WM8741_UPDATELM;
++	reg_cache[WM8741_DACRLSB_ATTENUATION] |= WM8741_UPDATERL;
++	reg_cache[WM8741_DACRLSB_ATTENUATION] |= WM8741_UPDATERM;
+ 
+ 	snd_soc_add_controls(codec, wm8741_snd_controls,
+ 			     ARRAY_SIZE(wm8741_snd_controls));
+--- a/sound/soc/codecs/wm8753.c
++++ b/sound/soc/codecs/wm8753.c
+@@ -65,22 +65,22 @@ static void wm8753_set_dai_mode(struct s
+  * are using 2 wire for device control, so we cache them instead.
+  */
+ static const u16 wm8753_reg[] = {
+-	0x0008, 0x0000, 0x000a, 0x000a,
+-	0x0033, 0x0000, 0x0007, 0x00ff,
+-	0x00ff, 0x000f, 0x000f, 0x007b,
+-	0x0000, 0x0032, 0x0000, 0x00c3,
+-	0x00c3, 0x00c0, 0x0000, 0x0000,
++	0x0000, 0x0008, 0x0000, 0x000a,
++	0x000a, 0x0033, 0x0000, 0x0007,
++	0x00ff, 0x00ff, 0x000f, 0x000f,
++	0x007b, 0x0000, 0x0032, 0x0000,
++	0x00c3, 0x00c3, 0x00c0, 0x0000,
+ 	0x0000, 0x0000, 0x0000, 0x0000,
+ 	0x0000, 0x0000, 0x0000, 0x0000,
+-	0x0000, 0x0000, 0x0000, 0x0055,
+-	0x0005, 0x0050, 0x0055, 0x0050,
+-	0x0055, 0x0050, 0x0055, 0x0079,
+-	0x0079, 0x0079, 0x0079, 0x0079,
+ 	0x0000, 0x0000, 0x0000, 0x0000,
+-	0x0097, 0x0097, 0x0000, 0x0004,
+-	0x0000, 0x0083, 0x0024, 0x01ba,
+-	0x0000, 0x0083, 0x0024, 0x01ba,
+-	0x0000, 0x0000, 0x0000
++	0x0055, 0x0005, 0x0050, 0x0055,
++	0x0050, 0x0055, 0x0050, 0x0055,
++	0x0079, 0x0079, 0x0079, 0x0079,
++	0x0079, 0x0000, 0x0000, 0x0000,
++	0x0000, 0x0097, 0x0097, 0x0000,
++	0x0004, 0x0000, 0x0083, 0x0024,
++	0x01ba, 0x0000, 0x0083, 0x0024,
++	0x01ba, 0x0000, 0x0000, 0x0000
+ };
+ 
+ /* codec private data */
+@@ -88,57 +88,10 @@ struct wm8753_priv {
+ 	enum snd_soc_control_type control_type;
+ 	unsigned int sysclk;
+ 	unsigned int pcmclk;
+-	u16 reg_cache[ARRAY_SIZE(wm8753_reg)];
+ 	int dai_func;
+ };
+ 
+-/*
+- * read wm8753 register cache
+- */
+-static inline unsigned int wm8753_read_reg_cache(struct snd_soc_codec *codec,
+-	unsigned int reg)
+-{
+-	u16 *cache = codec->reg_cache;
+-	if (reg < 1 || reg >= (ARRAY_SIZE(wm8753_reg) + 1))
+-		return -1;
+-	return cache[reg - 1];
+-}
+-
+-/*
+- * write wm8753 register cache
+- */
+-static inline void wm8753_write_reg_cache(struct snd_soc_codec *codec,
+-	unsigned int reg, unsigned int value)
+-{
+-	u16 *cache = codec->reg_cache;
+-	if (reg < 1 || reg >= (ARRAY_SIZE(wm8753_reg) + 1))
+-		return;
+-	cache[reg - 1] = value;
+-}
+-
+-/*
+- * write to the WM8753 register space
+- */
+-static int wm8753_write(struct snd_soc_codec *codec, unsigned int reg,
+-	unsigned int value)
+-{
+-	u8 data[2];
+-
+-	/* data is
+-	 *   D15..D9 WM8753 register offset
+-	 *   D8...D0 register data
+-	 */
+-	data[0] = (reg << 1) | ((value >> 8) & 0x0001);
+-	data[1] = value & 0x00ff;
+-
+-	wm8753_write_reg_cache(codec, reg, value);
+-	if (codec->hw_write(codec->control_data, data, 2) == 2)
+-		return 0;
+-	else
+-		return -EIO;
+-}
+-
+-#define wm8753_reset(c) wm8753_write(c, WM8753_RESET, 0)
++#define wm8753_reset(c) snd_soc_write(c, WM8753_RESET, 0)
+ 
+ /*
+  * WM8753 Controls
+@@ -218,7 +171,7 @@ static int wm8753_get_dai(struct snd_kco
+ 	struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct snd_soc_codec *codec =  snd_kcontrol_chip(kcontrol);
+-	int mode = wm8753_read_reg_cache(codec, WM8753_IOCTL);
++	int mode = snd_soc_read(codec, WM8753_IOCTL);
+ 
+ 	ucontrol->value.integer.value[0] = (mode & 0xc) >> 2;
+ 	return 0;
+@@ -228,7 +181,7 @@ static int wm8753_set_dai(struct snd_kco
+ 	struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct snd_soc_codec *codec =  snd_kcontrol_chip(kcontrol);
+-	int mode = wm8753_read_reg_cache(codec, WM8753_IOCTL);
++	int mode = snd_soc_read(codec, WM8753_IOCTL);
+ 	struct wm8753_priv *wm8753 = snd_soc_codec_get_drvdata(codec);
+ 
+ 	if (((mode & 0xc) >> 2) == ucontrol->value.integer.value[0])
+@@ -738,17 +691,17 @@ static int wm8753_set_dai_pll(struct snd
+ 	if (pll_id == WM8753_PLL1) {
+ 		offset = 0;
+ 		enable = 0x10;
+-		reg = wm8753_read_reg_cache(codec, WM8753_CLOCK) & 0xffef;
++		reg = snd_soc_read(codec, WM8753_CLOCK) & 0xffef;
+ 	} else {
+ 		offset = 4;
+ 		enable = 0x8;
+-		reg = wm8753_read_reg_cache(codec, WM8753_CLOCK) & 0xfff7;
++		reg = snd_soc_read(codec, WM8753_CLOCK) & 0xfff7;
+ 	}
+ 
+ 	if (!freq_in || !freq_out) {
+ 		/* disable PLL  */
+-		wm8753_write(codec, WM8753_PLL1CTL1 + offset, 0x0026);
+-		wm8753_write(codec, WM8753_CLOCK, reg);
++		snd_soc_write(codec, WM8753_PLL1CTL1 + offset, 0x0026);
++		snd_soc_write(codec, WM8753_CLOCK, reg);
+ 		return 0;
+ 	} else {
+ 		u16 value = 0;
+@@ -759,20 +712,20 @@ static int wm8753_set_dai_pll(struct snd
+ 		/* set up N and K PLL divisor ratios */
+ 		/* bits 8:5 = PLL_N, bits 3:0 = PLL_K[21:18] */
+ 		value = (pll_div.n << 5) + ((pll_div.k & 0x3c0000) >> 18);
+-		wm8753_write(codec, WM8753_PLL1CTL2 + offset, value);
++		snd_soc_write(codec, WM8753_PLL1CTL2 + offset, value);
+ 
+ 		/* bits 8:0 = PLL_K[17:9] */
+ 		value = (pll_div.k & 0x03fe00) >> 9;
+-		wm8753_write(codec, WM8753_PLL1CTL3 + offset, value);
++		snd_soc_write(codec, WM8753_PLL1CTL3 + offset, value);
+ 
+ 		/* bits 8:0 = PLL_K[8:0] */
+ 		value = pll_div.k & 0x0001ff;
+-		wm8753_write(codec, WM8753_PLL1CTL4 + offset, value);
++		snd_soc_write(codec, WM8753_PLL1CTL4 + offset, value);
+ 
+ 		/* set PLL as input and enable */
+-		wm8753_write(codec, WM8753_PLL1CTL1 + offset, 0x0027 |
++		snd_soc_write(codec, WM8753_PLL1CTL1 + offset, 0x0027 |
+ 			(pll_div.div2 << 3));
+-		wm8753_write(codec, WM8753_CLOCK, reg | enable);
++		snd_soc_write(codec, WM8753_CLOCK, reg | enable);
+ 	}
+ 	return 0;
+ }
+@@ -879,7 +832,7 @@ static int wm8753_vdac_adc_set_dai_fmt(s
+ 		unsigned int fmt)
+ {
+ 	struct snd_soc_codec *codec = codec_dai->codec;
+-	u16 voice = wm8753_read_reg_cache(codec, WM8753_PCM) & 0x01ec;
++	u16 voice = snd_soc_read(codec, WM8753_PCM) & 0x01ec;
+ 
+ 	/* interface format */
+ 	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
+@@ -901,7 +854,7 @@ static int wm8753_vdac_adc_set_dai_fmt(s
+ 		return -EINVAL;
+ 	}
+ 
+-	wm8753_write(codec, WM8753_PCM, voice);
++	snd_soc_write(codec, WM8753_PCM, voice);
+ 	return 0;
+ }
+ 
+@@ -922,8 +875,8 @@ static int wm8753_pcm_hw_params(struct s
+ 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+ 	struct snd_soc_codec *codec = rtd->codec;
+ 	struct wm8753_priv *wm8753 = snd_soc_codec_get_drvdata(codec);
+-	u16 voice = wm8753_read_reg_cache(codec, WM8753_PCM) & 0x01f3;
+-	u16 srate = wm8753_read_reg_cache(codec, WM8753_SRATE1) & 0x017f;
++	u16 voice = snd_soc_read(codec, WM8753_PCM) & 0x01f3;
++	u16 srate = snd_soc_read(codec, WM8753_SRATE1) & 0x017f;
+ 
+ 	/* bit size */
+ 	switch (params_format(params)) {
+@@ -943,9 +896,9 @@ static int wm8753_pcm_hw_params(struct s
+ 	/* sample rate */
+ 	if (params_rate(params) * 384 == wm8753->pcmclk)
+ 		srate |= 0x80;
+-	wm8753_write(codec, WM8753_SRATE1, srate);
++	snd_soc_write(codec, WM8753_SRATE1, srate);
+ 
+-	wm8753_write(codec, WM8753_PCM, voice);
++	snd_soc_write(codec, WM8753_PCM, voice);
+ 	return 0;
+ }
+ 
+@@ -958,8 +911,8 @@ static int wm8753_pcm_set_dai_fmt(struct
+ 	struct snd_soc_codec *codec = codec_dai->codec;
+ 	u16 voice, ioctl;
+ 
+-	voice = wm8753_read_reg_cache(codec, WM8753_PCM) & 0x011f;
+-	ioctl = wm8753_read_reg_cache(codec, WM8753_IOCTL) & 0x015d;
++	voice = snd_soc_read(codec, WM8753_PCM) & 0x011f;
++	ioctl = snd_soc_read(codec, WM8753_IOCTL) & 0x015d;
+ 
+ 	/* set master/slave audio interface */
+ 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
+@@ -1013,8 +966,8 @@ static int wm8753_pcm_set_dai_fmt(struct
+ 		return -EINVAL;
+ 	}
+ 
+-	wm8753_write(codec, WM8753_PCM, voice);
+-	wm8753_write(codec, WM8753_IOCTL, ioctl);
++	snd_soc_write(codec, WM8753_PCM, voice);
++	snd_soc_write(codec, WM8753_IOCTL, ioctl);
+ 	return 0;
+ }
+ 
+@@ -1026,16 +979,16 @@ static int wm8753_set_dai_clkdiv(struct
+ 
+ 	switch (div_id) {
+ 	case WM8753_PCMDIV:
+-		reg = wm8753_read_reg_cache(codec, WM8753_CLOCK) & 0x003f;
+-		wm8753_write(codec, WM8753_CLOCK, reg | div);
++		reg = snd_soc_read(codec, WM8753_CLOCK) & 0x003f;
++		snd_soc_write(codec, WM8753_CLOCK, reg | div);
+ 		break;
+ 	case WM8753_BCLKDIV:
+-		reg = wm8753_read_reg_cache(codec, WM8753_SRATE2) & 0x01c7;
+-		wm8753_write(codec, WM8753_SRATE2, reg | div);
++		reg = snd_soc_read(codec, WM8753_SRATE2) & 0x01c7;
++		snd_soc_write(codec, WM8753_SRATE2, reg | div);
+ 		break;
+ 	case WM8753_VXCLKDIV:
+-		reg = wm8753_read_reg_cache(codec, WM8753_SRATE2) & 0x003f;
+-		wm8753_write(codec, WM8753_SRATE2, reg | div);
++		reg = snd_soc_read(codec, WM8753_SRATE2) & 0x003f;
++		snd_soc_write(codec, WM8753_SRATE2, reg | div);
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -1050,7 +1003,7 @@ static int wm8753_hdac_set_dai_fmt(struc
+ 		unsigned int fmt)
+ {
+ 	struct snd_soc_codec *codec = codec_dai->codec;
+-	u16 hifi = wm8753_read_reg_cache(codec, WM8753_HIFI) & 0x01e0;
++	u16 hifi = snd_soc_read(codec, WM8753_HIFI) & 0x01e0;
+ 
+ 	/* interface format */
+ 	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
+@@ -1072,7 +1025,7 @@ static int wm8753_hdac_set_dai_fmt(struc
+ 		return -EINVAL;
+ 	}
+ 
+-	wm8753_write(codec, WM8753_HIFI, hifi);
++	snd_soc_write(codec, WM8753_HIFI, hifi);
+ 	return 0;
+ }
+ 
+@@ -1085,8 +1038,8 @@ static int wm8753_i2s_set_dai_fmt(struct
+ 	struct snd_soc_codec *codec = codec_dai->codec;
+ 	u16 ioctl, hifi;
+ 
+-	hifi = wm8753_read_reg_cache(codec, WM8753_HIFI) & 0x011f;
+-	ioctl = wm8753_read_reg_cache(codec, WM8753_IOCTL) & 0x00ae;
++	hifi = snd_soc_read(codec, WM8753_HIFI) & 0x011f;
++	ioctl = snd_soc_read(codec, WM8753_IOCTL) & 0x00ae;
+ 
+ 	/* set master/slave audio interface */
+ 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
+@@ -1140,8 +1093,8 @@ static int wm8753_i2s_set_dai_fmt(struct
+ 		return -EINVAL;
+ 	}
+ 
+-	wm8753_write(codec, WM8753_HIFI, hifi);
+-	wm8753_write(codec, WM8753_IOCTL, ioctl);
++	snd_soc_write(codec, WM8753_HIFI, hifi);
++	snd_soc_write(codec, WM8753_IOCTL, ioctl);
+ 	return 0;
+ }
+ 
+@@ -1162,8 +1115,8 @@ static int wm8753_i2s_hw_params(struct s
+ 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+ 	struct snd_soc_codec *codec = rtd->codec;
+ 	struct wm8753_priv *wm8753 = snd_soc_codec_get_drvdata(codec);
+-	u16 srate = wm8753_read_reg_cache(codec, WM8753_SRATE1) & 0x01c0;
+-	u16 hifi = wm8753_read_reg_cache(codec, WM8753_HIFI) & 0x01f3;
++	u16 srate = snd_soc_read(codec, WM8753_SRATE1) & 0x01c0;
++	u16 hifi = snd_soc_read(codec, WM8753_HIFI) & 0x01f3;
+ 	int coeff;
+ 
+ 	/* is digital filter coefficient valid ? */
+@@ -1172,7 +1125,7 @@ static int wm8753_i2s_hw_params(struct s
+ 		printk(KERN_ERR "wm8753 invalid MCLK or rate\n");
+ 		return coeff;
+ 	}
+-	wm8753_write(codec, WM8753_SRATE1, srate | (coeff_div[coeff].sr << 1) |
++	snd_soc_write(codec, WM8753_SRATE1, srate | (coeff_div[coeff].sr << 1) |
+ 		coeff_div[coeff].usb);
+ 
+ 	/* bit size */
+@@ -1190,7 +1143,7 @@ static int wm8753_i2s_hw_params(struct s
+ 		break;
+ 	}
+ 
+-	wm8753_write(codec, WM8753_HIFI, hifi);
++	snd_soc_write(codec, WM8753_HIFI, hifi);
+ 	return 0;
+ }
+ 
+@@ -1201,8 +1154,8 @@ static int wm8753_mode1v_set_dai_fmt(str
+ 	u16 clock;
+ 
+ 	/* set clk source as pcmclk */
+-	clock = wm8753_read_reg_cache(codec, WM8753_CLOCK) & 0xfffb;
+-	wm8753_write(codec, WM8753_CLOCK, clock);
++	clock = snd_soc_read(codec, WM8753_CLOCK) & 0xfffb;
++	snd_soc_write(codec, WM8753_CLOCK, clock);
+ 
+ 	if (wm8753_vdac_adc_set_dai_fmt(codec_dai, fmt) < 0)
+ 		return -EINVAL;
+@@ -1224,8 +1177,8 @@ static int wm8753_mode2_set_dai_fmt(stru
+ 	u16 clock;
+ 
+ 	/* set clk source as pcmclk */
+-	clock = wm8753_read_reg_cache(codec, WM8753_CLOCK) & 0xfffb;
+-	wm8753_write(codec, WM8753_CLOCK, clock);
++	clock = snd_soc_read(codec, WM8753_CLOCK) & 0xfffb;
++	snd_soc_write(codec, WM8753_CLOCK, clock);
+ 
+ 	if (wm8753_vdac_adc_set_dai_fmt(codec_dai, fmt) < 0)
+ 		return -EINVAL;
+@@ -1239,8 +1192,8 @@ static int wm8753_mode3_4_set_dai_fmt(st
+ 	u16 clock;
+ 
+ 	/* set clk source as mclk */
+-	clock = wm8753_read_reg_cache(codec, WM8753_CLOCK) & 0xfffb;
+-	wm8753_write(codec, WM8753_CLOCK, clock | 0x4);
++	clock = snd_soc_read(codec, WM8753_CLOCK) & 0xfffb;
++	snd_soc_write(codec, WM8753_CLOCK, clock | 0x4);
+ 
+ 	if (wm8753_hdac_set_dai_fmt(codec_dai, fmt) < 0)
+ 		return -EINVAL;
+@@ -1252,19 +1205,19 @@ static int wm8753_mode3_4_set_dai_fmt(st
+ static int wm8753_mute(struct snd_soc_dai *dai, int mute)
+ {
+ 	struct snd_soc_codec *codec = dai->codec;
+-	u16 mute_reg = wm8753_read_reg_cache(codec, WM8753_DAC) & 0xfff7;
++	u16 mute_reg = snd_soc_read(codec, WM8753_DAC) & 0xfff7;
+ 	struct wm8753_priv *wm8753 = snd_soc_codec_get_drvdata(codec);
+ 
+ 	/* the digital mute covers the HiFi and Voice DAC's on the WM8753.
+ 	 * make sure we check if they are not both active when we mute */
+ 	if (mute && wm8753->dai_func == 1) {
+ 		if (!codec->active)
+-			wm8753_write(codec, WM8753_DAC, mute_reg | 0x8);
++			snd_soc_write(codec, WM8753_DAC, mute_reg | 0x8);
+ 	} else {
+ 		if (mute)
+-			wm8753_write(codec, WM8753_DAC, mute_reg | 0x8);
++			snd_soc_write(codec, WM8753_DAC, mute_reg | 0x8);
+ 		else
+-			wm8753_write(codec, WM8753_DAC, mute_reg);
++			snd_soc_write(codec, WM8753_DAC, mute_reg);
+ 	}
+ 
+ 	return 0;
+@@ -1273,23 +1226,23 @@ static int wm8753_mute(struct snd_soc_da
+ static int wm8753_set_bias_level(struct snd_soc_codec *codec,
+ 				 enum snd_soc_bias_level level)
+ {
+-	u16 pwr_reg = wm8753_read_reg_cache(codec, WM8753_PWR1) & 0xfe3e;
++	u16 pwr_reg = snd_soc_read(codec, WM8753_PWR1) & 0xfe3e;
+ 
+ 	switch (level) {
+ 	case SND_SOC_BIAS_ON:
+ 		/* set vmid to 50k and unmute dac */
+-		wm8753_write(codec, WM8753_PWR1, pwr_reg | 0x00c0);
++		snd_soc_write(codec, WM8753_PWR1, pwr_reg | 0x00c0);
+ 		break;
+ 	case SND_SOC_BIAS_PREPARE:
+ 		/* set vmid to 5k for quick power up */
+-		wm8753_write(codec, WM8753_PWR1, pwr_reg | 0x01c1);
++		snd_soc_write(codec, WM8753_PWR1, pwr_reg | 0x01c1);
+ 		break;
+ 	case SND_SOC_BIAS_STANDBY:
+ 		/* mute dac and set vmid to 500k, enable VREF */
+-		wm8753_write(codec, WM8753_PWR1, pwr_reg | 0x0141);
++		snd_soc_write(codec, WM8753_PWR1, pwr_reg | 0x0141);
+ 		break;
+ 	case SND_SOC_BIAS_OFF:
+-		wm8753_write(codec, WM8753_PWR1, 0x0001);
++		snd_soc_write(codec, WM8753_PWR1, 0x0001);
+ 		break;
+ 	}
+ 	codec->bias_level = level;
+@@ -1477,7 +1430,7 @@ static void wm8753_set_dai_mode(struct s
+ 		else
+ 			dai->driver = &wm8753_all_dai[(wm8753->dai_func << 1) + 1];
+ 	}
+-	wm8753_write(codec, WM8753_IOCTL, wm8753->dai_func);
++	snd_soc_write(codec, WM8753_IOCTL, wm8753->dai_func);
+ }
+ 
+ static void wm8753_work(struct work_struct *work)
+@@ -1495,22 +1448,19 @@ static int wm8753_suspend(struct snd_soc
+ 
+ static int wm8753_resume(struct snd_soc_codec *codec)
+ {
++	u16 *reg_cache = codec->reg_cache;
+ 	int i;
+-	u8 data[2];
+-	u16 *cache = codec->reg_cache;
+ 
+ 	/* Sync reg_cache with the hardware */
+-	for (i = 0; i < ARRAY_SIZE(wm8753_reg); i++) {
+-		if (i + 1 == WM8753_RESET)
++	for (i = 1; i < ARRAY_SIZE(wm8753_reg); i++) {
++		if (i == WM8753_RESET)
+ 			continue;
+ 
+ 		/* No point in writing hardware default values back */
+-		if (cache[i] == wm8753_reg[i])
++		if (reg_cache[i] == wm8753_reg[i])
+ 			continue;
+ 
+-		data[0] = ((i + 1) << 1) | ((cache[i] >> 8) & 0x0001);
+-		data[1] = cache[i] & 0x00ff;
+-		codec->hw_write(codec->control_data, data, 2);
++		snd_soc_write(codec, i, reg_cache[i]);
+ 	}
+ 
+ 	wm8753_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
+@@ -1548,7 +1498,7 @@ static int run_delayed_work(struct delay
+ static int wm8753_probe(struct snd_soc_codec *codec)
+ {
+ 	struct wm8753_priv *wm8753 = snd_soc_codec_get_drvdata(codec);
+-	int ret = 0, reg;
++	int ret;
+ 
+ 	INIT_DELAYED_WORK(&codec->delayed_work, wm8753_work);
+ 
+@@ -1573,26 +1523,16 @@ static int wm8753_probe(struct snd_soc_c
+ 			      msecs_to_jiffies(caps_charge));
+ 
+ 	/* set the update bits */
+-	reg = wm8753_read_reg_cache(codec, WM8753_LDAC);
+-	wm8753_write(codec, WM8753_LDAC, reg | 0x0100);
+-	reg = wm8753_read_reg_cache(codec, WM8753_RDAC);
+-	wm8753_write(codec, WM8753_RDAC, reg | 0x0100);
+-	reg = wm8753_read_reg_cache(codec, WM8753_LADC);
+-	wm8753_write(codec, WM8753_LADC, reg | 0x0100);
+-	reg = wm8753_read_reg_cache(codec, WM8753_RADC);
+-	wm8753_write(codec, WM8753_RADC, reg | 0x0100);
+-	reg = wm8753_read_reg_cache(codec, WM8753_LOUT1V);
+-	wm8753_write(codec, WM8753_LOUT1V, reg | 0x0100);
+-	reg = wm8753_read_reg_cache(codec, WM8753_ROUT1V);
+-	wm8753_write(codec, WM8753_ROUT1V, reg | 0x0100);
+-	reg = wm8753_read_reg_cache(codec, WM8753_LOUT2V);
+-	wm8753_write(codec, WM8753_LOUT2V, reg | 0x0100);
+-	reg = wm8753_read_reg_cache(codec, WM8753_ROUT2V);
+-	wm8753_write(codec, WM8753_ROUT2V, reg | 0x0100);
+-	reg = wm8753_read_reg_cache(codec, WM8753_LINVOL);
+-	wm8753_write(codec, WM8753_LINVOL, reg | 0x0100);
+-	reg = wm8753_read_reg_cache(codec, WM8753_RINVOL);
+-	wm8753_write(codec, WM8753_RINVOL, reg | 0x0100);
++	snd_soc_update_bits(codec, WM8753_LDAC, 0x0100, 0x0100);
++	snd_soc_update_bits(codec, WM8753_RDAC, 0x0100, 0x0100);
++	snd_soc_update_bits(codec, WM8753_LDAC, 0x0100, 0x0100);
++	snd_soc_update_bits(codec, WM8753_RDAC, 0x0100, 0x0100);
++	snd_soc_update_bits(codec, WM8753_LOUT1V, 0x0100, 0x0100);
++	snd_soc_update_bits(codec, WM8753_ROUT1V, 0x0100, 0x0100);
++	snd_soc_update_bits(codec, WM8753_LOUT2V, 0x0100, 0x0100);
++	snd_soc_update_bits(codec, WM8753_ROUT2V, 0x0100, 0x0100);
++	snd_soc_update_bits(codec, WM8753_LINVOL, 0x0100, 0x0100);
++	snd_soc_update_bits(codec, WM8753_RINVOL, 0x0100, 0x0100);
+ 
+ 	snd_soc_add_controls(codec, wm8753_snd_controls,
+ 			     ARRAY_SIZE(wm8753_snd_controls));
+--- a/sound/soc/codecs/wm8904.c
++++ b/sound/soc/codecs/wm8904.c
+@@ -50,8 +50,6 @@ static const char *wm8904_supply_names[W
+ /* codec private data */
+ struct wm8904_priv {
+ 
+-	u16 reg_cache[WM8904_MAX_REGISTER + 1];
+-
+ 	enum wm8904_type devtype;
+ 	void *control_data;
+ 
+@@ -2094,7 +2092,7 @@ static int wm8904_digital_mute(struct sn
+ 
+ static void wm8904_sync_cache(struct snd_soc_codec *codec)
+ {
+-	struct wm8904_priv *wm8904 = snd_soc_codec_get_drvdata(codec);
++	u16 *reg_cache = codec->reg_cache;
+ 	int i;
+ 
+ 	if (!codec->cache_sync)
+@@ -2105,14 +2103,14 @@ static void wm8904_sync_cache(struct snd
+ 	/* Sync back cached values if they're different from the
+ 	 * hardware default.
+ 	 */
+-	for (i = 1; i < ARRAY_SIZE(wm8904->reg_cache); i++) {
++	for (i = 1; i < codec->driver->reg_cache_size; i++) {
+ 		if (!wm8904_access[i].writable)
+ 			continue;
+ 
+-		if (wm8904->reg_cache[i] == wm8904_reg[i])
++		if (reg_cache[i] == wm8904_reg[i])
+ 			continue;
+ 
+-		snd_soc_write(codec, i, wm8904->reg_cache[i]);
++		snd_soc_write(codec, i, reg_cache[i]);
+ 	}
+ 
+ 	codec->cache_sync = 0;
+@@ -2371,6 +2369,7 @@ static int wm8904_probe(struct snd_soc_c
+ {
+ 	struct wm8904_priv *wm8904 = snd_soc_codec_get_drvdata(codec);
+ 	struct wm8904_pdata *pdata = wm8904->pdata;
++	u16 *reg_cache = codec->reg_cache;
+ 	int ret, i;
+ 
+ 	codec->cache_sync = 1;
+@@ -2437,19 +2436,19 @@ static int wm8904_probe(struct snd_soc_c
+ 	}
+ 
+ 	/* Change some default settings - latch VU and enable ZC */
+-	wm8904->reg_cache[WM8904_ADC_DIGITAL_VOLUME_LEFT] |= WM8904_ADC_VU;
+-	wm8904->reg_cache[WM8904_ADC_DIGITAL_VOLUME_RIGHT] |= WM8904_ADC_VU;
+-	wm8904->reg_cache[WM8904_DAC_DIGITAL_VOLUME_LEFT] |= WM8904_DAC_VU;
+-	wm8904->reg_cache[WM8904_DAC_DIGITAL_VOLUME_RIGHT] |= WM8904_DAC_VU;
+-	wm8904->reg_cache[WM8904_ANALOGUE_OUT1_LEFT] |= WM8904_HPOUT_VU |
++	reg_cache[WM8904_ADC_DIGITAL_VOLUME_LEFT] |= WM8904_ADC_VU;
++	reg_cache[WM8904_ADC_DIGITAL_VOLUME_RIGHT] |= WM8904_ADC_VU;
++	reg_cache[WM8904_DAC_DIGITAL_VOLUME_LEFT] |= WM8904_DAC_VU;
++	reg_cache[WM8904_DAC_DIGITAL_VOLUME_RIGHT] |= WM8904_DAC_VU;
++	reg_cache[WM8904_ANALOGUE_OUT1_LEFT] |= WM8904_HPOUT_VU |
+ 		WM8904_HPOUTLZC;
+-	wm8904->reg_cache[WM8904_ANALOGUE_OUT1_RIGHT] |= WM8904_HPOUT_VU |
++	reg_cache[WM8904_ANALOGUE_OUT1_RIGHT] |= WM8904_HPOUT_VU |
+ 		WM8904_HPOUTRZC;
+-	wm8904->reg_cache[WM8904_ANALOGUE_OUT2_LEFT] |= WM8904_LINEOUT_VU |
++	reg_cache[WM8904_ANALOGUE_OUT2_LEFT] |= WM8904_LINEOUT_VU |
+ 		WM8904_LINEOUTLZC;
+-	wm8904->reg_cache[WM8904_ANALOGUE_OUT2_RIGHT] |= WM8904_LINEOUT_VU |
++	reg_cache[WM8904_ANALOGUE_OUT2_RIGHT] |= WM8904_LINEOUT_VU |
+ 		WM8904_LINEOUTRZC;
+-	wm8904->reg_cache[WM8904_CLOCK_RATES_0] &= ~WM8904_SR_MODE;
++	reg_cache[WM8904_CLOCK_RATES_0] &= ~WM8904_SR_MODE;
+ 
+ 	/* Apply configuration from the platform data. */
+ 	if (wm8904->pdata) {
+@@ -2457,23 +2456,23 @@ static int wm8904_probe(struct snd_soc_c
+ 			if (!pdata->gpio_cfg[i])
+ 				continue;
+ 
+-			wm8904->reg_cache[WM8904_GPIO_CONTROL_1 + i]
++			reg_cache[WM8904_GPIO_CONTROL_1 + i]
+ 				= pdata->gpio_cfg[i] & 0xffff;
+ 		}
+ 
+ 		/* Zero is the default value for these anyway */
+ 		for (i = 0; i < WM8904_MIC_REGS; i++)
+-			wm8904->reg_cache[WM8904_MIC_BIAS_CONTROL_0 + i]
++			reg_cache[WM8904_MIC_BIAS_CONTROL_0 + i]
+ 				= pdata->mic_cfg[i];
+ 	}
+ 
+ 	/* Set Class W by default - this will be managed by the Class
+ 	 * G widget at runtime where bypass paths are available.
+ 	 */
+-	wm8904->reg_cache[WM8904_CLASS_W_0] |= WM8904_CP_DYN_PWR;
++	reg_cache[WM8904_CLASS_W_0] |= WM8904_CP_DYN_PWR;
+ 
+ 	/* Use normal bias source */
+-	wm8904->reg_cache[WM8904_BIAS_CONTROL_0] &= ~WM8904_POBCTRL;
++	reg_cache[WM8904_BIAS_CONTROL_0] &= ~WM8904_POBCTRL;
+ 
+ 	wm8904_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
+ 
+--- a/sound/soc/codecs/wm8940.c
++++ b/sound/soc/codecs/wm8940.c
+@@ -768,6 +768,7 @@ static __devinit int wm8940_i2c_probe(st
+ 
+ 	i2c_set_clientdata(i2c, wm8940);
+ 	wm8940->control_data = i2c;
++	wm8940->control_type = SND_SOC_I2C;
+ 
+ 	ret = snd_soc_register_codec(&i2c->dev,
+ 			&soc_codec_dev_wm8940, &wm8940_dai, 1);
+--- a/sound/soc/codecs/wm8955.c
++++ b/sound/soc/codecs/wm8955.c
+@@ -42,8 +42,6 @@ static const char *wm8955_supply_names[W
+ struct wm8955_priv {
+ 	enum snd_soc_control_type control_type;
+ 
+-	u16 reg_cache[WM8955_MAX_REGISTER + 1];
+-
+ 	unsigned int mclk_rate;
+ 
+ 	int deemph;
+@@ -768,6 +766,7 @@ static int wm8955_set_bias_level(struct
+ 				 enum snd_soc_bias_level level)
+ {
+ 	struct wm8955_priv *wm8955 = snd_soc_codec_get_drvdata(codec);
++	u16 *reg_cache = codec->reg_cache;
+ 	int ret, i;
+ 
+ 	switch (level) {
+@@ -800,14 +799,14 @@ static int wm8955_set_bias_level(struct
+ 			/* Sync back cached values if they're
+ 			 * different from the hardware default.
+ 			 */
+-			for (i = 0; i < ARRAY_SIZE(wm8955->reg_cache); i++) {
++			for (i = 0; i < codec->driver->reg_cache_size; i++) {
+ 				if (i == WM8955_RESET)
+ 					continue;
+ 
+-				if (wm8955->reg_cache[i] == wm8955_reg[i])
++				if (reg_cache[i] == wm8955_reg[i])
+ 					continue;
+ 
+-				snd_soc_write(codec, i, wm8955->reg_cache[i]);
++				snd_soc_write(codec, i, reg_cache[i]);
+ 			}
+ 
+ 			/* Enable VREF and VMID */
+@@ -902,6 +901,7 @@ static int wm8955_probe(struct snd_soc_c
+ {
+ 	struct wm8955_priv *wm8955 = snd_soc_codec_get_drvdata(codec);
+ 	struct wm8955_pdata *pdata = dev_get_platdata(codec->dev);
++	u16 *reg_cache = codec->reg_cache;
+ 	int ret, i;
+ 
+ 	ret = snd_soc_codec_set_cache_io(codec, 7, 9, wm8955->control_type);
+@@ -934,25 +934,25 @@ static int wm8955_probe(struct snd_soc_c
+ 	}
+ 
+ 	/* Change some default settings - latch VU and enable ZC */
+-	wm8955->reg_cache[WM8955_LEFT_DAC_VOLUME] |= WM8955_LDVU;
+-	wm8955->reg_cache[WM8955_RIGHT_DAC_VOLUME] |= WM8955_RDVU;
+-	wm8955->reg_cache[WM8955_LOUT1_VOLUME] |= WM8955_LO1VU | WM8955_LO1ZC;
+-	wm8955->reg_cache[WM8955_ROUT1_VOLUME] |= WM8955_RO1VU | WM8955_RO1ZC;
+-	wm8955->reg_cache[WM8955_LOUT2_VOLUME] |= WM8955_LO2VU | WM8955_LO2ZC;
+-	wm8955->reg_cache[WM8955_ROUT2_VOLUME] |= WM8955_RO2VU | WM8955_RO2ZC;
+-	wm8955->reg_cache[WM8955_MONOOUT_VOLUME] |= WM8955_MOZC;
++	reg_cache[WM8955_LEFT_DAC_VOLUME] |= WM8955_LDVU;
++	reg_cache[WM8955_RIGHT_DAC_VOLUME] |= WM8955_RDVU;
++	reg_cache[WM8955_LOUT1_VOLUME] |= WM8955_LO1VU | WM8955_LO1ZC;
++	reg_cache[WM8955_ROUT1_VOLUME] |= WM8955_RO1VU | WM8955_RO1ZC;
++	reg_cache[WM8955_LOUT2_VOLUME] |= WM8955_LO2VU | WM8955_LO2ZC;
++	reg_cache[WM8955_ROUT2_VOLUME] |= WM8955_RO2VU | WM8955_RO2ZC;
++	reg_cache[WM8955_MONOOUT_VOLUME] |= WM8955_MOZC;
+ 
+ 	/* Also enable adaptive bass boost by default */
+-	wm8955->reg_cache[WM8955_BASS_CONTROL] |= WM8955_BB;
++	reg_cache[WM8955_BASS_CONTROL] |= WM8955_BB;
+ 
+ 	/* Set platform data values */
+ 	if (pdata) {
+ 		if (pdata->out2_speaker)
+-			wm8955->reg_cache[WM8955_ADDITIONAL_CONTROL_2]
++			reg_cache[WM8955_ADDITIONAL_CONTROL_2]
+ 				|= WM8955_ROUT2INV;
+ 
+ 		if (pdata->monoin_diff)
+-			wm8955->reg_cache[WM8955_MONO_OUT_MIX_1]
++			reg_cache[WM8955_MONO_OUT_MIX_1]
+ 				|= WM8955_DMEN;
+ 	}
+ 
+@@ -1003,6 +1003,7 @@ static __devinit int wm8955_i2c_probe(st
+ 		return -ENOMEM;
+ 
+ 	i2c_set_clientdata(i2c, wm8955);
++	wm8955->control_type = SND_SOC_I2C;
+ 
+ 	ret = snd_soc_register_codec(&i2c->dev,
+ 			&soc_codec_dev_wm8955, &wm8955_dai, 1);
+--- a/sound/soc/codecs/wm8960.c
++++ b/sound/soc/codecs/wm8960.c
+@@ -1013,6 +1013,7 @@ static __devinit int wm8960_i2c_probe(st
+ 		return -ENOMEM;
+ 
+ 	i2c_set_clientdata(i2c, wm8960);
++	wm8960->control_type = SND_SOC_I2C;
+ 	wm8960->control_data = i2c;
+ 
+ 	ret = snd_soc_register_codec(&i2c->dev,
+--- a/sound/soc/codecs/wm8962.c
++++ b/sound/soc/codecs/wm8962.c
+@@ -52,8 +52,6 @@ static const char *wm8962_supply_names[W
+ struct wm8962_priv {
+ 	struct snd_soc_codec *codec;
+ 
+-	u16 reg_cache[WM8962_MAX_REGISTER + 1];
+-
+ 	int sysclk;
+ 	int sysclk_rate;
+ 
+@@ -1991,8 +1989,7 @@ static int wm8962_put_hp_sw(struct snd_k
+ 			    struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
+-	struct wm8962_priv *wm8962 = snd_soc_codec_get_drvdata(codec);
+-	u16 *reg_cache = wm8962->reg_cache;
++	u16 *reg_cache = codec->reg_cache;
+ 	int ret;
+ 
+ 	/* Apply the update (if any) */
+@@ -2020,8 +2017,7 @@ static int wm8962_put_spk_sw(struct snd_
+ 			    struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
+-	struct wm8962_priv *wm8962 = snd_soc_codec_get_drvdata(codec);
+-	u16 *reg_cache = wm8962->reg_cache;
++	u16 *reg_cache = codec->reg_cache;
+ 	int ret;
+ 
+ 	/* Apply the update (if any) */
+@@ -2329,8 +2325,7 @@ static int out_pga_event(struct snd_soc_
+ 			 struct snd_kcontrol *kcontrol, int event)
+ {
+ 	struct snd_soc_codec *codec = w->codec;
+-	struct wm8962_priv *wm8962 = snd_soc_codec_get_drvdata(codec);
+-	u16 *reg_cache = wm8962->reg_cache;
++	u16 *reg_cache = codec->reg_cache;
+ 	int reg;
+ 
+ 	switch (w->shift) {
+@@ -2719,7 +2714,7 @@ static int wm8962_add_widgets(struct snd
+ 
+ static void wm8962_sync_cache(struct snd_soc_codec *codec)
+ {
+-	struct wm8962_priv *wm8962 = snd_soc_codec_get_drvdata(codec);
++	u16 *reg_cache = codec->reg_cache;
+ 	int i;
+ 
+ 	if (!codec->cache_sync)
+@@ -2732,13 +2727,13 @@ static void wm8962_sync_cache(struct snd
+ 	/* Sync back cached values if they're different from the
+ 	 * hardware default.
+ 	 */
+-	for (i = 1; i < ARRAY_SIZE(wm8962->reg_cache); i++) {
++	for (i = 1; i < codec->driver->reg_cache_size; i++) {
+ 		if (i == WM8962_SOFTWARE_RESET)
+ 			continue;
+-		if (wm8962->reg_cache[i] == wm8962_reg[i])
++		if (reg_cache[i] == wm8962_reg[i])
+ 			continue;
+ 
+-		snd_soc_write(codec, i, wm8962->reg_cache[i]);
++		snd_soc_write(codec, i, reg_cache[i]);
+ 	}
+ 
+ 	codec->cache_sync = 0;
+@@ -3406,12 +3401,11 @@ EXPORT_SYMBOL_GPL(wm8962_mic_detect);
+ #ifdef CONFIG_PM
+ static int wm8962_resume(struct snd_soc_codec *codec)
+ {
+-	struct wm8962_priv *wm8962 = snd_soc_codec_get_drvdata(codec);
+ 	u16 *reg_cache = codec->reg_cache;
+ 	int i;
+ 
+ 	/* Restore the registers */
+-	for (i = 1; i < ARRAY_SIZE(wm8962->reg_cache); i++) {
++	for (i = 1; i < codec->driver->reg_cache_size; i++) {
+ 		switch (i) {
+ 		case WM8962_SOFTWARE_RESET:
+ 			continue;
+@@ -3705,6 +3699,7 @@ static int wm8962_probe(struct snd_soc_c
+ 	struct wm8962_pdata *pdata = dev_get_platdata(codec->dev);
+ 	struct i2c_client *i2c = container_of(codec->dev, struct i2c_client,
+ 					      dev);
++	u16 *reg_cache = codec->reg_cache;
+ 	int i, trigger, irq_pol;
+ 
+ 	wm8962->codec = codec;
+@@ -3804,7 +3799,7 @@ static int wm8962_probe(struct snd_soc_c
+ 
+ 		/* Put the speakers into mono mode? */
+ 		if (pdata->spk_mono)
+-			wm8962->reg_cache[WM8962_CLASS_D_CONTROL_2]
++			reg_cache[WM8962_CLASS_D_CONTROL_2]
+ 				|= WM8962_SPK_MONO;
+ 
+ 		/* Micbias setup, detection enable and detection
+@@ -3819,16 +3814,16 @@ static int wm8962_probe(struct snd_soc_c
+ 	}
+ 
+ 	/* Latch volume update bits */
+-	wm8962->reg_cache[WM8962_LEFT_INPUT_VOLUME] |= WM8962_IN_VU;
+-	wm8962->reg_cache[WM8962_RIGHT_INPUT_VOLUME] |= WM8962_IN_VU;
+-	wm8962->reg_cache[WM8962_LEFT_ADC_VOLUME] |= WM8962_ADC_VU;
+-	wm8962->reg_cache[WM8962_RIGHT_ADC_VOLUME] |= WM8962_ADC_VU;	
+-	wm8962->reg_cache[WM8962_LEFT_DAC_VOLUME] |= WM8962_DAC_VU;
+-	wm8962->reg_cache[WM8962_RIGHT_DAC_VOLUME] |= WM8962_DAC_VU;
+-	wm8962->reg_cache[WM8962_SPKOUTL_VOLUME] |= WM8962_SPKOUT_VU;
+-	wm8962->reg_cache[WM8962_SPKOUTR_VOLUME] |= WM8962_SPKOUT_VU;
+-	wm8962->reg_cache[WM8962_HPOUTL_VOLUME] |= WM8962_HPOUT_VU;
+-	wm8962->reg_cache[WM8962_HPOUTR_VOLUME] |= WM8962_HPOUT_VU;
++	reg_cache[WM8962_LEFT_INPUT_VOLUME] |= WM8962_IN_VU;
++	reg_cache[WM8962_RIGHT_INPUT_VOLUME] |= WM8962_IN_VU;
++	reg_cache[WM8962_LEFT_ADC_VOLUME] |= WM8962_ADC_VU;
++	reg_cache[WM8962_RIGHT_ADC_VOLUME] |= WM8962_ADC_VU;
++	reg_cache[WM8962_LEFT_DAC_VOLUME] |= WM8962_DAC_VU;
++	reg_cache[WM8962_RIGHT_DAC_VOLUME] |= WM8962_DAC_VU;
++	reg_cache[WM8962_SPKOUTL_VOLUME] |= WM8962_SPKOUT_VU;
++	reg_cache[WM8962_SPKOUTR_VOLUME] |= WM8962_SPKOUT_VU;
++	reg_cache[WM8962_HPOUTL_VOLUME] |= WM8962_HPOUT_VU;
++	reg_cache[WM8962_HPOUTR_VOLUME] |= WM8962_HPOUT_VU;
+ 
+ 	wm8962_add_widgets(codec);
+ 
+--- a/sound/soc/codecs/wm8971.c
++++ b/sound/soc/codecs/wm8971.c
+@@ -718,6 +718,7 @@ static __devinit int wm8971_i2c_probe(st
+ 	if (wm8971 == NULL)
+ 		return -ENOMEM;
+ 
++	wm8971->control_type = SND_SOC_I2C;
+ 	i2c_set_clientdata(i2c, wm8971);
+ 
+ 	ret = snd_soc_register_codec(&i2c->dev,
+--- a/sound/soc/codecs/wm9081.c
++++ b/sound/soc/codecs/wm9081.c
+@@ -1335,6 +1335,7 @@ static __devinit int wm9081_i2c_probe(st
+ 		return -ENOMEM;
+ 
+ 	i2c_set_clientdata(i2c, wm9081);
++	wm9081->control_type = SND_SOC_I2C;
+ 	wm9081->control_data = i2c;
+ 
+ 	ret = snd_soc_register_codec(&i2c->dev,
+--- a/sound/soc/codecs/wm9090.c
++++ b/sound/soc/codecs/wm9090.c
+@@ -141,7 +141,6 @@ static const u16 wm9090_reg_defaults[] =
+ /* This struct is used to save the context */
+ struct wm9090_priv {
+ 	struct mutex mutex;
+-	u16 reg_cache[WM9090_MAX_REGISTER + 1];
+ 	struct wm9090_platform_data pdata;
+ 	void *control_data;
+ };
+@@ -552,6 +551,7 @@ static int wm9090_set_bias_level(struct
+ static int wm9090_probe(struct snd_soc_codec *codec)
+ {
+ 	struct wm9090_priv *wm9090 = snd_soc_codec_get_drvdata(codec);
++	u16 *reg_cache = codec->reg_cache;
+ 	int ret;
+ 
+ 	codec->control_data = wm9090->control_data;
+@@ -576,22 +576,22 @@ static int wm9090_probe(struct snd_soc_c
+ 	/* Configure some defaults; they will be written out when we
+ 	 * bring the bias up.
+ 	 */
+-	wm9090->reg_cache[WM9090_IN1_LINE_INPUT_A_VOLUME] |= WM9090_IN1_VU
++	reg_cache[WM9090_IN1_LINE_INPUT_A_VOLUME] |= WM9090_IN1_VU
+ 		| WM9090_IN1A_ZC;
+-	wm9090->reg_cache[WM9090_IN1_LINE_INPUT_B_VOLUME] |= WM9090_IN1_VU
++	reg_cache[WM9090_IN1_LINE_INPUT_B_VOLUME] |= WM9090_IN1_VU
+ 		| WM9090_IN1B_ZC;
+-	wm9090->reg_cache[WM9090_IN2_LINE_INPUT_A_VOLUME] |= WM9090_IN2_VU
++	reg_cache[WM9090_IN2_LINE_INPUT_A_VOLUME] |= WM9090_IN2_VU
+ 		| WM9090_IN2A_ZC;
+-	wm9090->reg_cache[WM9090_IN2_LINE_INPUT_B_VOLUME] |= WM9090_IN2_VU
++	reg_cache[WM9090_IN2_LINE_INPUT_B_VOLUME] |= WM9090_IN2_VU
+ 		| WM9090_IN2B_ZC;
+-	wm9090->reg_cache[WM9090_SPEAKER_VOLUME_LEFT] |=
++	reg_cache[WM9090_SPEAKER_VOLUME_LEFT] |=
+ 		WM9090_SPKOUT_VU | WM9090_SPKOUTL_ZC;
+-	wm9090->reg_cache[WM9090_LEFT_OUTPUT_VOLUME] |=
++	reg_cache[WM9090_LEFT_OUTPUT_VOLUME] |=
+ 		WM9090_HPOUT1_VU | WM9090_HPOUT1L_ZC;
+-	wm9090->reg_cache[WM9090_RIGHT_OUTPUT_VOLUME] |=
++	reg_cache[WM9090_RIGHT_OUTPUT_VOLUME] |=
+ 		WM9090_HPOUT1_VU | WM9090_HPOUT1R_ZC;
+ 
+-	wm9090->reg_cache[WM9090_CLOCKING_1] |= WM9090_TOCLK_ENA;
++	reg_cache[WM9090_CLOCKING_1] |= WM9090_TOCLK_ENA;
+ 
+ 	wm9090_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
+ 
