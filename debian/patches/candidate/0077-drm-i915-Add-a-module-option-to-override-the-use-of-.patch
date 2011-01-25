@@ -1,0 +1,128 @@
+From 2a475f670952d2c5a50000549e7b6c21ed083572 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 12 Jan 2011 17:04:08 +0000
+Subject: [PATCH 077/118] drm/i915: Add a module option to override the use of SSC
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In order to workaround the issue with LVDS not working on the Lenovo
+U160 apparently due to using the wrong SSC frequency, add an option to
+disable SSC.
+
+Suggested-by: Lukács, Árpád <lukacs.arpad@gmail.com>
+Bugzillla: https://bugs.freedesktop.org/show_bug.cgi?id=32748
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: stable@kernel.org
+---
+ drivers/gpu/drm/i915/i915_drv.c      |    3 +++
+ drivers/gpu/drm/i915/i915_drv.h      |    1 +
+ drivers/gpu/drm/i915/intel_bios.c    |   17 ++++++-----------
+ drivers/gpu/drm/i915/intel_display.c |   31 ++++++++++++++++++++++++++-----
+ 4 files changed, 36 insertions(+), 16 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -49,6 +49,9 @@ module_param_named(powersave, i915_power
+ unsigned int i915_lvds_downclock = 0;
+ module_param_named(lvds_downclock, i915_lvds_downclock, int, 0400);
+ 
++unsigned int i915_panel_use_ssc = 1;
++module_param_named(lvds_use_ssc, i915_panel_use_ssc, int, 0600);
++
+ static struct drm_driver driver;
+ extern int intel_agp_enabled;
+ 
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -886,6 +886,7 @@ extern int i915_max_ioctl;
+ extern unsigned int i915_fbpercrtc;
+ extern unsigned int i915_powersave;
+ extern unsigned int i915_lvds_downclock;
++extern unsigned int i915_panel_use_ssc;
+ 
+ extern int i915_suspend(struct drm_device *dev, pm_message_t state);
+ extern int i915_resume(struct drm_device *dev);
+--- a/drivers/gpu/drm/i915/intel_bios.c
++++ b/drivers/gpu/drm/i915/intel_bios.c
+@@ -264,17 +264,12 @@ parse_general_features(struct drm_i915_p
+ 		dev_priv->int_crt_support = general->int_crt_support;
+ 		dev_priv->lvds_use_ssc = general->enable_ssc;
+ 
+-		if (dev_priv->lvds_use_ssc) {
+-			if (IS_I85X(dev))
+-				dev_priv->lvds_ssc_freq =
+-					general->ssc_freq ? 66 : 48;
+-			else if (IS_GEN5(dev) || IS_GEN6(dev))
+-				dev_priv->lvds_ssc_freq =
+-					general->ssc_freq ? 100 : 120;
+-			else
+-				dev_priv->lvds_ssc_freq =
+-					general->ssc_freq ? 100 : 96;
+-		}
++		if (IS_I85X(dev))
++			dev_priv->lvds_ssc_freq = general->ssc_freq ? 66 : 48;
++		else if (IS_GEN5(dev) || IS_GEN6(dev))
++			dev_priv->lvds_ssc_freq = general->ssc_freq ? 100 : 120;
++		else
++			dev_priv->lvds_ssc_freq = general->ssc_freq ? 100 : 96;
+ 	}
+ }
+ 
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -3580,6 +3580,11 @@ static void intel_update_watermarks(stru
+ 				    sr_hdisplay, sr_htotal, pixel_size);
+ }
+ 
++static inline bool intel_panel_use_ssc(struct drm_i915_private *dev_priv)
++{
++	return dev_priv->lvds_use_ssc && i915_panel_use_ssc;
++}
++
+ static int intel_crtc_mode_set(struct drm_crtc *crtc,
+ 			       struct drm_display_mode *mode,
+ 			       struct drm_display_mode *adjusted_mode,
+@@ -3642,7 +3647,7 @@ static int intel_crtc_mode_set(struct dr
+ 		num_connectors++;
+ 	}
+ 
+-	if (is_lvds && dev_priv->lvds_use_ssc && num_connectors < 2) {
++	if (is_lvds && intel_panel_use_ssc(dev_priv) && num_connectors < 2) {
+ 		refclk = dev_priv->lvds_ssc_freq * 1000;
+ 		DRM_DEBUG_KMS("using SSC reference clock of %d MHz\n",
+ 			      refclk / 1000);
+@@ -3817,7 +3822,7 @@ static int intel_crtc_mode_set(struct dr
+ 		udelay(200);
+ 
+ 		if (has_edp_encoder) {
+-			if (dev_priv->lvds_use_ssc) {
++			if (intel_panel_use_ssc(dev_priv)) {
+ 				temp |= DREF_SSC1_ENABLE;
+ 				I915_WRITE(PCH_DREF_CONTROL, temp);
+ 
+@@ -3828,13 +3833,13 @@ static int intel_crtc_mode_set(struct dr
+ 
+ 			/* Enable CPU source on CPU attached eDP */
+ 			if (!intel_encoder_is_pch_edp(&has_edp_encoder->base)) {
+-				if (dev_priv->lvds_use_ssc)
++				if (intel_panel_use_ssc(dev_priv))
+ 					temp |= DREF_CPU_SOURCE_OUTPUT_DOWNSPREAD;
+ 				else
+ 					temp |= DREF_CPU_SOURCE_OUTPUT_NONSPREAD;
+ 			} else {
+ 				/* Enable SSC on PCH eDP if needed */
+-				if (dev_priv->lvds_use_ssc) {
++				if (intel_panel_use_ssc(dev_priv)) {
+ 					DRM_ERROR("enabling SSC on PCH\n");
+ 					temp |= DREF_SUPERSPREAD_SOURCE_ENABLE;
+ 				}
+@@ -3925,7 +3930,7 @@ static int intel_crtc_mode_set(struct dr
+ 		/* XXX: just matching BIOS for now */
+ 		/*	dpll |= PLL_REF_INPUT_TVCLKINBC; */
+ 		dpll |= 3;
+-	else if (is_lvds && dev_priv->lvds_use_ssc && num_connectors < 2)
++	else if (is_lvds && intel_panel_use_ssc(dev_priv) && num_connectors < 2)
+ 		dpll |= PLLB_REF_INPUT_SPREADSPECTRUMIN;
+ 	else
+ 		dpll |= PLL_REF_INPUT_DREFCLK;
