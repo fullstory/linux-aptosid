@@ -1,0 +1,106 @@
+From afdcc94750bde3416a098b9d3b48f38a7e77702f Mon Sep 17 00:00:00 2001
+From: Roland Vossen <rvossen@broadcom.com>
+Date: Tue, 25 Jan 2011 11:51:56 +0100
+Subject: [PATCH 226/245] staging: brcm80211: bugfix for softmac crash on multi cpu configurations
+
+Solved a locking issue that resulted in driver crashes with the 43224 and 43225
+chips. The problem has been reported on several fora. Root cause was two fold:
+hardware was being manipulated by two unsynchronized threads, and a scan
+operation could interfere with an ongoing dynamic calibration process. Fix was
+to invoke a lock on wl_ops_config() operation and to set internal flags when a
+scan operation is started and stopped.
+
+Please add this to the staging-linus branch.
+
+Reviewed-by: Arend van Spriel <arend@broadcom.com>
+Signed-off-by: Roland Vossen <rvossen@broadcom.com>
+Cc: stable <stable@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ drivers/staging/brcm80211/sys/wl_mac80211.c  |   16 ++++++++++++----
+ drivers/staging/brcm80211/sys/wlc_mac80211.c |   13 +++++++++++++
+ drivers/staging/brcm80211/sys/wlc_pub.h      |    2 ++
+ 3 files changed, 27 insertions(+), 4 deletions(-)
+
+--- a/drivers/staging/brcm80211/sys/wl_mac80211.c
++++ b/drivers/staging/brcm80211/sys/wl_mac80211.c
+@@ -353,9 +353,7 @@ ieee_set_channel(struct ieee80211_hw *hw
+ 	switch (type) {
+ 	case NL80211_CHAN_HT20:
+ 	case NL80211_CHAN_NO_HT:
+-		WL_LOCK(wl);
+ 		err = wlc_set(wl->wlc, WLC_SET_CHANNEL, chan->hw_value);
+-		WL_UNLOCK(wl);
+ 		break;
+ 	case NL80211_CHAN_HT40MINUS:
+ 	case NL80211_CHAN_HT40PLUS:
+@@ -376,6 +374,7 @@ static int wl_ops_config(struct ieee8021
+ 	int err = 0;
+ 	int new_int;
+ 
++	WL_LOCK(wl);
+ 	if (changed & IEEE80211_CONF_CHANGE_LISTEN_INTERVAL) {
+ 		WL_NONE(("%s: Setting listen interval to %d\n",
+ 			 __func__, conf->listen_interval));
+@@ -431,6 +430,7 @@ static int wl_ops_config(struct ieee8021
+ 	}
+ 
+  config_out:
++	WL_UNLOCK(wl);
+ 	return err;
+ }
+ 
+@@ -559,13 +559,21 @@ wl_ops_set_tim(struct ieee80211_hw *hw,
+ 
+ static void wl_ops_sw_scan_start(struct ieee80211_hw *hw)
+ {
+-	WL_NONE(("Scan Start\n"));
++	struct wl_info *wl = hw->priv;
++	WL_NONE("Scan Start\n");
++	WL_LOCK(wl);
++	wlc_scan_start(wl->wlc);
++	WL_UNLOCK(wl);
+ 	return;
+ }
+ 
+ static void wl_ops_sw_scan_complete(struct ieee80211_hw *hw)
+ {
+-	WL_NONE(("Scan Complete\n"));
++	struct wl_info *wl = hw->priv;
++	WL_NONE("Scan Complete\n");
++	WL_LOCK(wl);
++	wlc_scan_stop(wl->wlc);
++	WL_UNLOCK(wl);
+ 	return;
+ }
+ 
+--- a/drivers/staging/brcm80211/sys/wlc_mac80211.c
++++ b/drivers/staging/brcm80211/sys/wlc_mac80211.c
+@@ -8672,3 +8672,16 @@ static void wlc_txq_free(wlc_info_t *wlc
+ 
+ 	kfree(qi);
+ }
++
++/*
++ * Flag 'scan in progress' to withold dynamic phy calibration
++ */
++void wlc_scan_start(struct wlc_info *wlc)
++{
++	wlc_phy_hold_upd(wlc->band->pi, PHY_HOLD_FOR_SCAN, true);
++}
++
++void wlc_scan_stop(struct wlc_info *wlc)
++{
++	wlc_phy_hold_upd(wlc->band->pi, PHY_HOLD_FOR_SCAN, false);
++}
+--- a/drivers/staging/brcm80211/sys/wlc_pub.h
++++ b/drivers/staging/brcm80211/sys/wlc_pub.h
+@@ -568,6 +568,8 @@ extern void wlc_enable_mac(struct wlc_in
+ extern u16 wlc_rate_shm_offset(struct wlc_info *wlc, u8 rate);
+ extern u32 wlc_get_rspec_history(struct wlc_bsscfg *cfg);
+ extern u32 wlc_get_current_highest_rate(struct wlc_bsscfg *cfg);
++extern void wlc_scan_start(struct wlc_info *wlc);
++extern void wlc_scan_stop(struct wlc_info *wlc);
+ 
+ static inline int wlc_iovar_getuint(struct wlc_info *wlc, const char *name,
+ 				    uint *arg)
