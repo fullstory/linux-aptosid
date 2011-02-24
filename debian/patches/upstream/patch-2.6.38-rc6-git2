@@ -1,0 +1,905 @@
+--- a/.gitignore
++++ b/.gitignore
+@@ -28,6 +28,7 @@ modules.builtin
+ *.gz
+ *.bz2
+ *.lzma
++*.xz
+ *.lzo
+ *.patch
+ *.gcno
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 38
+-EXTRAVERSION = -rc6
++EXTRAVERSION = -rc6-git2
+ NAME = Flesh-Eating Bats with Fangs
+ 
+ # *DOCUMENTATION*
+--- a/arch/x86/include/asm/perf_event_p4.h
++++ b/arch/x86/include/asm/perf_event_p4.h
+@@ -22,6 +22,7 @@
+ 
+ #define ARCH_P4_CNTRVAL_BITS	(40)
+ #define ARCH_P4_CNTRVAL_MASK	((1ULL << ARCH_P4_CNTRVAL_BITS) - 1)
++#define ARCH_P4_UNFLAGGED_BIT	((1ULL) << (ARCH_P4_CNTRVAL_BITS - 1))
+ 
+ #define P4_ESCR_EVENT_MASK	0x7e000000U
+ #define P4_ESCR_EVENT_SHIFT	25
+--- a/arch/x86/kernel/cpu/perf_event_p4.c
++++ b/arch/x86/kernel/cpu/perf_event_p4.c
+@@ -770,9 +770,14 @@ static inline int p4_pmu_clear_cccr_ovf(
+ 		return 1;
+ 	}
+ 
+-	/* it might be unflagged overflow */
+-	rdmsrl(hwc->event_base + hwc->idx, v);
+-	if (!(v & ARCH_P4_CNTRVAL_MASK))
++	/*
++	 * In some circumstances the overflow might issue an NMI but did
++	 * not set P4_CCCR_OVF bit. Because a counter holds a negative value
++	 * we simply check for high bit being set, if it's cleared it means
++	 * the counter has reached zero value and continued counting before
++	 * real NMI signal was received:
++	 */
++	if (!(v & ARCH_P4_UNFLAGGED_BIT))
+ 		return 1;
+ 
+ 	return 0;
+--- a/drivers/char/pcmcia/cm4000_cs.c
++++ b/drivers/char/pcmcia/cm4000_cs.c
+@@ -830,8 +830,7 @@ static void monitor_card(unsigned long p
+ 			    test_bit(IS_ANY_T1, &dev->flags))) {
+ 				DEBUGP(4, dev, "Perform AUTOPPS\n");
+ 				set_bit(IS_AUTOPPS_ACT, &dev->flags);
+-				ptsreq.protocol = ptsreq.protocol =
+-				    (0x01 << dev->proto);
++				ptsreq.protocol = (0x01 << dev->proto);
+ 				ptsreq.flags = 0x01;
+ 				ptsreq.pts1 = 0x00;
+ 				ptsreq.pts2 = 0x00;
+--- a/drivers/char/pcmcia/ipwireless/main.c
++++ b/drivers/char/pcmcia/ipwireless/main.c
+@@ -78,7 +78,6 @@ static void signalled_reboot_callback(vo
+ static int ipwireless_probe(struct pcmcia_device *p_dev, void *priv_data)
+ {
+ 	struct ipw_dev *ipw = priv_data;
+-	struct resource *io_resource;
+ 	int ret;
+ 
+ 	p_dev->resource[0]->flags &= ~IO_DATA_PATH_WIDTH;
+@@ -92,9 +91,12 @@ static int ipwireless_probe(struct pcmci
+ 	if (ret)
+ 		return ret;
+ 
+-	io_resource = request_region(p_dev->resource[0]->start,
+-				resource_size(p_dev->resource[0]),
+-				IPWIRELESS_PCCARD_NAME);
++	if (!request_region(p_dev->resource[0]->start,
++			    resource_size(p_dev->resource[0]),
++			    IPWIRELESS_PCCARD_NAME)) {
++		ret = -EBUSY;
++		goto exit;
++	}
+ 
+ 	p_dev->resource[2]->flags |=
+ 		WIN_DATA_WIDTH_16 | WIN_MEMORY_TYPE_CM | WIN_ENABLE;
+@@ -105,22 +107,25 @@ static int ipwireless_probe(struct pcmci
+ 
+ 	ret = pcmcia_map_mem_page(p_dev, p_dev->resource[2], p_dev->card_addr);
+ 	if (ret != 0)
+-		goto exit2;
++		goto exit1;
+ 
+ 	ipw->is_v2_card = resource_size(p_dev->resource[2]) == 0x100;
+ 
+-	ipw->attr_memory = ioremap(p_dev->resource[2]->start,
++	ipw->common_memory = ioremap(p_dev->resource[2]->start,
+ 				resource_size(p_dev->resource[2]));
+-	request_mem_region(p_dev->resource[2]->start,
+-			resource_size(p_dev->resource[2]),
+-			IPWIRELESS_PCCARD_NAME);
++	if (!request_mem_region(p_dev->resource[2]->start,
++				resource_size(p_dev->resource[2]),
++				IPWIRELESS_PCCARD_NAME)) {
++		ret = -EBUSY;
++		goto exit2;
++	}
+ 
+ 	p_dev->resource[3]->flags |= WIN_DATA_WIDTH_16 | WIN_MEMORY_TYPE_AM |
+ 					WIN_ENABLE;
+ 	p_dev->resource[3]->end = 0; /* this used to be 0x1000 */
+ 	ret = pcmcia_request_window(p_dev, p_dev->resource[3], 0);
+ 	if (ret != 0)
+-		goto exit2;
++		goto exit3;
+ 
+ 	ret = pcmcia_map_mem_page(p_dev, p_dev->resource[3], 0);
+ 	if (ret != 0)
+@@ -128,23 +133,28 @@ static int ipwireless_probe(struct pcmci
+ 
+ 	ipw->attr_memory = ioremap(p_dev->resource[3]->start,
+ 				resource_size(p_dev->resource[3]));
+-	request_mem_region(p_dev->resource[3]->start,
+-			resource_size(p_dev->resource[3]),
+-			IPWIRELESS_PCCARD_NAME);
++	if (!request_mem_region(p_dev->resource[3]->start,
++				resource_size(p_dev->resource[3]),
++				IPWIRELESS_PCCARD_NAME)) {
++		ret = -EBUSY;
++		goto exit4;
++	}
+ 
+ 	return 0;
+ 
++exit4:
++	iounmap(ipw->attr_memory);
+ exit3:
++	release_mem_region(p_dev->resource[2]->start,
++			resource_size(p_dev->resource[2]));
+ exit2:
+-	if (ipw->common_memory) {
+-		release_mem_region(p_dev->resource[2]->start,
+-				resource_size(p_dev->resource[2]));
+-		iounmap(ipw->common_memory);
+-	}
++	iounmap(ipw->common_memory);
+ exit1:
+-	release_resource(io_resource);
++	release_region(p_dev->resource[0]->start,
++		       resource_size(p_dev->resource[0]));
++exit:
+ 	pcmcia_disable_device(p_dev);
+-	return -1;
++	return ret;
+ }
+ 
+ static int config_ipwireless(struct ipw_dev *ipw)
+@@ -219,6 +229,8 @@ exit:
+ 
+ static void release_ipwireless(struct ipw_dev *ipw)
+ {
++	release_region(ipw->link->resource[0]->start,
++		       resource_size(ipw->link->resource[0]));
+ 	if (ipw->common_memory) {
+ 		release_mem_region(ipw->link->resource[2]->start,
+ 				resource_size(ipw->link->resource[2]));
+--- a/drivers/i2c/busses/i2c-omap.c
++++ b/drivers/i2c/busses/i2c-omap.c
+@@ -847,11 +847,15 @@ complete:
+ 			dev_err(dev->dev, "Arbitration lost\n");
+ 			err |= OMAP_I2C_STAT_AL;
+ 		}
++		/*
++		 * ProDB0017052: Clear ARDY bit twice
++		 */
+ 		if (stat & (OMAP_I2C_STAT_ARDY | OMAP_I2C_STAT_NACK |
+ 					OMAP_I2C_STAT_AL)) {
+ 			omap_i2c_ack_stat(dev, stat &
+ 				(OMAP_I2C_STAT_RRDY | OMAP_I2C_STAT_RDR |
+-				OMAP_I2C_STAT_XRDY | OMAP_I2C_STAT_XDR));
++				OMAP_I2C_STAT_XRDY | OMAP_I2C_STAT_XDR |
++				OMAP_I2C_STAT_ARDY));
+ 			omap_i2c_complete_cmd(dev, err);
+ 			return IRQ_HANDLED;
+ 		}
+@@ -1137,12 +1141,41 @@ omap_i2c_remove(struct platform_device *
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_SUSPEND
++static int omap_i2c_suspend(struct device *dev)
++{
++	if (!pm_runtime_suspended(dev))
++		if (dev->bus && dev->bus->pm && dev->bus->pm->runtime_suspend)
++			dev->bus->pm->runtime_suspend(dev);
++
++	return 0;
++}
++
++static int omap_i2c_resume(struct device *dev)
++{
++	if (!pm_runtime_suspended(dev))
++		if (dev->bus && dev->bus->pm && dev->bus->pm->runtime_resume)
++			dev->bus->pm->runtime_resume(dev);
++
++	return 0;
++}
++
++static struct dev_pm_ops omap_i2c_pm_ops = {
++	.suspend = omap_i2c_suspend,
++	.resume = omap_i2c_resume,
++};
++#define OMAP_I2C_PM_OPS (&omap_i2c_pm_ops)
++#else
++#define OMAP_I2C_PM_OPS NULL
++#endif
++
+ static struct platform_driver omap_i2c_driver = {
+ 	.probe		= omap_i2c_probe,
+ 	.remove		= omap_i2c_remove,
+ 	.driver		= {
+ 		.name	= "omap_i2c",
+ 		.owner	= THIS_MODULE,
++		.pm	= OMAP_I2C_PM_OPS,
+ 	},
+ };
+ 
+--- a/drivers/i2c/busses/i2c-stu300.c
++++ b/drivers/i2c/busses/i2c-stu300.c
+@@ -942,7 +942,7 @@ stu300_probe(struct platform_device *pde
+ 	adap->owner = THIS_MODULE;
+ 	/* DDC class but actually often used for more generic I2C */
+ 	adap->class = I2C_CLASS_DDC;
+-	strncpy(adap->name, "ST Microelectronics DDC I2C adapter",
++	strlcpy(adap->name, "ST Microelectronics DDC I2C adapter",
+ 		sizeof(adap->name));
+ 	adap->nr = bus_nr;
+ 	adap->algo = &stu300_algo;
+--- a/drivers/pcmcia/pcmcia_resource.c
++++ b/drivers/pcmcia/pcmcia_resource.c
+@@ -518,6 +518,8 @@ int pcmcia_enable_device(struct pcmcia_d
+ 		flags |= CONF_ENABLE_IOCARD;
+ 	if (flags & CONF_ENABLE_IOCARD)
+ 		s->socket.flags |= SS_IOCARD;
++	if (flags & CONF_ENABLE_ZVCARD)
++		s->socket.flags |= SS_ZVCARD | SS_IOCARD;
+ 	if (flags & CONF_ENABLE_SPKR) {
+ 		s->socket.flags |= SS_SPKR_ENA;
+ 		status = CCSR_AUDIO_ENA;
+--- a/drivers/pcmcia/pxa2xx_base.c
++++ b/drivers/pcmcia/pxa2xx_base.c
+@@ -215,7 +215,7 @@ pxa2xx_pcmcia_frequency_change(struct so
+ }
+ #endif
+ 
+-static void pxa2xx_configure_sockets(struct device *dev)
++void pxa2xx_configure_sockets(struct device *dev)
+ {
+ 	struct pcmcia_low_level *ops = dev->platform_data;
+ 	/*
+--- a/drivers/pcmcia/pxa2xx_base.h
++++ b/drivers/pcmcia/pxa2xx_base.h
+@@ -1,3 +1,4 @@
+ int pxa2xx_drv_pcmcia_add_one(struct soc_pcmcia_socket *skt);
+ void pxa2xx_drv_pcmcia_ops(struct pcmcia_low_level *ops);
++void pxa2xx_configure_sockets(struct device *dev);
+ 
+--- a/drivers/pcmcia/pxa2xx_lubbock.c
++++ b/drivers/pcmcia/pxa2xx_lubbock.c
+@@ -226,6 +226,7 @@ int pcmcia_lubbock_init(struct sa1111_de
+ 		lubbock_set_misc_wr((1 << 15) | (1 << 14), 0);
+ 
+ 		pxa2xx_drv_pcmcia_ops(&lubbock_pcmcia_ops);
++		pxa2xx_configure_sockets(&sadev->dev);
+ 		ret = sa1111_pcmcia_add(sadev, &lubbock_pcmcia_ops,
+ 				pxa2xx_drv_pcmcia_add_one);
+ 	}
+--- a/drivers/usb/core/quirks.c
++++ b/drivers/usb/core/quirks.c
+@@ -48,6 +48,10 @@ static const struct usb_device_id usb_qu
+ 	{ USB_DEVICE(0x04b4, 0x0526), .driver_info =
+ 			USB_QUIRK_CONFIG_INTF_STRINGS },
+ 
++	/* Samsung Android phone modem - ID conflict with SPH-I500 */
++	{ USB_DEVICE(0x04e8, 0x6601), .driver_info =
++			USB_QUIRK_CONFIG_INTF_STRINGS },
++
+ 	/* Roland SC-8820 */
+ 	{ USB_DEVICE(0x0582, 0x0007), .driver_info = USB_QUIRK_RESET_RESUME },
+ 
+@@ -68,6 +72,10 @@ static const struct usb_device_id usb_qu
+ 	/* M-Systems Flash Disk Pioneers */
+ 	{ USB_DEVICE(0x08ec, 0x1000), .driver_info = USB_QUIRK_RESET_RESUME },
+ 
++	/* Keytouch QWERTY Panel keyboard */
++	{ USB_DEVICE(0x0926, 0x3333), .driver_info =
++			USB_QUIRK_CONFIG_INTF_STRINGS },
++
+ 	/* X-Rite/Gretag-Macbeth Eye-One Pro display colorimeter */
+ 	{ USB_DEVICE(0x0971, 0x2000), .driver_info = USB_QUIRK_NO_SET_INTF },
+ 
+--- a/drivers/usb/musb/musb_core.h
++++ b/drivers/usb/musb/musb_core.h
+@@ -488,6 +488,15 @@ struct musb {
+ 	unsigned		set_address:1;
+ 	unsigned		test_mode:1;
+ 	unsigned		softconnect:1;
++
++	u8			address;
++	u8			test_mode_nr;
++	u16			ackpend;		/* ep0 */
++	enum musb_g_ep0_state	ep0_state;
++	struct usb_gadget	g;			/* the gadget */
++	struct usb_gadget_driver *gadget_driver;	/* its driver */
++#endif
++
+ 	/*
+ 	 * FIXME: Remove this flag.
+ 	 *
+@@ -501,14 +510,6 @@ struct musb {
+ 	 */
+ 	unsigned                double_buffer_not_ok:1 __deprecated;
+ 
+-	u8			address;
+-	u8			test_mode_nr;
+-	u16			ackpend;		/* ep0 */
+-	enum musb_g_ep0_state	ep0_state;
+-	struct usb_gadget	g;			/* the gadget */
+-	struct usb_gadget_driver *gadget_driver;	/* its driver */
+-#endif
+-
+ 	struct musb_hdrc_config	*config;
+ 
+ #ifdef MUSB_CONFIG_PROC_FS
+--- a/drivers/usb/musb/omap2430.c
++++ b/drivers/usb/musb/omap2430.c
+@@ -362,6 +362,7 @@ static int omap2430_musb_init(struct mus
+ 
+ static int omap2430_musb_exit(struct musb *musb)
+ {
++	del_timer_sync(&musb_idle_timer);
+ 
+ 	omap2430_low_level_exit(musb);
+ 	otg_put_transceiver(musb->xceiv);
+--- a/drivers/usb/serial/sierra.c
++++ b/drivers/usb/serial/sierra.c
+@@ -301,6 +301,9 @@ static const struct usb_device_id id_tab
+ 	{ USB_DEVICE(0x1199, 0x68A3), 	/* Sierra Wireless Direct IP modems */
+ 	  .driver_info = (kernel_ulong_t)&direct_ip_interface_blacklist
+ 	},
++	{ USB_DEVICE(0x0f3d, 0x68A3), 	/* Airprime/Sierra Wireless Direct IP modems */
++	  .driver_info = (kernel_ulong_t)&direct_ip_interface_blacklist
++	},
+        { USB_DEVICE(0x413C, 0x08133) }, /* Dell Computer Corp. Wireless 5720 VZW Mobile Broadband (EVDO Rev-A) Minicard GPS Port */
+ 
+ 	{ }
+--- a/drivers/usb/serial/usb_wwan.c
++++ b/drivers/usb/serial/usb_wwan.c
+@@ -295,12 +295,15 @@ static void usb_wwan_indat_callback(stru
+ 		    __func__, status, endpoint);
+ 	} else {
+ 		tty = tty_port_tty_get(&port->port);
+-		if (urb->actual_length) {
+-			tty_insert_flip_string(tty, data, urb->actual_length);
+-			tty_flip_buffer_push(tty);
+-		} else
+-			dbg("%s: empty read urb received", __func__);
+-		tty_kref_put(tty);
++		if (tty) {
++			if (urb->actual_length) {
++				tty_insert_flip_string(tty, data,
++						urb->actual_length);
++				tty_flip_buffer_push(tty);
++			} else
++				dbg("%s: empty read urb received", __func__);
++			tty_kref_put(tty);
++		}
+ 
+ 		/* Resubmit urb so we continue receiving */
+ 		if (status != -ESHUTDOWN) {
+--- a/drivers/usb/serial/visor.c
++++ b/drivers/usb/serial/visor.c
+@@ -27,6 +27,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/usb.h>
+ #include <linux/usb/serial.h>
++#include <linux/usb/cdc.h>
+ #include "visor.h"
+ 
+ /*
+@@ -479,6 +480,17 @@ static int visor_probe(struct usb_serial
+ 
+ 	dbg("%s", __func__);
+ 
++	/*
++	 * some Samsung Android phones in modem mode have the same ID
++	 * as SPH-I500, but they are ACM devices, so dont bind to them
++	 */
++	if (id->idVendor == SAMSUNG_VENDOR_ID &&
++		id->idProduct == SAMSUNG_SPH_I500_ID &&
++		serial->dev->descriptor.bDeviceClass == USB_CLASS_COMM &&
++		serial->dev->descriptor.bDeviceSubClass ==
++			USB_CDC_SUBCLASS_ACM)
++		return -ENODEV;
++
+ 	if (serial->dev->actconfig->desc.bConfigurationValue != 1) {
+ 		dev_err(&serial->dev->dev, "active config #%d != 1 ??\n",
+ 			serial->dev->actconfig->desc.bConfigurationValue);
+--- a/include/pcmcia/ds.h
++++ b/include/pcmcia/ds.h
+@@ -261,6 +261,7 @@ void pcmcia_disable_device(struct pcmcia
+ #define CONF_ENABLE_ESR         0x0008
+ #define CONF_ENABLE_IOCARD	0x0010 /* auto-enabled if IO resources or IRQ
+ 					* (CONF_ENABLE_IRQ) in use */
++#define CONF_ENABLE_ZVCARD	0x0020
+ 
+ /* flags used by pcmcia_loop_config() autoconfiguration */
+ #define CONF_AUTO_CHECK_VCC	0x0100 /* check for matching Vcc? */
+--- a/include/sound/wm8903.h
++++ b/include/sound/wm8903.h
+@@ -17,13 +17,9 @@
+ /*
+  * R6 (0x06) - Mic Bias Control 0
+  */
+-#define WM8903_MICDET_HYST_ENA                  0x0080  /* MICDET_HYST_ENA */
+-#define WM8903_MICDET_HYST_ENA_MASK             0x0080  /* MICDET_HYST_ENA */
+-#define WM8903_MICDET_HYST_ENA_SHIFT                 7  /* MICDET_HYST_ENA */
+-#define WM8903_MICDET_HYST_ENA_WIDTH                 1  /* MICDET_HYST_ENA */
+-#define WM8903_MICDET_THR_MASK                  0x0070  /* MICDET_THR - [6:4] */
+-#define WM8903_MICDET_THR_SHIFT                      4  /* MICDET_THR - [6:4] */
+-#define WM8903_MICDET_THR_WIDTH                      3  /* MICDET_THR - [6:4] */
++#define WM8903_MICDET_THR_MASK                  0x0030  /* MICDET_THR - [5:4] */
++#define WM8903_MICDET_THR_SHIFT                      4  /* MICDET_THR - [5:4] */
++#define WM8903_MICDET_THR_WIDTH                      2  /* MICDET_THR - [5:4] */
+ #define WM8903_MICSHORT_THR_MASK                0x000C  /* MICSHORT_THR - [3:2] */
+ #define WM8903_MICSHORT_THR_SHIFT                    2  /* MICSHORT_THR - [3:2] */
+ #define WM8903_MICSHORT_THR_WIDTH                    2  /* MICSHORT_THR - [3:2] */
+--- a/kernel/irq/internals.h
++++ b/kernel/irq/internals.h
+@@ -3,6 +3,12 @@
+  */
+ #include <linux/irqdesc.h>
+ 
++#ifdef CONFIG_SPARSE_IRQ
++# define IRQ_BITMAP_BITS	(NR_IRQS + 8196)
++#else
++# define IRQ_BITMAP_BITS	NR_IRQS
++#endif
++
+ extern int noirqdebug;
+ 
+ #define irq_data_to_desc(data)	container_of(data, struct irq_desc, irq_data)
+--- a/kernel/irq/irqdesc.c
++++ b/kernel/irq/irqdesc.c
+@@ -94,7 +94,7 @@ int nr_irqs = NR_IRQS;
+ EXPORT_SYMBOL_GPL(nr_irqs);
+ 
+ static DEFINE_MUTEX(sparse_irq_lock);
+-static DECLARE_BITMAP(allocated_irqs, NR_IRQS);
++static DECLARE_BITMAP(allocated_irqs, IRQ_BITMAP_BITS);
+ 
+ #ifdef CONFIG_SPARSE_IRQ
+ 
+@@ -217,6 +217,15 @@ int __init early_irq_init(void)
+ 	initcnt = arch_probe_nr_irqs();
+ 	printk(KERN_INFO "NR_IRQS:%d nr_irqs:%d %d\n", NR_IRQS, nr_irqs, initcnt);
+ 
++	if (WARN_ON(nr_irqs > IRQ_BITMAP_BITS))
++		nr_irqs = IRQ_BITMAP_BITS;
++
++	if (WARN_ON(initcnt > IRQ_BITMAP_BITS))
++		initcnt = IRQ_BITMAP_BITS;
++
++	if (initcnt > nr_irqs)
++		nr_irqs = initcnt;
++
+ 	for (i = 0; i < initcnt; i++) {
+ 		desc = alloc_desc(i, node);
+ 		set_bit(i, allocated_irqs);
+--- a/kernel/irq/manage.c
++++ b/kernel/irq/manage.c
+@@ -1100,7 +1100,7 @@ int request_threaded_irq(unsigned int ir
+ 	if (retval)
+ 		kfree(action);
+ 
+-#ifdef CONFIG_DEBUG_SHIRQ
++#ifdef CONFIG_DEBUG_SHIRQ_FIXME
+ 	if (!retval && (irqflags & IRQF_SHARED)) {
+ 		/*
+ 		 * It's a shared IRQ -- the driver ought to be prepared for it
+--- a/kernel/irq/resend.c
++++ b/kernel/irq/resend.c
+@@ -23,7 +23,7 @@
+ #ifdef CONFIG_HARDIRQS_SW_RESEND
+ 
+ /* Bitmap to handle software resend of interrupts: */
+-static DECLARE_BITMAP(irqs_resend, NR_IRQS);
++static DECLARE_BITMAP(irqs_resend, IRQ_BITMAP_BITS);
+ 
+ /*
+  * Run software resends of IRQ's
+--- a/kernel/perf_event.c
++++ b/kernel/perf_event.c
+@@ -782,6 +782,10 @@ retry:
+ 	raw_spin_unlock_irq(&ctx->lock);
+ }
+ 
++#define MAX_INTERRUPTS (~0ULL)
++
++static void perf_log_throttle(struct perf_event *event, int enable);
++
+ static int
+ event_sched_in(struct perf_event *event,
+ 		 struct perf_cpu_context *cpuctx,
+@@ -794,6 +798,17 @@ event_sched_in(struct perf_event *event,
+ 
+ 	event->state = PERF_EVENT_STATE_ACTIVE;
+ 	event->oncpu = smp_processor_id();
++
++	/*
++	 * Unthrottle events, since we scheduled we might have missed several
++	 * ticks already, also for a heavily scheduling task there is little
++	 * guarantee it'll get a tick in a timely manner.
++	 */
++	if (unlikely(event->hw.interrupts == MAX_INTERRUPTS)) {
++		perf_log_throttle(event, 1);
++		event->hw.interrupts = 0;
++	}
++
+ 	/*
+ 	 * The new state must be visible before we turn it on in the hardware:
+ 	 */
+@@ -1596,10 +1611,6 @@ void __perf_event_task_sched_in(struct t
+ 	}
+ }
+ 
+-#define MAX_INTERRUPTS (~0ULL)
+-
+-static void perf_log_throttle(struct perf_event *event, int enable);
+-
+ static u64 perf_calculate_period(struct perf_event *event, u64 nsec, u64 count)
+ {
+ 	u64 frequency = event->attr.sample_freq;
+--- a/sound/soc/codecs/cx20442.c
++++ b/sound/soc/codecs/cx20442.c
+@@ -367,7 +367,7 @@ static int cx20442_codec_remove(struct s
+ 	return 0;
+ }
+ 
+-static const u8 cx20442_reg = CX20442_TELOUT | CX20442_MIC;
++static const u8 cx20442_reg;
+ 
+ static struct snd_soc_codec_driver cx20442_codec_dev = {
+ 	.probe = 	cx20442_codec_probe,
+--- a/sound/soc/codecs/wm8903.c
++++ b/sound/soc/codecs/wm8903.c
+@@ -1482,7 +1482,7 @@ int wm8903_mic_detect(struct snd_soc_cod
+ 			    WM8903_MICDET_EINT | WM8903_MICSHRT_EINT,
+ 			    irq_mask);
+ 
+-	if (det && shrt) {
++	if (det || shrt) {
+ 		/* Enable mic detection, this may not have been set through
+ 		 * platform data (eg, if the defaults are OK). */
+ 		snd_soc_update_bits(codec, WM8903_WRITE_SEQUENCER_0,
+--- a/sound/soc/codecs/wm8994.c
++++ b/sound/soc/codecs/wm8994.c
+@@ -107,6 +107,9 @@ struct wm8994_priv {
+ 
+ 	int revision;
+ 	struct wm8994_pdata *pdata;
++
++	unsigned int aif1clk_enable:1;
++	unsigned int aif2clk_enable:1;
+ };
+ 
+ static int wm8994_readable(unsigned int reg)
+@@ -1004,6 +1007,93 @@ static void wm8994_update_class_w(struct
+ 	}
+ }
+ 
++static int late_enable_ev(struct snd_soc_dapm_widget *w,
++			  struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_codec *codec = w->codec;
++	struct wm8994_priv *wm8994 = snd_soc_codec_get_drvdata(codec);
++
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		if (wm8994->aif1clk_enable)
++			snd_soc_update_bits(codec, WM8994_AIF1_CLOCKING_1,
++					    WM8994_AIF1CLK_ENA_MASK,
++					    WM8994_AIF1CLK_ENA);
++		if (wm8994->aif2clk_enable)
++			snd_soc_update_bits(codec, WM8994_AIF2_CLOCKING_1,
++					    WM8994_AIF2CLK_ENA_MASK,
++					    WM8994_AIF2CLK_ENA);
++		break;
++	}
++
++	return 0;
++}
++
++static int late_disable_ev(struct snd_soc_dapm_widget *w,
++			   struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_codec *codec = w->codec;
++	struct wm8994_priv *wm8994 = snd_soc_codec_get_drvdata(codec);
++
++	switch (event) {
++	case SND_SOC_DAPM_POST_PMD:
++		if (wm8994->aif1clk_enable) {
++			snd_soc_update_bits(codec, WM8994_AIF1_CLOCKING_1,
++					    WM8994_AIF1CLK_ENA_MASK, 0);
++			wm8994->aif1clk_enable = 0;
++		}
++		if (wm8994->aif2clk_enable) {
++			snd_soc_update_bits(codec, WM8994_AIF2_CLOCKING_1,
++					    WM8994_AIF2CLK_ENA_MASK, 0);
++			wm8994->aif2clk_enable = 0;
++		}
++		break;
++	}
++
++	return 0;
++}
++
++static int aif1clk_ev(struct snd_soc_dapm_widget *w,
++		      struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_codec *codec = w->codec;
++	struct wm8994_priv *wm8994 = snd_soc_codec_get_drvdata(codec);
++
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		wm8994->aif1clk_enable = 1;
++		break;
++	}
++
++	return 0;
++}
++
++static int aif2clk_ev(struct snd_soc_dapm_widget *w,
++		      struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_codec *codec = w->codec;
++	struct wm8994_priv *wm8994 = snd_soc_codec_get_drvdata(codec);
++
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		wm8994->aif2clk_enable = 1;
++		break;
++	}
++
++	return 0;
++}
++
++static int dac_ev(struct snd_soc_dapm_widget *w,
++		  struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_codec *codec = w->codec;
++	unsigned int mask = 1 << w->shift;
++
++	snd_soc_update_bits(codec, WM8994_POWER_MANAGEMENT_5,
++			    mask, mask);
++	return 0;
++}
++
+ static const char *hp_mux_text[] = {
+ 	"Mixer",
+ 	"DAC",
+@@ -1272,6 +1362,47 @@ static const struct soc_enum aif2dacr_sr
+ static const struct snd_kcontrol_new aif2dacr_src_mux =
+ 	SOC_DAPM_ENUM("AIF2DACR Mux", aif2dacr_src_enum);
+ 
++static const struct snd_soc_dapm_widget wm8994_lateclk_revd_widgets[] = {
++SND_SOC_DAPM_SUPPLY("AIF1CLK", SND_SOC_NOPM, 0, 0, aif1clk_ev,
++	SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++SND_SOC_DAPM_SUPPLY("AIF2CLK", SND_SOC_NOPM, 0, 0, aif2clk_ev,
++	SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++
++SND_SOC_DAPM_PGA_E("Late DAC1L Enable PGA", SND_SOC_NOPM, 0, 0, NULL, 0,
++	late_enable_ev, SND_SOC_DAPM_PRE_PMU),
++SND_SOC_DAPM_PGA_E("Late DAC1R Enable PGA", SND_SOC_NOPM, 0, 0, NULL, 0,
++	late_enable_ev, SND_SOC_DAPM_PRE_PMU),
++SND_SOC_DAPM_PGA_E("Late DAC2L Enable PGA", SND_SOC_NOPM, 0, 0, NULL, 0,
++	late_enable_ev, SND_SOC_DAPM_PRE_PMU),
++SND_SOC_DAPM_PGA_E("Late DAC2R Enable PGA", SND_SOC_NOPM, 0, 0, NULL, 0,
++	late_enable_ev, SND_SOC_DAPM_PRE_PMU),
++
++SND_SOC_DAPM_POST("Late Disable PGA", late_disable_ev)
++};
++
++static const struct snd_soc_dapm_widget wm8994_lateclk_widgets[] = {
++SND_SOC_DAPM_SUPPLY("AIF1CLK", WM8994_AIF1_CLOCKING_1, 0, 0, NULL, 0),
++SND_SOC_DAPM_SUPPLY("AIF2CLK", WM8994_AIF2_CLOCKING_1, 0, 0, NULL, 0)
++};
++
++static const struct snd_soc_dapm_widget wm8994_dac_revd_widgets[] = {
++SND_SOC_DAPM_DAC_E("DAC2L", NULL, SND_SOC_NOPM, 3, 0,
++	dac_ev, SND_SOC_DAPM_PRE_PMU),
++SND_SOC_DAPM_DAC_E("DAC2R", NULL, SND_SOC_NOPM, 2, 0,
++	dac_ev, SND_SOC_DAPM_PRE_PMU),
++SND_SOC_DAPM_DAC_E("DAC1L", NULL, SND_SOC_NOPM, 1, 0,
++	dac_ev, SND_SOC_DAPM_PRE_PMU),
++SND_SOC_DAPM_DAC_E("DAC1R", NULL, SND_SOC_NOPM, 0, 0,
++	dac_ev, SND_SOC_DAPM_PRE_PMU),
++};
++
++static const struct snd_soc_dapm_widget wm8994_dac_widgets[] = {
++SND_SOC_DAPM_DAC("DAC2L", NULL, WM8994_POWER_MANAGEMENT_5, 3, 0),
++SND_SOC_DAPM_DAC("DAC1R", NULL, WM8994_POWER_MANAGEMENT_5, 2, 0),
++SND_SOC_DAPM_DAC("DAC1L", NULL, WM8994_POWER_MANAGEMENT_5, 1, 0),
++SND_SOC_DAPM_DAC("DAC1R", NULL, WM8994_POWER_MANAGEMENT_5, 0, 0),
++};
++
+ static const struct snd_soc_dapm_widget wm8994_dapm_widgets[] = {
+ SND_SOC_DAPM_INPUT("DMIC1DAT"),
+ SND_SOC_DAPM_INPUT("DMIC2DAT"),
+@@ -1284,9 +1415,6 @@ SND_SOC_DAPM_SUPPLY("DSP1CLK", WM8994_CL
+ SND_SOC_DAPM_SUPPLY("DSP2CLK", WM8994_CLOCKING_1, 2, 0, NULL, 0),
+ SND_SOC_DAPM_SUPPLY("DSPINTCLK", WM8994_CLOCKING_1, 1, 0, NULL, 0),
+ 
+-SND_SOC_DAPM_SUPPLY("AIF1CLK", WM8994_AIF1_CLOCKING_1, 0, 0, NULL, 0),
+-SND_SOC_DAPM_SUPPLY("AIF2CLK", WM8994_AIF2_CLOCKING_1, 0, 0, NULL, 0),
+-
+ SND_SOC_DAPM_AIF_OUT("AIF1ADC1L", NULL,
+ 		     0, WM8994_POWER_MANAGEMENT_4, 9, 0),
+ SND_SOC_DAPM_AIF_OUT("AIF1ADC1R", NULL,
+@@ -1372,11 +1500,6 @@ SND_SOC_DAPM_ADC("ADCR", NULL, SND_SOC_N
+ SND_SOC_DAPM_MUX("ADCL Mux", WM8994_POWER_MANAGEMENT_4, 1, 0, &adcl_mux),
+ SND_SOC_DAPM_MUX("ADCR Mux", WM8994_POWER_MANAGEMENT_4, 0, 0, &adcr_mux),
+ 
+-SND_SOC_DAPM_DAC("DAC2L", NULL, WM8994_POWER_MANAGEMENT_5, 3, 0),
+-SND_SOC_DAPM_DAC("DAC2R", NULL, WM8994_POWER_MANAGEMENT_5, 2, 0),
+-SND_SOC_DAPM_DAC("DAC1L", NULL, WM8994_POWER_MANAGEMENT_5, 1, 0),
+-SND_SOC_DAPM_DAC("DAC1R", NULL, WM8994_POWER_MANAGEMENT_5, 0, 0),
+-
+ SND_SOC_DAPM_MUX("Left Headphone Mux", SND_SOC_NOPM, 0, 0, &hpl_mux),
+ SND_SOC_DAPM_MUX("Right Headphone Mux", SND_SOC_NOPM, 0, 0, &hpr_mux),
+ 
+@@ -1516,14 +1639,12 @@ static const struct snd_soc_dapm_route i
+ 	{ "AIF2ADC Mux", "AIF3DACDAT", "AIF3ADCDAT" },
+ 
+ 	/* DAC1 inputs */
+-	{ "DAC1L", NULL, "DAC1L Mixer" },
+ 	{ "DAC1L Mixer", "AIF2 Switch", "AIF2DACL" },
+ 	{ "DAC1L Mixer", "AIF1.2 Switch", "AIF1DAC2L" },
+ 	{ "DAC1L Mixer", "AIF1.1 Switch", "AIF1DAC1L" },
+ 	{ "DAC1L Mixer", "Left Sidetone Switch", "Left Sidetone" },
+ 	{ "DAC1L Mixer", "Right Sidetone Switch", "Right Sidetone" },
+ 
+-	{ "DAC1R", NULL, "DAC1R Mixer" },
+ 	{ "DAC1R Mixer", "AIF2 Switch", "AIF2DACR" },
+ 	{ "DAC1R Mixer", "AIF1.2 Switch", "AIF1DAC2R" },
+ 	{ "DAC1R Mixer", "AIF1.1 Switch", "AIF1DAC1R" },
+@@ -1532,7 +1653,6 @@ static const struct snd_soc_dapm_route i
+ 
+ 	/* DAC2/AIF2 outputs  */
+ 	{ "AIF2ADCL", NULL, "AIF2DAC2L Mixer" },
+-	{ "DAC2L", NULL, "AIF2DAC2L Mixer" },
+ 	{ "AIF2DAC2L Mixer", "AIF2 Switch", "AIF2DACL" },
+ 	{ "AIF2DAC2L Mixer", "AIF1.2 Switch", "AIF1DAC2L" },
+ 	{ "AIF2DAC2L Mixer", "AIF1.1 Switch", "AIF1DAC1L" },
+@@ -1540,7 +1660,6 @@ static const struct snd_soc_dapm_route i
+ 	{ "AIF2DAC2L Mixer", "Right Sidetone Switch", "Right Sidetone" },
+ 
+ 	{ "AIF2ADCR", NULL, "AIF2DAC2R Mixer" },
+-	{ "DAC2R", NULL, "AIF2DAC2R Mixer" },
+ 	{ "AIF2DAC2R Mixer", "AIF2 Switch", "AIF2DACR" },
+ 	{ "AIF2DAC2R Mixer", "AIF1.2 Switch", "AIF1DAC2R" },
+ 	{ "AIF2DAC2R Mixer", "AIF1.1 Switch", "AIF1DAC1R" },
+@@ -1584,6 +1703,24 @@ static const struct snd_soc_dapm_route i
+ 	{ "Right Headphone Mux", "DAC", "DAC1R" },
+ };
+ 
++static const struct snd_soc_dapm_route wm8994_lateclk_revd_intercon[] = {
++	{ "DAC1L", NULL, "Late DAC1L Enable PGA" },
++	{ "Late DAC1L Enable PGA", NULL, "DAC1L Mixer" },
++	{ "DAC1R", NULL, "Late DAC1R Enable PGA" },
++	{ "Late DAC1R Enable PGA", NULL, "DAC1R Mixer" },
++	{ "DAC2L", NULL, "Late DAC2L Enable PGA" },
++	{ "Late DAC2L Enable PGA", NULL, "AIF2DAC2L Mixer" },
++	{ "DAC2R", NULL, "Late DAC2R Enable PGA" },
++	{ "Late DAC2R Enable PGA", NULL, "AIF2DAC2R Mixer" }
++};
++
++static const struct snd_soc_dapm_route wm8994_lateclk_intercon[] = {
++	{ "DAC1L", NULL, "DAC1L Mixer" },
++	{ "DAC1R", NULL, "DAC1R Mixer" },
++	{ "DAC2L", NULL, "AIF2DAC2L Mixer" },
++	{ "DAC2R", NULL, "AIF2DAC2R Mixer" },
++};
++
+ static const struct snd_soc_dapm_route wm8994_revd_intercon[] = {
+ 	{ "AIF1DACDAT", NULL, "AIF2DACDAT" },
+ 	{ "AIF2DACDAT", NULL, "AIF1DACDAT" },
+@@ -2514,6 +2651,22 @@ static int wm8994_resume(struct snd_soc_
+ {
+ 	struct wm8994_priv *wm8994 = snd_soc_codec_get_drvdata(codec);
+ 	int i, ret;
++	unsigned int val, mask;
++
++	if (wm8994->revision < 4) {
++		/* force a HW read */
++		val = wm8994_reg_read(codec->control_data,
++				      WM8994_POWER_MANAGEMENT_5);
++
++		/* modify the cache only */
++		codec->cache_only = 1;
++		mask =  WM8994_DAC1R_ENA | WM8994_DAC1L_ENA |
++			WM8994_DAC2R_ENA | WM8994_DAC2L_ENA;
++		val &= mask;
++		snd_soc_update_bits(codec, WM8994_POWER_MANAGEMENT_5,
++				    mask, val);
++		codec->cache_only = 0;
++	}
+ 
+ 	/* Restore the registers */
+ 	ret = snd_soc_cache_sync(codec);
+@@ -3125,6 +3278,17 @@ static int wm8994_codec_probe(struct snd
+ 	case WM8994:
+ 		snd_soc_dapm_new_controls(dapm, wm8994_specific_dapm_widgets,
+ 					  ARRAY_SIZE(wm8994_specific_dapm_widgets));
++		if (wm8994->revision < 4) {
++			snd_soc_dapm_new_controls(dapm, wm8994_lateclk_revd_widgets,
++						  ARRAY_SIZE(wm8994_lateclk_revd_widgets));
++			snd_soc_dapm_new_controls(dapm, wm8994_dac_revd_widgets,
++						  ARRAY_SIZE(wm8994_dac_revd_widgets));
++		} else {
++			snd_soc_dapm_new_controls(dapm, wm8994_lateclk_widgets,
++						  ARRAY_SIZE(wm8994_lateclk_widgets));
++			snd_soc_dapm_new_controls(dapm, wm8994_dac_widgets,
++						  ARRAY_SIZE(wm8994_dac_widgets));
++		}
+ 		break;
+ 	case WM8958:
+ 		snd_soc_add_controls(codec, wm8958_snd_controls,
+@@ -3143,10 +3307,15 @@ static int wm8994_codec_probe(struct snd
+ 		snd_soc_dapm_add_routes(dapm, wm8994_intercon,
+ 					ARRAY_SIZE(wm8994_intercon));
+ 
+-		if (wm8994->revision < 4)
++		if (wm8994->revision < 4) {
+ 			snd_soc_dapm_add_routes(dapm, wm8994_revd_intercon,
+ 						ARRAY_SIZE(wm8994_revd_intercon));
+-			
++			snd_soc_dapm_add_routes(dapm, wm8994_lateclk_revd_intercon,
++						ARRAY_SIZE(wm8994_lateclk_revd_intercon));
++		} else {
++			snd_soc_dapm_add_routes(dapm, wm8994_lateclk_intercon,
++						ARRAY_SIZE(wm8994_lateclk_intercon));
++		}
+ 		break;
+ 	case WM8958:
+ 		snd_soc_dapm_add_routes(dapm, wm8958_intercon,
+--- a/sound/soc/soc-dapm.c
++++ b/sound/soc/soc-dapm.c
+@@ -712,7 +712,15 @@ static int dapm_supply_check_power(struc
+ 		    !path->connected(path->source, path->sink))
+ 			continue;
+ 
+-		if (path->sink && path->sink->power_check &&
++		if (!path->sink)
++			continue;
++
++		if (path->sink->force) {
++			power = 1;
++			break;
++		}
++
++		if (path->sink->power_check &&
+ 		    path->sink->power_check(path->sink)) {
+ 			power = 1;
+ 			break;
+@@ -1627,6 +1635,7 @@ EXPORT_SYMBOL_GPL(snd_soc_dapm_add_route
+ int snd_soc_dapm_new_widgets(struct snd_soc_dapm_context *dapm)
+ {
+ 	struct snd_soc_dapm_widget *w;
++	unsigned int val;
+ 
+ 	list_for_each_entry(w, &dapm->card->widgets, list)
+ 	{
+@@ -1675,6 +1684,18 @@ int snd_soc_dapm_new_widgets(struct snd_
+ 		case snd_soc_dapm_post:
+ 			break;
+ 		}
++
++		/* Read the initial power state from the device */
++		if (w->reg >= 0) {
++			val = snd_soc_read(w->codec, w->reg);
++			val &= 1 << w->shift;
++			if (w->invert)
++				val = !val;
++
++			if (val)
++				w->power = 1;
++		}
++
+ 		w->new = 1;
+ 	}
+ 
