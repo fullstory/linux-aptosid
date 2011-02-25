@@ -8,6 +8,26 @@
  *.lzo
  *.patch
  *.gcno
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -5266,7 +5266,7 @@ S:	Maintained
+ F:	drivers/net/wireless/rtl818x/rtl8180/
+ 
+ RTL8187 WIRELESS DRIVER
+-M:	Herton Ronaldo Krzesinski <herton@mandriva.com.br>
++M:	Herton Ronaldo Krzesinski <herton@canonical.com>
+ M:	Hin-Tak Leung <htl10@users.sourceforge.net>
+ M:	Larry Finger <Larry.Finger@lwfinger.net>
+ L:	linux-wireless@vger.kernel.org
+@@ -6104,7 +6104,7 @@ S:	Maintained
+ F:	security/tomoyo/
+ 
+ TOPSTAR LAPTOP EXTRAS DRIVER
+-M:	Herton Ronaldo Krzesinski <herton@mandriva.com.br>
++M:	Herton Ronaldo Krzesinski <herton@canonical.com>
+ L:	platform-driver-x86@vger.kernel.org
+ S:	Maintained
+ F:	drivers/platform/x86/topstar-laptop.c
 --- a/Makefile
 +++ b/Makefile
 @@ -1,7 +1,7 @@
@@ -15,7 +35,7 @@
  PATCHLEVEL = 6
  SUBLEVEL = 38
 -EXTRAVERSION = -rc6
-+EXTRAVERSION = -rc6-git3
++EXTRAVERSION = -rc6-git4
  NAME = Flesh-Eating Bats with Fangs
  
  # *DOCUMENTATION*
@@ -72,6 +92,34 @@
  		return 1;
  
  	return 0;
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -2777,6 +2777,8 @@ static int dr_interception(struct vcpu_s
+ 			kvm_register_write(&svm->vcpu, reg, val);
+ 	}
+ 
++	skip_emulated_instruction(&svm->vcpu);
++
+ 	return 1;
+ }
+ 
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@ -294,9 +294,11 @@ int blkdev_ioctl(struct block_device *bd
+ 			return -EINVAL;
+ 		if (get_user(n, (int __user *) arg))
+ 			return -EFAULT;
+-		if (!(mode & FMODE_EXCL) &&
+-		    blkdev_get(bdev, mode | FMODE_EXCL, &bdev) < 0)
+-			return -EBUSY;
++		if (!(mode & FMODE_EXCL)) {
++			bdgrab(bdev);
++			if (blkdev_get(bdev, mode | FMODE_EXCL, &bdev) < 0)
++				return -EBUSY;
++		}
+ 		ret = set_blocksize(bdev, n);
+ 		if (!(mode & FMODE_EXCL))
+ 			blkdev_put(bdev, mode | FMODE_EXCL);
 --- a/drivers/bluetooth/ath3k.c
 +++ b/drivers/bluetooth/ath3k.c
 @@ -41,6 +41,9 @@ static struct usb_device_id ath3k_table[
@@ -1403,6 +1451,28 @@
  	if (serial->dev->actconfig->desc.bConfigurationValue != 1) {
  		dev_err(&serial->dev->dev, "active config #%d != 1 ??\n",
  			serial->dev->actconfig->desc.bConfigurationValue);
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -873,6 +873,11 @@ int bd_link_disk_holder(struct block_dev
+ 	ret = add_symlink(bdev->bd_part->holder_dir, &disk_to_dev(disk)->kobj);
+ 	if (ret)
+ 		goto out_del;
++	/*
++	 * bdev could be deleted beneath us which would implicitly destroy
++	 * the holder directory.  Hold on to it.
++	 */
++	kobject_get(bdev->bd_part->holder_dir);
+ 
+ 	list_add(&holder->list, &bdev->bd_holder_disks);
+ 	goto out_unlock;
+@@ -909,6 +914,7 @@ void bd_unlink_disk_holder(struct block_
+ 		del_symlink(disk->slave_dir, &part_to_dev(bdev->bd_part)->kobj);
+ 		del_symlink(bdev->bd_part->holder_dir,
+ 			    &disk_to_dev(disk)->kobj);
++		kobject_put(bdev->bd_part->holder_dir);
+ 		list_del_init(&holder->list);
+ 		kfree(holder);
+ 	}
 --- a/fs/gfs2/main.c
 +++ b/fs/gfs2/main.c
 @@ -59,14 +59,7 @@ static void gfs2_init_gl_aspace_once(voi
@@ -1459,6 +1529,17 @@
  	i_size_ordered_init(inode);
  #ifdef CONFIG_FSNOTIFY
  	INIT_HLIST_HEAD(&inode->i_fsnotify_marks);
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1244,7 +1244,7 @@ static int do_umount(struct vfsmount *mn
+ 		 */
+ 		br_write_lock(vfsmount_lock);
+ 		if (mnt_get_count(mnt) != 2) {
+-			br_write_lock(vfsmount_lock);
++			br_write_unlock(vfsmount_lock);
+ 			return -EBUSY;
+ 		}
+ 		br_write_unlock(vfsmount_lock);
 --- a/fs/nilfs2/btnode.c
 +++ b/fs/nilfs2/btnode.c
 @@ -35,11 +35,6 @@
@@ -1800,6 +1881,30 @@
  }
  EXPORT_SYMBOL(unmap_mapping_range);
  
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -94,9 +94,7 @@ static void move_ptes(struct vm_area_str
+ 		 */
+ 		mapping = vma->vm_file->f_mapping;
+ 		spin_lock(&mapping->i_mmap_lock);
+-		if (new_vma->vm_truncate_count &&
+-		    new_vma->vm_truncate_count != vma->vm_truncate_count)
+-			new_vma->vm_truncate_count = 0;
++		new_vma->vm_truncate_count = 0;
+ 	}
+ 
+ 	/*
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -1940,7 +1940,7 @@ SYSCALL_DEFINE2(swapon, const char __use
+ 
+ 	error = -EINVAL;
+ 	if (S_ISBLK(inode->i_mode)) {
+-		bdev = I_BDEV(inode);
++		bdev = bdgrab(I_BDEV(inode));
+ 		error = blkdev_get(bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL,
+ 				   sys_swapon);
+ 		if (error < 0) {
 --- a/net/bluetooth/rfcomm/tty.c
 +++ b/net/bluetooth/rfcomm/tty.c
 @@ -727,7 +727,9 @@ static int rfcomm_tty_open(struct tty_st
