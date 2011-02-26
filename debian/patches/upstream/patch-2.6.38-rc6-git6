@@ -10,7 +10,21 @@
  *.gcno
 --- a/MAINTAINERS
 +++ b/MAINTAINERS
-@@ -5266,7 +5266,7 @@ S:	Maintained
+@@ -1692,6 +1692,13 @@ M:	Andy Whitcroft <apw@canonical.com>
+ S:	Supported
+ F:	scripts/checkpatch.pl
+ 
++CHINESE DOCUMENTATION
++M:	Harry Wei <harryxiyou@gmail.com>
++L:	xiyoulinuxkernelgroup@googlegroups.com
++L:	linux-kernel@zh-kernel.org (moderated for non-subscribers)
++S:	Maintained
++F:	Documentation/zh_CN/
++
+ CISCO VIC ETHERNET NIC DRIVER
+ M:	Vasanthy Kolluri <vkolluri@cisco.com>
+ M:	Roopa Prabhu <roprabhu@cisco.com>
+@@ -5266,7 +5273,7 @@ S:	Maintained
  F:	drivers/net/wireless/rtl818x/rtl8180/
  
  RTL8187 WIRELESS DRIVER
@@ -19,7 +33,7 @@
  M:	Hin-Tak Leung <htl10@users.sourceforge.net>
  M:	Larry Finger <Larry.Finger@lwfinger.net>
  L:	linux-wireless@vger.kernel.org
-@@ -6104,7 +6104,7 @@ S:	Maintained
+@@ -6104,7 +6111,7 @@ S:	Maintained
  F:	security/tomoyo/
  
  TOPSTAR LAPTOP EXTRAS DRIVER
@@ -35,7 +49,7 @@
  PATCHLEVEL = 6
  SUBLEVEL = 38
 -EXTRAVERSION = -rc6
-+EXTRAVERSION = -rc6-git5
++EXTRAVERSION = -rc6-git6
  NAME = Flesh-Eating Bats with Fangs
  
  # *DOCUMENTATION*
@@ -62,6 +76,16 @@
  	.initcall.init : {
  		INIT_CALLS
  	}
+--- a/arch/x86/include/asm/acpi.h
++++ b/arch/x86/include/asm/acpi.h
+@@ -88,6 +88,7 @@ extern int acpi_disabled;
+ extern int acpi_pci_disabled;
+ extern int acpi_skip_timer_override;
+ extern int acpi_use_timer_override;
++extern int acpi_fix_pin2_polarity;
+ 
+ extern u8 acpi_sci_flags;
+ extern int acpi_sci_override_gsi;
 --- a/arch/x86/include/asm/perf_event_p4.h
 +++ b/arch/x86/include/asm/perf_event_p4.h
 @@ -22,6 +22,7 @@
@@ -72,6 +96,47 @@
  
  #define P4_ESCR_EVENT_MASK	0x7e000000U
  #define P4_ESCR_EVENT_SHIFT	25
+--- a/arch/x86/kernel/acpi/boot.c
++++ b/arch/x86/kernel/acpi/boot.c
+@@ -72,6 +72,7 @@ u8 acpi_sci_flags __initdata;
+ int acpi_sci_override_gsi __initdata;
+ int acpi_skip_timer_override __initdata;
+ int acpi_use_timer_override __initdata;
++int acpi_fix_pin2_polarity __initdata;
+ 
+ #ifdef CONFIG_X86_LOCAL_APIC
+ static u64 acpi_lapic_addr __initdata = APIC_DEFAULT_PHYS_BASE;
+@@ -415,10 +416,15 @@ acpi_parse_int_src_ovr(struct acpi_subta
+ 		return 0;
+ 	}
+ 
+-	if (acpi_skip_timer_override &&
+-	    intsrc->source_irq == 0 && intsrc->global_irq == 2) {
+-		printk(PREFIX "BIOS IRQ0 pin2 override ignored.\n");
+-		return 0;
++	if (intsrc->source_irq == 0 && intsrc->global_irq == 2) {
++		if (acpi_skip_timer_override) {
++			printk(PREFIX "BIOS IRQ0 pin2 override ignored.\n");
++			return 0;
++		}
++		if (acpi_fix_pin2_polarity && (intsrc->inti_flags & ACPI_MADT_POLARITY_MASK)) {
++			intsrc->inti_flags &= ~ACPI_MADT_POLARITY_MASK;
++			printk(PREFIX "BIOS IRQ0 pin2 override: forcing polarity to high active.\n");
++		}
+ 	}
+ 
+ 	mp_override_legacy_irq(intsrc->source_irq,
+--- a/arch/x86/kernel/apb_timer.c
++++ b/arch/x86/kernel/apb_timer.c
+@@ -284,7 +284,7 @@ static int __init apbt_clockevent_regist
+ 	memcpy(&adev->evt, &apbt_clockevent, sizeof(struct clock_event_device));
+ 
+ 	if (mrst_timer_options == MRST_TIMER_LAPIC_APBT) {
+-		apbt_clockevent.rating = APBT_CLOCKEVENT_RATING - 100;
++		adev->evt.rating = APBT_CLOCKEVENT_RATING - 100;
+ 		global_clock_event = &adev->evt;
+ 		printk(KERN_DEBUG "%s clockevent registered as global\n",
+ 		       global_clock_event->name);
 --- a/arch/x86/kernel/cpu/perf_event_p4.c
 +++ b/arch/x86/kernel/cpu/perf_event_p4.c
 @@ -770,9 +770,14 @@ static inline int p4_pmu_clear_cccr_ovf(
@@ -92,6 +157,62 @@
  		return 1;
  
  	return 0;
+--- a/arch/x86/kernel/early-quirks.c
++++ b/arch/x86/kernel/early-quirks.c
+@@ -143,15 +143,10 @@ static void __init ati_bugs(int num, int
+ 
+ static u32 __init ati_sbx00_rev(int num, int slot, int func)
+ {
+-	u32 old, d;
++	u32 d;
+ 
+-	d = read_pci_config(num, slot, func, 0x70);
+-	old = d;
+-	d &= ~(1<<8);
+-	write_pci_config(num, slot, func, 0x70, d);
+ 	d = read_pci_config(num, slot, func, 0x8);
+ 	d &= 0xff;
+-	write_pci_config(num, slot, func, 0x70, old);
+ 
+ 	return d;
+ }
+@@ -160,13 +155,16 @@ static void __init ati_bugs_contd(int nu
+ {
+ 	u32 d, rev;
+ 
+-	if (acpi_use_timer_override)
+-		return;
+-
+ 	rev = ati_sbx00_rev(num, slot, func);
++	if (rev >= 0x40)
++		acpi_fix_pin2_polarity = 1;
++
+ 	if (rev > 0x13)
+ 		return;
+ 
++	if (acpi_use_timer_override)
++		return;
++
+ 	/* check for IRQ0 interrupt swap */
+ 	d = read_pci_config(num, slot, func, 0x64);
+ 	if (!(d & (1<<14)))
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -285,6 +285,14 @@ static struct dmi_system_id __initdata r
+ 			DMI_MATCH(DMI_BOARD_NAME, "P4S800"),
+ 		},
+ 	},
++	{	/* Handle problems with rebooting on VersaLogic Menlow boards */
++		.callback = set_bios_reboot,
++		.ident = "VersaLogic Menlow based board",
++		.matches = {
++			DMI_MATCH(DMI_BOARD_VENDOR, "VersaLogic Corporation"),
++			DMI_MATCH(DMI_BOARD_NAME, "VersaLogic Menlow board"),
++		},
++	},
+ 	{ }
+ };
+ 
 --- a/arch/x86/kvm/svm.c
 +++ b/arch/x86/kvm/svm.c
 @@ -2777,6 +2777,8 @@ static int dr_interception(struct vcpu_s
@@ -103,6 +224,17 @@
  	return 1;
  }
  
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -1355,7 +1355,7 @@ int invalidate_partition(struct gendisk
+ 	struct block_device *bdev = bdget_disk(disk, partno);
+ 	if (bdev) {
+ 		fsync_bdev(bdev);
+-		res = __invalidate_device(bdev);
++		res = __invalidate_device(bdev, true);
+ 		bdput(bdev);
+ 	}
+ 	return res;
 --- a/block/ioctl.c
 +++ b/block/ioctl.c
 @@ -294,9 +294,11 @@ int blkdev_ioctl(struct block_device *bd
@@ -120,6 +252,17 @@
  		ret = set_blocksize(bdev, n);
  		if (!(mode & FMODE_EXCL))
  			blkdev_put(bdev, mode | FMODE_EXCL);
+--- a/drivers/block/floppy.c
++++ b/drivers/block/floppy.c
+@@ -3281,7 +3281,7 @@ static int set_geometry(unsigned int cmd
+ 			struct block_device *bdev = opened_bdev[cnt];
+ 			if (!bdev || ITYPE(drive_state[cnt].fd_device) != type)
+ 				continue;
+-			__invalidate_device(bdev);
++			__invalidate_device(bdev, true);
+ 		}
+ 		mutex_unlock(&open_lock);
+ 	} else {
 --- a/drivers/bluetooth/ath3k.c
 +++ b/drivers/bluetooth/ath3k.c
 @@ -41,6 +41,9 @@ static struct usb_device_id ath3k_table[
@@ -985,6 +1128,216 @@
  
  out:
  	spin_unlock_irqrestore(&serio_event_lock, flags);
+--- a/drivers/md/linear.c
++++ b/drivers/md/linear.c
+@@ -216,7 +216,6 @@ static int linear_run (mddev_t *mddev)
+ 
+ 	if (md_check_no_bitmap(mddev))
+ 		return -EINVAL;
+-	mddev->queue->queue_lock = &mddev->queue->__queue_lock;
+ 	conf = linear_conf(mddev, mddev->raid_disks);
+ 
+ 	if (!conf)
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -553,6 +553,9 @@ static mddev_t * mddev_find(dev_t unit)
+ {
+ 	mddev_t *mddev, *new = NULL;
+ 
++	if (unit && MAJOR(unit) != MD_MAJOR)
++		unit &= ~((1<<MdpMinorShift)-1);
++
+  retry:
+ 	spin_lock(&all_mddevs_lock);
+ 
+@@ -4138,10 +4141,10 @@ array_size_store(mddev_t *mddev, const c
+ 	}
+ 
+ 	mddev->array_sectors = sectors;
+-	set_capacity(mddev->gendisk, mddev->array_sectors);
+-	if (mddev->pers)
++	if (mddev->pers) {
++		set_capacity(mddev->gendisk, mddev->array_sectors);
+ 		revalidate_disk(mddev->gendisk);
+-
++	}
+ 	return len;
+ }
+ 
+@@ -4624,6 +4627,7 @@ static int do_md_run(mddev_t *mddev)
+ 	}
+ 	set_capacity(mddev->gendisk, mddev->array_sectors);
+ 	revalidate_disk(mddev->gendisk);
++	mddev->changed = 1;
+ 	kobject_uevent(&disk_to_dev(mddev->gendisk)->kobj, KOBJ_CHANGE);
+ out:
+ 	return err;
+@@ -4712,6 +4716,7 @@ static void md_clean(mddev_t *mddev)
+ 	mddev->sync_speed_min = mddev->sync_speed_max = 0;
+ 	mddev->recovery = 0;
+ 	mddev->in_sync = 0;
++	mddev->changed = 0;
+ 	mddev->degraded = 0;
+ 	mddev->safemode = 0;
+ 	mddev->bitmap_info.offset = 0;
+@@ -4827,6 +4832,7 @@ static int do_md_stop(mddev_t * mddev, i
+ 
+ 		set_capacity(disk, 0);
+ 		mutex_unlock(&mddev->open_mutex);
++		mddev->changed = 1;
+ 		revalidate_disk(disk);
+ 
+ 		if (mddev->ro)
+@@ -6011,7 +6017,7 @@ static int md_open(struct block_device *
+ 	atomic_inc(&mddev->openers);
+ 	mutex_unlock(&mddev->open_mutex);
+ 
+-	check_disk_size_change(mddev->gendisk, bdev);
++	check_disk_change(bdev);
+  out:
+ 	return err;
+ }
+@@ -6026,6 +6032,21 @@ static int md_release(struct gendisk *di
+ 
+ 	return 0;
+ }
++
++static int md_media_changed(struct gendisk *disk)
++{
++	mddev_t *mddev = disk->private_data;
++
++	return mddev->changed;
++}
++
++static int md_revalidate(struct gendisk *disk)
++{
++	mddev_t *mddev = disk->private_data;
++
++	mddev->changed = 0;
++	return 0;
++}
+ static const struct block_device_operations md_fops =
+ {
+ 	.owner		= THIS_MODULE,
+@@ -6036,6 +6057,8 @@ static const struct block_device_operati
+ 	.compat_ioctl	= md_compat_ioctl,
+ #endif
+ 	.getgeo		= md_getgeo,
++	.media_changed  = md_media_changed,
++	.revalidate_disk= md_revalidate,
+ };
+ 
+ static int md_thread(void * arg)
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -274,6 +274,8 @@ struct mddev_s
+ 	atomic_t			active;		/* general refcount */
+ 	atomic_t			openers;	/* number of active opens */
+ 
++	int				changed;	/* True if we might need to
++							 * reread partition info */
+ 	int				degraded;	/* whether md should consider
+ 							 * adding a spare
+ 							 */
+--- a/drivers/md/multipath.c
++++ b/drivers/md/multipath.c
+@@ -435,7 +435,6 @@ static int multipath_run (mddev_t *mddev
+ 	 * bookkeeping area. [whatever we allocate in multipath_run(),
+ 	 * should be freed in multipath_stop()]
+ 	 */
+-	mddev->queue->queue_lock = &mddev->queue->__queue_lock;
+ 
+ 	conf = kzalloc(sizeof(multipath_conf_t), GFP_KERNEL);
+ 	mddev->private = conf;
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@ -361,7 +361,6 @@ static int raid0_run(mddev_t *mddev)
+ 	if (md_check_no_bitmap(mddev))
+ 		return -EINVAL;
+ 	blk_queue_max_hw_sectors(mddev->queue, mddev->chunk_sectors);
+-	mddev->queue->queue_lock = &mddev->queue->__queue_lock;
+ 
+ 	/* if private is not null, we are here after takeover */
+ 	if (mddev->private == NULL) {
+@@ -670,6 +669,7 @@ static void *raid0_takeover_raid1(mddev_
+ 	mddev->new_layout = 0;
+ 	mddev->new_chunk_sectors = 128; /* by default set chunk size to 64k */
+ 	mddev->delta_disks = 1 - mddev->raid_disks;
++	mddev->raid_disks = 1;
+ 	/* make sure it will be not marked as dirty */
+ 	mddev->recovery_cp = MaxSector;
+ 
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -593,7 +593,10 @@ static int flush_pending_writes(conf_t *
+ 	if (conf->pending_bio_list.head) {
+ 		struct bio *bio;
+ 		bio = bio_list_get(&conf->pending_bio_list);
++		/* Only take the spinlock to quiet a warning */
++		spin_lock(conf->mddev->queue->queue_lock);
+ 		blk_remove_plug(conf->mddev->queue);
++		spin_unlock(conf->mddev->queue->queue_lock);
+ 		spin_unlock_irq(&conf->device_lock);
+ 		/* flush any pending bitmap writes to
+ 		 * disk before proceeding w/ I/O */
+@@ -959,7 +962,7 @@ static int make_request(mddev_t *mddev,
+ 		atomic_inc(&r1_bio->remaining);
+ 		spin_lock_irqsave(&conf->device_lock, flags);
+ 		bio_list_add(&conf->pending_bio_list, mbio);
+-		blk_plug_device(mddev->queue);
++		blk_plug_device_unlocked(mddev->queue);
+ 		spin_unlock_irqrestore(&conf->device_lock, flags);
+ 	}
+ 	r1_bio_write_done(r1_bio, bio->bi_vcnt, behind_pages, behind_pages != NULL);
+@@ -2021,7 +2024,6 @@ static int run(mddev_t *mddev)
+ 	if (IS_ERR(conf))
+ 		return PTR_ERR(conf);
+ 
+-	mddev->queue->queue_lock = &conf->device_lock;
+ 	list_for_each_entry(rdev, &mddev->disks, same_set) {
+ 		disk_stack_limits(mddev->gendisk, rdev->bdev,
+ 				  rdev->data_offset << 9);
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -662,7 +662,10 @@ static int flush_pending_writes(conf_t *
+ 	if (conf->pending_bio_list.head) {
+ 		struct bio *bio;
+ 		bio = bio_list_get(&conf->pending_bio_list);
++		/* Spinlock only taken to quiet a warning */
++		spin_lock(conf->mddev->queue->queue_lock);
+ 		blk_remove_plug(conf->mddev->queue);
++		spin_unlock(conf->mddev->queue->queue_lock);
+ 		spin_unlock_irq(&conf->device_lock);
+ 		/* flush any pending bitmap writes to disk
+ 		 * before proceeding w/ I/O */
+@@ -971,7 +974,7 @@ static int make_request(mddev_t *mddev,
+ 		atomic_inc(&r10_bio->remaining);
+ 		spin_lock_irqsave(&conf->device_lock, flags);
+ 		bio_list_add(&conf->pending_bio_list, mbio);
+-		blk_plug_device(mddev->queue);
++		blk_plug_device_unlocked(mddev->queue);
+ 		spin_unlock_irqrestore(&conf->device_lock, flags);
+ 	}
+ 
+@@ -2304,8 +2307,6 @@ static int run(mddev_t *mddev)
+ 	if (!conf)
+ 		goto out;
+ 
+-	mddev->queue->queue_lock = &conf->device_lock;
+-
+ 	mddev->thread = conf->thread;
+ 	conf->thread = NULL;
+ 
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5204,7 +5204,6 @@ static int run(mddev_t *mddev)
+ 
+ 		mddev->queue->backing_dev_info.congested_data = mddev;
+ 		mddev->queue->backing_dev_info.congested_fn = raid5_congested;
+-		mddev->queue->queue_lock = &conf->device_lock;
+ 		mddev->queue->unplug_fn = raid5_unplug_queue;
+ 
+ 		chunk_size = mddev->chunk_sectors << 9;
 --- a/drivers/net/dm9000.c
 +++ b/drivers/net/dm9000.c
 @@ -802,10 +802,7 @@ dm9000_init_dm9000(struct net_device *de
@@ -1595,6 +1948,44 @@
  		if (rxdesc->cipher_status == RX_CRYPTO_SUCCESS)
  			rxdesc->flags |= RX_FLAG_DECRYPTED;
  		else if (rxdesc->cipher_status == RX_CRYPTO_FAIL_MIC)
+--- a/drivers/nfc/Kconfig
++++ b/drivers/nfc/Kconfig
+@@ -3,7 +3,7 @@
+ #
+ 
+ menuconfig NFC_DEVICES
+-	bool "NFC devices"
++	bool "Near Field Communication (NFC) devices"
+ 	default n
+ 	---help---
+ 	  You'll have to say Y if your computer contains an NFC device that
+--- a/drivers/nfc/pn544.c
++++ b/drivers/nfc/pn544.c
+@@ -60,7 +60,7 @@ enum pn544_irq {
+ struct pn544_info {
+ 	struct miscdevice miscdev;
+ 	struct i2c_client *i2c_dev;
+-	struct regulator_bulk_data regs[2];
++	struct regulator_bulk_data regs[3];
+ 
+ 	enum pn544_state state;
+ 	wait_queue_head_t read_wait;
+@@ -74,6 +74,7 @@ struct pn544_info {
+ 
+ static const char reg_vdd_io[]	= "Vdd_IO";
+ static const char reg_vbat[]	= "VBat";
++static const char reg_vsim[]	= "VSim";
+ 
+ /* sysfs interface */
+ static ssize_t pn544_test(struct device *dev,
+@@ -740,6 +741,7 @@ static int __devinit pn544_probe(struct
+ 
+ 	info->regs[0].supply = reg_vdd_io;
+ 	info->regs[1].supply = reg_vbat;
++	info->regs[2].supply = reg_vsim;
+ 	r = regulator_bulk_get(&client->dev, ARRAY_SIZE(info->regs),
+ 				 info->regs);
+ 	if (r < 0)
 --- a/drivers/pcmcia/pcmcia_resource.c
 +++ b/drivers/pcmcia/pcmcia_resource.c
 @@ -518,6 +518,8 @@ int pcmcia_enable_device(struct pcmcia_d
@@ -1634,6 +2025,152 @@
  		ret = sa1111_pcmcia_add(sadev, &lubbock_pcmcia_ops,
  				pxa2xx_drv_pcmcia_add_one);
  	}
+--- a/drivers/pps/kapi.c
++++ b/drivers/pps/kapi.c
+@@ -168,7 +168,7 @@ void pps_event(struct pps_device *pps, s
+ {
+ 	unsigned long flags;
+ 	int captured = 0;
+-	struct pps_ktime ts_real;
++	struct pps_ktime ts_real = { .sec = 0, .nsec = 0, .flags = 0 };
+ 
+ 	/* check event type */
+ 	BUG_ON((event & (PPS_CAPTUREASSERT | PPS_CAPTURECLEAR)) == 0);
+--- a/drivers/rapidio/rio-sysfs.c
++++ b/drivers/rapidio/rio-sysfs.c
+@@ -77,9 +77,9 @@ rio_read_config(struct file *filp, struc
+ 
+ 	/* Several chips lock up trying to read undefined config space */
+ 	if (capable(CAP_SYS_ADMIN))
+-		size = 0x200000;
++		size = RIO_MAINT_SPACE_SZ;
+ 
+-	if (off > size)
++	if (off >= size)
+ 		return 0;
+ 	if (off + count > size) {
+ 		size -= off;
+@@ -147,10 +147,10 @@ rio_write_config(struct file *filp, stru
+ 	loff_t init_off = off;
+ 	u8 *data = (u8 *) buf;
+ 
+-	if (off > 0x200000)
++	if (off >= RIO_MAINT_SPACE_SZ)
+ 		return 0;
+-	if (off + count > 0x200000) {
+-		size = 0x200000 - off;
++	if (off + count > RIO_MAINT_SPACE_SZ) {
++		size = RIO_MAINT_SPACE_SZ - off;
+ 		count = size;
+ 	}
+ 
+@@ -200,7 +200,7 @@ static struct bin_attribute rio_config_a
+ 		 .name = "config",
+ 		 .mode = S_IRUGO | S_IWUSR,
+ 		 },
+-	.size = 0x200000,
++	.size = RIO_MAINT_SPACE_SZ,
+ 	.read = rio_read_config,
+ 	.write = rio_write_config,
+ };
+--- a/drivers/regulator/mc13xxx-regulator-core.c
++++ b/drivers/regulator/mc13xxx-regulator-core.c
+@@ -174,7 +174,7 @@ static int mc13xxx_regulator_get_voltage
+ 
+ 	dev_dbg(rdev_get_dev(rdev), "%s id: %d val: %d\n", __func__, id, val);
+ 
+-	BUG_ON(val < 0 || val > mc13xxx_regulators[id].desc.n_voltages);
++	BUG_ON(val > mc13xxx_regulators[id].desc.n_voltages);
+ 
+ 	return mc13xxx_regulators[id].voltages[val];
+ }
+--- a/drivers/regulator/wm831x-dcdc.c
++++ b/drivers/regulator/wm831x-dcdc.c
+@@ -120,6 +120,7 @@ static unsigned int wm831x_dcdc_get_mode
+ 		return REGULATOR_MODE_IDLE;
+ 	default:
+ 		BUG();
++		return -EINVAL;
+ 	}
+ }
+ 
+--- a/drivers/rtc/rtc-at91sam9.c
++++ b/drivers/rtc/rtc-at91sam9.c
+@@ -309,7 +309,7 @@ static const struct rtc_class_ops at91_r
+ 	.read_alarm	= at91_rtc_readalarm,
+ 	.set_alarm	= at91_rtc_setalarm,
+ 	.proc		= at91_rtc_proc,
+-	.alarm_irq_enabled = at91_rtc_alarm_irq_enable,
++	.alarm_irq_enable = at91_rtc_alarm_irq_enable,
+ };
+ 
+ /*
+--- a/drivers/rtc/rtc-ds3232.c
++++ b/drivers/rtc/rtc-ds3232.c
+@@ -1,7 +1,7 @@
+ /*
+  * RTC client/driver for the Maxim/Dallas DS3232 Real-Time Clock over I2C
+  *
+- * Copyright (C) 2009-2010 Freescale Semiconductor.
++ * Copyright (C) 2009-2011 Freescale Semiconductor.
+  * Author: Jack Lan <jack.lan@freescale.com>
+  *
+  * This program is free software; you can redistribute  it and/or modify it
+@@ -141,9 +141,11 @@ static int ds3232_read_time(struct devic
+ 		time->tm_hour = bcd2bin(hour);
+ 	}
+ 
+-	time->tm_wday = bcd2bin(week);
++	/* Day of the week in linux range is 0~6 while 1~7 in RTC chip */
++	time->tm_wday = bcd2bin(week) - 1;
+ 	time->tm_mday = bcd2bin(day);
+-	time->tm_mon = bcd2bin(month & 0x7F);
++	/* linux tm_mon range:0~11, while month range is 1~12 in RTC chip */
++	time->tm_mon = bcd2bin(month & 0x7F) - 1;
+ 	if (century)
+ 		add_century = 100;
+ 
+@@ -162,9 +164,11 @@ static int ds3232_set_time(struct device
+ 	buf[0] = bin2bcd(time->tm_sec);
+ 	buf[1] = bin2bcd(time->tm_min);
+ 	buf[2] = bin2bcd(time->tm_hour);
+-	buf[3] = bin2bcd(time->tm_wday); /* Day of the week */
++	/* Day of the week in linux range is 0~6 while 1~7 in RTC chip */
++	buf[3] = bin2bcd(time->tm_wday + 1);
+ 	buf[4] = bin2bcd(time->tm_mday); /* Date */
+-	buf[5] = bin2bcd(time->tm_mon);
++	/* linux tm_mon range:0~11, while month range is 1~12 in RTC chip */
++	buf[5] = bin2bcd(time->tm_mon + 1);
+ 	if (time->tm_year >= 100) {
+ 		buf[5] |= 0x80;
+ 		buf[6] = bin2bcd(time->tm_year - 100);
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -2681,17 +2681,13 @@ hub_port_init (struct usb_hub *hub, stru
+ 
+ 	mutex_lock(&usb_address0_mutex);
+ 
+-	if (!udev->config && oldspeed == USB_SPEED_SUPER) {
+-		/* Don't reset USB 3.0 devices during an initial setup */
+-		usb_set_device_state(udev, USB_STATE_DEFAULT);
+-	} else {
+-		/* Reset the device; full speed may morph to high speed */
+-		/* FIXME a USB 2.0 device may morph into SuperSpeed on reset. */
+-		retval = hub_port_reset(hub, port1, udev, delay);
+-		if (retval < 0)		/* error or disconnect */
+-			goto fail;
+-		/* success, speed is known */
+-	}
++	/* Reset the device; full speed may morph to high speed */
++	/* FIXME a USB 2.0 device may morph into SuperSpeed on reset. */
++	retval = hub_port_reset(hub, port1, udev, delay);
++	if (retval < 0)		/* error or disconnect */
++		goto fail;
++	/* success, speed is known */
++
+ 	retval = -ENODEV;
+ 
+ 	if (oldspeed != USB_SPEED_UNKNOWN && oldspeed != udev->speed) {
 --- a/drivers/usb/core/quirks.c
 +++ b/drivers/usb/core/quirks.c
 @@ -48,6 +48,10 @@ static const struct usb_device_id usb_qu
@@ -1658,6 +2195,287 @@
  	/* X-Rite/Gretag-Macbeth Eye-One Pro display colorimeter */
  	{ USB_DEVICE(0x0971, 0x2000), .driver_info = USB_QUIRK_NO_SET_INTF },
  
+--- a/drivers/usb/host/xhci-dbg.c
++++ b/drivers/usb/host/xhci-dbg.c
+@@ -169,9 +169,10 @@ static void xhci_print_ports(struct xhci
+ 	}
+ }
+ 
+-void xhci_print_ir_set(struct xhci_hcd *xhci, struct xhci_intr_reg *ir_set, int set_num)
++void xhci_print_ir_set(struct xhci_hcd *xhci, int set_num)
+ {
+-	void *addr;
++	struct xhci_intr_reg __iomem *ir_set = &xhci->run_regs->ir_set[set_num];
++	void __iomem *addr;
+ 	u32 temp;
+ 	u64 temp_64;
+ 
+@@ -449,7 +450,7 @@ char *xhci_get_slot_state(struct xhci_hc
+ 	}
+ }
+ 
+-void xhci_dbg_slot_ctx(struct xhci_hcd *xhci, struct xhci_container_ctx *ctx)
++static void xhci_dbg_slot_ctx(struct xhci_hcd *xhci, struct xhci_container_ctx *ctx)
+ {
+ 	/* Fields are 32 bits wide, DMA addresses are in bytes */
+ 	int field_size = 32 / 8;
+@@ -488,7 +489,7 @@ void xhci_dbg_slot_ctx(struct xhci_hcd *
+ 		dbg_rsvd64(xhci, (u64 *)slot_ctx, dma);
+ }
+ 
+-void xhci_dbg_ep_ctx(struct xhci_hcd *xhci,
++static void xhci_dbg_ep_ctx(struct xhci_hcd *xhci,
+ 		     struct xhci_container_ctx *ctx,
+ 		     unsigned int last_ep)
+ {
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -307,7 +307,7 @@ struct xhci_ep_ctx *xhci_get_ep_ctx(stru
+ 
+ /***************** Streams structures manipulation *************************/
+ 
+-void xhci_free_stream_ctx(struct xhci_hcd *xhci,
++static void xhci_free_stream_ctx(struct xhci_hcd *xhci,
+ 		unsigned int num_stream_ctxs,
+ 		struct xhci_stream_ctx *stream_ctx, dma_addr_t dma)
+ {
+@@ -335,7 +335,7 @@ void xhci_free_stream_ctx(struct xhci_hc
+  * The stream context array must be a power of 2, and can be as small as
+  * 64 bytes or as large as 1MB.
+  */
+-struct xhci_stream_ctx *xhci_alloc_stream_ctx(struct xhci_hcd *xhci,
++static struct xhci_stream_ctx *xhci_alloc_stream_ctx(struct xhci_hcd *xhci,
+ 		unsigned int num_stream_ctxs, dma_addr_t *dma,
+ 		gfp_t mem_flags)
+ {
+@@ -1900,11 +1900,11 @@ int xhci_mem_init(struct xhci_hcd *xhci,
+ 	val &= DBOFF_MASK;
+ 	xhci_dbg(xhci, "// Doorbell array is located at offset 0x%x"
+ 			" from cap regs base addr\n", val);
+-	xhci->dba = (void *) xhci->cap_regs + val;
++	xhci->dba = (void __iomem *) xhci->cap_regs + val;
+ 	xhci_dbg_regs(xhci);
+ 	xhci_print_run_regs(xhci);
+ 	/* Set ir_set to interrupt register set 0 */
+-	xhci->ir_set = (void *) xhci->run_regs->ir_set;
++	xhci->ir_set = &xhci->run_regs->ir_set[0];
+ 
+ 	/*
+ 	 * Event ring setup: Allocate a normal ring, but also setup
+@@ -1961,7 +1961,7 @@ int xhci_mem_init(struct xhci_hcd *xhci,
+ 	/* Set the event ring dequeue address */
+ 	xhci_set_hc_event_deq(xhci);
+ 	xhci_dbg(xhci, "Wrote ERST address to ir_set 0.\n");
+-	xhci_print_ir_set(xhci, xhci->ir_set, 0);
++	xhci_print_ir_set(xhci, 0);
+ 
+ 	/*
+ 	 * XXX: Might need to set the Interrupter Moderation Register to
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -474,8 +474,11 @@ void xhci_find_new_dequeue_state(struct
+ 	state->new_deq_seg = find_trb_seg(cur_td->start_seg,
+ 			dev->eps[ep_index].stopped_trb,
+ 			&state->new_cycle_state);
+-	if (!state->new_deq_seg)
+-		BUG();
++	if (!state->new_deq_seg) {
++		WARN_ON(1);
++		return;
++	}
++
+ 	/* Dig out the cycle state saved by the xHC during the stop ep cmd */
+ 	xhci_dbg(xhci, "Finding endpoint context\n");
+ 	ep_ctx = xhci_get_ep_ctx(xhci, dev->out_ctx, ep_index);
+@@ -486,8 +489,10 @@ void xhci_find_new_dequeue_state(struct
+ 	state->new_deq_seg = find_trb_seg(state->new_deq_seg,
+ 			state->new_deq_ptr,
+ 			&state->new_cycle_state);
+-	if (!state->new_deq_seg)
+-		BUG();
++	if (!state->new_deq_seg) {
++		WARN_ON(1);
++		return;
++	}
+ 
+ 	trb = &state->new_deq_ptr->generic;
+ 	if ((trb->field[3] & TRB_TYPE_BITMASK) == TRB_TYPE(TRB_LINK) &&
+@@ -2363,12 +2368,13 @@ static unsigned int count_sg_trbs_needed
+ 
+ 		/* Scatter gather list entries may cross 64KB boundaries */
+ 		running_total = TRB_MAX_BUFF_SIZE -
+-			(sg_dma_address(sg) & ((1 << TRB_MAX_BUFF_SHIFT) - 1));
++			(sg_dma_address(sg) & (TRB_MAX_BUFF_SIZE - 1));
++		running_total &= TRB_MAX_BUFF_SIZE - 1;
+ 		if (running_total != 0)
+ 			num_trbs++;
+ 
+ 		/* How many more 64KB chunks to transfer, how many more TRBs? */
+-		while (running_total < sg_dma_len(sg)) {
++		while (running_total < sg_dma_len(sg) && running_total < temp) {
+ 			num_trbs++;
+ 			running_total += TRB_MAX_BUFF_SIZE;
+ 		}
+@@ -2394,11 +2400,11 @@ static unsigned int count_sg_trbs_needed
+ static void check_trb_math(struct urb *urb, int num_trbs, int running_total)
+ {
+ 	if (num_trbs != 0)
+-		dev_dbg(&urb->dev->dev, "%s - ep %#x - Miscalculated number of "
++		dev_err(&urb->dev->dev, "%s - ep %#x - Miscalculated number of "
+ 				"TRBs, %d left\n", __func__,
+ 				urb->ep->desc.bEndpointAddress, num_trbs);
+ 	if (running_total != urb->transfer_buffer_length)
+-		dev_dbg(&urb->dev->dev, "%s - ep %#x - Miscalculated tx length, "
++		dev_err(&urb->dev->dev, "%s - ep %#x - Miscalculated tx length, "
+ 				"queued %#x (%d), asked for %#x (%d)\n",
+ 				__func__,
+ 				urb->ep->desc.bEndpointAddress,
+@@ -2533,8 +2539,7 @@ static int queue_bulk_sg_tx(struct xhci_
+ 	sg = urb->sg;
+ 	addr = (u64) sg_dma_address(sg);
+ 	this_sg_len = sg_dma_len(sg);
+-	trb_buff_len = TRB_MAX_BUFF_SIZE -
+-		(addr & ((1 << TRB_MAX_BUFF_SHIFT) - 1));
++	trb_buff_len = TRB_MAX_BUFF_SIZE - (addr & (TRB_MAX_BUFF_SIZE - 1));
+ 	trb_buff_len = min_t(int, trb_buff_len, this_sg_len);
+ 	if (trb_buff_len > urb->transfer_buffer_length)
+ 		trb_buff_len = urb->transfer_buffer_length;
+@@ -2572,7 +2577,7 @@ static int queue_bulk_sg_tx(struct xhci_
+ 				(unsigned int) (addr + TRB_MAX_BUFF_SIZE) & ~(TRB_MAX_BUFF_SIZE - 1),
+ 				(unsigned int) addr + trb_buff_len);
+ 		if (TRB_MAX_BUFF_SIZE -
+-				(addr & ((1 << TRB_MAX_BUFF_SHIFT) - 1)) < trb_buff_len) {
++				(addr & (TRB_MAX_BUFF_SIZE - 1)) < trb_buff_len) {
+ 			xhci_warn(xhci, "WARN: sg dma xfer crosses 64KB boundaries!\n");
+ 			xhci_dbg(xhci, "Next boundary at %#x, end dma = %#x\n",
+ 					(unsigned int) (addr + TRB_MAX_BUFF_SIZE) & ~(TRB_MAX_BUFF_SIZE - 1),
+@@ -2616,7 +2621,7 @@ static int queue_bulk_sg_tx(struct xhci_
+ 		}
+ 
+ 		trb_buff_len = TRB_MAX_BUFF_SIZE -
+-			(addr & ((1 << TRB_MAX_BUFF_SHIFT) - 1));
++			(addr & (TRB_MAX_BUFF_SIZE - 1));
+ 		trb_buff_len = min_t(int, trb_buff_len, this_sg_len);
+ 		if (running_total + trb_buff_len > urb->transfer_buffer_length)
+ 			trb_buff_len =
+@@ -2656,7 +2661,8 @@ int xhci_queue_bulk_tx(struct xhci_hcd *
+ 	num_trbs = 0;
+ 	/* How much data is (potentially) left before the 64KB boundary? */
+ 	running_total = TRB_MAX_BUFF_SIZE -
+-		(urb->transfer_dma & ((1 << TRB_MAX_BUFF_SHIFT) - 1));
++		(urb->transfer_dma & (TRB_MAX_BUFF_SIZE - 1));
++	running_total &= TRB_MAX_BUFF_SIZE - 1;
+ 
+ 	/* If there's some data on this 64KB chunk, or we have to send a
+ 	 * zero-length transfer, we need at least one TRB
+@@ -2700,8 +2706,8 @@ int xhci_queue_bulk_tx(struct xhci_hcd *
+ 	/* How much data is in the first TRB? */
+ 	addr = (u64) urb->transfer_dma;
+ 	trb_buff_len = TRB_MAX_BUFF_SIZE -
+-		(urb->transfer_dma & ((1 << TRB_MAX_BUFF_SHIFT) - 1));
+-	if (urb->transfer_buffer_length < trb_buff_len)
++		(urb->transfer_dma & (TRB_MAX_BUFF_SIZE - 1));
++	if (trb_buff_len > urb->transfer_buffer_length)
+ 		trb_buff_len = urb->transfer_buffer_length;
+ 
+ 	first_trb = true;
+@@ -2879,8 +2885,8 @@ static int count_isoc_trbs_needed(struct
+ 	addr = (u64) (urb->transfer_dma + urb->iso_frame_desc[i].offset);
+ 	td_len = urb->iso_frame_desc[i].length;
+ 
+-	running_total = TRB_MAX_BUFF_SIZE -
+-			(addr & ((1 << TRB_MAX_BUFF_SHIFT) - 1));
++	running_total = TRB_MAX_BUFF_SIZE - (addr & (TRB_MAX_BUFF_SIZE - 1));
++	running_total &= TRB_MAX_BUFF_SIZE - 1;
+ 	if (running_total != 0)
+ 		num_trbs++;
+ 
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -109,7 +109,7 @@ int xhci_halt(struct xhci_hcd *xhci)
+ /*
+  * Set the run bit and wait for the host to be running.
+  */
+-int xhci_start(struct xhci_hcd *xhci)
++static int xhci_start(struct xhci_hcd *xhci)
+ {
+ 	u32 temp;
+ 	int ret;
+@@ -329,7 +329,7 @@ int xhci_init(struct usb_hcd *hcd)
+ 
+ 
+ #ifdef CONFIG_USB_XHCI_HCD_DEBUGGING
+-void xhci_event_ring_work(unsigned long arg)
++static void xhci_event_ring_work(unsigned long arg)
+ {
+ 	unsigned long flags;
+ 	int temp;
+@@ -473,7 +473,7 @@ int xhci_run(struct usb_hcd *hcd)
+ 			xhci->ir_set, (unsigned int) ER_IRQ_ENABLE(temp));
+ 	xhci_writel(xhci, ER_IRQ_ENABLE(temp),
+ 			&xhci->ir_set->irq_pending);
+-	xhci_print_ir_set(xhci, xhci->ir_set, 0);
++	xhci_print_ir_set(xhci, 0);
+ 
+ 	if (NUM_TEST_NOOPS > 0)
+ 		doorbell = xhci_setup_one_noop(xhci);
+@@ -528,7 +528,7 @@ void xhci_stop(struct usb_hcd *hcd)
+ 	temp = xhci_readl(xhci, &xhci->ir_set->irq_pending);
+ 	xhci_writel(xhci, ER_IRQ_DISABLE(temp),
+ 			&xhci->ir_set->irq_pending);
+-	xhci_print_ir_set(xhci, xhci->ir_set, 0);
++	xhci_print_ir_set(xhci, 0);
+ 
+ 	xhci_dbg(xhci, "cleaning up memory\n");
+ 	xhci_mem_cleanup(xhci);
+@@ -755,7 +755,7 @@ int xhci_resume(struct xhci_hcd *xhci, b
+ 		temp = xhci_readl(xhci, &xhci->ir_set->irq_pending);
+ 		xhci_writel(xhci, ER_IRQ_DISABLE(temp),
+ 				&xhci->ir_set->irq_pending);
+-		xhci_print_ir_set(xhci, xhci->ir_set, 0);
++		xhci_print_ir_set(xhci, 0);
+ 
+ 		xhci_dbg(xhci, "cleaning up memory\n");
+ 		xhci_mem_cleanup(xhci);
+@@ -857,7 +857,7 @@ unsigned int xhci_last_valid_endpoint(u3
+ /* Returns 1 if the arguments are OK;
+  * returns 0 this is a root hub; returns -EINVAL for NULL pointers.
+  */
+-int xhci_check_args(struct usb_hcd *hcd, struct usb_device *udev,
++static int xhci_check_args(struct usb_hcd *hcd, struct usb_device *udev,
+ 		struct usb_host_endpoint *ep, int check_ep, bool check_virt_dev,
+ 		const char *func) {
+ 	struct xhci_hcd	*xhci;
+@@ -1693,7 +1693,7 @@ static void xhci_setup_input_ctx_for_con
+ 	xhci_dbg_ctx(xhci, in_ctx, xhci_last_valid_endpoint(add_flags));
+ }
+ 
+-void xhci_setup_input_ctx_for_quirk(struct xhci_hcd *xhci,
++static void xhci_setup_input_ctx_for_quirk(struct xhci_hcd *xhci,
+ 		unsigned int slot_id, unsigned int ep_index,
+ 		struct xhci_dequeue_state *deq_state)
+ {
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1348,7 +1348,7 @@ static inline int xhci_link_trb_quirk(st
+ }
+ 
+ /* xHCI debugging */
+-void xhci_print_ir_set(struct xhci_hcd *xhci, struct xhci_intr_reg *ir_set, int set_num);
++void xhci_print_ir_set(struct xhci_hcd *xhci, int set_num);
+ void xhci_print_registers(struct xhci_hcd *xhci);
+ void xhci_dbg_regs(struct xhci_hcd *xhci);
+ void xhci_print_run_regs(struct xhci_hcd *xhci);
+--- a/drivers/usb/musb/musb_core.c
++++ b/drivers/usb/musb/musb_core.c
+@@ -1864,6 +1864,7 @@ allocate_instance(struct device *dev,
+ 	INIT_LIST_HEAD(&musb->out_bulk);
+ 
+ 	hcd->uses_new_polling = 1;
++	hcd->has_tt = 1;
+ 
+ 	musb->vbuserr_retry = VBUSERR_RETRY_COUNT;
+ 	musb->a_wait_bcon = OTG_TIME_A_WAIT_BCON;
 --- a/drivers/usb/musb/musb_core.h
 +++ b/drivers/usb/musb/musb_core.h
 @@ -488,6 +488,15 @@ struct musb {
@@ -1765,6 +2583,91 @@
  	if (serial->dev->actconfig->desc.bConfigurationValue != 1) {
  		dev_err(&serial->dev->dev, "active config #%d != 1 ??\n",
  			serial->dev->actconfig->desc.bConfigurationValue);
+--- a/fs/afs/write.c
++++ b/fs/afs/write.c
+@@ -140,6 +140,7 @@ int afs_write_begin(struct file *file, s
+ 	candidate->first = candidate->last = index;
+ 	candidate->offset_first = from;
+ 	candidate->to_last = to;
++	INIT_LIST_HEAD(&candidate->link);
+ 	candidate->usage = 1;
+ 	candidate->state = AFS_WBACK_PENDING;
+ 	init_waitqueue_head(&candidate->waitq);
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -239,15 +239,23 @@ static void __put_ioctx(struct kioctx *c
+ 	call_rcu(&ctx->rcu_head, ctx_rcu_free);
+ }
+ 
+-#define get_ioctx(kioctx) do {						\
+-	BUG_ON(atomic_read(&(kioctx)->users) <= 0);			\
+-	atomic_inc(&(kioctx)->users);					\
+-} while (0)
+-#define put_ioctx(kioctx) do {						\
+-	BUG_ON(atomic_read(&(kioctx)->users) <= 0);			\
+-	if (unlikely(atomic_dec_and_test(&(kioctx)->users))) 		\
+-		__put_ioctx(kioctx);					\
+-} while (0)
++static inline void get_ioctx(struct kioctx *kioctx)
++{
++	BUG_ON(atomic_read(&kioctx->users) <= 0);
++	atomic_inc(&kioctx->users);
++}
++
++static inline int try_get_ioctx(struct kioctx *kioctx)
++{
++	return atomic_inc_not_zero(&kioctx->users);
++}
++
++static inline void put_ioctx(struct kioctx *kioctx)
++{
++	BUG_ON(atomic_read(&kioctx->users) <= 0);
++	if (unlikely(atomic_dec_and_test(&kioctx->users)))
++		__put_ioctx(kioctx);
++}
+ 
+ /* ioctx_alloc
+  *	Allocates and initializes an ioctx.  Returns an ERR_PTR if it failed.
+@@ -601,8 +609,13 @@ static struct kioctx *lookup_ioctx(unsig
+ 	rcu_read_lock();
+ 
+ 	hlist_for_each_entry_rcu(ctx, n, &mm->ioctx_list, list) {
+-		if (ctx->user_id == ctx_id && !ctx->dead) {
+-			get_ioctx(ctx);
++		/*
++		 * RCU protects us against accessing freed memory but
++		 * we have to be careful not to get a reference when the
++		 * reference count already dropped to 0 (ctx->dead test
++		 * is unreliable because of races).
++		 */
++		if (ctx->user_id == ctx_id && !ctx->dead && try_get_ioctx(ctx)){
+ 			ret = ctx;
+ 			break;
+ 		}
+@@ -1629,6 +1642,23 @@ static int io_submit_one(struct kioctx *
+ 		goto out_put_req;
+ 
+ 	spin_lock_irq(&ctx->ctx_lock);
++	/*
++	 * We could have raced with io_destroy() and are currently holding a
++	 * reference to ctx which should be destroyed. We cannot submit IO
++	 * since ctx gets freed as soon as io_submit() puts its reference.  The
++	 * check here is reliable: io_destroy() sets ctx->dead before waiting
++	 * for outstanding IO and the barrier between these two is realized by
++	 * unlock of mm->ioctx_lock and lock of ctx->ctx_lock.  Analogously we
++	 * increment ctx->reqs_active before checking for ctx->dead and the
++	 * barrier is realized by unlock and lock of ctx->ctx_lock. Thus if we
++	 * don't see ctx->dead set here, io_destroy() waits for our IO to
++	 * finish.
++	 */
++	if (ctx->dead) {
++		spin_unlock_irq(&ctx->ctx_lock);
++		ret = -EINVAL;
++		goto out_put_req;
++	}
+ 	aio_run_iocb(req);
+ 	if (!list_empty(&ctx->run_list)) {
+ 		/* drain the run list */
 --- a/fs/block_dev.c
 +++ b/fs/block_dev.c
 @@ -873,6 +873,11 @@ int bd_link_disk_holder(struct block_dev
@@ -1787,6 +2690,842 @@
  		list_del_init(&holder->list);
  		kfree(holder);
  	}
+@@ -927,9 +933,9 @@ EXPORT_SYMBOL_GPL(bd_unlink_disk_holder)
+  * when a disk has been changed -- either by a media change or online
+  * resize.
+  */
+-static void flush_disk(struct block_device *bdev)
++static void flush_disk(struct block_device *bdev, bool kill_dirty)
+ {
+-	if (__invalidate_device(bdev)) {
++	if (__invalidate_device(bdev, kill_dirty)) {
+ 		char name[BDEVNAME_SIZE] = "";
+ 
+ 		if (bdev->bd_disk)
+@@ -966,7 +972,7 @@ void check_disk_size_change(struct gendi
+ 		       "%s: detected capacity change from %lld to %lld\n",
+ 		       name, bdev_size, disk_size);
+ 		i_size_write(bdev->bd_inode, disk_size);
+-		flush_disk(bdev);
++		flush_disk(bdev, false);
+ 	}
+ }
+ EXPORT_SYMBOL(check_disk_size_change);
+@@ -1019,7 +1025,7 @@ int check_disk_change(struct block_devic
+ 	if (!(events & DISK_EVENT_MEDIA_CHANGE))
+ 		return 0;
+ 
+-	flush_disk(bdev);
++	flush_disk(bdev, true);
+ 	if (bdops->revalidate_disk)
+ 		bdops->revalidate_disk(bdev->bd_disk);
+ 	return 1;
+@@ -1600,7 +1606,7 @@ fail:
+ }
+ EXPORT_SYMBOL(lookup_bdev);
+ 
+-int __invalidate_device(struct block_device *bdev)
++int __invalidate_device(struct block_device *bdev, bool kill_dirty)
+ {
+ 	struct super_block *sb = get_super(bdev);
+ 	int res = 0;
+@@ -1613,7 +1619,7 @@ int __invalidate_device(struct block_dev
+ 		 * hold).
+ 		 */
+ 		shrink_dcache_sb(sb);
+-		res = invalidate_inodes(sb);
++		res = invalidate_inodes(sb, kill_dirty);
+ 		drop_super(sb);
+ 	}
+ 	invalidate_bdev(bdev);
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -1254,6 +1254,7 @@ struct btrfs_root {
+ #define BTRFS_MOUNT_SPACE_CACHE		(1 << 12)
+ #define BTRFS_MOUNT_CLEAR_CACHE		(1 << 13)
+ #define BTRFS_MOUNT_USER_SUBVOL_RM_ALLOWED (1 << 14)
++#define BTRFS_MOUNT_ENOSPC_DEBUG	 (1 << 15)
+ 
+ #define btrfs_clear_opt(o, opt)		((o) &= ~BTRFS_MOUNT_##opt)
+ #define btrfs_set_opt(o, opt)		((o) |= BTRFS_MOUNT_##opt)
+@@ -2218,6 +2219,8 @@ int btrfs_error_unpin_extent_range(struc
+ 				   u64 start, u64 end);
+ int btrfs_error_discard_extent(struct btrfs_root *root, u64 bytenr,
+ 			       u64 num_bytes);
++int btrfs_force_chunk_alloc(struct btrfs_trans_handle *trans,
++			    struct btrfs_root *root, u64 type);
+ 
+ /* ctree.c */
+ int btrfs_bin_search(struct extent_buffer *eb, struct btrfs_key *key,
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -5376,7 +5376,7 @@ again:
+ 			       num_bytes, data, 1);
+ 		goto again;
+ 	}
+-	if (ret == -ENOSPC) {
++	if (ret == -ENOSPC && btrfs_test_opt(root, ENOSPC_DEBUG)) {
+ 		struct btrfs_space_info *sinfo;
+ 
+ 		sinfo = __find_space_info(root->fs_info, data);
+@@ -8065,6 +8065,13 @@ out:
+ 	return ret;
+ }
+ 
++int btrfs_force_chunk_alloc(struct btrfs_trans_handle *trans,
++			    struct btrfs_root *root, u64 type)
++{
++	u64 alloc_flags = get_alloc_profile(root, type);
++	return do_chunk_alloc(trans, root, 2 * 1024 * 1024, alloc_flags, 1);
++}
++
+ /*
+  * helper to account the unused space of all the readonly block group in the
+  * list. takes mirrors into account.
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -1433,12 +1433,13 @@ int extent_clear_unlock_delalloc(struct
+  */
+ u64 count_range_bits(struct extent_io_tree *tree,
+ 		     u64 *start, u64 search_end, u64 max_bytes,
+-		     unsigned long bits)
++		     unsigned long bits, int contig)
+ {
+ 	struct rb_node *node;
+ 	struct extent_state *state;
+ 	u64 cur_start = *start;
+ 	u64 total_bytes = 0;
++	u64 last = 0;
+ 	int found = 0;
+ 
+ 	if (search_end <= cur_start) {
+@@ -1463,7 +1464,9 @@ u64 count_range_bits(struct extent_io_tr
+ 		state = rb_entry(node, struct extent_state, rb_node);
+ 		if (state->start > search_end)
+ 			break;
+-		if (state->end >= cur_start && (state->state & bits)) {
++		if (contig && found && state->start > last + 1)
++			break;
++		if (state->end >= cur_start && (state->state & bits) == bits) {
+ 			total_bytes += min(search_end, state->end) + 1 -
+ 				       max(cur_start, state->start);
+ 			if (total_bytes >= max_bytes)
+@@ -1472,6 +1475,9 @@ u64 count_range_bits(struct extent_io_tr
+ 				*start = state->start;
+ 				found = 1;
+ 			}
++			last = state->end;
++		} else if (contig && found) {
++			break;
+ 		}
+ 		node = rb_next(node);
+ 		if (!node)
+@@ -2912,6 +2918,46 @@ out:
+ 	return sector;
+ }
+ 
++/*
++ * helper function for fiemap, which doesn't want to see any holes.
++ * This maps until we find something past 'last'
++ */
++static struct extent_map *get_extent_skip_holes(struct inode *inode,
++						u64 offset,
++						u64 last,
++						get_extent_t *get_extent)
++{
++	u64 sectorsize = BTRFS_I(inode)->root->sectorsize;
++	struct extent_map *em;
++	u64 len;
++
++	if (offset >= last)
++		return NULL;
++
++	while(1) {
++		len = last - offset;
++		if (len == 0)
++			break;
++		len = (len + sectorsize - 1) & ~(sectorsize - 1);
++		em = get_extent(inode, NULL, 0, offset, len, 0);
++		if (!em || IS_ERR(em))
++			return em;
++
++		/* if this isn't a hole return it */
++		if (!test_bit(EXTENT_FLAG_VACANCY, &em->flags) &&
++		    em->block_start != EXTENT_MAP_HOLE) {
++			return em;
++		}
++
++		/* this is a hole, advance to the next extent */
++		offset = extent_map_end(em);
++		free_extent_map(em);
++		if (offset >= last)
++			break;
++	}
++	return NULL;
++}
++
+ int extent_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+ 		__u64 start, __u64 len, get_extent_t *get_extent)
+ {
+@@ -2921,16 +2967,19 @@ int extent_fiemap(struct inode *inode, s
+ 	u32 flags = 0;
+ 	u32 found_type;
+ 	u64 last;
++	u64 last_for_get_extent = 0;
+ 	u64 disko = 0;
++	u64 isize = i_size_read(inode);
+ 	struct btrfs_key found_key;
+ 	struct extent_map *em = NULL;
+ 	struct extent_state *cached_state = NULL;
+ 	struct btrfs_path *path;
+ 	struct btrfs_file_extent_item *item;
+ 	int end = 0;
+-	u64 em_start = 0, em_len = 0;
++	u64 em_start = 0;
++	u64 em_len = 0;
++	u64 em_end = 0;
+ 	unsigned long emflags;
+-	int hole = 0;
+ 
+ 	if (len == 0)
+ 		return -EINVAL;
+@@ -2940,6 +2989,10 @@ int extent_fiemap(struct inode *inode, s
+ 		return -ENOMEM;
+ 	path->leave_spinning = 1;
+ 
++	/*
++	 * lookup the last file extent.  We're not using i_size here
++	 * because there might be preallocation past i_size
++	 */
+ 	ret = btrfs_lookup_file_extent(NULL, BTRFS_I(inode)->root,
+ 				       path, inode->i_ino, -1, 0);
+ 	if (ret < 0) {
+@@ -2953,18 +3006,38 @@ int extent_fiemap(struct inode *inode, s
+ 	btrfs_item_key_to_cpu(path->nodes[0], &found_key, path->slots[0]);
+ 	found_type = btrfs_key_type(&found_key);
+ 
+-	/* No extents, just return */
++	/* No extents, but there might be delalloc bits */
+ 	if (found_key.objectid != inode->i_ino ||
+ 	    found_type != BTRFS_EXTENT_DATA_KEY) {
+-		btrfs_free_path(path);
+-		return 0;
++		/* have to trust i_size as the end */
++		last = (u64)-1;
++		last_for_get_extent = isize;
++	} else {
++		/*
++		 * remember the start of the last extent.  There are a
++		 * bunch of different factors that go into the length of the
++		 * extent, so its much less complex to remember where it started
++		 */
++		last = found_key.offset;
++		last_for_get_extent = last + 1;
+ 	}
+-	last = found_key.offset;
+ 	btrfs_free_path(path);
+ 
++	/*
++	 * we might have some extents allocated but more delalloc past those
++	 * extents.  so, we trust isize unless the start of the last extent is
++	 * beyond isize
++	 */
++	if (last < isize) {
++		last = (u64)-1;
++		last_for_get_extent = isize;
++	}
++
+ 	lock_extent_bits(&BTRFS_I(inode)->io_tree, start, start + len, 0,
+ 			 &cached_state, GFP_NOFS);
+-	em = get_extent(inode, NULL, 0, off, max - off, 0);
++
++	em = get_extent_skip_holes(inode, off, last_for_get_extent,
++				   get_extent);
+ 	if (!em)
+ 		goto out;
+ 	if (IS_ERR(em)) {
+@@ -2973,19 +3046,14 @@ int extent_fiemap(struct inode *inode, s
+ 	}
+ 
+ 	while (!end) {
+-		hole = 0;
+-		off = em->start + em->len;
++		off = extent_map_end(em);
+ 		if (off >= max)
+ 			end = 1;
+ 
+-		if (em->block_start == EXTENT_MAP_HOLE) {
+-			hole = 1;
+-			goto next;
+-		}
+-
+ 		em_start = em->start;
+ 		em_len = em->len;
+-
++		em_end = extent_map_end(em);
++		emflags = em->flags;
+ 		disko = 0;
+ 		flags = 0;
+ 
+@@ -3004,37 +3072,29 @@ int extent_fiemap(struct inode *inode, s
+ 		if (test_bit(EXTENT_FLAG_COMPRESSED, &em->flags))
+ 			flags |= FIEMAP_EXTENT_ENCODED;
+ 
+-next:
+-		emflags = em->flags;
+ 		free_extent_map(em);
+ 		em = NULL;
+-		if (!end) {
+-			em = get_extent(inode, NULL, 0, off, max - off, 0);
+-			if (!em)
+-				goto out;
+-			if (IS_ERR(em)) {
+-				ret = PTR_ERR(em);
+-				goto out;
+-			}
+-			emflags = em->flags;
+-		}
+-
+-		if (test_bit(EXTENT_FLAG_VACANCY, &emflags)) {
++		if ((em_start >= last) || em_len == (u64)-1 ||
++		   (last == (u64)-1 && isize <= em_end)) {
+ 			flags |= FIEMAP_EXTENT_LAST;
+ 			end = 1;
+ 		}
+ 
+-		if (em_start == last) {
++		/* now scan forward to see if this is really the last extent. */
++		em = get_extent_skip_holes(inode, off, last_for_get_extent,
++					   get_extent);
++		if (IS_ERR(em)) {
++			ret = PTR_ERR(em);
++			goto out;
++		}
++		if (!em) {
+ 			flags |= FIEMAP_EXTENT_LAST;
+ 			end = 1;
+ 		}
+-
+-		if (!hole) {
+-			ret = fiemap_fill_next_extent(fieinfo, em_start, disko,
+-						em_len, flags);
+-			if (ret)
+-				goto out_free;
+-		}
++		ret = fiemap_fill_next_extent(fieinfo, em_start, disko,
++					      em_len, flags);
++		if (ret)
++			goto out_free;
+ 	}
+ out_free:
+ 	free_extent_map(em);
+--- a/fs/btrfs/extent_io.h
++++ b/fs/btrfs/extent_io.h
+@@ -191,7 +191,7 @@ void extent_io_exit(void);
+ 
+ u64 count_range_bits(struct extent_io_tree *tree,
+ 		     u64 *start, u64 search_end,
+-		     u64 max_bytes, unsigned long bits);
++		     u64 max_bytes, unsigned long bits, int contig);
+ 
+ void free_extent_state(struct extent_state *state);
+ int test_range_bit(struct extent_io_tree *tree, u64 start, u64 end,
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -1913,7 +1913,7 @@ static int btrfs_clean_io_failures(struc
+ 
+ 	private = 0;
+ 	if (count_range_bits(&BTRFS_I(inode)->io_failure_tree, &private,
+-			     (u64)-1, 1, EXTENT_DIRTY)) {
++			     (u64)-1, 1, EXTENT_DIRTY, 0)) {
+ 		ret = get_state_private(&BTRFS_I(inode)->io_failure_tree,
+ 					start, &private_failure);
+ 		if (ret == 0) {
+@@ -5280,6 +5280,128 @@ out:
+ 	return em;
+ }
+ 
++struct extent_map *btrfs_get_extent_fiemap(struct inode *inode, struct page *page,
++					   size_t pg_offset, u64 start, u64 len,
++					   int create)
++{
++	struct extent_map *em;
++	struct extent_map *hole_em = NULL;
++	u64 range_start = start;
++	u64 end;
++	u64 found;
++	u64 found_end;
++	int err = 0;
++
++	em = btrfs_get_extent(inode, page, pg_offset, start, len, create);
++	if (IS_ERR(em))
++		return em;
++	if (em) {
++		/*
++		 * if our em maps to a hole, there might
++		 * actually be delalloc bytes behind it
++		 */
++		if (em->block_start != EXTENT_MAP_HOLE)
++			return em;
++		else
++			hole_em = em;
++	}
++
++	/* check to see if we've wrapped (len == -1 or similar) */
++	end = start + len;
++	if (end < start)
++		end = (u64)-1;
++	else
++		end -= 1;
++
++	em = NULL;
++
++	/* ok, we didn't find anything, lets look for delalloc */
++	found = count_range_bits(&BTRFS_I(inode)->io_tree, &range_start,
++				 end, len, EXTENT_DELALLOC, 1);
++	found_end = range_start + found;
++	if (found_end < range_start)
++		found_end = (u64)-1;
++
++	/*
++	 * we didn't find anything useful, return
++	 * the original results from get_extent()
++	 */
++	if (range_start > end || found_end <= start) {
++		em = hole_em;
++		hole_em = NULL;
++		goto out;
++	}
++
++	/* adjust the range_start to make sure it doesn't
++	 * go backwards from the start they passed in
++	 */
++	range_start = max(start,range_start);
++	found = found_end - range_start;
++
++	if (found > 0) {
++		u64 hole_start = start;
++		u64 hole_len = len;
++
++		em = alloc_extent_map(GFP_NOFS);
++		if (!em) {
++			err = -ENOMEM;
++			goto out;
++		}
++		/*
++		 * when btrfs_get_extent can't find anything it
++		 * returns one huge hole
++		 *
++		 * make sure what it found really fits our range, and
++		 * adjust to make sure it is based on the start from
++		 * the caller
++		 */
++		if (hole_em) {
++			u64 calc_end = extent_map_end(hole_em);
++
++			if (calc_end <= start || (hole_em->start > end)) {
++				free_extent_map(hole_em);
++				hole_em = NULL;
++			} else {
++				hole_start = max(hole_em->start, start);
++				hole_len = calc_end - hole_start;
++			}
++		}
++		em->bdev = NULL;
++		if (hole_em && range_start > hole_start) {
++			/* our hole starts before our delalloc, so we
++			 * have to return just the parts of the hole
++			 * that go until  the delalloc starts
++			 */
++			em->len = min(hole_len,
++				      range_start - hole_start);
++			em->start = hole_start;
++			em->orig_start = hole_start;
++			/*
++			 * don't adjust block start at all,
++			 * it is fixed at EXTENT_MAP_HOLE
++			 */
++			em->block_start = hole_em->block_start;
++			em->block_len = hole_len;
++		} else {
++			em->start = range_start;
++			em->len = found;
++			em->orig_start = range_start;
++			em->block_start = EXTENT_MAP_DELALLOC;
++			em->block_len = found;
++		}
++	} else if (hole_em) {
++		return hole_em;
++	}
++out:
++
++	free_extent_map(hole_em);
++	if (err) {
++		free_extent_map(em);
++		return ERR_PTR(err);
++	}
++	return em;
++}
++
+ static struct extent_map *btrfs_new_extent_direct(struct inode *inode,
+ 						  u64 start, u64 len)
+ {
+@@ -6102,7 +6224,7 @@ out:
+ static int btrfs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+ 		__u64 start, __u64 len)
+ {
+-	return extent_fiemap(inode, fieinfo, start, len, btrfs_get_extent);
++	return extent_fiemap(inode, fieinfo, start, len, btrfs_get_extent_fiemap);
+ }
+ 
+ int btrfs_readpage(struct file *file, struct page *page)
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -1071,12 +1071,15 @@ static noinline int btrfs_ioctl_subvol_s
+ 	if (copy_from_user(&flags, arg, sizeof(flags)))
+ 		return -EFAULT;
+ 
+-	if (flags & ~BTRFS_SUBVOL_CREATE_ASYNC)
++	if (flags & BTRFS_SUBVOL_CREATE_ASYNC)
+ 		return -EINVAL;
+ 
+ 	if (flags & ~BTRFS_SUBVOL_RDONLY)
+ 		return -EOPNOTSUPP;
+ 
++	if (!is_owner_or_cap(inode))
++		return -EACCES;
++
+ 	down_write(&root->fs_info->subvol_sem);
+ 
+ 	/* nothing to do */
+@@ -1097,7 +1100,7 @@ static noinline int btrfs_ioctl_subvol_s
+ 		goto out_reset;
+ 	}
+ 
+-	ret = btrfs_update_root(trans, root,
++	ret = btrfs_update_root(trans, root->fs_info->tree_root,
+ 				&root->root_key, &root->root_item);
+ 
+ 	btrfs_commit_transaction(trans, root);
+--- a/fs/btrfs/lzo.c
++++ b/fs/btrfs/lzo.c
+@@ -280,6 +280,7 @@ static int lzo_decompress_biovec(struct
+ 	unsigned long tot_out;
+ 	unsigned long tot_len;
+ 	char *buf;
++	bool may_late_unmap, need_unmap;
+ 
+ 	data_in = kmap(pages_in[0]);
+ 	tot_len = read_compress_length(data_in);
+@@ -300,11 +301,13 @@ static int lzo_decompress_biovec(struct
+ 
+ 		tot_in += in_len;
+ 		working_bytes = in_len;
++		may_late_unmap = need_unmap = false;
+ 
+ 		/* fast path: avoid using the working buffer */
+ 		if (in_page_bytes_left >= in_len) {
+ 			buf = data_in + in_offset;
+ 			bytes = in_len;
++			may_late_unmap = true;
+ 			goto cont;
+ 		}
+ 
+@@ -329,14 +332,17 @@ cont:
+ 				if (working_bytes == 0 && tot_in >= tot_len)
+ 					break;
+ 
+-				kunmap(pages_in[page_in_index]);
+-				page_in_index++;
+-				if (page_in_index >= total_pages_in) {
++				if (page_in_index + 1 >= total_pages_in) {
+ 					ret = -1;
+-					data_in = NULL;
+ 					goto done;
+ 				}
+-				data_in = kmap(pages_in[page_in_index]);
++
++				if (may_late_unmap)
++					need_unmap = true;
++				else
++					kunmap(pages_in[page_in_index]);
++
++				data_in = kmap(pages_in[++page_in_index]);
+ 
+ 				in_page_bytes_left = PAGE_CACHE_SIZE;
+ 				in_offset = 0;
+@@ -346,6 +352,8 @@ cont:
+ 		out_len = lzo1x_worst_compress(PAGE_CACHE_SIZE);
+ 		ret = lzo1x_decompress_safe(buf, in_len, workspace->buf,
+ 					    &out_len);
++		if (need_unmap)
++			kunmap(pages_in[page_in_index - 1]);
+ 		if (ret != LZO_E_OK) {
+ 			printk(KERN_WARNING "btrfs decompress failed\n");
+ 			ret = -1;
+@@ -363,8 +371,7 @@ cont:
+ 			break;
+ 	}
+ done:
+-	if (data_in)
+-		kunmap(pages_in[page_in_index]);
++	kunmap(pages_in[page_in_index]);
+ 	return ret;
+ }
+ 
+--- a/fs/btrfs/relocation.c
++++ b/fs/btrfs/relocation.c
+@@ -3654,6 +3654,7 @@ static noinline_for_stack int relocate_b
+ 	u32 item_size;
+ 	int ret;
+ 	int err = 0;
++	int progress = 0;
+ 
+ 	path = btrfs_alloc_path();
+ 	if (!path)
+@@ -3666,9 +3667,10 @@ static noinline_for_stack int relocate_b
+ 	}
+ 
+ 	while (1) {
++		progress++;
+ 		trans = btrfs_start_transaction(rc->extent_root, 0);
+ 		BUG_ON(IS_ERR(trans));
+-
++restart:
+ 		if (update_backref_cache(trans, &rc->backref_cache)) {
+ 			btrfs_end_transaction(trans, rc->extent_root);
+ 			continue;
+@@ -3781,6 +3783,15 @@ static noinline_for_stack int relocate_b
+ 			}
+ 		}
+ 	}
++	if (trans && progress && err == -ENOSPC) {
++		ret = btrfs_force_chunk_alloc(trans, rc->extent_root,
++					      rc->block_group->flags);
++		if (ret == 0) {
++			err = 0;
++			progress = 0;
++			goto restart;
++		}
++	}
+ 
+ 	btrfs_release_path(rc->extent_root, path);
+ 	clear_extent_bits(&rc->processed_blocks, 0, (u64)-1, EXTENT_DIRTY,
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@ -155,7 +155,8 @@ enum {
+ 	Opt_nossd, Opt_ssd_spread, Opt_thread_pool, Opt_noacl, Opt_compress,
+ 	Opt_compress_type, Opt_compress_force, Opt_compress_force_type,
+ 	Opt_notreelog, Opt_ratio, Opt_flushoncommit, Opt_discard,
+-	Opt_space_cache, Opt_clear_cache, Opt_user_subvol_rm_allowed, Opt_err,
++	Opt_space_cache, Opt_clear_cache, Opt_user_subvol_rm_allowed,
++	Opt_enospc_debug, Opt_err,
+ };
+ 
+ static match_table_t tokens = {
+@@ -184,6 +185,7 @@ static match_table_t tokens = {
+ 	{Opt_space_cache, "space_cache"},
+ 	{Opt_clear_cache, "clear_cache"},
+ 	{Opt_user_subvol_rm_allowed, "user_subvol_rm_allowed"},
++	{Opt_enospc_debug, "enospc_debug"},
+ 	{Opt_err, NULL},
+ };
+ 
+@@ -358,6 +360,9 @@ int btrfs_parse_options(struct btrfs_roo
+ 		case Opt_user_subvol_rm_allowed:
+ 			btrfs_set_opt(info->mount_opt, USER_SUBVOL_RM_ALLOWED);
+ 			break;
++		case Opt_enospc_debug:
++			btrfs_set_opt(info->mount_opt, ENOSPC_DEBUG);
++			break;
+ 		case Opt_err:
+ 			printk(KERN_INFO "btrfs: unrecognized mount option "
+ 			       "'%s'\n", p);
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -1338,11 +1338,11 @@ int btrfs_rm_device(struct btrfs_root *r
+ 
+ 	ret = btrfs_shrink_device(device, 0);
+ 	if (ret)
+-		goto error_brelse;
++		goto error_undo;
+ 
+ 	ret = btrfs_rm_dev_item(root->fs_info->chunk_root, device);
+ 	if (ret)
+-		goto error_brelse;
++		goto error_undo;
+ 
+ 	device->in_fs_metadata = 0;
+ 
+@@ -1416,6 +1416,13 @@ out:
+ 	mutex_unlock(&root->fs_info->volume_mutex);
+ 	mutex_unlock(&uuid_mutex);
+ 	return ret;
++error_undo:
++	if (device->writeable) {
++		list_add(&device->dev_alloc_list,
++			 &root->fs_info->fs_devices->alloc_list);
++		root->fs_info->fs_devices->rw_devices++;
++	}
++	goto error_brelse;
+ }
+ 
+ /*
+@@ -1633,7 +1640,7 @@ int btrfs_init_new_device(struct btrfs_r
+ 	device->dev_root = root->fs_info->dev_root;
+ 	device->bdev = bdev;
+ 	device->in_fs_metadata = 1;
+-	device->mode = 0;
++	device->mode = FMODE_EXCL;
+ 	set_blocksize(device->bdev, 4096);
+ 
+ 	if (seeding_dev) {
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@ -63,6 +63,13 @@
+  * cleanup path and it is also acquired by eventpoll_release_file()
+  * if a file has been pushed inside an epoll set and it is then
+  * close()d without a previous call toepoll_ctl(EPOLL_CTL_DEL).
++ * It is also acquired when inserting an epoll fd onto another epoll
++ * fd. We do this so that we walk the epoll tree and ensure that this
++ * insertion does not create a cycle of epoll file descriptors, which
++ * could lead to deadlock. We need a global mutex to prevent two
++ * simultaneous inserts (A into B and B into A) from racing and
++ * constructing a cycle without either insert observing that it is
++ * going to.
+  * It is possible to drop the "ep->mtx" and to use the global
+  * mutex "epmutex" (together with "ep->lock") to have it working,
+  * but having "ep->mtx" will make the interface more scalable.
+@@ -224,6 +231,9 @@ static long max_user_watches __read_most
+  */
+ static DEFINE_MUTEX(epmutex);
+ 
++/* Used to check for epoll file descriptor inclusion loops */
++static struct nested_calls poll_loop_ncalls;
++
+ /* Used for safe wake up implementation */
+ static struct nested_calls poll_safewake_ncalls;
+ 
+@@ -1198,6 +1208,62 @@ retry:
+ 	return res;
+ }
+ 
++/**
++ * ep_loop_check_proc - Callback function to be passed to the @ep_call_nested()
++ *                      API, to verify that adding an epoll file inside another
++ *                      epoll structure, does not violate the constraints, in
++ *                      terms of closed loops, or too deep chains (which can
++ *                      result in excessive stack usage).
++ *
++ * @priv: Pointer to the epoll file to be currently checked.
++ * @cookie: Original cookie for this call. This is the top-of-the-chain epoll
++ *          data structure pointer.
++ * @call_nests: Current dept of the @ep_call_nested() call stack.
++ *
++ * Returns: Returns zero if adding the epoll @file inside current epoll
++ *          structure @ep does not violate the constraints, or -1 otherwise.
++ */
++static int ep_loop_check_proc(void *priv, void *cookie, int call_nests)
++{
++	int error = 0;
++	struct file *file = priv;
++	struct eventpoll *ep = file->private_data;
++	struct rb_node *rbp;
++	struct epitem *epi;
++
++	mutex_lock(&ep->mtx);
++	for (rbp = rb_first(&ep->rbr); rbp; rbp = rb_next(rbp)) {
++		epi = rb_entry(rbp, struct epitem, rbn);
++		if (unlikely(is_file_epoll(epi->ffd.file))) {
++			error = ep_call_nested(&poll_loop_ncalls, EP_MAX_NESTS,
++					       ep_loop_check_proc, epi->ffd.file,
++					       epi->ffd.file->private_data, current);
++			if (error != 0)
++				break;
++		}
++	}
++	mutex_unlock(&ep->mtx);
++
++	return error;
++}
++
++/**
++ * ep_loop_check - Performs a check to verify that adding an epoll file (@file)
++ *                 another epoll file (represented by @ep) does not create
++ *                 closed loops or too deep chains.
++ *
++ * @ep: Pointer to the epoll private data structure.
++ * @file: Pointer to the epoll file to be checked.
++ *
++ * Returns: Returns zero if adding the epoll @file inside current epoll
++ *          structure @ep does not violate the constraints, or -1 otherwise.
++ */
++static int ep_loop_check(struct eventpoll *ep, struct file *file)
++{
++	return ep_call_nested(&poll_loop_ncalls, EP_MAX_NESTS,
++			      ep_loop_check_proc, file, ep, current);
++}
++
+ /*
+  * Open an eventpoll file descriptor.
+  */
+@@ -1246,6 +1312,7 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, in
+ 		struct epoll_event __user *, event)
+ {
+ 	int error;
++	int did_lock_epmutex = 0;
+ 	struct file *file, *tfile;
+ 	struct eventpoll *ep;
+ 	struct epitem *epi;
+@@ -1287,6 +1354,25 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, in
+ 	 */
+ 	ep = file->private_data;
+ 
++	/*
++	 * When we insert an epoll file descriptor, inside another epoll file
++	 * descriptor, there is the change of creating closed loops, which are
++	 * better be handled here, than in more critical paths.
++	 *
++	 * We hold epmutex across the loop check and the insert in this case, in
++	 * order to prevent two separate inserts from racing and each doing the
++	 * insert "at the same time" such that ep_loop_check passes on both
++	 * before either one does the insert, thereby creating a cycle.
++	 */
++	if (unlikely(is_file_epoll(tfile) && op == EPOLL_CTL_ADD)) {
++		mutex_lock(&epmutex);
++		did_lock_epmutex = 1;
++		error = -ELOOP;
++		if (ep_loop_check(ep, tfile) != 0)
++			goto error_tgt_fput;
++	}
++
++
+ 	mutex_lock(&ep->mtx);
+ 
+ 	/*
+@@ -1322,6 +1408,9 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, in
+ 	mutex_unlock(&ep->mtx);
+ 
+ error_tgt_fput:
++	if (unlikely(did_lock_epmutex))
++		mutex_unlock(&epmutex);
++
+ 	fput(tfile);
+ error_fput:
+ 	fput(file);
+@@ -1441,6 +1530,12 @@ static int __init eventpoll_init(void)
+ 		EP_ITEM_COST;
+ 	BUG_ON(max_user_watches < 0);
+ 
++	/*
++	 * Initialize the structure used to perform epoll file descriptor
++	 * inclusion loops checks.
++	 */
++	ep_nested_calls_init(&poll_loop_ncalls);
++
+ 	/* Initialize the structure used to perform safe poll wait head wake ups */
+ 	ep_nested_calls_init(&poll_safewake_ncalls);
+ 
 --- a/fs/gfs2/main.c
 +++ b/fs/gfs2/main.c
 @@ -59,14 +59,7 @@ static void gfs2_init_gl_aspace_once(voi
@@ -1843,6 +3582,41 @@
  	i_size_ordered_init(inode);
  #ifdef CONFIG_FSNOTIFY
  	INIT_HLIST_HEAD(&inode->i_fsnotify_marks);
+@@ -540,11 +548,14 @@ void evict_inodes(struct super_block *sb
+ /**
+  * invalidate_inodes	- attempt to free all inodes on a superblock
+  * @sb:		superblock to operate on
++ * @kill_dirty: flag to guide handling of dirty inodes
+  *
+  * Attempts to free all inodes for a given superblock.  If there were any
+  * busy inodes return a non-zero value, else zero.
++ * If @kill_dirty is set, discard dirty inodes too, otherwise treat
++ * them as busy.
+  */
+-int invalidate_inodes(struct super_block *sb)
++int invalidate_inodes(struct super_block *sb, bool kill_dirty)
+ {
+ 	int busy = 0;
+ 	struct inode *inode, *next;
+@@ -556,6 +567,10 @@ int invalidate_inodes(struct super_block
+ 	list_for_each_entry_safe(inode, next, &sb->s_inodes, i_sb_list) {
+ 		if (inode->i_state & (I_NEW | I_FREEING | I_WILL_FREE))
+ 			continue;
++		if (inode->i_state & I_DIRTY && !kill_dirty) {
++			busy = 1;
++			continue;
++		}
+ 		if (atomic_read(&inode->i_count)) {
+ 			busy = 1;
+ 			continue;
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -112,4 +112,4 @@ extern void release_open_intent(struct n
+  */
+ extern int get_nr_dirty_inodes(void);
+ extern void evict_inodes(struct super_block *);
+-extern int invalidate_inodes(struct super_block *);
++extern int invalidate_inodes(struct super_block *, bool);
 --- a/fs/namespace.c
 +++ b/fs/namespace.c
 @@ -1244,7 +1244,7 @@ static int do_umount(struct vfsmount *mn
@@ -1935,6 +3709,20 @@
  	ii->i_bmap = &ii->i_bmap_data;
  	inode_init_once(&ii->vfs_inode);
  }
+--- a/fs/partitions/ldm.c
++++ b/fs/partitions/ldm.c
+@@ -251,6 +251,11 @@ static bool ldm_parse_vmdb (const u8 *da
+ 	}
+ 
+ 	vm->vblk_size     = get_unaligned_be32(data + 0x08);
++	if (vm->vblk_size == 0) {
++		ldm_error ("Illegal VBLK size");
++		return false;
++	}
++
+ 	vm->vblk_offset   = get_unaligned_be32(data + 0x0C);
+ 	vm->last_vblk_seq = get_unaligned_be32(data + 0x04);
+ 
 --- a/fs/xfs/linux-2.6/xfs_discard.c
 +++ b/fs/xfs/linux-2.6/xfs_discard.c
 @@ -152,6 +152,8 @@ xfs_ioc_trim(
@@ -1980,6 +3768,15 @@
  } __attribute__((aligned(sizeof(long))));
  	/*
  	 * On most architectures that alignment is already the case; but
+@@ -2139,7 +2140,7 @@ extern void check_disk_size_change(struc
+ 				   struct block_device *bdev);
+ extern int revalidate_disk(struct gendisk *);
+ extern int check_disk_change(struct block_device *);
+-extern int __invalidate_device(struct block_device *);
++extern int __invalidate_device(struct block_device *, bool);
+ extern int invalidate_partition(struct gendisk *, int);
+ #endif
+ unsigned long invalidate_mapping_pages(struct address_space *mapping,
 @@ -2225,6 +2226,7 @@ extern loff_t vfs_llseek(struct file *fi
  
  extern int inode_init_always(struct super_block *, struct inode *);
@@ -1988,6 +3785,86 @@
  extern void ihold(struct inode * inode);
  extern void iput(struct inode *);
  extern struct inode * igrab(struct inode *);
+--- a/include/linux/pm.h
++++ b/include/linux/pm.h
+@@ -431,6 +431,8 @@ struct dev_pm_info {
+ 	struct list_head	entry;
+ 	struct completion	completion;
+ 	struct wakeup_source	*wakeup;
++#else
++	unsigned int		should_wakeup:1;
+ #endif
+ #ifdef CONFIG_PM_RUNTIME
+ 	struct timer_list	suspend_timer;
+--- a/include/linux/pm_wakeup.h
++++ b/include/linux/pm_wakeup.h
+@@ -109,11 +109,6 @@ static inline bool device_can_wakeup(str
+ 	return dev->power.can_wakeup;
+ }
+ 
+-static inline bool device_may_wakeup(struct device *dev)
+-{
+-	return false;
+-}
+-
+ static inline struct wakeup_source *wakeup_source_create(const char *name)
+ {
+ 	return NULL;
+@@ -134,24 +129,32 @@ static inline void wakeup_source_unregis
+ 
+ static inline int device_wakeup_enable(struct device *dev)
+ {
+-	return -EINVAL;
++	dev->power.should_wakeup = true;
++	return 0;
+ }
+ 
+ static inline int device_wakeup_disable(struct device *dev)
+ {
++	dev->power.should_wakeup = false;
+ 	return 0;
+ }
+ 
+-static inline int device_init_wakeup(struct device *dev, bool val)
++static inline int device_set_wakeup_enable(struct device *dev, bool enable)
+ {
+-	dev->power.can_wakeup = val;
+-	return val ? -EINVAL : 0;
++	dev->power.should_wakeup = enable;
++	return 0;
+ }
+ 
++static inline int device_init_wakeup(struct device *dev, bool val)
++{
++	device_set_wakeup_capable(dev, val);
++	device_set_wakeup_enable(dev, val);
++	return 0;
++}
+ 
+-static inline int device_set_wakeup_enable(struct device *dev, bool enable)
++static inline bool device_may_wakeup(struct device *dev)
+ {
+-	return -EINVAL;
++	return dev->power.can_wakeup && dev->power.should_wakeup;
+ }
+ 
+ static inline void __pm_stay_awake(struct wakeup_source *ws) {}
+--- a/include/linux/rio_regs.h
++++ b/include/linux/rio_regs.h
+@@ -14,10 +14,12 @@
+ #define LINUX_RIO_REGS_H
+ 
+ /*
+- * In RapidIO, each device has a 2MB configuration space that is
++ * In RapidIO, each device has a 16MB configuration space that is
+  * accessed via maintenance transactions.  Portions of configuration
+  * space are standardized and/or reserved.
+  */
++#define RIO_MAINT_SPACE_SZ	0x1000000 /* 16MB of RapidIO mainenance space */
++
+ #define RIO_DEV_ID_CAR		0x00	/* [I] Device Identity CAR */
+ #define RIO_DEV_INFO_CAR	0x04	/* [I] Device Information CAR */
+ #define RIO_ASM_ID_CAR		0x08	/* [I] Assembly Identity CAR */
 --- a/include/net/ipv6.h
 +++ b/include/net/ipv6.h
 @@ -89,6 +89,18 @@
@@ -2177,6 +4054,21 @@
  static u64 perf_calculate_period(struct perf_event *event, u64 nsec, u64 count)
  {
  	u64 frequency = event->attr.sample_freq;
+--- a/lib/swiotlb.c
++++ b/lib/swiotlb.c
+@@ -686,8 +686,10 @@ dma_addr_t swiotlb_map_page(struct devic
+ 	/*
+ 	 * Ensure that the address returned is DMA'ble
+ 	 */
+-	if (!dma_capable(dev, dev_addr, size))
+-		panic("map_single: bounce buffer is not DMA'ble");
++	if (!dma_capable(dev, dev_addr, size)) {
++		swiotlb_tbl_unmap_single(dev, map, size, dir);
++		dev_addr = swiotlb_virt_to_bus(dev, io_tlb_overflow_buffer);
++	}
+ 
+ 	return dev_addr;
+ }
 --- a/mm/memory.c
 +++ b/mm/memory.c
 @@ -2648,6 +2648,7 @@ void unmap_mapping_range(struct address_
@@ -2195,6 +4087,37 @@
  }
  EXPORT_SYMBOL(unmap_mapping_range);
  
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -1830,7 +1830,7 @@ alloc_pages_vma(gfp_t gfp, int order, st
+ 	if (unlikely(pol->mode == MPOL_INTERLEAVE)) {
+ 		unsigned nid;
+ 
+-		nid = interleave_nid(pol, vma, addr, PAGE_SHIFT);
++		nid = interleave_nid(pol, vma, addr, PAGE_SHIFT + order);
+ 		mpol_cond_put(pol);
+ 		page = alloc_page_interleave(gfp, order, nid);
+ 		put_mems_allowed();
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1287,14 +1287,14 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid,
+ 		return -EPERM;
+ 
+ 	/* Find the mm_struct */
+-	read_lock(&tasklist_lock);
++	rcu_read_lock();
+ 	task = pid ? find_task_by_vpid(pid) : current;
+ 	if (!task) {
+-		read_unlock(&tasklist_lock);
++		rcu_read_unlock();
+ 		return -ESRCH;
+ 	}
+ 	mm = get_task_mm(task);
+-	read_unlock(&tasklist_lock);
++	rcu_read_unlock();
+ 
+ 	if (!mm)
+ 		return -EINVAL;
 --- a/mm/mremap.c
 +++ b/mm/mremap.c
 @@ -94,9 +94,7 @@ static void move_ptes(struct vm_area_str
@@ -2208,6 +4131,21 @@
  	}
  
  	/*
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -5376,10 +5376,9 @@ __count_immobile_pages(struct zone *zone
+ 	for (found = 0, iter = 0; iter < pageblock_nr_pages; iter++) {
+ 		unsigned long check = pfn + iter;
+ 
+-		if (!pfn_valid_within(check)) {
+-			iter++;
++		if (!pfn_valid_within(check))
+ 			continue;
+-		}
++
+ 		page = pfn_to_page(check);
+ 		if (!page_count(page)) {
+ 			if (PageBuddy(page))
 --- a/mm/swapfile.c
 +++ b/mm/swapfile.c
 @@ -1940,7 +1940,7 @@ SYSCALL_DEFINE2(swapon, const char __use
@@ -2219,6 +4157,65 @@
  		error = blkdev_get(bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL,
  				   sys_swapon);
  		if (error < 0) {
+--- a/mm/truncate.c
++++ b/mm/truncate.c
+@@ -225,6 +225,7 @@ void truncate_inode_pages_range(struct a
+ 	next = start;
+ 	while (next <= end &&
+ 	       pagevec_lookup(&pvec, mapping, next, PAGEVEC_SIZE)) {
++		mem_cgroup_uncharge_start();
+ 		for (i = 0; i < pagevec_count(&pvec); i++) {
+ 			struct page *page = pvec.pages[i];
+ 			pgoff_t page_index = page->index;
+@@ -247,6 +248,7 @@ void truncate_inode_pages_range(struct a
+ 			unlock_page(page);
+ 		}
+ 		pagevec_release(&pvec);
++		mem_cgroup_uncharge_end();
+ 		cond_resched();
+ 	}
+ 
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1841,16 +1841,28 @@ static inline bool should_continue_recla
+ 	if (!(sc->reclaim_mode & RECLAIM_MODE_COMPACTION))
+ 		return false;
+ 
+-	/*
+-	 * If we failed to reclaim and have scanned the full list, stop.
+-	 * NOTE: Checking just nr_reclaimed would exit reclaim/compaction far
+-	 *       faster but obviously would be less likely to succeed
+-	 *       allocation. If this is desirable, use GFP_REPEAT to decide
+-	 *       if both reclaimed and scanned should be checked or just
+-	 *       reclaimed
+-	 */
+-	if (!nr_reclaimed && !nr_scanned)
+-		return false;
++	/* Consider stopping depending on scan and reclaim activity */
++	if (sc->gfp_mask & __GFP_REPEAT) {
++		/*
++		 * For __GFP_REPEAT allocations, stop reclaiming if the
++		 * full LRU list has been scanned and we are still failing
++		 * to reclaim pages. This full LRU scan is potentially
++		 * expensive but a __GFP_REPEAT caller really wants to succeed
++		 */
++		if (!nr_reclaimed && !nr_scanned)
++			return false;
++	} else {
++		/*
++		 * For non-__GFP_REPEAT allocations which can presumably
++		 * fail without consequence, stop if we failed to reclaim
++		 * any pages from the last SWAP_CLUSTER_MAX number of
++		 * pages that were scanned. This will return to the
++		 * caller faster at the risk reclaim/compaction and
++		 * the resulting allocation attempt fails
++		 */
++		if (!nr_reclaimed)
++			return false;
++	}
+ 
+ 	/*
+ 	 * If we have not reclaimed enough pages for compaction and the
 --- a/net/bluetooth/rfcomm/tty.c
 +++ b/net/bluetooth/rfcomm/tty.c
 @@ -727,7 +727,9 @@ static int rfcomm_tty_open(struct tty_st
@@ -2527,6 +4524,35 @@
  
  		if (wildcard || !transparent)
  			sk = NULL;
+--- a/net/rxrpc/ar-key.c
++++ b/net/rxrpc/ar-key.c
+@@ -89,11 +89,11 @@ static int rxrpc_instantiate_xdr_rxkad(s
+ 		return ret;
+ 
+ 	plen -= sizeof(*token);
+-	token = kmalloc(sizeof(*token), GFP_KERNEL);
++	token = kzalloc(sizeof(*token), GFP_KERNEL);
+ 	if (!token)
+ 		return -ENOMEM;
+ 
+-	token->kad = kmalloc(plen, GFP_KERNEL);
++	token->kad = kzalloc(plen, GFP_KERNEL);
+ 	if (!token->kad) {
+ 		kfree(token);
+ 		return -ENOMEM;
+@@ -731,10 +731,10 @@ static int rxrpc_instantiate(struct key
+ 		goto error;
+ 
+ 	ret = -ENOMEM;
+-	token = kmalloc(sizeof(*token), GFP_KERNEL);
++	token = kzalloc(sizeof(*token), GFP_KERNEL);
+ 	if (!token)
+ 		goto error;
+-	token->kad = kmalloc(plen, GFP_KERNEL);
++	token->kad = kzalloc(plen, GFP_KERNEL);
+ 	if (!token->kad)
+ 		goto error_free;
+ 
 --- a/net/sched/sch_generic.c
 +++ b/net/sched/sch_generic.c
 @@ -839,6 +839,7 @@ void dev_deactivate(struct net_device *d
