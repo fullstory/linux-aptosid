@@ -1,0 +1,1996 @@
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 38
+-EXTRAVERSION = -rc7
++EXTRAVERSION = -rc7-git1
+ NAME = Flesh-Eating Bats with Fangs
+ 
+ # *DOCUMENTATION*
+--- a/arch/alpha/Kconfig
++++ b/arch/alpha/Kconfig
+@@ -11,6 +11,7 @@ config ALPHA
+ 	select HAVE_GENERIC_HARDIRQS
+ 	select GENERIC_IRQ_PROBE
+ 	select AUTO_IRQ_AFFINITY if SMP
++	select GENERIC_HARDIRQS_NO_DEPRECATED
+ 	help
+ 	  The Alpha is a 64-bit general-purpose processor designed and
+ 	  marketed by the Digital Equipment Corporation of blessed memory,
+--- a/arch/alpha/kernel/irq.c
++++ b/arch/alpha/kernel/irq.c
+@@ -44,11 +44,16 @@ static char irq_user_affinity[NR_IRQS];
+ 
+ int irq_select_affinity(unsigned int irq)
+ {
+-	struct irq_desc *desc = irq_to_desc[irq];
++	struct irq_data *data = irq_get_irq_data(irq);
++	struct irq_chip *chip;
+ 	static int last_cpu;
+ 	int cpu = last_cpu + 1;
+ 
+-	if (!desc || !get_irq_desc_chip(desc)->set_affinity || irq_user_affinity[irq])
++	if (!data)
++		return 1;
++	chip = irq_data_get_irq_chip(data);
++
++	if (!chip->irq_set_affinity || irq_user_affinity[irq])
+ 		return 1;
+ 
+ 	while (!cpu_possible(cpu) ||
+@@ -56,8 +61,8 @@ int irq_select_affinity(unsigned int irq
+ 		cpu = (cpu < (NR_CPUS-1) ? cpu + 1 : 0);
+ 	last_cpu = cpu;
+ 
+-	cpumask_copy(desc->affinity, cpumask_of(cpu));
+-	get_irq_desc_chip(desc)->set_affinity(irq, cpumask_of(cpu));
++	cpumask_copy(data->affinity, cpumask_of(cpu));
++	chip->irq_set_affinity(data, cpumask_of(cpu), false);
+ 	return 0;
+ }
+ #endif /* CONFIG_SMP */
+--- a/arch/alpha/kernel/irq_alpha.c
++++ b/arch/alpha/kernel/irq_alpha.c
+@@ -228,14 +228,9 @@ struct irqaction timer_irqaction = {
+ void __init
+ init_rtc_irq(void)
+ {
+-	struct irq_desc *desc = irq_to_desc(RTC_IRQ);
+-
+-	if (desc) {
+-		desc->status |= IRQ_DISABLED;
+-		set_irq_chip_and_handler_name(RTC_IRQ, &no_irq_chip,
+-			handle_simple_irq, "RTC");
+-		setup_irq(RTC_IRQ, &timer_irqaction);
+-	}
++	set_irq_chip_and_handler_name(RTC_IRQ, &no_irq_chip,
++				      handle_simple_irq, "RTC");
++	setup_irq(RTC_IRQ, &timer_irqaction);
+ }
+ 
+ /* Dummy irqactions.  */
+--- a/arch/alpha/kernel/irq_i8259.c
++++ b/arch/alpha/kernel/irq_i8259.c
+@@ -33,10 +33,10 @@ i8259_update_irq_hw(unsigned int irq, un
+ }
+ 
+ inline void
+-i8259a_enable_irq(unsigned int irq)
++i8259a_enable_irq(struct irq_data *d)
+ {
+ 	spin_lock(&i8259_irq_lock);
+-	i8259_update_irq_hw(irq, cached_irq_mask &= ~(1 << irq));
++	i8259_update_irq_hw(d->irq, cached_irq_mask &= ~(1 << d->irq));
+ 	spin_unlock(&i8259_irq_lock);
+ }
+ 
+@@ -47,16 +47,18 @@ __i8259a_disable_irq(unsigned int irq)
+ }
+ 
+ void
+-i8259a_disable_irq(unsigned int irq)
++i8259a_disable_irq(struct irq_data *d)
+ {
+ 	spin_lock(&i8259_irq_lock);
+-	__i8259a_disable_irq(irq);
++	__i8259a_disable_irq(d->irq);
+ 	spin_unlock(&i8259_irq_lock);
+ }
+ 
+ void
+-i8259a_mask_and_ack_irq(unsigned int irq)
++i8259a_mask_and_ack_irq(struct irq_data *d)
+ {
++	unsigned int irq = d->irq;
++
+ 	spin_lock(&i8259_irq_lock);
+ 	__i8259a_disable_irq(irq);
+ 
+@@ -71,9 +73,9 @@ i8259a_mask_and_ack_irq(unsigned int irq
+ 
+ struct irq_chip i8259a_irq_type = {
+ 	.name		= "XT-PIC",
+-	.unmask		= i8259a_enable_irq,
+-	.mask		= i8259a_disable_irq,
+-	.mask_ack	= i8259a_mask_and_ack_irq,
++	.irq_unmask	= i8259a_enable_irq,
++	.irq_mask	= i8259a_disable_irq,
++	.irq_mask_ack	= i8259a_mask_and_ack_irq,
+ };
+ 
+ void __init
+--- a/arch/alpha/kernel/irq_impl.h
++++ b/arch/alpha/kernel/irq_impl.h
+@@ -31,11 +31,9 @@ extern void init_rtc_irq(void);
+ 
+ extern void common_init_isa_dma(void);
+ 
+-extern void i8259a_enable_irq(unsigned int);
+-extern void i8259a_disable_irq(unsigned int);
+-extern void i8259a_mask_and_ack_irq(unsigned int);
+-extern unsigned int i8259a_startup_irq(unsigned int);
+-extern void i8259a_end_irq(unsigned int);
++extern void i8259a_enable_irq(struct irq_data *d);
++extern void i8259a_disable_irq(struct irq_data *d);
++extern void i8259a_mask_and_ack_irq(struct irq_data *d);
+ extern struct irq_chip i8259a_irq_type;
+ extern void init_i8259a_irqs(void);
+ 
+--- a/arch/alpha/kernel/irq_pyxis.c
++++ b/arch/alpha/kernel/irq_pyxis.c
+@@ -29,21 +29,21 @@ pyxis_update_irq_hw(unsigned long mask)
+ }
+ 
+ static inline void
+-pyxis_enable_irq(unsigned int irq)
++pyxis_enable_irq(struct irq_data *d)
+ {
+-	pyxis_update_irq_hw(cached_irq_mask |= 1UL << (irq - 16));
++	pyxis_update_irq_hw(cached_irq_mask |= 1UL << (d->irq - 16));
+ }
+ 
+ static void
+-pyxis_disable_irq(unsigned int irq)
++pyxis_disable_irq(struct irq_data *d)
+ {
+-	pyxis_update_irq_hw(cached_irq_mask &= ~(1UL << (irq - 16)));
++	pyxis_update_irq_hw(cached_irq_mask &= ~(1UL << (d->irq - 16)));
+ }
+ 
+ static void
+-pyxis_mask_and_ack_irq(unsigned int irq)
++pyxis_mask_and_ack_irq(struct irq_data *d)
+ {
+-	unsigned long bit = 1UL << (irq - 16);
++	unsigned long bit = 1UL << (d->irq - 16);
+ 	unsigned long mask = cached_irq_mask &= ~bit;
+ 
+ 	/* Disable the interrupt.  */
+@@ -58,9 +58,9 @@ pyxis_mask_and_ack_irq(unsigned int irq)
+ 
+ static struct irq_chip pyxis_irq_type = {
+ 	.name		= "PYXIS",
+-	.mask_ack	= pyxis_mask_and_ack_irq,
+-	.mask		= pyxis_disable_irq,
+-	.unmask		= pyxis_enable_irq,
++	.irq_mask_ack	= pyxis_mask_and_ack_irq,
++	.irq_mask	= pyxis_disable_irq,
++	.irq_unmask	= pyxis_enable_irq,
+ };
+ 
+ void 
+@@ -103,7 +103,7 @@ init_pyxis_irqs(unsigned long ignore_mas
+ 		if ((ignore_mask >> i) & 1)
+ 			continue;
+ 		set_irq_chip_and_handler(i, &pyxis_irq_type, handle_level_irq);
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ 
+ 	setup_irq(16+7, &isa_cascade_irqaction);
+--- a/arch/alpha/kernel/irq_srm.c
++++ b/arch/alpha/kernel/irq_srm.c
+@@ -18,27 +18,27 @@
+ DEFINE_SPINLOCK(srm_irq_lock);
+ 
+ static inline void
+-srm_enable_irq(unsigned int irq)
++srm_enable_irq(struct irq_data *d)
+ {
+ 	spin_lock(&srm_irq_lock);
+-	cserve_ena(irq - 16);
++	cserve_ena(d->irq - 16);
+ 	spin_unlock(&srm_irq_lock);
+ }
+ 
+ static void
+-srm_disable_irq(unsigned int irq)
++srm_disable_irq(struct irq_data *d)
+ {
+ 	spin_lock(&srm_irq_lock);
+-	cserve_dis(irq - 16);
++	cserve_dis(d->irq - 16);
+ 	spin_unlock(&srm_irq_lock);
+ }
+ 
+ /* Handle interrupts from the SRM, assuming no additional weirdness.  */
+ static struct irq_chip srm_irq_type = {
+ 	.name		= "SRM",
+-	.unmask		= srm_enable_irq,
+-	.mask		= srm_disable_irq,
+-	.mask_ack	= srm_disable_irq,
++	.irq_unmask	= srm_enable_irq,
++	.irq_mask	= srm_disable_irq,
++	.irq_mask_ack	= srm_disable_irq,
+ };
+ 
+ void __init
+@@ -52,7 +52,7 @@ init_srm_irqs(long max, unsigned long ig
+ 		if (i < 64 && ((ignore_mask >> i) & 1))
+ 			continue;
+ 		set_irq_chip_and_handler(i, &srm_irq_type, handle_level_irq);
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ }
+ 
+--- a/arch/alpha/kernel/sys_alcor.c
++++ b/arch/alpha/kernel/sys_alcor.c
+@@ -44,31 +44,31 @@ alcor_update_irq_hw(unsigned long mask)
+ }
+ 
+ static inline void
+-alcor_enable_irq(unsigned int irq)
++alcor_enable_irq(struct irq_data *d)
+ {
+-	alcor_update_irq_hw(cached_irq_mask |= 1UL << (irq - 16));
++	alcor_update_irq_hw(cached_irq_mask |= 1UL << (d->irq - 16));
+ }
+ 
+ static void
+-alcor_disable_irq(unsigned int irq)
++alcor_disable_irq(struct irq_data *d)
+ {
+-	alcor_update_irq_hw(cached_irq_mask &= ~(1UL << (irq - 16)));
++	alcor_update_irq_hw(cached_irq_mask &= ~(1UL << (d->irq - 16)));
+ }
+ 
+ static void
+-alcor_mask_and_ack_irq(unsigned int irq)
++alcor_mask_and_ack_irq(struct irq_data *d)
+ {
+-	alcor_disable_irq(irq);
++	alcor_disable_irq(d);
+ 
+ 	/* On ALCOR/XLT, need to dismiss interrupt via GRU. */
+-	*(vuip)GRU_INT_CLEAR = 1 << (irq - 16); mb();
++	*(vuip)GRU_INT_CLEAR = 1 << (d->irq - 16); mb();
+ 	*(vuip)GRU_INT_CLEAR = 0; mb();
+ }
+ 
+ static void
+-alcor_isa_mask_and_ack_irq(unsigned int irq)
++alcor_isa_mask_and_ack_irq(struct irq_data *d)
+ {
+-	i8259a_mask_and_ack_irq(irq);
++	i8259a_mask_and_ack_irq(d);
+ 
+ 	/* On ALCOR/XLT, need to dismiss interrupt via GRU. */
+ 	*(vuip)GRU_INT_CLEAR = 0x80000000; mb();
+@@ -77,9 +77,9 @@ alcor_isa_mask_and_ack_irq(unsigned int
+ 
+ static struct irq_chip alcor_irq_type = {
+ 	.name		= "ALCOR",
+-	.unmask		= alcor_enable_irq,
+-	.mask		= alcor_disable_irq,
+-	.mask_ack	= alcor_mask_and_ack_irq,
++	.irq_unmask	= alcor_enable_irq,
++	.irq_mask	= alcor_disable_irq,
++	.irq_mask_ack	= alcor_mask_and_ack_irq,
+ };
+ 
+ static void
+@@ -126,9 +126,9 @@ alcor_init_irq(void)
+ 		if (i >= 16+20 && i <= 16+30)
+ 			continue;
+ 		set_irq_chip_and_handler(i, &alcor_irq_type, handle_level_irq);
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+-	i8259a_irq_type.ack = alcor_isa_mask_and_ack_irq;
++	i8259a_irq_type.irq_ack = alcor_isa_mask_and_ack_irq;
+ 
+ 	init_i8259a_irqs();
+ 	common_init_isa_dma();
+--- a/arch/alpha/kernel/sys_cabriolet.c
++++ b/arch/alpha/kernel/sys_cabriolet.c
+@@ -46,22 +46,22 @@ cabriolet_update_irq_hw(unsigned int irq
+ }
+ 
+ static inline void
+-cabriolet_enable_irq(unsigned int irq)
++cabriolet_enable_irq(struct irq_data *d)
+ {
+-	cabriolet_update_irq_hw(irq, cached_irq_mask &= ~(1UL << irq));
++	cabriolet_update_irq_hw(d->irq, cached_irq_mask &= ~(1UL << d->irq));
+ }
+ 
+ static void
+-cabriolet_disable_irq(unsigned int irq)
++cabriolet_disable_irq(struct irq_data *d)
+ {
+-	cabriolet_update_irq_hw(irq, cached_irq_mask |= 1UL << irq);
++	cabriolet_update_irq_hw(d->irq, cached_irq_mask |= 1UL << d->irq);
+ }
+ 
+ static struct irq_chip cabriolet_irq_type = {
+ 	.name		= "CABRIOLET",
+-	.unmask		= cabriolet_enable_irq,
+-	.mask		= cabriolet_disable_irq,
+-	.mask_ack	= cabriolet_disable_irq,
++	.irq_unmask	= cabriolet_enable_irq,
++	.irq_mask	= cabriolet_disable_irq,
++	.irq_mask_ack	= cabriolet_disable_irq,
+ };
+ 
+ static void 
+@@ -107,7 +107,7 @@ common_init_irq(void (*srm_dev_int)(unsi
+ 		for (i = 16; i < 35; ++i) {
+ 			set_irq_chip_and_handler(i, &cabriolet_irq_type,
+ 				handle_level_irq);
+-			irq_to_desc(i)->status |= IRQ_LEVEL;
++			irq_set_status_flags(i, IRQ_LEVEL);
+ 		}
+ 	}
+ 
+--- a/arch/alpha/kernel/sys_dp264.c
++++ b/arch/alpha/kernel/sys_dp264.c
+@@ -98,37 +98,37 @@ tsunami_update_irq_hw(unsigned long mask
+ }
+ 
+ static void
+-dp264_enable_irq(unsigned int irq)
++dp264_enable_irq(struct irq_data *d)
+ {
+ 	spin_lock(&dp264_irq_lock);
+-	cached_irq_mask |= 1UL << irq;
++	cached_irq_mask |= 1UL << d->irq;
+ 	tsunami_update_irq_hw(cached_irq_mask);
+ 	spin_unlock(&dp264_irq_lock);
+ }
+ 
+ static void
+-dp264_disable_irq(unsigned int irq)
++dp264_disable_irq(struct irq_data *d)
+ {
+ 	spin_lock(&dp264_irq_lock);
+-	cached_irq_mask &= ~(1UL << irq);
++	cached_irq_mask &= ~(1UL << d->irq);
+ 	tsunami_update_irq_hw(cached_irq_mask);
+ 	spin_unlock(&dp264_irq_lock);
+ }
+ 
+ static void
+-clipper_enable_irq(unsigned int irq)
++clipper_enable_irq(struct irq_data *d)
+ {
+ 	spin_lock(&dp264_irq_lock);
+-	cached_irq_mask |= 1UL << (irq - 16);
++	cached_irq_mask |= 1UL << (d->irq - 16);
+ 	tsunami_update_irq_hw(cached_irq_mask);
+ 	spin_unlock(&dp264_irq_lock);
+ }
+ 
+ static void
+-clipper_disable_irq(unsigned int irq)
++clipper_disable_irq(struct irq_data *d)
+ {
+ 	spin_lock(&dp264_irq_lock);
+-	cached_irq_mask &= ~(1UL << (irq - 16));
++	cached_irq_mask &= ~(1UL << (d->irq - 16));
+ 	tsunami_update_irq_hw(cached_irq_mask);
+ 	spin_unlock(&dp264_irq_lock);
+ }
+@@ -149,10 +149,11 @@ cpu_set_irq_affinity(unsigned int irq, c
+ }
+ 
+ static int
+-dp264_set_affinity(unsigned int irq, const struct cpumask *affinity)
+-{ 
++dp264_set_affinity(struct irq_data *d, const struct cpumask *affinity,
++		   bool force)
++{
+ 	spin_lock(&dp264_irq_lock);
+-	cpu_set_irq_affinity(irq, *affinity);
++	cpu_set_irq_affinity(d->irq, *affinity);
+ 	tsunami_update_irq_hw(cached_irq_mask);
+ 	spin_unlock(&dp264_irq_lock);
+ 
+@@ -160,10 +161,11 @@ dp264_set_affinity(unsigned int irq, con
+ }
+ 
+ static int
+-clipper_set_affinity(unsigned int irq, const struct cpumask *affinity)
+-{ 
++clipper_set_affinity(struct irq_data *d, const struct cpumask *affinity,
++		     bool force)
++{
+ 	spin_lock(&dp264_irq_lock);
+-	cpu_set_irq_affinity(irq - 16, *affinity);
++	cpu_set_irq_affinity(d->irq - 16, *affinity);
+ 	tsunami_update_irq_hw(cached_irq_mask);
+ 	spin_unlock(&dp264_irq_lock);
+ 
+@@ -171,19 +173,19 @@ clipper_set_affinity(unsigned int irq, c
+ }
+ 
+ static struct irq_chip dp264_irq_type = {
+-	.name		= "DP264",
+-	.unmask		= dp264_enable_irq,
+-	.mask		= dp264_disable_irq,
+-	.mask_ack	= dp264_disable_irq,
+-	.set_affinity	= dp264_set_affinity,
++	.name			= "DP264",
++	.irq_unmask		= dp264_enable_irq,
++	.irq_mask		= dp264_disable_irq,
++	.irq_mask_ack		= dp264_disable_irq,
++	.irq_set_affinity	= dp264_set_affinity,
+ };
+ 
+ static struct irq_chip clipper_irq_type = {
+-	.name		= "CLIPPER",
+-	.unmask		= clipper_enable_irq,
+-	.mask		= clipper_disable_irq,
+-	.mask_ack	= clipper_disable_irq,
+-	.set_affinity	= clipper_set_affinity,
++	.name			= "CLIPPER",
++	.irq_unmask		= clipper_enable_irq,
++	.irq_mask		= clipper_disable_irq,
++	.irq_mask_ack		= clipper_disable_irq,
++	.irq_set_affinity	= clipper_set_affinity,
+ };
+ 
+ static void
+@@ -268,8 +270,8 @@ init_tsunami_irqs(struct irq_chip * ops,
+ {
+ 	long i;
+ 	for (i = imin; i <= imax; ++i) {
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(i, ops, handle_level_irq);
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ }
+ 
+--- a/arch/alpha/kernel/sys_eb64p.c
++++ b/arch/alpha/kernel/sys_eb64p.c
+@@ -44,22 +44,22 @@ eb64p_update_irq_hw(unsigned int irq, un
+ }
+ 
+ static inline void
+-eb64p_enable_irq(unsigned int irq)
++eb64p_enable_irq(struct irq_data *d)
+ {
+-	eb64p_update_irq_hw(irq, cached_irq_mask &= ~(1 << irq));
++	eb64p_update_irq_hw(d->irq, cached_irq_mask &= ~(1 << d->irq));
+ }
+ 
+ static void
+-eb64p_disable_irq(unsigned int irq)
++eb64p_disable_irq(struct irq_data *d)
+ {
+-	eb64p_update_irq_hw(irq, cached_irq_mask |= 1 << irq);
++	eb64p_update_irq_hw(d->irq, cached_irq_mask |= 1 << d->irq);
+ }
+ 
+ static struct irq_chip eb64p_irq_type = {
+ 	.name		= "EB64P",
+-	.unmask		= eb64p_enable_irq,
+-	.mask		= eb64p_disable_irq,
+-	.mask_ack	= eb64p_disable_irq,
++	.irq_unmask	= eb64p_enable_irq,
++	.irq_mask	= eb64p_disable_irq,
++	.irq_mask_ack	= eb64p_disable_irq,
+ };
+ 
+ static void 
+@@ -118,9 +118,9 @@ eb64p_init_irq(void)
+ 	init_i8259a_irqs();
+ 
+ 	for (i = 16; i < 32; ++i) {
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(i, &eb64p_irq_type, handle_level_irq);
+-	}		
++		irq_set_status_flags(i, IRQ_LEVEL);
++	}
+ 
+ 	common_init_isa_dma();
+ 	setup_irq(16+5, &isa_cascade_irqaction);
+--- a/arch/alpha/kernel/sys_eiger.c
++++ b/arch/alpha/kernel/sys_eiger.c
+@@ -51,16 +51,18 @@ eiger_update_irq_hw(unsigned long irq, u
+ }
+ 
+ static inline void
+-eiger_enable_irq(unsigned int irq)
++eiger_enable_irq(struct irq_data *d)
+ {
++	unsigned int irq = d->irq;
+ 	unsigned long mask;
+ 	mask = (cached_irq_mask[irq >= 64] &= ~(1UL << (irq & 63)));
+ 	eiger_update_irq_hw(irq, mask);
+ }
+ 
+ static void
+-eiger_disable_irq(unsigned int irq)
++eiger_disable_irq(struct irq_data *d)
+ {
++	unsigned int irq = d->irq;
+ 	unsigned long mask;
+ 	mask = (cached_irq_mask[irq >= 64] |= 1UL << (irq & 63));
+ 	eiger_update_irq_hw(irq, mask);
+@@ -68,9 +70,9 @@ eiger_disable_irq(unsigned int irq)
+ 
+ static struct irq_chip eiger_irq_type = {
+ 	.name		= "EIGER",
+-	.unmask		= eiger_enable_irq,
+-	.mask		= eiger_disable_irq,
+-	.mask_ack	= eiger_disable_irq,
++	.irq_unmask	= eiger_enable_irq,
++	.irq_mask	= eiger_disable_irq,
++	.irq_mask_ack	= eiger_disable_irq,
+ };
+ 
+ static void
+@@ -136,8 +138,8 @@ eiger_init_irq(void)
+ 	init_i8259a_irqs();
+ 
+ 	for (i = 16; i < 128; ++i) {
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(i, &eiger_irq_type, handle_level_irq);
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ }
+ 
+--- a/arch/alpha/kernel/sys_jensen.c
++++ b/arch/alpha/kernel/sys_jensen.c
+@@ -63,34 +63,34 @@
+  */
+ 
+ static void
+-jensen_local_enable(unsigned int irq)
++jensen_local_enable(struct irq_data *d)
+ {
+ 	/* the parport is really hw IRQ 1, silly Jensen.  */
+-	if (irq == 7)
+-		i8259a_enable_irq(1);
++	if (d->irq == 7)
++		i8259a_enable_irq(d);
+ }
+ 
+ static void
+-jensen_local_disable(unsigned int irq)
++jensen_local_disable(struct irq_data *d)
+ {
+ 	/* the parport is really hw IRQ 1, silly Jensen.  */
+-	if (irq == 7)
+-		i8259a_disable_irq(1);
++	if (d->irq == 7)
++		i8259a_disable_irq(d);
+ }
+ 
+ static void
+-jensen_local_mask_ack(unsigned int irq)
++jensen_local_mask_ack(struct irq_data *d)
+ {
+ 	/* the parport is really hw IRQ 1, silly Jensen.  */
+-	if (irq == 7)
+-		i8259a_mask_and_ack_irq(1);
++	if (d->irq == 7)
++		i8259a_mask_and_ack_irq(d);
+ }
+ 
+ static struct irq_chip jensen_local_irq_type = {
+ 	.name		= "LOCAL",
+-	.unmask		= jensen_local_enable,
+-	.mask		= jensen_local_disable,
+-	.mask_ack	= jensen_local_mask_ack,
++	.irq_unmask	= jensen_local_enable,
++	.irq_mask	= jensen_local_disable,
++	.irq_mask_ack	= jensen_local_mask_ack,
+ };
+ 
+ static void 
+--- a/arch/alpha/kernel/sys_marvel.c
++++ b/arch/alpha/kernel/sys_marvel.c
+@@ -104,9 +104,10 @@ io7_get_irq_ctl(unsigned int irq, struct
+ }
+ 
+ static void
+-io7_enable_irq(unsigned int irq)
++io7_enable_irq(struct irq_data *d)
+ {
+ 	volatile unsigned long *ctl;
++	unsigned int irq = d->irq;
+ 	struct io7 *io7;
+ 
+ 	ctl = io7_get_irq_ctl(irq, &io7);
+@@ -115,7 +116,7 @@ io7_enable_irq(unsigned int irq)
+ 		       __func__, irq);
+ 		return;
+ 	}
+-		
++
+ 	spin_lock(&io7->irq_lock);
+ 	*ctl |= 1UL << 24;
+ 	mb();
+@@ -124,9 +125,10 @@ io7_enable_irq(unsigned int irq)
+ }
+ 
+ static void
+-io7_disable_irq(unsigned int irq)
++io7_disable_irq(struct irq_data *d)
+ {
+ 	volatile unsigned long *ctl;
++	unsigned int irq = d->irq;
+ 	struct io7 *io7;
+ 
+ 	ctl = io7_get_irq_ctl(irq, &io7);
+@@ -135,7 +137,7 @@ io7_disable_irq(unsigned int irq)
+ 		       __func__, irq);
+ 		return;
+ 	}
+-		
++
+ 	spin_lock(&io7->irq_lock);
+ 	*ctl &= ~(1UL << 24);
+ 	mb();
+@@ -144,35 +146,29 @@ io7_disable_irq(unsigned int irq)
+ }
+ 
+ static void
+-marvel_irq_noop(unsigned int irq) 
+-{ 
+-	return; 
+-}
+-
+-static unsigned int
+-marvel_irq_noop_return(unsigned int irq) 
+-{ 
+-	return 0; 
++marvel_irq_noop(struct irq_data *d)
++{
++	return;
+ }
+ 
+ static struct irq_chip marvel_legacy_irq_type = {
+ 	.name		= "LEGACY",
+-	.mask		= marvel_irq_noop,
+-	.unmask		= marvel_irq_noop,
++	.irq_mask	= marvel_irq_noop,
++	.irq_unmask	= marvel_irq_noop,
+ };
+ 
+ static struct irq_chip io7_lsi_irq_type = {
+ 	.name		= "LSI",
+-	.unmask		= io7_enable_irq,
+-	.mask		= io7_disable_irq,
+-	.mask_ack	= io7_disable_irq,
++	.irq_unmask	= io7_enable_irq,
++	.irq_mask	= io7_disable_irq,
++	.irq_mask_ack	= io7_disable_irq,
+ };
+ 
+ static struct irq_chip io7_msi_irq_type = {
+ 	.name		= "MSI",
+-	.unmask		= io7_enable_irq,
+-	.mask		= io7_disable_irq,
+-	.ack		= marvel_irq_noop,
++	.irq_unmask	= io7_enable_irq,
++	.irq_mask	= io7_disable_irq,
++	.irq_ack	= marvel_irq_noop,
+ };
+ 
+ static void
+@@ -280,8 +276,8 @@ init_io7_irqs(struct io7 *io7,
+ 
+ 	/* Set up the lsi irqs.  */
+ 	for (i = 0; i < 128; ++i) {
+-		irq_to_desc(base + i)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(base + i, lsi_ops, handle_level_irq);
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ 
+ 	/* Disable the implemented irqs in hardware.  */
+@@ -294,8 +290,8 @@ init_io7_irqs(struct io7 *io7,
+ 
+ 	/* Set up the msi irqs.  */
+ 	for (i = 128; i < (128 + 512); ++i) {
+-		irq_to_desc(base + i)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(base + i, msi_ops, handle_level_irq);
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ 
+ 	for (i = 0; i < 16; ++i)
+--- a/arch/alpha/kernel/sys_mikasa.c
++++ b/arch/alpha/kernel/sys_mikasa.c
+@@ -43,22 +43,22 @@ mikasa_update_irq_hw(int mask)
+ }
+ 
+ static inline void
+-mikasa_enable_irq(unsigned int irq)
++mikasa_enable_irq(struct irq_data *d)
+ {
+-	mikasa_update_irq_hw(cached_irq_mask |= 1 << (irq - 16));
++	mikasa_update_irq_hw(cached_irq_mask |= 1 << (d->irq - 16));
+ }
+ 
+ static void
+-mikasa_disable_irq(unsigned int irq)
++mikasa_disable_irq(struct irq_data *d)
+ {
+-	mikasa_update_irq_hw(cached_irq_mask &= ~(1 << (irq - 16)));
++	mikasa_update_irq_hw(cached_irq_mask &= ~(1 << (d->irq - 16)));
+ }
+ 
+ static struct irq_chip mikasa_irq_type = {
+ 	.name		= "MIKASA",
+-	.unmask		= mikasa_enable_irq,
+-	.mask		= mikasa_disable_irq,
+-	.mask_ack	= mikasa_disable_irq,
++	.irq_unmask	= mikasa_enable_irq,
++	.irq_mask	= mikasa_disable_irq,
++	.irq_mask_ack	= mikasa_disable_irq,
+ };
+ 
+ static void 
+@@ -98,8 +98,8 @@ mikasa_init_irq(void)
+ 	mikasa_update_irq_hw(0);
+ 
+ 	for (i = 16; i < 32; ++i) {
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(i, &mikasa_irq_type, handle_level_irq);
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ 
+ 	init_i8259a_irqs();
+--- a/arch/alpha/kernel/sys_noritake.c
++++ b/arch/alpha/kernel/sys_noritake.c
+@@ -48,22 +48,22 @@ noritake_update_irq_hw(int irq, int mask
+ }
+ 
+ static void
+-noritake_enable_irq(unsigned int irq)
++noritake_enable_irq(struct irq_data *d)
+ {
+-	noritake_update_irq_hw(irq, cached_irq_mask |= 1 << (irq - 16));
++	noritake_update_irq_hw(d->irq, cached_irq_mask |= 1 << (d->irq - 16));
+ }
+ 
+ static void
+-noritake_disable_irq(unsigned int irq)
++noritake_disable_irq(struct irq_data *d)
+ {
+-	noritake_update_irq_hw(irq, cached_irq_mask &= ~(1 << (irq - 16)));
++	noritake_update_irq_hw(d->irq, cached_irq_mask &= ~(1 << (d->irq - 16)));
+ }
+ 
+ static struct irq_chip noritake_irq_type = {
+ 	.name		= "NORITAKE",
+-	.unmask		= noritake_enable_irq,
+-	.mask		= noritake_disable_irq,
+-	.mask_ack	= noritake_disable_irq,
++	.irq_unmask	= noritake_enable_irq,
++	.irq_mask	= noritake_disable_irq,
++	.irq_mask_ack	= noritake_disable_irq,
+ };
+ 
+ static void 
+@@ -127,8 +127,8 @@ noritake_init_irq(void)
+ 	outw(0, 0x54c);
+ 
+ 	for (i = 16; i < 48; ++i) {
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(i, &noritake_irq_type, handle_level_irq);
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ 
+ 	init_i8259a_irqs();
+--- a/arch/alpha/kernel/sys_rawhide.c
++++ b/arch/alpha/kernel/sys_rawhide.c
+@@ -56,9 +56,10 @@ rawhide_update_irq_hw(int hose, int mask
+   (((h) < MCPCIA_MAX_HOSES) && (cached_irq_masks[(h)] != 0))
+ 
+ static inline void 
+-rawhide_enable_irq(unsigned int irq)
++rawhide_enable_irq(struct irq_data *d)
+ {
+ 	unsigned int mask, hose;
++	unsigned int irq = d->irq;
+ 
+ 	irq -= 16;
+ 	hose = irq / 24;
+@@ -76,9 +77,10 @@ rawhide_enable_irq(unsigned int irq)
+ }
+ 
+ static void 
+-rawhide_disable_irq(unsigned int irq)
++rawhide_disable_irq(struct irq_data *d)
+ {
+ 	unsigned int mask, hose;
++	unsigned int irq = d->irq;
+ 
+ 	irq -= 16;
+ 	hose = irq / 24;
+@@ -96,9 +98,10 @@ rawhide_disable_irq(unsigned int irq)
+ }
+ 
+ static void
+-rawhide_mask_and_ack_irq(unsigned int irq)
++rawhide_mask_and_ack_irq(struct irq_data *d)
+ {
+ 	unsigned int mask, mask1, hose;
++	unsigned int irq = d->irq;
+ 
+ 	irq -= 16;
+ 	hose = irq / 24;
+@@ -123,9 +126,9 @@ rawhide_mask_and_ack_irq(unsigned int ir
+ 
+ static struct irq_chip rawhide_irq_type = {
+ 	.name		= "RAWHIDE",
+-	.unmask		= rawhide_enable_irq,
+-	.mask		= rawhide_disable_irq,
+-	.mask_ack	= rawhide_mask_and_ack_irq,
++	.irq_unmask	= rawhide_enable_irq,
++	.irq_mask	= rawhide_disable_irq,
++	.irq_mask_ack	= rawhide_mask_and_ack_irq,
+ };
+ 
+ static void 
+@@ -177,8 +180,8 @@ rawhide_init_irq(void)
+ 	}
+ 
+ 	for (i = 16; i < 128; ++i) {
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(i, &rawhide_irq_type, handle_level_irq);
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ 
+ 	init_i8259a_irqs();
+--- a/arch/alpha/kernel/sys_rx164.c
++++ b/arch/alpha/kernel/sys_rx164.c
+@@ -47,22 +47,22 @@ rx164_update_irq_hw(unsigned long mask)
+ }
+ 
+ static inline void
+-rx164_enable_irq(unsigned int irq)
++rx164_enable_irq(struct irq_data *d)
+ {
+-	rx164_update_irq_hw(cached_irq_mask |= 1UL << (irq - 16));
++	rx164_update_irq_hw(cached_irq_mask |= 1UL << (d->irq - 16));
+ }
+ 
+ static void
+-rx164_disable_irq(unsigned int irq)
++rx164_disable_irq(struct irq_data *d)
+ {
+-	rx164_update_irq_hw(cached_irq_mask &= ~(1UL << (irq - 16)));
++	rx164_update_irq_hw(cached_irq_mask &= ~(1UL << (d->irq - 16)));
+ }
+ 
+ static struct irq_chip rx164_irq_type = {
+ 	.name		= "RX164",
+-	.unmask		= rx164_enable_irq,
+-	.mask		= rx164_disable_irq,
+-	.mask_ack	= rx164_disable_irq,
++	.irq_unmask	= rx164_enable_irq,
++	.irq_mask	= rx164_disable_irq,
++	.irq_mask_ack	= rx164_disable_irq,
+ };
+ 
+ static void 
+@@ -99,8 +99,8 @@ rx164_init_irq(void)
+ 
+ 	rx164_update_irq_hw(0);
+ 	for (i = 16; i < 40; ++i) {
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(i, &rx164_irq_type, handle_level_irq);
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ 
+ 	init_i8259a_irqs();
+--- a/arch/alpha/kernel/sys_sable.c
++++ b/arch/alpha/kernel/sys_sable.c
+@@ -443,11 +443,11 @@ lynx_swizzle(struct pci_dev *dev, u8 *pi
+ /* GENERIC irq routines */
+ 
+ static inline void
+-sable_lynx_enable_irq(unsigned int irq)
++sable_lynx_enable_irq(struct irq_data *d)
+ {
+ 	unsigned long bit, mask;
+ 
+-	bit = sable_lynx_irq_swizzle->irq_to_mask[irq];
++	bit = sable_lynx_irq_swizzle->irq_to_mask[d->irq];
+ 	spin_lock(&sable_lynx_irq_lock);
+ 	mask = sable_lynx_irq_swizzle->shadow_mask &= ~(1UL << bit);
+ 	sable_lynx_irq_swizzle->update_irq_hw(bit, mask);
+@@ -459,11 +459,11 @@ sable_lynx_enable_irq(unsigned int irq)
+ }
+ 
+ static void
+-sable_lynx_disable_irq(unsigned int irq)
++sable_lynx_disable_irq(struct irq_data *d)
+ {
+ 	unsigned long bit, mask;
+ 
+-	bit = sable_lynx_irq_swizzle->irq_to_mask[irq];
++	bit = sable_lynx_irq_swizzle->irq_to_mask[d->irq];
+ 	spin_lock(&sable_lynx_irq_lock);
+ 	mask = sable_lynx_irq_swizzle->shadow_mask |= 1UL << bit;
+ 	sable_lynx_irq_swizzle->update_irq_hw(bit, mask);
+@@ -475,11 +475,11 @@ sable_lynx_disable_irq(unsigned int irq)
+ }
+ 
+ static void
+-sable_lynx_mask_and_ack_irq(unsigned int irq)
++sable_lynx_mask_and_ack_irq(struct irq_data *d)
+ {
+ 	unsigned long bit, mask;
+ 
+-	bit = sable_lynx_irq_swizzle->irq_to_mask[irq];
++	bit = sable_lynx_irq_swizzle->irq_to_mask[d->irq];
+ 	spin_lock(&sable_lynx_irq_lock);
+ 	mask = sable_lynx_irq_swizzle->shadow_mask |= 1UL << bit;
+ 	sable_lynx_irq_swizzle->update_irq_hw(bit, mask);
+@@ -489,9 +489,9 @@ sable_lynx_mask_and_ack_irq(unsigned int
+ 
+ static struct irq_chip sable_lynx_irq_type = {
+ 	.name		= "SABLE/LYNX",
+-	.unmask		= sable_lynx_enable_irq,
+-	.mask		= sable_lynx_disable_irq,
+-	.mask_ack	= sable_lynx_mask_and_ack_irq,
++	.irq_unmask	= sable_lynx_enable_irq,
++	.irq_mask	= sable_lynx_disable_irq,
++	.irq_mask_ack	= sable_lynx_mask_and_ack_irq,
+ };
+ 
+ static void 
+@@ -518,9 +518,9 @@ sable_lynx_init_irq(int nr_of_irqs)
+ 	long i;
+ 
+ 	for (i = 0; i < nr_of_irqs; ++i) {
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(i, &sable_lynx_irq_type,
+ 			handle_level_irq);
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ 
+ 	common_init_isa_dma();
+--- a/arch/alpha/kernel/sys_takara.c
++++ b/arch/alpha/kernel/sys_takara.c
+@@ -45,16 +45,18 @@ takara_update_irq_hw(unsigned long irq,
+ }
+ 
+ static inline void
+-takara_enable_irq(unsigned int irq)
++takara_enable_irq(struct irq_data *d)
+ {
++	unsigned int irq = d->irq;
+ 	unsigned long mask;
+ 	mask = (cached_irq_mask[irq >= 64] &= ~(1UL << (irq & 63)));
+ 	takara_update_irq_hw(irq, mask);
+ }
+ 
+ static void
+-takara_disable_irq(unsigned int irq)
++takara_disable_irq(struct irq_data *d)
+ {
++	unsigned int irq = d->irq;
+ 	unsigned long mask;
+ 	mask = (cached_irq_mask[irq >= 64] |= 1UL << (irq & 63));
+ 	takara_update_irq_hw(irq, mask);
+@@ -62,9 +64,9 @@ takara_disable_irq(unsigned int irq)
+ 
+ static struct irq_chip takara_irq_type = {
+ 	.name		= "TAKARA",
+-	.unmask		= takara_enable_irq,
+-	.mask		= takara_disable_irq,
+-	.mask_ack	= takara_disable_irq,
++	.irq_unmask	= takara_enable_irq,
++	.irq_mask	= takara_disable_irq,
++	.irq_mask_ack	= takara_disable_irq,
+ };
+ 
+ static void
+@@ -136,8 +138,8 @@ takara_init_irq(void)
+ 		takara_update_irq_hw(i, -1);
+ 
+ 	for (i = 16; i < 128; ++i) {
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(i, &takara_irq_type, handle_level_irq);
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ 
+ 	common_init_isa_dma();
+--- a/arch/alpha/kernel/sys_titan.c
++++ b/arch/alpha/kernel/sys_titan.c
+@@ -112,8 +112,9 @@ titan_update_irq_hw(unsigned long mask)
+ }
+ 
+ static inline void
+-titan_enable_irq(unsigned int irq)
++titan_enable_irq(struct irq_data *d)
+ {
++	unsigned int irq = d->irq;
+ 	spin_lock(&titan_irq_lock);
+ 	titan_cached_irq_mask |= 1UL << (irq - 16);
+ 	titan_update_irq_hw(titan_cached_irq_mask);
+@@ -121,8 +122,9 @@ titan_enable_irq(unsigned int irq)
+ }
+ 
+ static inline void
+-titan_disable_irq(unsigned int irq)
++titan_disable_irq(struct irq_data *d)
+ {
++	unsigned int irq = d->irq;
+ 	spin_lock(&titan_irq_lock);
+ 	titan_cached_irq_mask &= ~(1UL << (irq - 16));
+ 	titan_update_irq_hw(titan_cached_irq_mask);
+@@ -144,7 +146,8 @@ titan_cpu_set_irq_affinity(unsigned int
+ }
+ 
+ static int
+-titan_set_irq_affinity(unsigned int irq, const struct cpumask *affinity)
++titan_set_irq_affinity(struct irq_data *d, const struct cpumask *affinity,
++		       bool force)
+ { 
+ 	spin_lock(&titan_irq_lock);
+ 	titan_cpu_set_irq_affinity(irq - 16, *affinity);
+@@ -175,17 +178,17 @@ init_titan_irqs(struct irq_chip * ops, i
+ {
+ 	long i;
+ 	for (i = imin; i <= imax; ++i) {
+-		irq_to_desc(i)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(i, ops, handle_level_irq);
++		irq_set_status_flags(i, IRQ_LEVEL);
+ 	}
+ }
+ 
+ static struct irq_chip titan_irq_type = {
+-       .name		= "TITAN",
+-       .unmask		= titan_enable_irq,
+-       .mask		= titan_disable_irq,
+-       .mask_ack	= titan_disable_irq,
+-       .set_affinity	= titan_set_irq_affinity,
++       .name			= "TITAN",
++       .irq_unmask		= titan_enable_irq,
++       .irq_mask		= titan_disable_irq,
++       .irq_mask_ack		= titan_disable_irq,
++       .irq_set_affinity	= titan_set_irq_affinity,
+ };
+ 
+ static irqreturn_t
+--- a/arch/alpha/kernel/sys_wildfire.c
++++ b/arch/alpha/kernel/sys_wildfire.c
+@@ -104,10 +104,12 @@ wildfire_init_irq_hw(void)
+ }
+ 
+ static void
+-wildfire_enable_irq(unsigned int irq)
++wildfire_enable_irq(struct irq_data *d)
+ {
++	unsigned int irq = d->irq;
++
+ 	if (irq < 16)
+-		i8259a_enable_irq(irq);
++		i8259a_enable_irq(d);
+ 
+ 	spin_lock(&wildfire_irq_lock);
+ 	set_bit(irq, &cached_irq_mask);
+@@ -116,10 +118,12 @@ wildfire_enable_irq(unsigned int irq)
+ }
+ 
+ static void
+-wildfire_disable_irq(unsigned int irq)
++wildfire_disable_irq(struct irq_data *d)
+ {
++	unsigned int irq = d->irq;
++
+ 	if (irq < 16)
+-		i8259a_disable_irq(irq);
++		i8259a_disable_irq(d);
+ 
+ 	spin_lock(&wildfire_irq_lock);
+ 	clear_bit(irq, &cached_irq_mask);
+@@ -128,10 +132,12 @@ wildfire_disable_irq(unsigned int irq)
+ }
+ 
+ static void
+-wildfire_mask_and_ack_irq(unsigned int irq)
++wildfire_mask_and_ack_irq(struct irq_data *d)
+ {
++	unsigned int irq = d->irq;
++
+ 	if (irq < 16)
+-		i8259a_mask_and_ack_irq(irq);
++		i8259a_mask_and_ack_irq(d);
+ 
+ 	spin_lock(&wildfire_irq_lock);
+ 	clear_bit(irq, &cached_irq_mask);
+@@ -141,9 +147,9 @@ wildfire_mask_and_ack_irq(unsigned int i
+ 
+ static struct irq_chip wildfire_irq_type = {
+ 	.name		= "WILDFIRE",
+-	.unmask		= wildfire_enable_irq,
+-	.mask		= wildfire_disable_irq,
+-	.mask_ack	= wildfire_mask_and_ack_irq,
++	.irq_unmask	= wildfire_enable_irq,
++	.irq_mask	= wildfire_disable_irq,
++	.irq_mask_ack	= wildfire_mask_and_ack_irq,
+ };
+ 
+ static void __init
+@@ -177,21 +183,21 @@ wildfire_init_irq_per_pca(int qbbno, int
+ 	for (i = 0; i < 16; ++i) {
+ 		if (i == 2)
+ 			continue;
+-		irq_to_desc(i+irq_bias)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(i+irq_bias, &wildfire_irq_type,
+ 			handle_level_irq);
++		irq_set_status_flags(i + irq_bias, IRQ_LEVEL);
+ 	}
+ 
+-	irq_to_desc(36+irq_bias)->status |= IRQ_LEVEL;
+ 	set_irq_chip_and_handler(36+irq_bias, &wildfire_irq_type,
+ 		handle_level_irq);
++	irq_set_status_flags(36 + irq_bias, IRQ_LEVEL);
+ 	for (i = 40; i < 64; ++i) {
+-		irq_to_desc(i+irq_bias)->status |= IRQ_LEVEL;
+ 		set_irq_chip_and_handler(i+irq_bias, &wildfire_irq_type,
+ 			handle_level_irq);
++		irq_set_status_flags(i + irq_bias, IRQ_LEVEL);
+ 	}
+ 
+-	setup_irq(32+irq_bias, &isa_enable);	
++	setup_irq(32+irq_bias, &isa_enable);
+ }
+ 
+ static void __init
+--- a/arch/powerpc/include/asm/machdep.h
++++ b/arch/powerpc/include/asm/machdep.h
+@@ -240,6 +240,12 @@ struct machdep_calls {
+ 	 * claims to support kexec.
+ 	 */
+ 	int (*machine_kexec_prepare)(struct kimage *image);
++
++	/* Called to perform the _real_ kexec.
++	 * Do NOT allocate memory or fail here. We are past the point of
++	 * no return.
++	 */
++	void (*machine_kexec)(struct kimage *image);
+ #endif /* CONFIG_KEXEC */
+ 
+ #ifdef CONFIG_SUSPEND
+--- a/arch/powerpc/kernel/machine_kexec.c
++++ b/arch/powerpc/kernel/machine_kexec.c
+@@ -87,7 +87,10 @@ void machine_kexec(struct kimage *image)
+ 
+ 	save_ftrace_enabled = __ftrace_enabled_save();
+ 
+-	default_machine_kexec(image);
++	if (ppc_md.machine_kexec)
++		ppc_md.machine_kexec(image);
++	else
++		default_machine_kexec(image);
+ 
+ 	__ftrace_enabled_restore(save_ftrace_enabled);
+ 
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@ -353,6 +353,7 @@ static void switch_booke_debug_regs(stru
+ 			prime_debug_regs(new_thread);
+ }
+ #else	/* !CONFIG_PPC_ADV_DEBUG_REGS */
++#ifndef CONFIG_HAVE_HW_BREAKPOINT
+ static void set_debug_reg_defaults(struct thread_struct *thread)
+ {
+ 	if (thread->dabr) {
+@@ -360,6 +361,7 @@ static void set_debug_reg_defaults(struc
+ 		set_dabr(0);
+ 	}
+ }
++#endif /* !CONFIG_HAVE_HW_BREAKPOINT */
+ #endif	/* CONFIG_PPC_ADV_DEBUG_REGS */
+ 
+ int set_dabr(unsigned long dabr)
+@@ -670,11 +672,11 @@ void flush_thread(void)
+ {
+ 	discard_lazy_cpu_state();
+ 
+-#ifdef CONFIG_HAVE_HW_BREAKPOINTS
++#ifdef CONFIG_HAVE_HW_BREAKPOINT
+ 	flush_ptrace_hw_breakpoint(current);
+-#else /* CONFIG_HAVE_HW_BREAKPOINTS */
++#else /* CONFIG_HAVE_HW_BREAKPOINT */
+ 	set_debug_reg_defaults(&current->thread);
+-#endif /* CONFIG_HAVE_HW_BREAKPOINTS */
++#endif /* CONFIG_HAVE_HW_BREAKPOINT */
+ }
+ 
+ void
+--- a/arch/powerpc/mm/tlb_hash64.c
++++ b/arch/powerpc/mm/tlb_hash64.c
+@@ -38,13 +38,11 @@ DEFINE_PER_CPU(struct ppc64_tlb_batch, p
+  * neesd to be flushed. This function will either perform the flush
+  * immediately or will batch it up if the current CPU has an active
+  * batch on it.
+- *
+- * Must be called from within some kind of spinlock/non-preempt region...
+  */
+ void hpte_need_flush(struct mm_struct *mm, unsigned long addr,
+ 		     pte_t *ptep, unsigned long pte, int huge)
+ {
+-	struct ppc64_tlb_batch *batch = &__get_cpu_var(ppc64_tlb_batch);
++	struct ppc64_tlb_batch *batch = &get_cpu_var(ppc64_tlb_batch);
+ 	unsigned long vsid, vaddr;
+ 	unsigned int psize;
+ 	int ssize;
+@@ -99,6 +97,7 @@ void hpte_need_flush(struct mm_struct *m
+ 	 */
+ 	if (!batch->active) {
+ 		flush_hash_page(vaddr, rpte, psize, ssize, 0);
++		put_cpu_var(ppc64_tlb_batch);
+ 		return;
+ 	}
+ 
+@@ -127,6 +126,7 @@ void hpte_need_flush(struct mm_struct *m
+ 	batch->index = ++i;
+ 	if (i >= PPC64_TLB_BATCH_NR)
+ 		__flush_tlb_pending(batch);
++	put_cpu_var(ppc64_tlb_batch);
+ }
+ 
+ /*
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -36,6 +36,11 @@
+ #define MSR_IA32_PERFCTR1		0x000000c2
+ #define MSR_FSB_FREQ			0x000000cd
+ 
++#define MSR_NHM_SNB_PKG_CST_CFG_CTL	0x000000e2
++#define NHM_C3_AUTO_DEMOTE		(1UL << 25)
++#define NHM_C1_AUTO_DEMOTE		(1UL << 26)
++#define ATM_LNC_C6_AUTO_DEMOTE		(1UL << 25)
++
+ #define MSR_MTRRcap			0x000000fe
+ #define MSR_IA32_BBL_CR_CTL		0x00000119
+ 
+--- a/arch/x86/kernel/cpu/cpufreq/p4-clockmod.c
++++ b/arch/x86/kernel/cpu/cpufreq/p4-clockmod.c
+@@ -158,9 +158,9 @@ static unsigned int cpufreq_p4_get_frequ
+ {
+ 	if (c->x86 == 0x06) {
+ 		if (cpu_has(c, X86_FEATURE_EST))
+-			printk(KERN_WARNING PFX "Warning: EST-capable CPU "
+-			       "detected. The acpi-cpufreq module offers "
+-			       "voltage scaling in addition of frequency "
++			printk_once(KERN_WARNING PFX "Warning: EST-capable "
++			       "CPU detected. The acpi-cpufreq module offers "
++			       "voltage scaling in addition to frequency "
+ 			       "scaling. You should use that instead of "
+ 			       "p4-clockmod, if possible.\n");
+ 		switch (c->x86_model) {
+--- a/arch/x86/kernel/cpu/cpufreq/powernow-k8.c
++++ b/arch/x86/kernel/cpu/cpufreq/powernow-k8.c
+@@ -1537,6 +1537,7 @@ static struct notifier_block cpb_nb = {
+ static int __cpuinit powernowk8_init(void)
+ {
+ 	unsigned int i, supported_cpus = 0, cpu;
++	int rv;
+ 
+ 	for_each_online_cpu(i) {
+ 		int rc;
+@@ -1555,14 +1556,14 @@ static int __cpuinit powernowk8_init(voi
+ 
+ 		cpb_capable = true;
+ 
+-		register_cpu_notifier(&cpb_nb);
+-
+ 		msrs = msrs_alloc();
+ 		if (!msrs) {
+ 			printk(KERN_ERR "%s: Error allocating msrs!\n", __func__);
+ 			return -ENOMEM;
+ 		}
+ 
++		register_cpu_notifier(&cpb_nb);
++
+ 		rdmsr_on_cpus(cpu_online_mask, MSR_K7_HWCR, msrs);
+ 
+ 		for_each_cpu(cpu, cpu_online_mask) {
+@@ -1574,7 +1575,13 @@ static int __cpuinit powernowk8_init(voi
+ 			(cpb_enabled ? "on" : "off"));
+ 	}
+ 
+-	return cpufreq_register_driver(&cpufreq_amd64_driver);
++	rv = cpufreq_register_driver(&cpufreq_amd64_driver);
++	if (rv < 0 && boot_cpu_has(X86_FEATURE_CPB)) {
++		unregister_cpu_notifier(&cpb_nb);
++		msrs_free(msrs);
++		msrs = NULL;
++	}
++	return rv;
+ }
+ 
+ /* driver entry point for term */
+--- a/arch/x86/platform/olpc/olpc_dt.c
++++ b/arch/x86/platform/olpc/olpc_dt.c
+@@ -140,8 +140,7 @@ void * __init prom_early_alloc(unsigned
+ 		 * wasted bootmem) and hand off chunks of it to callers.
+ 		 */
+ 		res = alloc_bootmem(chunk_size);
+-		if (!res)
+-			return NULL;
++		BUG_ON(!res);
+ 		prom_early_allocated += chunk_size;
+ 		memset(res, 0, chunk_size);
+ 		free_mem = chunk_size;
+--- a/drivers/acpi/acpica/aclocal.h
++++ b/drivers/acpi/acpica/aclocal.h
+@@ -416,10 +416,15 @@ struct acpi_gpe_handler_info {
+ 	u8 originally_enabled;  /* True if GPE was originally enabled */
+ };
+ 
++struct acpi_gpe_notify_object {
++	struct acpi_namespace_node *node;
++	struct acpi_gpe_notify_object *next;
++};
++
+ union acpi_gpe_dispatch_info {
+ 	struct acpi_namespace_node *method_node;	/* Method node for this GPE level */
+ 	struct acpi_gpe_handler_info *handler;  /* Installed GPE handler */
+-	struct acpi_namespace_node *device_node;        /* Parent _PRW device for implicit notify */
++	struct acpi_gpe_notify_object device;   /* List of _PRW devices for implicit notify */
+ };
+ 
+ /*
+--- a/drivers/acpi/acpica/evgpe.c
++++ b/drivers/acpi/acpica/evgpe.c
+@@ -457,6 +457,7 @@ static void ACPI_SYSTEM_XFACE acpi_ev_as
+ 	acpi_status status;
+ 	struct acpi_gpe_event_info *local_gpe_event_info;
+ 	struct acpi_evaluate_info *info;
++	struct acpi_gpe_notify_object *notify_object;
+ 
+ 	ACPI_FUNCTION_TRACE(ev_asynch_execute_gpe_method);
+ 
+@@ -508,10 +509,18 @@ static void ACPI_SYSTEM_XFACE acpi_ev_as
+ 		 * from this thread -- because handlers may in turn run other
+ 		 * control methods.
+ 		 */
+-		status =
+-		    acpi_ev_queue_notify_request(local_gpe_event_info->dispatch.
+-						 device_node,
+-						 ACPI_NOTIFY_DEVICE_WAKE);
++		status = acpi_ev_queue_notify_request(
++				local_gpe_event_info->dispatch.device.node,
++				ACPI_NOTIFY_DEVICE_WAKE);
++
++		notify_object = local_gpe_event_info->dispatch.device.next;
++		while (ACPI_SUCCESS(status) && notify_object) {
++			status = acpi_ev_queue_notify_request(
++					notify_object->node,
++					ACPI_NOTIFY_DEVICE_WAKE);
++			notify_object = notify_object->next;
++		}
++
+ 		break;
+ 
+ 	case ACPI_GPE_DISPATCH_METHOD:
+--- a/drivers/acpi/acpica/evxfgpe.c
++++ b/drivers/acpi/acpica/evxfgpe.c
+@@ -198,7 +198,9 @@ acpi_setup_gpe_for_wake(acpi_handle wake
+ 	acpi_status status = AE_BAD_PARAMETER;
+ 	struct acpi_gpe_event_info *gpe_event_info;
+ 	struct acpi_namespace_node *device_node;
++	struct acpi_gpe_notify_object *notify_object;
+ 	acpi_cpu_flags flags;
++	u8 gpe_dispatch_mask;
+ 
+ 	ACPI_FUNCTION_TRACE(acpi_setup_gpe_for_wake);
+ 
+@@ -221,27 +223,49 @@ acpi_setup_gpe_for_wake(acpi_handle wake
+ 		goto unlock_and_exit;
+ 	}
+ 
++	if (wake_device == ACPI_ROOT_OBJECT) {
++		goto out;
++	}
++
+ 	/*
+ 	 * If there is no method or handler for this GPE, then the
+ 	 * wake_device will be notified whenever this GPE fires (aka
+ 	 * "implicit notify") Note: The GPE is assumed to be
+ 	 * level-triggered (for windows compatibility).
+ 	 */
+-	if (((gpe_event_info->flags & ACPI_GPE_DISPATCH_MASK) ==
+-	      ACPI_GPE_DISPATCH_NONE) && (wake_device != ACPI_ROOT_OBJECT)) {
++	gpe_dispatch_mask = gpe_event_info->flags & ACPI_GPE_DISPATCH_MASK;
++	if (gpe_dispatch_mask != ACPI_GPE_DISPATCH_NONE
++	    && gpe_dispatch_mask != ACPI_GPE_DISPATCH_NOTIFY) {
++		goto out;
++	}
+ 
+-		/* Validate wake_device is of type Device */
++	/* Validate wake_device is of type Device */
+ 
+-		device_node = ACPI_CAST_PTR(struct acpi_namespace_node,
+-					    wake_device);
+-		if (device_node->type != ACPI_TYPE_DEVICE) {
+-			goto unlock_and_exit;
+-		}
++	device_node = ACPI_CAST_PTR(struct acpi_namespace_node, wake_device);
++	if (device_node->type != ACPI_TYPE_DEVICE) {
++		goto unlock_and_exit;
++	}
++
++	if (gpe_dispatch_mask == ACPI_GPE_DISPATCH_NONE) {
+ 		gpe_event_info->flags = (ACPI_GPE_DISPATCH_NOTIFY |
+ 					 ACPI_GPE_LEVEL_TRIGGERED);
+-		gpe_event_info->dispatch.device_node = device_node;
++		gpe_event_info->dispatch.device.node = device_node;
++		gpe_event_info->dispatch.device.next = NULL;
++	} else {
++		/* There are multiple devices to notify implicitly. */
++
++		notify_object = ACPI_ALLOCATE_ZEROED(sizeof(*notify_object));
++		if (!notify_object) {
++			status = AE_NO_MEMORY;
++			goto unlock_and_exit;
++		}
++
++		notify_object->node = device_node;
++		notify_object->next = gpe_event_info->dispatch.device.next;
++		gpe_event_info->dispatch.device.next = notify_object;
+ 	}
+ 
++ out:
+ 	gpe_event_info->flags |= ACPI_GPE_CAN_WAKE;
+ 	status = AE_OK;
+ 
+--- a/drivers/acpi/debugfs.c
++++ b/drivers/acpi/debugfs.c
+@@ -26,7 +26,9 @@ static ssize_t cm_write(struct file *fil
+ 			size_t count, loff_t *ppos)
+ {
+ 	static char *buf;
+-	static int uncopied_bytes;
++	static u32 max_size;
++	static u32 uncopied_bytes;
++
+ 	struct acpi_table_header table;
+ 	acpi_status status;
+ 
+@@ -37,19 +39,24 @@ static ssize_t cm_write(struct file *fil
+ 		if (copy_from_user(&table, user_buf,
+ 				   sizeof(struct acpi_table_header)))
+ 			return -EFAULT;
+-		uncopied_bytes = table.length;
+-		buf = kzalloc(uncopied_bytes, GFP_KERNEL);
++		uncopied_bytes = max_size = table.length;
++		buf = kzalloc(max_size, GFP_KERNEL);
+ 		if (!buf)
+ 			return -ENOMEM;
+ 	}
+ 
+-	if (uncopied_bytes < count) {
+-		kfree(buf);
++	if (buf == NULL)
++		return -EINVAL;
++
++	if ((*ppos > max_size) ||
++	    (*ppos + count > max_size) ||
++	    (*ppos + count < count) ||
++	    (count > uncopied_bytes))
+ 		return -EINVAL;
+-	}
+ 
+ 	if (copy_from_user(buf + (*ppos), user_buf, count)) {
+ 		kfree(buf);
++		buf = NULL;
+ 		return -EFAULT;
+ 	}
+ 
+@@ -59,6 +66,7 @@ static ssize_t cm_write(struct file *fil
+ 	if (!uncopied_bytes) {
+ 		status = acpi_install_method(buf);
+ 		kfree(buf);
++		buf = NULL;
+ 		if (ACPI_FAILURE(status))
+ 			return -EINVAL;
+ 		add_taint(TAINT_OVERRIDDEN_ACPI_TABLE);
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -1919,8 +1919,10 @@ int cpufreq_register_driver(struct cpufr
+ 
+ 	ret = sysdev_driver_register(&cpu_sysdev_class,
+ 					&cpufreq_sysdev_driver);
++	if (ret)
++		goto err_null_driver;
+ 
+-	if ((!ret) && !(cpufreq_driver->flags & CPUFREQ_STICKY)) {
++	if (!(cpufreq_driver->flags & CPUFREQ_STICKY)) {
+ 		int i;
+ 		ret = -ENODEV;
+ 
+@@ -1935,21 +1937,22 @@ int cpufreq_register_driver(struct cpufr
+ 		if (ret) {
+ 			dprintk("no CPU initialized for driver %s\n",
+ 							driver_data->name);
+-			sysdev_driver_unregister(&cpu_sysdev_class,
+-						&cpufreq_sysdev_driver);
+-
+-			spin_lock_irqsave(&cpufreq_driver_lock, flags);
+-			cpufreq_driver = NULL;
+-			spin_unlock_irqrestore(&cpufreq_driver_lock, flags);
++			goto err_sysdev_unreg;
+ 		}
+ 	}
+ 
+-	if (!ret) {
+-		register_hotcpu_notifier(&cpufreq_cpu_notifier);
+-		dprintk("driver %s up and running\n", driver_data->name);
+-		cpufreq_debug_enable_ratelimit();
+-	}
+-
++	register_hotcpu_notifier(&cpufreq_cpu_notifier);
++	dprintk("driver %s up and running\n", driver_data->name);
++	cpufreq_debug_enable_ratelimit();
++
++	return 0;
++err_sysdev_unreg:
++	sysdev_driver_unregister(&cpu_sysdev_class,
++			&cpufreq_sysdev_driver);
++err_null_driver:
++	spin_lock_irqsave(&cpufreq_driver_lock, flags);
++	cpufreq_driver = NULL;
++	spin_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(cpufreq_register_driver);
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1895,6 +1895,17 @@ int i915_driver_load(struct drm_device *
+ 	if (IS_GEN2(dev))
+ 		dma_set_coherent_mask(&dev->pdev->dev, DMA_BIT_MASK(30));
+ 
++	/* 965GM sometimes incorrectly writes to hardware status page (HWS)
++	 * using 32bit addressing, overwriting memory if HWS is located
++	 * above 4GB.
++	 *
++	 * The documentation also mentions an issue with undefined
++	 * behaviour if any general state is accessed within a page above 4GB,
++	 * which also needs to be handled carefully.
++	 */
++	if (IS_BROADWATER(dev) || IS_CRESTLINE(dev))
++		dma_set_coherent_mask(&dev->pdev->dev, DMA_BIT_MASK(32));
++
+ 	mmio_bar = IS_GEN2(dev) ? 1 : 0;
+ 	dev_priv->regs = pci_iomap(dev->pdev, mmio_bar, 0);
+ 	if (!dev_priv->regs) {
+--- a/drivers/idle/intel_idle.c
++++ b/drivers/idle/intel_idle.c
+@@ -62,6 +62,7 @@
+ #include <linux/notifier.h>
+ #include <linux/cpu.h>
+ #include <asm/mwait.h>
++#include <asm/msr.h>
+ 
+ #define INTEL_IDLE_VERSION "0.4"
+ #define PREFIX "intel_idle: "
+@@ -85,6 +86,12 @@ static int intel_idle(struct cpuidle_dev
+ static struct cpuidle_state *cpuidle_state_table;
+ 
+ /*
++ * Hardware C-state auto-demotion may not always be optimal.
++ * Indicate which enable bits to clear here.
++ */
++static unsigned long long auto_demotion_disable_flags;
++
++/*
+  * Set this flag for states where the HW flushes the TLB for us
+  * and so we don't need cross-calls to keep it consistent.
+  * If this flag is set, SW flushes the TLB, so even if the
+@@ -281,6 +288,15 @@ static struct notifier_block setup_broad
+ 	.notifier_call = setup_broadcast_cpuhp_notify,
+ };
+ 
++static void auto_demotion_disable(void *dummy)
++{
++	unsigned long long msr_bits;
++
++	rdmsrl(MSR_NHM_SNB_PKG_CST_CFG_CTL, msr_bits);
++	msr_bits &= ~auto_demotion_disable_flags;
++	wrmsrl(MSR_NHM_SNB_PKG_CST_CFG_CTL, msr_bits);
++}
++
+ /*
+  * intel_idle_probe()
+  */
+@@ -324,11 +340,17 @@ static int intel_idle_probe(void)
+ 	case 0x25:	/* Westmere */
+ 	case 0x2C:	/* Westmere */
+ 		cpuidle_state_table = nehalem_cstates;
++		auto_demotion_disable_flags =
++			(NHM_C1_AUTO_DEMOTE | NHM_C3_AUTO_DEMOTE);
+ 		break;
+ 
+ 	case 0x1C:	/* 28 - Atom Processor */
++		cpuidle_state_table = atom_cstates;
++		break;
++
+ 	case 0x26:	/* 38 - Lincroft Atom Processor */
+ 		cpuidle_state_table = atom_cstates;
++		auto_demotion_disable_flags = ATM_LNC_C6_AUTO_DEMOTE;
+ 		break;
+ 
+ 	case 0x2A:	/* SNB */
+@@ -436,6 +458,8 @@ static int intel_idle_cpuidle_devices_in
+ 			return -EIO;
+ 		}
+ 	}
++	if (auto_demotion_disable_flags)
++		smp_call_function(auto_demotion_disable, NULL, 1);
+ 
+ 	return 0;
+ }
+--- a/drivers/mfd/asic3.c
++++ b/drivers/mfd/asic3.c
+@@ -143,9 +143,9 @@ static void asic3_irq_demux(unsigned int
+ 	unsigned long flags;
+ 	struct asic3 *asic;
+ 
+-	desc->chip->ack(irq);
++	desc->irq_data.chip->irq_ack(&desc->irq_data);
+ 
+-	asic = desc->handler_data;
++	asic = get_irq_data(irq);
+ 
+ 	for (iter = 0 ; iter < MAX_ASIC_ISR_LOOPS; iter++) {
+ 		u32 status;
+--- a/drivers/mfd/davinci_voicecodec.c
++++ b/drivers/mfd/davinci_voicecodec.c
+@@ -118,12 +118,12 @@ static int __init davinci_vc_probe(struc
+ 
+ 	/* Voice codec interface client */
+ 	cell = &davinci_vc->cells[DAVINCI_VC_VCIF_CELL];
+-	cell->name = "davinci_vcif";
++	cell->name = "davinci-vcif";
+ 	cell->driver_data = davinci_vc;
+ 
+ 	/* Voice codec CQ93VC client */
+ 	cell = &davinci_vc->cells[DAVINCI_VC_CQ93VC_CELL];
+-	cell->name = "cq93vc";
++	cell->name = "cq93vc-codec";
+ 	cell->driver_data = davinci_vc;
+ 
+ 	ret = mfd_add_devices(&pdev->dev, pdev->id, davinci_vc->cells,
+--- a/drivers/mfd/tps6586x.c
++++ b/drivers/mfd/tps6586x.c
+@@ -150,12 +150,12 @@ static inline int __tps6586x_write(struc
+ static inline int __tps6586x_writes(struct i2c_client *client, int reg,
+ 				  int len, uint8_t *val)
+ {
+-	int ret;
++	int ret, i;
+ 
+-	ret = i2c_smbus_write_i2c_block_data(client, reg, len, val);
+-	if (ret < 0) {
+-		dev_err(&client->dev, "failed writings to 0x%02x\n", reg);
+-		return ret;
++	for (i = 0; i < len; i++) {
++		ret = __tps6586x_write(client, reg + i, *(val + i));
++		if (ret < 0)
++			return ret;
+ 	}
+ 
+ 	return 0;
+--- a/drivers/mfd/ucb1x00-ts.c
++++ b/drivers/mfd/ucb1x00-ts.c
+@@ -385,12 +385,18 @@ static int ucb1x00_ts_add(struct ucb1x00
+ 	idev->close      = ucb1x00_ts_close;
+ 
+ 	__set_bit(EV_ABS, idev->evbit);
+-	__set_bit(ABS_X, idev->absbit);
+-	__set_bit(ABS_Y, idev->absbit);
+-	__set_bit(ABS_PRESSURE, idev->absbit);
+ 
+ 	input_set_drvdata(idev, ts);
+ 
++	ucb1x00_adc_enable(ts->ucb);
++	ts->x_res = ucb1x00_ts_read_xres(ts);
++	ts->y_res = ucb1x00_ts_read_yres(ts);
++	ucb1x00_adc_disable(ts->ucb);
++
++	input_set_abs_params(idev, ABS_X, 0, ts->x_res, 0, 0);
++	input_set_abs_params(idev, ABS_Y, 0, ts->y_res, 0, 0);
++	input_set_abs_params(idev, ABS_PRESSURE, 0, 0, 0, 0);
++
+ 	err = input_register_device(idev);
+ 	if (err)
+ 		goto fail;
+--- a/drivers/mfd/wm8994-core.c
++++ b/drivers/mfd/wm8994-core.c
+@@ -246,6 +246,16 @@ static int wm8994_suspend(struct device
+ 	struct wm8994 *wm8994 = dev_get_drvdata(dev);
+ 	int ret;
+ 
++	/* Don't actually go through with the suspend if the CODEC is
++	 * still active (eg, for audio passthrough from CP. */
++	ret = wm8994_reg_read(wm8994, WM8994_POWER_MANAGEMENT_1);
++	if (ret < 0) {
++		dev_err(dev, "Failed to read power status: %d\n", ret);
++	} else if (ret & WM8994_VMID_SEL_MASK) {
++		dev_dbg(dev, "CODEC still active, ignoring suspend\n");
++		return 0;
++	}
++
+ 	/* GPIO configuration state is saved here since we may be configuring
+ 	 * the GPIO alternate functions even if we're not using the gpiolib
+ 	 * driver for them.
+@@ -261,6 +271,8 @@ static int wm8994_suspend(struct device
+ 	if (ret < 0)
+ 		dev_err(dev, "Failed to save LDO registers: %d\n", ret);
+ 
++	wm8994->suspended = true;
++
+ 	ret = regulator_bulk_disable(wm8994->num_supplies,
+ 				     wm8994->supplies);
+ 	if (ret != 0) {
+@@ -276,6 +288,10 @@ static int wm8994_resume(struct device *
+ 	struct wm8994 *wm8994 = dev_get_drvdata(dev);
+ 	int ret;
+ 
++	/* We may have lied to the PM core about suspending */
++	if (!wm8994->suspended)
++		return 0;
++
+ 	ret = regulator_bulk_enable(wm8994->num_supplies,
+ 				    wm8994->supplies);
+ 	if (ret != 0) {
+@@ -298,6 +314,8 @@ static int wm8994_resume(struct device *
+ 	if (ret < 0)
+ 		dev_err(dev, "Failed to restore GPIO registers: %d\n", ret);
+ 
++	wm8994->suspended = false;
++
+ 	return 0;
+ }
+ #endif
+--- a/drivers/of/pdt.c
++++ b/drivers/of/pdt.c
+@@ -36,19 +36,55 @@ unsigned int of_pdt_unique_id __initdata
+ 	(p)->unique_id = of_pdt_unique_id++; \
+ } while (0)
+ 
+-static inline const char *of_pdt_node_name(struct device_node *dp)
++static char * __init of_pdt_build_full_name(struct device_node *dp)
+ {
+-	return dp->path_component_name;
++	int len, ourlen, plen;
++	char *n;
++
++	dp->path_component_name = build_path_component(dp);
++
++	plen = strlen(dp->parent->full_name);
++	ourlen = strlen(dp->path_component_name);
++	len = ourlen + plen + 2;
++
++	n = prom_early_alloc(len);
++	strcpy(n, dp->parent->full_name);
++	if (!of_node_is_root(dp->parent)) {
++		strcpy(n + plen, "/");
++		plen++;
++	}
++	strcpy(n + plen, dp->path_component_name);
++
++	return n;
+ }
+ 
+-#else
++#else /* CONFIG_SPARC */
+ 
+ static inline void of_pdt_incr_unique_id(void *p) { }
+ static inline void irq_trans_init(struct device_node *dp) { }
+ 
+-static inline const char *of_pdt_node_name(struct device_node *dp)
++static char * __init of_pdt_build_full_name(struct device_node *dp)
+ {
+-	return dp->name;
++	static int failsafe_id = 0; /* for generating unique names on failure */
++	char *buf;
++	int len;
++
++	if (of_pdt_prom_ops->pkg2path(dp->phandle, NULL, 0, &len))
++		goto failsafe;
++
++	buf = prom_early_alloc(len + 1);
++	if (of_pdt_prom_ops->pkg2path(dp->phandle, buf, len, &len))
++		goto failsafe;
++	return buf;
++
++ failsafe:
++	buf = prom_early_alloc(strlen(dp->parent->full_name) +
++			       strlen(dp->name) + 16);
++	sprintf(buf, "%s/%s@unknown%i",
++		of_node_is_root(dp->parent) ? "" : dp->parent->full_name,
++		dp->name, failsafe_id++);
++	pr_err("%s: pkg2path failed; assigning %s\n", __func__, buf);
++	return buf;
+ }
+ 
+ #endif /* !CONFIG_SPARC */
+@@ -132,47 +168,6 @@ static char * __init of_pdt_get_one_prop
+ 	return buf;
+ }
+ 
+-static char * __init of_pdt_try_pkg2path(phandle node)
+-{
+-	char *res, *buf = NULL;
+-	int len;
+-
+-	if (!of_pdt_prom_ops->pkg2path)
+-		return NULL;
+-
+-	if (of_pdt_prom_ops->pkg2path(node, buf, 0, &len))
+-		return NULL;
+-	buf = prom_early_alloc(len + 1);
+-	if (of_pdt_prom_ops->pkg2path(node, buf, len, &len)) {
+-		pr_err("%s: package-to-path failed\n", __func__);
+-		return NULL;
+-	}
+-
+-	res = strrchr(buf, '/');
+-	if (!res) {
+-		pr_err("%s: couldn't find / in %s\n", __func__, buf);
+-		return NULL;
+-	}
+-	return res+1;
+-}
+-
+-/*
+- * When fetching the node's name, first try using package-to-path; if
+- * that fails (either because the arch hasn't supplied a PROM callback,
+- * or some other random failure), fall back to just looking at the node's
+- * 'name' property.
+- */
+-static char * __init of_pdt_build_name(phandle node)
+-{
+-	char *buf;
+-
+-	buf = of_pdt_try_pkg2path(node);
+-	if (!buf)
+-		buf = of_pdt_get_one_property(node, "name");
+-
+-	return buf;
+-}
+-
+ static struct device_node * __init of_pdt_create_node(phandle node,
+ 						    struct device_node *parent)
+ {
+@@ -187,7 +182,7 @@ static struct device_node * __init of_pd
+ 
+ 	kref_init(&dp->kref);
+ 
+-	dp->name = of_pdt_build_name(node);
++	dp->name = of_pdt_get_one_property(node, "name");
+ 	dp->type = of_pdt_get_one_property(node, "device_type");
+ 	dp->phandle = node;
+ 
+@@ -198,26 +193,6 @@ static struct device_node * __init of_pd
+ 	return dp;
+ }
+ 
+-static char * __init of_pdt_build_full_name(struct device_node *dp)
+-{
+-	int len, ourlen, plen;
+-	char *n;
+-
+-	plen = strlen(dp->parent->full_name);
+-	ourlen = strlen(of_pdt_node_name(dp));
+-	len = ourlen + plen + 2;
+-
+-	n = prom_early_alloc(len);
+-	strcpy(n, dp->parent->full_name);
+-	if (!of_node_is_root(dp->parent)) {
+-		strcpy(n + plen, "/");
+-		plen++;
+-	}
+-	strcpy(n + plen, of_pdt_node_name(dp));
+-
+-	return n;
+-}
+-
+ static struct device_node * __init of_pdt_build_tree(struct device_node *parent,
+ 						   phandle node,
+ 						   struct device_node ***nextp)
+@@ -240,9 +215,6 @@ static struct device_node * __init of_pd
+ 		*(*nextp) = dp;
+ 		*nextp = &dp->allnext;
+ 
+-#if defined(CONFIG_SPARC)
+-		dp->path_component_name = build_path_component(dp);
+-#endif
+ 		dp->full_name = of_pdt_build_full_name(dp);
+ 
+ 		dp->child = of_pdt_build_tree(dp,
+--- a/drivers/usb/host/ehci-xilinx-of.c
++++ b/drivers/usb/host/ehci-xilinx-of.c
+@@ -29,6 +29,7 @@
+ 
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
++#include <linux/of_address.h>
+ 
+ /**
+  * ehci_xilinx_of_setup - Initialize the device for ehci_reset()
+--- a/fs/ext2/namei.c
++++ b/fs/ext2/namei.c
+@@ -344,7 +344,6 @@ static int ext2_rename (struct inode * o
+ 		new_de = ext2_find_entry (new_dir, &new_dentry->d_name, &new_page);
+ 		if (!new_de)
+ 			goto out_dir;
+-		inode_inc_link_count(old_inode);
+ 		ext2_set_link(new_dir, new_de, new_page, old_inode, 1);
+ 		new_inode->i_ctime = CURRENT_TIME_SEC;
+ 		if (dir_de)
+@@ -356,12 +355,9 @@ static int ext2_rename (struct inode * o
+ 			if (new_dir->i_nlink >= EXT2_LINK_MAX)
+ 				goto out_dir;
+ 		}
+-		inode_inc_link_count(old_inode);
+ 		err = ext2_add_link(new_dentry, old_inode);
+-		if (err) {
+-			inode_dec_link_count(old_inode);
++		if (err)
+ 			goto out_dir;
+-		}
+ 		if (dir_de)
+ 			inode_inc_link_count(new_dir);
+ 	}
+@@ -369,12 +365,11 @@ static int ext2_rename (struct inode * o
+ 	/*
+ 	 * Like most other Unix systems, set the ctime for inodes on a
+  	 * rename.
+-	 * inode_dec_link_count() will mark the inode dirty.
+ 	 */
+ 	old_inode->i_ctime = CURRENT_TIME_SEC;
++	mark_inode_dirty(old_inode);
+ 
+ 	ext2_delete_entry (old_de, old_page);
+-	inode_dec_link_count(old_inode);
+ 
+ 	if (dir_de) {
+ 		if (old_dir != new_dir)
+--- a/fs/proc/proc_devtree.c
++++ b/fs/proc/proc_devtree.c
+@@ -233,7 +233,7 @@ void __init proc_device_tree_init(void)
+ 		return;
+ 	root = of_find_node_by_path("/");
+ 	if (root == NULL) {
+-		printk(KERN_ERR "/proc/device-tree: can't find root\n");
++		pr_debug("/proc/device-tree: can't find root\n");
+ 		return;
+ 	}
+ 	proc_device_tree_add_node(root, proc_device_tree);
+--- a/include/linux/mfd/wm8994/core.h
++++ b/include/linux/mfd/wm8994/core.h
+@@ -71,6 +71,7 @@ struct wm8994 {
+ 	u16 irq_masks_cache[WM8994_NUM_IRQ_REGS];
+ 
+ 	/* Used over suspend/resume */
++	bool suspended;
+ 	u16 ldo_regs[WM8994_NUM_LDO_REGS];
+ 	u16 gpio_regs[WM8994_NUM_GPIO_REGS];
+ 
