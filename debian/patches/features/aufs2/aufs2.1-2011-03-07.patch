@@ -8857,7 +8857,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/file.h
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,236 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -8989,8 +8989,6 @@
 +		   struct file *h_file);
 +
 +void au_update_figen(struct file *file);
-+void au_fi_mmap_lock(struct file *file);
-+void au_fi_mmap_unlock(struct file *file);
 +struct au_fidir *au_fidir_alloc(struct super_block *sb);
 +int au_fidir_realloc(struct au_finfo *finfo, int nbr);
 +
@@ -9098,7 +9096,7 @@
 +#endif /* __AUFS_FILE_H__ */
 --- /dev/null
 +++ b/fs/aufs/finfo.c
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,157 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -9161,23 +9159,6 @@
 +{
 +	atomic_set(&au_fi(file)->fi_generation, au_digen(file->f_dentry));
 +	/* smp_mb(); */ /* atomic_set */
-+}
-+
-+/* ---------------------------------------------------------------------- */
-+
-+void au_fi_mmap_lock(struct file *file)
-+{
-+	FiMustWriteLock(file);
-+	lockdep_off();
-+	mutex_lock(&au_fi(file)->fi_mmap);
-+	lockdep_on();
-+}
-+
-+void au_fi_mmap_unlock(struct file *file)
-+{
-+	lockdep_off();
-+	mutex_unlock(&au_fi(file)->fi_mmap);
-+	lockdep_on();
 +}
 +
 +/* ---------------------------------------------------------------------- */
@@ -9275,7 +9256,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/f_op.c
-@@ -0,0 +1,907 @@
+@@ -0,0 +1,937 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -9846,6 +9827,33 @@
 +/* very ugly approach */
 +#include "mtx.h"
 +
++static void au_fi_mmap_lock_and_sell(struct file *file)
++{
++	struct mutex *mtx;
++
++	FiMustWriteLock(file);
++
++	mtx = &au_fi(file)->fi_mmap;
++	mutex_lock(mtx);
++	mutex_release(&mtx->dep_map, /*nested*/0, _RET_IP_);
++}
++
++static void au_fi_mmap_buy(struct file *file)
++{
++	struct mutex *mtx;
++
++	mtx = &au_fi(file)->fi_mmap;
++	MtxMustLock(mtx);
++
++	mutex_set_owner(mtx);
++	mutex_acquire(&mtx->dep_map, /*subclass*/0, /*trylock*/0, _RET_IP_);
++}
++
++static void au_fi_mmap_unlock(struct file *file)
++{
++	mutex_unlock(&au_fi(file)->fi_mmap);
++}
++
 +struct au_mmap_pre_args {
 +	/* input */
 +	struct file *file;
@@ -9891,7 +9899,8 @@
 +	*br = au_sbr(sb, bstart);
 +	*h_file = au_hf_top(file);
 +	get_file(*h_file);
-+	au_fi_mmap_lock(file);
++	if (!*mmapped)
++		au_fi_mmap_lock_and_sell(file);
 +
 +out_unlock:
 +	fi_write_unlock(file);
@@ -9925,8 +9934,8 @@
 +		err = wkq_err;
 +	if (unlikely(err))
 +		goto out;
-+	finfo = au_fi(file);
-+	mutex_set_owner(&finfo->fi_mmap);
++	if (!args.mmapped)
++		au_fi_mmap_buy(file);
 +
 +	h_dentry = args.h_file->f_dentry;
 +	if (!args.mmapped && au_test_fs_bad_mapping(h_dentry->d_sb)) {
@@ -9945,6 +9954,7 @@
 +	err = PTR_ERR(h_vmop);
 +	if (IS_ERR(h_vmop))
 +		goto out_unlock;
++	finfo = au_fi(file);
 +	AuDebugOn(args.mmapped && h_vmop != finfo->fi_hvmop);
 +
 +	vmop = (void *)au_dy_vmop(file, args.br, h_vmop);
@@ -9973,7 +9983,8 @@
 +	fsstack_copy_attr_atime(file->f_dentry->d_inode, h_dentry->d_inode);
 +
 +out_unlock:
-+	au_fi_mmap_unlock(file);
++	if (!args.mmapped)
++		au_fi_mmap_unlock(file);
 +	fput(args.h_file);
 +out:
 +	return err;
@@ -24174,7 +24185,7 @@
 +
 +	d = path->dentry;
 +	path->dentry = d->d_parent;
-+	err = security_path_mknod(path, d, mode, dev);
++	err = security_path_mknod(path, d, mode, new_encode_dev(dev));
 +	path->dentry = d;
 +	if (unlikely(err))
 +		goto out;
@@ -28404,7 +28415,7 @@
 +#include <linux/limits.h>
 +#include <linux/types.h>
 +
-+#define AUFS_VERSION	"2.1-standalone.tree-38-rcN-20110228"
++#define AUFS_VERSION	"2.1-standalone.tree-38-rcN-20110307"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
