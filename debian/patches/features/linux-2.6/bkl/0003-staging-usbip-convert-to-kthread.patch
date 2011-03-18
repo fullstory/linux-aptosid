@@ -1,7 +1,7 @@
-From 0170888db61f5392c6b46d93fb9a1176f43a40c4 Mon Sep 17 00:00:00 2001
+From 12aa93828cd96e870e77c7bbab37e194ac29e09f Mon Sep 17 00:00:00 2001
 From: Arnd Bergmann <arnd@arndb.de>
-Date: Sat, 22 Jan 2011 17:41:29 +0100
-Subject: [PATCH 03/21] staging/usbip: convert to kthread
+Date: Wed, 2 Mar 2011 00:13:05 +0100
+Subject: [PATCH 03/17] staging/usbip: convert to kthread
 
 usbip has its own infrastructure for managing kernel
 threads, similar to kthread. By changing it to use
@@ -9,26 +9,28 @@ the standard functions, we can simplify the code
 and get rid of one of the last BKL users at the
 same time.
 
-Compile-tested only, please verify.
+Includes changes suggested by Max Vozeler.
 
 Signed-off-by: Arnd Bergmann <arnd@arndb.de>
 Cc: Greg Kroah-Hartman <gregkh@suse.de>
 Cc: Takahiro Hirofuchi <hirofuchi@users.sourceforge.net>
+Cc: Max Vozeler <max@vozeler.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
 ---
  drivers/staging/usbip/Kconfig        |    2 +-
  drivers/staging/usbip/stub.h         |    4 +-
- drivers/staging/usbip/stub_dev.c     |   13 +++--
+ drivers/staging/usbip/stub_dev.c     |   12 ++--
  drivers/staging/usbip/stub_rx.c      |   13 ++---
- drivers/staging/usbip/stub_tx.c      |   14 ++---
+ drivers/staging/usbip/stub_tx.c      |   17 +++---
  drivers/staging/usbip/usbip_common.c |  105 ----------------------------------
  drivers/staging/usbip/usbip_common.h |   20 +------
- drivers/staging/usbip/usbip_event.c  |   31 +++-------
+ drivers/staging/usbip/usbip_event.c  |   38 ++++--------
  drivers/staging/usbip/vhci.h         |    4 +-
  drivers/staging/usbip/vhci_hcd.c     |   10 ++-
  drivers/staging/usbip/vhci_rx.c      |   16 ++---
  drivers/staging/usbip/vhci_sysfs.c   |    9 +--
- drivers/staging/usbip/vhci_tx.c      |   14 ++---
- 13 files changed, 58 insertions(+), 197 deletions(-)
+ drivers/staging/usbip/vhci_tx.c      |   17 +++---
+ 13 files changed, 64 insertions(+), 203 deletions(-)
 
 --- a/drivers/staging/usbip/Kconfig
 +++ b/drivers/staging/usbip/Kconfig
@@ -73,8 +75,8 @@ Cc: Takahiro Hirofuchi <hirofuchi@users.sourceforge.net>
  		spin_unlock(&sdev->ud.lock);
  
 -		usbip_start_threads(&sdev->ud);
-+		wake_up_process(sdev->ud.tcp_rx);
-+		wake_up_process(sdev->ud.tcp_tx);
++		sdev->ud.tcp_rx = kthread_run(stub_rx_loop, &sdev->ud, "stub_rx");
++		sdev->ud.tcp_tx = kthread_run(stub_tx_loop, &sdev->ud, "stub_tx");
  
  		spin_lock(&sdev->ud.lock);
  		sdev->ud.status = SDEV_ST_USED;
@@ -88,18 +90,17 @@ Cc: Takahiro Hirofuchi <hirofuchi@users.sourceforge.net>
  
  	/* 2. close the socket */
  	/*
-@@ -336,8 +339,8 @@ static struct stub_device *stub_device_a
+@@ -336,9 +339,6 @@ static struct stub_device *stub_device_a
  	 */
  	sdev->devid     = (busnum << 16) | devnum;
  
 -	usbip_task_init(&sdev->ud.tcp_rx, "stub_rx", stub_rx_loop);
 -	usbip_task_init(&sdev->ud.tcp_tx, "stub_tx", stub_tx_loop);
-+	sdev->ud.tcp_rx = kthread_create(stub_rx_loop, &sdev->ud, "stub_rx");
-+	sdev->ud.tcp_tx = kthread_create(stub_tx_loop, &sdev->ud, "stub_tx");
- 
+-
  	sdev->ud.side = USBIP_STUB;
  	sdev->ud.status = SDEV_ST_AVAILABLE;
-@@ -543,7 +546,7 @@ static void stub_disconnect(struct usb_i
+ 	/* sdev->ud.lock = SPIN_LOCK_UNLOCKED; */
+@@ -543,7 +543,7 @@ static void stub_disconnect(struct usb_i
  	stub_remove_files(&interface->dev);
  
  	/*If usb reset called from event handler*/
@@ -173,9 +174,13 @@ Cc: Takahiro Hirofuchi <hirofuchi@users.sourceforge.net>
  		if (usbip_event_happened(ud))
  			break;
  
-@@ -371,4 +367,6 @@ void stub_tx_loop(struct usbip_task *ut)
+@@ -369,6 +365,9 @@ void stub_tx_loop(struct usbip_task *ut)
+ 
+ 		wait_event_interruptible(sdev->tx_waitq,
  				(!list_empty(&sdev->priv_tx) ||
- 				 !list_empty(&sdev->unlink_tx)));
+-				 !list_empty(&sdev->unlink_tx)));
++				 !list_empty(&sdev->unlink_tx) ||
++				 kthread_should_stop()));
  	}
 +
 +	return 0;
@@ -353,7 +358,7 @@ Cc: Takahiro Hirofuchi <hirofuchi@users.sourceforge.net>
  
 --- a/drivers/staging/usbip/usbip_event.c
 +++ b/drivers/staging/usbip/usbip_event.c
-@@ -62,16 +62,11 @@ static int event_handler(struct usbip_de
+@@ -62,55 +62,43 @@ static int event_handler(struct usbip_de
  	return 0;
  }
  
@@ -361,21 +366,25 @@ Cc: Takahiro Hirofuchi <hirofuchi@users.sourceforge.net>
 +static int event_handler_loop(void *data)
  {
 -	struct usbip_device *ud = container_of(ut, struct usbip_device, eh);
--
++	struct usbip_device *ud = data;
+ 
 -	while (1) {
 -		if (signal_pending(current)) {
 -			usbip_dbg_eh("signal catched!\n");
 -			break;
 -		}
-+	struct usbip_device *ud = data;
- 
 +	while (!kthread_should_stop()) {
++		wait_event_interruptible(ud->eh_waitq,
++					usbip_event_happened(ud) ||
++					kthread_should_stop());
++		usbip_dbg_eh("wakeup\n");
+ 
  		if (event_handler(ud) < 0)
  			break;
- 
-@@ -79,38 +74,30 @@ static void event_handler_loop(struct us
- 					usbip_event_happened(ud));
- 		usbip_dbg_eh("wakeup\n");
+-
+-		wait_event_interruptible(ud->eh_waitq,
+-					usbip_event_happened(ud));
+-		usbip_dbg_eh("wakeup\n");
  	}
 +	return 0;
  }
@@ -555,7 +564,13 @@ Cc: Takahiro Hirofuchi <hirofuchi@users.sourceforge.net>
  		if (vhci_send_cmd_submit(vdev) < 0)
  			break;
  
-@@ -238,4 +234,6 @@ void vhci_tx_loop(struct usbip_task *ut)
+@@ -234,8 +230,11 @@ void vhci_tx_loop(struct usbip_task *ut)
+ 
+ 		wait_event_interruptible(vdev->waitq_tx,
+ 				(!list_empty(&vdev->priv_tx) ||
+-				 !list_empty(&vdev->unlink_tx)));
++				 !list_empty(&vdev->unlink_tx) ||
++				 kthread_should_stop()));
  
  		usbip_dbg_vhci_tx("pending urbs ?, now wake up\n");
  	}

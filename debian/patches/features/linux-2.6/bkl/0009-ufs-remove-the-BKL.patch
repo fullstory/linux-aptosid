@@ -1,7 +1,7 @@
-From 969eecdb10a32af265bbe47168a9e40e343a2a76 Mon Sep 17 00:00:00 2001
+From 2e22969bf2ee5484ada552ad4bcf0f2a9e9659d9 Mon Sep 17 00:00:00 2001
 From: Arnd Bergmann <arnd@arndb.de>
 Date: Mon, 24 Jan 2011 10:14:12 +0100
-Subject: [PATCH 12/21] ufs: remove the BKL
+Subject: [PATCH 09/17] ufs: remove the BKL
 
 This introduces a new per-superblock mutex in UFS to replace
 the big kernel lock. I have been careful to avoid nested
@@ -12,21 +12,26 @@ I did not make any attempt to prove that the big kernel
 lock is not needed in a particular place in the code,
 which is very possible.
 
-The code is still only compile-tested, but it should
-at least be harmless on non-SMP systems, since the
-new mutex is not taken on those.
+The mutex has a significant performance impact, so it is only
+used on SMP or PREEMPT configurations.
+
+As Nick Piggin noticed, any allocation inside of the lock
+may end up deadlocking when we get to ufs_getfrag_block
+in the reclaim task, so we now use GFP_NOFS.
 
 Signed-off-by: Arnd Bergmann <arnd@arndb.de>
-Cc: Nick Bowler <nbowler@elliptictech.com>
+Tested-by: Nick Bowler <nbowler@elliptictech.com>
 Cc: Evgeniy Dushistov <dushistov@mail.ru>
+Cc: Nick Piggin <npiggin@gmail.com>
 ---
  fs/ufs/Kconfig    |    1 -
  fs/ufs/inode.c    |   78 ++++++++++++++--------------------------------------
  fs/ufs/namei.c    |   35 +++++++++++------------
- fs/ufs/super.c    |   56 ++++++++++++++++++++++---------------
+ fs/ufs/super.c    |   64 +++++++++++++++++++++++++------------------
  fs/ufs/truncate.c |    5 +--
  fs/ufs/ufs.h      |    6 +++-
- 6 files changed, 78 insertions(+), 103 deletions(-)
+ fs/ufs/util.c     |    2 +-
+ 7 files changed, 83 insertions(+), 108 deletions(-)
 
 --- a/fs/ufs/Kconfig
 +++ b/fs/ufs/Kconfig
@@ -397,6 +402,33 @@ Cc: Evgeniy Dushistov <dushistov@mail.ru>
  	uspi = UFS_SB(sb)->s_uspi;
  	usb1 = ubh_get_usb_first(uspi);
  	
+@@ -521,7 +539,7 @@ static int ufs_read_cylinder_structures(
+ 	 */
+ 	size = uspi->s_cssize;
+ 	blks = (size + uspi->s_fsize - 1) >> uspi->s_fshift;
+-	base = space = kmalloc(size, GFP_KERNEL);
++	base = space = kmalloc(size, GFP_NOFS);
+ 	if (!base)
+ 		goto failed; 
+ 	sbi->s_csp = (struct ufs_csum *)space;
+@@ -546,7 +564,7 @@ static int ufs_read_cylinder_structures(
+ 	 * Read cylinder group (we read only first fragment from block
+ 	 * at this time) and prepare internal data structures for cg caching.
+ 	 */
+-	if (!(sbi->s_ucg = kmalloc (sizeof(struct buffer_head *) * uspi->s_ncg, GFP_KERNEL)))
++	if (!(sbi->s_ucg = kmalloc (sizeof(struct buffer_head *) * uspi->s_ncg, GFP_NOFS)))
+ 		goto failed;
+ 	for (i = 0; i < uspi->s_ncg; i++) 
+ 		sbi->s_ucg[i] = NULL;
+@@ -564,7 +582,7 @@ static int ufs_read_cylinder_structures(
+ 		ufs_print_cylinder_stuff(sb, (struct ufs_cylinder_group *) sbi->s_ucg[i]->b_data);
+ 	}
+ 	for (i = 0; i < UFS_MAX_GROUP_LOADED; i++) {
+-		if (!(sbi->s_ucpi[i] = kmalloc (sizeof(struct ufs_cg_private_info), GFP_KERNEL)))
++		if (!(sbi->s_ucpi[i] = kmalloc (sizeof(struct ufs_cg_private_info), GFP_NOFS)))
+ 			goto failed;
+ 		sbi->s_cgno[i] = UFS_CGNO_EMPTY;
+ 	}
 @@ -646,8 +664,6 @@ static void ufs_put_super_internal(struc
  	
  	UFSD("ENTER\n");
@@ -560,6 +592,15 @@ Cc: Evgeniy Dushistov <dushistov@mail.ru>
  
  	return 0;
  }
+@@ -1405,7 +1415,7 @@ static struct kmem_cache * ufs_inode_cac
+ static struct inode *ufs_alloc_inode(struct super_block *sb)
+ {
+ 	struct ufs_inode_info *ei;
+-	ei = (struct ufs_inode_info *)kmem_cache_alloc(ufs_inode_cachep, GFP_KERNEL);
++	ei = (struct ufs_inode_info *)kmem_cache_alloc(ufs_inode_cachep, GFP_NOFS);
+ 	if (!ei)
+ 		return NULL;
+ 	ei->vfs_inode.i_version = 1;
 --- a/fs/ufs/truncate.c
 +++ b/fs/ufs/truncate.c
 @@ -40,7 +40,6 @@
@@ -623,3 +664,14 @@ Cc: Evgeniy Dushistov <dushistov@mail.ru>
 +extern void unlock_ufs(struct super_block *sb);
 +
  #endif /* _UFS_UFS_H */
+--- a/fs/ufs/util.c
++++ b/fs/ufs/util.c
+@@ -27,7 +27,7 @@ struct ufs_buffer_head * _ubh_bread_ (st
+ 	if (count > UFS_MAXFRAG)
+ 		return NULL;
+ 	ubh = (struct ufs_buffer_head *)
+-		kmalloc (sizeof (struct ufs_buffer_head), GFP_KERNEL);
++		kmalloc (sizeof (struct ufs_buffer_head), GFP_NOFS);
+ 	if (!ubh)
+ 		return NULL;
+ 	ubh->fragment = fragment;

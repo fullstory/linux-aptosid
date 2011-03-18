@@ -1,27 +1,47 @@
-From 64ea68433f8c0e9982bd4b7a1713501c310e6608 Mon Sep 17 00:00:00 2001
+From 1e102eea55716a4a4e454eb38b15b930ffd12aa5 Mon Sep 17 00:00:00 2001
 From: Arnd Bergmann <arnd@arndb.de>
 Date: Sat, 22 Jan 2011 20:26:12 +0100
-Subject: [PATCH 09/21] hpfs: rename big kernel lock to hpfs_lock
+Subject: [PATCH 08/17] hpfs: remove the BKL
 
-This is a preparation to make it easier to get
-rid of the BKL, by just having to change one
-place in the HPFS code. There is no global
-state in hpfs, so all locking can be done
-per superblock, and the fill_super/put_super
-functions can do without it entirely.
+This removes the BKL in hpfs in a rather awful
+way, by making the code only work on uniprocessor
+systems without kernel preemption, as suggested
+by Andi Kleen.
+
+The HPFS code probably has close to zero remaining
+users on current kernels, all archeological uses of
+the file system can probably be done with the significant
+restrictions.
+
+The hpfs_lock/hpfs_unlock functions are left in the
+code, sincen Mikulas has indicated that he is still
+interested in fixing it in a better way.
 
 Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+Acked-by: Andi Kleen <ak@linux.intel.com>
 Cc: Mikulas Patocka <mikulas@artax.karlin.mff.cuni.cz>
 Cc: linux-fsdevel@vger.kernel.org
 ---
+ fs/hpfs/Kconfig   |    2 +-
  fs/hpfs/dir.c     |   23 +++++++++++------------
  fs/hpfs/file.c    |    9 ++++-----
- fs/hpfs/hpfs_fn.h |   14 ++++++++++++++
+ fs/hpfs/hpfs_fn.h |   22 ++++++++++++++++++++++
  fs/hpfs/inode.c   |    9 ++++-----
  fs/hpfs/namei.c   |   49 ++++++++++++++++++++++++-------------------------
- fs/hpfs/super.c   |   20 +++++---------------
- 6 files changed, 62 insertions(+), 62 deletions(-)
+ fs/hpfs/super.c   |   23 +++++++++--------------
+ 7 files changed, 75 insertions(+), 62 deletions(-)
 
+--- a/fs/hpfs/Kconfig
++++ b/fs/hpfs/Kconfig
+@@ -1,7 +1,7 @@
+ config HPFS_FS
+ 	tristate "OS/2 HPFS file system support"
+ 	depends on BLOCK
+-	depends on BKL # nontrivial to fix
++	depends on BROKEN || !PREEMPT
+ 	help
+ 	  OS/2 is IBM's operating system for PC's, the same as Warp, and HPFS
+ 	  is the file system used for organizing files on OS/2 hard disk
 --- a/fs/hpfs/dir.c
 +++ b/fs/hpfs/dir.c
 @@ -6,16 +6,15 @@
@@ -156,30 +176,31 @@ Cc: linux-fsdevel@vger.kernel.org
  static int hpfs_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
 --- a/fs/hpfs/hpfs_fn.h
 +++ b/fs/hpfs/hpfs_fn.h
-@@ -13,6 +13,7 @@
- #include <linux/pagemap.h>
- #include <linux/buffer_head.h>
- #include <linux/slab.h>
-+#include <linux/smp_lock.h>
- 
- #include "hpfs.h"
- 
-@@ -342,3 +343,16 @@ static inline time32_t gmt_to_local(stru
+@@ -342,3 +342,25 @@ static inline time32_t gmt_to_local(stru
  	extern struct timezone sys_tz;
  	return t - sys_tz.tz_minuteswest * 60 - hpfs_sb(s)->sb_timeshift;
  }
 +
 +/*
-+ * Locking
++ * Locking:
++ *
++ * hpfs_lock() is a leftover from the big kernel lock.
++ * Right now, these functions are empty and only left
++ * for documentation purposes. The file system no longer
++ * works on SMP systems, so the lock is not needed
++ * any more.
++ *
++ * If someone is interested in making it work again, this
++ * would be the place to start by adding a per-superblock
++ * mutex and fixing all the bugs and performance issues
++ * caused by that.
 + */
 +static inline void hpfs_lock(struct super_block *s)
 +{
-+	lock_kernel();
 +}
 +
 +static inline void hpfs_unlock(struct super_block *s)
 +{
-+	unlock_kernel();
 +}
 --- a/fs/hpfs/inode.c
 +++ b/fs/hpfs/inode.c
@@ -506,12 +527,16 @@ Cc: linux-fsdevel@vger.kernel.org
  	kfree(new_opts);
  	return -EINVAL;
  }
-@@ -484,13 +479,10 @@ static int hpfs_fill_super(struct super_
+@@ -484,13 +479,15 @@ static int hpfs_fill_super(struct super_
  
  	int o;
  
 -	lock_kernel();
--
++	if (num_possible_cpus() > 1) {
++		printk(KERN_ERR "HPFS is not SMP safe\n");
++		return -EINVAL;
++	}
+ 
  	save_mount_options(s, options);
  
  	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
@@ -520,7 +545,7 @@ Cc: linux-fsdevel@vger.kernel.org
  		return -ENOMEM;
  	}
  	s->s_fs_info = sbi;
-@@ -677,7 +669,6 @@ static int hpfs_fill_super(struct super_
+@@ -677,7 +674,6 @@ static int hpfs_fill_super(struct super_
  			root->i_blocks = 5;
  		hpfs_brelse4(&qbh);
  	}
@@ -528,7 +553,7 @@ Cc: linux-fsdevel@vger.kernel.org
  	return 0;
  
  bail4:	brelse(bh2);
-@@ -689,7 +680,6 @@ bail0:
+@@ -689,7 +685,6 @@ bail0:
  	kfree(sbi->sb_cp_table);
  	s->s_fs_info = NULL;
  	kfree(sbi);
