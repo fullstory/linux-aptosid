@@ -1,0 +1,192 @@
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 39
+-EXTRAVERSION = -rc6
++EXTRAVERSION = -rc6-git1
+ NAME = Flesh-Eating Bats with Fangs
+ 
+ # *DOCUMENTATION*
+--- a/drivers/gpu/drm/drm_irq.c
++++ b/drivers/gpu/drm/drm_irq.c
+@@ -932,34 +932,11 @@ EXPORT_SYMBOL(drm_vblank_put);
+ 
+ void drm_vblank_off(struct drm_device *dev, int crtc)
+ {
+-	struct drm_pending_vblank_event *e, *t;
+-	struct timeval now;
+ 	unsigned long irqflags;
+-	unsigned int seq;
+ 
+ 	spin_lock_irqsave(&dev->vbl_lock, irqflags);
+ 	vblank_disable_and_save(dev, crtc);
+ 	DRM_WAKEUP(&dev->vbl_queue[crtc]);
+-
+-	/* Send any queued vblank events, lest the natives grow disquiet */
+-	seq = drm_vblank_count_and_time(dev, crtc, &now);
+-	list_for_each_entry_safe(e, t, &dev->vblank_event_list, base.link) {
+-		if (e->pipe != crtc)
+-			continue;
+-		DRM_DEBUG("Sending premature vblank event on disable: \
+-			  wanted %d, current %d\n",
+-			  e->event.sequence, seq);
+-
+-		e->event.sequence = seq;
+-		e->event.tv_sec = now.tv_sec;
+-		e->event.tv_usec = now.tv_usec;
+-		drm_vblank_put(dev, e->pipe);
+-		list_move_tail(&e->base.link, &e->base.file_priv->event_list);
+-		wake_up_interruptible(&e->base.file_priv->event_wait);
+-		trace_drm_vblank_event_delivered(e->base.pid, e->pipe,
+-						 e->event.sequence);
+-	}
+-
+ 	spin_unlock_irqrestore(&dev->vbl_lock, irqflags);
+ }
+ EXPORT_SYMBOL(drm_vblank_off);
+--- a/drivers/gpu/drm/radeon/evergreen.c
++++ b/drivers/gpu/drm/radeon/evergreen.c
+@@ -862,15 +862,9 @@ int evergreen_pcie_gart_enable(struct ra
+ 		SYSTEM_ACCESS_MODE_NOT_IN_SYS |
+ 		SYSTEM_APERTURE_UNMAPPED_ACCESS_PASS_THRU |
+ 		EFFECTIVE_L1_TLB_SIZE(5) | EFFECTIVE_L1_QUEUE_SIZE(5);
+-	if (rdev->flags & RADEON_IS_IGP) {
+-		WREG32(FUS_MC_VM_MD_L1_TLB0_CNTL, tmp);
+-		WREG32(FUS_MC_VM_MD_L1_TLB1_CNTL, tmp);
+-		WREG32(FUS_MC_VM_MD_L1_TLB2_CNTL, tmp);
+-	} else {
+-		WREG32(MC_VM_MD_L1_TLB0_CNTL, tmp);
+-		WREG32(MC_VM_MD_L1_TLB1_CNTL, tmp);
+-		WREG32(MC_VM_MD_L1_TLB2_CNTL, tmp);
+-	}
++	WREG32(MC_VM_MD_L1_TLB0_CNTL, tmp);
++	WREG32(MC_VM_MD_L1_TLB1_CNTL, tmp);
++	WREG32(MC_VM_MD_L1_TLB2_CNTL, tmp);
+ 	WREG32(MC_VM_MB_L1_TLB0_CNTL, tmp);
+ 	WREG32(MC_VM_MB_L1_TLB1_CNTL, tmp);
+ 	WREG32(MC_VM_MB_L1_TLB2_CNTL, tmp);
+@@ -2929,6 +2923,11 @@ static int evergreen_startup(struct rade
+ 		rdev->asic->copy = NULL;
+ 		dev_warn(rdev->dev, "failed blitter (%d) falling back to memcpy\n", r);
+ 	}
++	/* XXX: ontario has problems blitting to gart at the moment */
++	if (rdev->family == CHIP_PALM) {
++		rdev->asic->copy = NULL;
++		radeon_ttm_set_active_vram_size(rdev, rdev->mc.visible_vram_size);
++	}
+ 
+ 	/* allocate wb buffer */
+ 	r = radeon_wb_init(rdev);
+--- a/drivers/gpu/drm/radeon/evergreend.h
++++ b/drivers/gpu/drm/radeon/evergreend.h
+@@ -221,11 +221,6 @@
+ #define	MC_VM_MD_L1_TLB0_CNTL				0x2654
+ #define	MC_VM_MD_L1_TLB1_CNTL				0x2658
+ #define	MC_VM_MD_L1_TLB2_CNTL				0x265C
+-
+-#define	FUS_MC_VM_MD_L1_TLB0_CNTL			0x265C
+-#define	FUS_MC_VM_MD_L1_TLB1_CNTL			0x2660
+-#define	FUS_MC_VM_MD_L1_TLB2_CNTL			0x2664
+-
+ #define	MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR		0x203C
+ #define	MC_VM_SYSTEM_APERTURE_HIGH_ADDR			0x2038
+ #define	MC_VM_SYSTEM_APERTURE_LOW_ADDR			0x2034
+--- a/drivers/gpu/drm/radeon/radeon_atombios.c
++++ b/drivers/gpu/drm/radeon/radeon_atombios.c
+@@ -1599,10 +1599,9 @@ struct radeon_encoder_atom_dig *radeon_a
+ 							memcpy((u8 *)edid, (u8 *)&fake_edid_record->ucFakeEDIDString[0],
+ 							       fake_edid_record->ucFakeEDIDLength);
+ 
+-							if (drm_edid_is_valid(edid)) {
++							if (drm_edid_is_valid(edid))
+ 								rdev->mode_info.bios_hardcoded_edid = edid;
+-								rdev->mode_info.bios_hardcoded_edid_size = edid_size;
+-							} else
++							else
+ 								kfree(edid);
+ 						}
+ 					}
+--- a/drivers/gpu/drm/radeon/radeon_kms.c
++++ b/drivers/gpu/drm/radeon/radeon_kms.c
+@@ -234,9 +234,6 @@ int radeon_info_ioctl(struct drm_device
+ 			return -EINVAL;
+ 		}
+ 		break;
+-	case RADEON_INFO_FUSION_GART_WORKING:
+-		value = 1;
+-		break;
+ 	default:
+ 		DRM_DEBUG_KMS("Invalid request %d\n", info->request);
+ 		return -EINVAL;
+--- a/fs/logfs/super.c
++++ b/fs/logfs/super.c
+@@ -480,6 +480,10 @@ static int logfs_read_sb(struct super_bl
+ 			!read_only)
+ 		return -EIO;
+ 
++	mutex_init(&super->s_dirop_mutex);
++	mutex_init(&super->s_object_alias_mutex);
++	INIT_LIST_HEAD(&super->s_freeing_list);
++
+ 	ret = logfs_init_rw(sb);
+ 	if (ret)
+ 		return ret;
+@@ -597,10 +601,6 @@ static struct dentry *logfs_mount(struct
+ 	if (!super)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	mutex_init(&super->s_dirop_mutex);
+-	mutex_init(&super->s_object_alias_mutex);
+-	INIT_LIST_HEAD(&super->s_freeing_list);
+-
+ 	if (!devname)
+ 		err = logfs_get_sb_bdev(super, type, devname);
+ 	else if (strncmp(devname, "mtd", 3))
+--- a/include/drm/drm_pciids.h
++++ b/include/drm/drm_pciids.h
+@@ -155,7 +155,6 @@
+ 	{0x1002, 0x6719, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CAYMAN|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x671c, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CAYMAN|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x671d, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CAYMAN|RADEON_NEW_MEMMAP}, \
+-	{0x1002, 0x671f, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CAYMAN|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6720, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_BARTS|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6721, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_BARTS|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6722, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_BARTS|RADEON_NEW_MEMMAP}, \
+@@ -168,7 +167,6 @@
+ 	{0x1002, 0x6729, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_BARTS|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6738, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_BARTS|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6739, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_BARTS|RADEON_NEW_MEMMAP}, \
+-	{0x1002, 0x673e, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_BARTS|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6740, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_TURKS|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6741, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_TURKS|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6742, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_TURKS|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+@@ -201,7 +199,6 @@
+ 	{0x1002, 0x688D, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYPRESS|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6898, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYPRESS|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x6899, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYPRESS|RADEON_NEW_MEMMAP}, \
+-	{0x1002, 0x689b, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYPRESS|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x689c, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_HEMLOCK|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x689d, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_HEMLOCK|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x689e, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_CYPRESS|RADEON_NEW_MEMMAP}, \
+@@ -212,9 +209,7 @@
+ 	{0x1002, 0x68b0, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_JUNIPER|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68b8, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_JUNIPER|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68b9, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_JUNIPER|RADEON_NEW_MEMMAP}, \
+-	{0x1002, 0x68ba, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_JUNIPER|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68be, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_JUNIPER|RADEON_NEW_MEMMAP}, \
+-	{0x1002, 0x68bf, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_JUNIPER|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68c0, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_REDWOOD|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68c1, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_REDWOOD|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+ 	{0x1002, 0x68c7, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_REDWOOD|RADEON_IS_MOBILITY|RADEON_NEW_MEMMAP}, \
+--- a/include/drm/radeon_drm.h
++++ b/include/drm/radeon_drm.h
+@@ -910,7 +910,6 @@ struct drm_radeon_cs {
+ #define RADEON_INFO_CLOCK_CRYSTAL_FREQ	0x09 /* clock crystal frequency */
+ #define RADEON_INFO_NUM_BACKENDS	0x0a /* DB/backends for r600+ - need for OQ */
+ #define RADEON_INFO_NUM_TILE_PIPES	0x0b /* tile pipes for r600+ */
+-#define RADEON_INFO_FUSION_GART_WORKING	0x0c /* fusion writes to GTT were broken before this */
+ 
+ struct drm_radeon_info {
+ 	uint32_t		request;
