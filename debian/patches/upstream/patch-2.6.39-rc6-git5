@@ -20,7 +20,7 @@
  PATCHLEVEL = 6
  SUBLEVEL = 39
 -EXTRAVERSION = -rc6
-+EXTRAVERSION = -rc6-git4
++EXTRAVERSION = -rc6-git5
  NAME = Flesh-Eating Bats with Fangs
  
  # *DOCUMENTATION*
@@ -1086,6 +1086,214 @@
  	return err;
  do_sync:
  	spin_unlock(&inode->i_lock);
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -274,7 +274,8 @@ static int coalesce_t2(struct smb_hdr *p
+ 	char *data_area_of_target;
+ 	char *data_area_of_buf2;
+ 	int remaining;
+-	__u16 byte_count, total_data_size, total_in_buf, total_in_buf2;
++	unsigned int byte_count, total_in_buf;
++	__u16 total_data_size, total_in_buf2;
+ 
+ 	total_data_size = get_unaligned_le16(&pSMBt->t2_rsp.TotalDataCount);
+ 
+@@ -287,7 +288,7 @@ static int coalesce_t2(struct smb_hdr *p
+ 	remaining = total_data_size - total_in_buf;
+ 
+ 	if (remaining < 0)
+-		return -EINVAL;
++		return -EPROTO;
+ 
+ 	if (remaining == 0) /* nothing to do, ignore */
+ 		return 0;
+@@ -308,20 +309,29 @@ static int coalesce_t2(struct smb_hdr *p
+ 	data_area_of_target += total_in_buf;
+ 
+ 	/* copy second buffer into end of first buffer */
+-	memcpy(data_area_of_target, data_area_of_buf2, total_in_buf2);
+ 	total_in_buf += total_in_buf2;
++	/* is the result too big for the field? */
++	if (total_in_buf > USHRT_MAX)
++		return -EPROTO;
+ 	put_unaligned_le16(total_in_buf, &pSMBt->t2_rsp.DataCount);
++
++	/* fix up the BCC */
+ 	byte_count = get_bcc_le(pTargetSMB);
+ 	byte_count += total_in_buf2;
++	/* is the result too big for the field? */
++	if (byte_count > USHRT_MAX)
++		return -EPROTO;
+ 	put_bcc_le(byte_count, pTargetSMB);
+ 
+ 	byte_count = pTargetSMB->smb_buf_length;
+ 	byte_count += total_in_buf2;
+-
+-	/* BB also add check that we are not beyond maximum buffer size */
+-
++	/* don't allow buffer to overflow */
++	if (byte_count > CIFSMaxBufSize)
++		return -ENOBUFS;
+ 	pTargetSMB->smb_buf_length = byte_count;
+ 
++	memcpy(data_area_of_target, data_area_of_buf2, total_in_buf2);
++
+ 	if (remaining == total_in_buf2) {
+ 		cFYI(1, "found the last secondary response");
+ 		return 0; /* we are done */
+@@ -607,59 +617,63 @@ incomplete_rcv:
+ 		list_for_each_safe(tmp, tmp2, &server->pending_mid_q) {
+ 			mid_entry = list_entry(tmp, struct mid_q_entry, qhead);
+ 
+-			if ((mid_entry->mid == smb_buffer->Mid) &&
+-			    (mid_entry->midState == MID_REQUEST_SUBMITTED) &&
+-			    (mid_entry->command == smb_buffer->Command)) {
+-				if (length == 0 &&
+-				   check2ndT2(smb_buffer, server->maxBuf) > 0) {
+-					/* We have a multipart transact2 resp */
+-					isMultiRsp = true;
+-					if (mid_entry->resp_buf) {
+-						/* merge response - fix up 1st*/
+-						if (coalesce_t2(smb_buffer,
+-							mid_entry->resp_buf)) {
+-							mid_entry->multiRsp =
+-								 true;
+-							break;
+-						} else {
+-							/* all parts received */
+-							mid_entry->multiEnd =
+-								 true;
+-							goto multi_t2_fnd;
+-						}
++			if (mid_entry->mid != smb_buffer->Mid ||
++			    mid_entry->midState != MID_REQUEST_SUBMITTED ||
++			    mid_entry->command != smb_buffer->Command) {
++				mid_entry = NULL;
++				continue;
++			}
++
++			if (length == 0 &&
++			    check2ndT2(smb_buffer, server->maxBuf) > 0) {
++				/* We have a multipart transact2 resp */
++				isMultiRsp = true;
++				if (mid_entry->resp_buf) {
++					/* merge response - fix up 1st*/
++					length = coalesce_t2(smb_buffer,
++							mid_entry->resp_buf);
++					if (length > 0) {
++						length = 0;
++						mid_entry->multiRsp = true;
++						break;
++					} else {
++						/* all parts received or
++						 * packet is malformed
++						 */
++						mid_entry->multiEnd = true;
++						goto multi_t2_fnd;
++					}
++				} else {
++					if (!isLargeBuf) {
++						/*
++						 * FIXME: switch to already
++						 *        allocated largebuf?
++						 */
++						cERROR(1, "1st trans2 resp "
++							  "needs bigbuf");
+ 					} else {
+-						if (!isLargeBuf) {
+-							cERROR(1, "1st trans2 resp needs bigbuf");
+-					/* BB maybe we can fix this up,  switch
+-					   to already allocated large buffer? */
+-						} else {
+-							/* Have first buffer */
+-							mid_entry->resp_buf =
+-								 smb_buffer;
+-							mid_entry->largeBuf =
+-								 true;
+-							bigbuf = NULL;
+-						}
++						/* Have first buffer */
++						mid_entry->resp_buf =
++							 smb_buffer;
++						mid_entry->largeBuf = true;
++						bigbuf = NULL;
+ 					}
+-					break;
+ 				}
+-				mid_entry->resp_buf = smb_buffer;
+-				mid_entry->largeBuf = isLargeBuf;
++				break;
++			}
++			mid_entry->resp_buf = smb_buffer;
++			mid_entry->largeBuf = isLargeBuf;
+ multi_t2_fnd:
+-				if (length == 0)
+-					mid_entry->midState =
+-							MID_RESPONSE_RECEIVED;
+-				else
+-					mid_entry->midState =
+-							MID_RESPONSE_MALFORMED;
++			if (length == 0)
++				mid_entry->midState = MID_RESPONSE_RECEIVED;
++			else
++				mid_entry->midState = MID_RESPONSE_MALFORMED;
+ #ifdef CONFIG_CIFS_STATS2
+-				mid_entry->when_received = jiffies;
++			mid_entry->when_received = jiffies;
+ #endif
+-				list_del_init(&mid_entry->qhead);
+-				mid_entry->callback(mid_entry);
+-				break;
+-			}
+-			mid_entry = NULL;
++			list_del_init(&mid_entry->qhead);
++			mid_entry->callback(mid_entry);
++			break;
+ 		}
+ 		spin_unlock(&GlobalMid_Lock);
+ 
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@ -276,7 +276,7 @@ static void ascii_ssetup_strings(char **
+ }
+ 
+ static void
+-decode_unicode_ssetup(char **pbcc_area, __u16 bleft, struct cifsSesInfo *ses,
++decode_unicode_ssetup(char **pbcc_area, int bleft, struct cifsSesInfo *ses,
+ 		      const struct nls_table *nls_cp)
+ {
+ 	int len;
+@@ -284,19 +284,6 @@ decode_unicode_ssetup(char **pbcc_area,
+ 
+ 	cFYI(1, "bleft %d", bleft);
+ 
+-	/*
+-	 * Windows servers do not always double null terminate their final
+-	 * Unicode string. Check to see if there are an uneven number of bytes
+-	 * left. If so, then add an extra NULL pad byte to the end of the
+-	 * response.
+-	 *
+-	 * See section 2.7.2 in "Implementing CIFS" for details
+-	 */
+-	if (bleft % 2) {
+-		data[bleft] = 0;
+-		++bleft;
+-	}
+-
+ 	kfree(ses->serverOS);
+ 	ses->serverOS = cifs_strndup_from_ucs(data, bleft, true, nls_cp);
+ 	cFYI(1, "serverOS=%s", ses->serverOS);
+@@ -929,7 +916,9 @@ ssetup_ntlmssp_authenticate:
+ 	}
+ 
+ 	/* BB check if Unicode and decode strings */
+-	if (smb_buf->Flags2 & SMBFLG2_UNICODE) {
++	if (bytes_remaining == 0) {
++		/* no string area to decode, do nothing */
++	} else if (smb_buf->Flags2 & SMBFLG2_UNICODE) {
+ 		/* unicode string area must be word-aligned */
+ 		if (((unsigned long) bcc_ptr - (unsigned long) smb_buf) % 2) {
+ 			++bcc_ptr;
 --- a/fs/partitions/efi.c
 +++ b/fs/partitions/efi.c
 @@ -348,6 +348,12 @@ static int is_gpt_valid(struct parsed_pa
@@ -1112,6 +1320,16 @@
  void flex_array_free(struct flex_array *fa);
  void flex_array_free_parts(struct flex_array *fa);
  int flex_array_put(struct flex_array *fa, unsigned int element_nr, void *src,
+--- a/include/linux/ftrace_event.h
++++ b/include/linux/ftrace_event.h
+@@ -37,6 +37,7 @@ struct trace_entry {
+ 	unsigned char		flags;
+ 	unsigned char		preempt_count;
+ 	int			pid;
++	int			padding;
+ };
+ 
+ #define FTRACE_MAX_EVENT						\
 --- a/include/linux/percpu.h
 +++ b/include/linux/percpu.h
 @@ -948,7 +948,7 @@ do {									\
@@ -1123,6 +1341,26 @@
  #endif
  
  #endif /* __LINUX_PERCPU_H */
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -1110,6 +1110,7 @@ tracing_generic_entry_update(struct trac
+ 
+ 	entry->preempt_count		= pc & 0xff;
+ 	entry->pid			= (tsk) ? tsk->pid : 0;
++	entry->padding			= 0;
+ 	entry->flags =
+ #ifdef CONFIG_TRACE_IRQFLAGS_SUPPORT
+ 		(irqs_disabled_flags(flags) ? TRACE_FLAG_IRQS_OFF : 0) |
+--- a/kernel/trace/trace_events.c
++++ b/kernel/trace/trace_events.c
+@@ -116,6 +116,7 @@ static int trace_define_common_fields(vo
+ 	__common_field(unsigned char, flags);
+ 	__common_field(unsigned char, preempt_count);
+ 	__common_field(int, pid);
++	__common_field(int, padding);
+ 
+ 	return ret;
+ }
 --- a/lib/flex_array.c
 +++ b/lib/flex_array.c
 @@ -232,10 +232,10 @@ EXPORT_SYMBOL(flex_array_clear);
