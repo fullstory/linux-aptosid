@@ -20,7 +20,7 @@
  PATCHLEVEL = 6
  SUBLEVEL = 39
 -EXTRAVERSION = -rc6
-+EXTRAVERSION = -rc6-git5
++EXTRAVERSION = -rc6-git6
  NAME = Flesh-Eating Bats with Fangs
  
  # *DOCUMENTATION*
@@ -75,6 +75,29 @@
 +# CONFIG_DNOTIFY is not set
 +CONFIG_ROMFS_FS=y
 +# CONFIG_ENABLE_MUST_CHECK is not set
+--- a/arch/arm/kernel/ptrace.c
++++ b/arch/arm/kernel/ptrace.c
+@@ -767,12 +767,20 @@ long arch_ptrace(struct task_struct *chi
+ 
+ #ifdef CONFIG_HAVE_HW_BREAKPOINT
+ 		case PTRACE_GETHBPREGS:
++			if (ptrace_get_breakpoints(child) < 0)
++				return -ESRCH;
++
+ 			ret = ptrace_gethbpregs(child, addr,
+ 						(unsigned long __user *)data);
++			ptrace_put_breakpoints(child);
+ 			break;
+ 		case PTRACE_SETHBPREGS:
++			if (ptrace_get_breakpoints(child) < 0)
++				return -ESRCH;
++
+ 			ret = ptrace_sethbpregs(child, addr,
+ 						(unsigned long __user *)data);
++			ptrace_put_breakpoints(child);
+ 			break;
+ #endif
+ 
 --- a/arch/arm/mach-at91/Kconfig
 +++ b/arch/arm/mach-at91/Kconfig
 @@ -83,6 +83,7 @@ config ARCH_AT91CAP9
@@ -159,6 +182,293 @@
  #ifdef CONFIG_ARCH_AT91CAP9
  #define cpu_is_at91cap9()	(at91_cpu_identify() == ARCH_ID_AT91CAP9)
  #define cpu_is_at91cap9_revB()	(at91cap9_rev_identify() == ARCH_REVISION_CAP9_B)
+--- a/arch/powerpc/kernel/ptrace.c
++++ b/arch/powerpc/kernel/ptrace.c
+@@ -933,12 +933,16 @@ int ptrace_set_debugreg(struct task_stru
+ 	if (data && !(data & DABR_TRANSLATION))
+ 		return -EIO;
+ #ifdef CONFIG_HAVE_HW_BREAKPOINT
++	if (ptrace_get_breakpoints(task) < 0)
++		return -ESRCH;
++
+ 	bp = thread->ptrace_bps[0];
+ 	if ((!data) || !(data & (DABR_DATA_WRITE | DABR_DATA_READ))) {
+ 		if (bp) {
+ 			unregister_hw_breakpoint(bp);
+ 			thread->ptrace_bps[0] = NULL;
+ 		}
++		ptrace_put_breakpoints(task);
+ 		return 0;
+ 	}
+ 	if (bp) {
+@@ -948,9 +952,12 @@ int ptrace_set_debugreg(struct task_stru
+ 					(DABR_DATA_WRITE | DABR_DATA_READ),
+ 							&attr.bp_type);
+ 		ret =  modify_user_hw_breakpoint(bp, &attr);
+-		if (ret)
++		if (ret) {
++			ptrace_put_breakpoints(task);
+ 			return ret;
++		}
+ 		thread->ptrace_bps[0] = bp;
++		ptrace_put_breakpoints(task);
+ 		thread->dabr = data;
+ 		return 0;
+ 	}
+@@ -965,9 +972,12 @@ int ptrace_set_debugreg(struct task_stru
+ 							ptrace_triggered, task);
+ 	if (IS_ERR(bp)) {
+ 		thread->ptrace_bps[0] = NULL;
++		ptrace_put_breakpoints(task);
+ 		return PTR_ERR(bp);
+ 	}
+ 
++	ptrace_put_breakpoints(task);
++
+ #endif /* CONFIG_HAVE_HW_BREAKPOINT */
+ 
+ 	/* Move contents to the DABR register */
+--- a/arch/sh/kernel/ptrace_32.c
++++ b/arch/sh/kernel/ptrace_32.c
+@@ -117,7 +117,11 @@ void user_enable_single_step(struct task
+ 
+ 	set_tsk_thread_flag(child, TIF_SINGLESTEP);
+ 
++	if (ptrace_get_breakpoints(child) < 0)
++		return;
++
+ 	set_single_step(child, pc);
++	ptrace_put_breakpoints(child);
+ }
+ 
+ void user_disable_single_step(struct task_struct *child)
+--- a/arch/x86/kernel/cpu/perf_event_intel.c
++++ b/arch/x86/kernel/cpu/perf_event_intel.c
+@@ -184,26 +184,23 @@ static __initconst const u64 snb_hw_cach
+ 	},
+  },
+  [ C(LL  ) ] = {
+-	/*
+-	 * TBD: Need Off-core Response Performance Monitoring support
+-	 */
+ 	[ C(OP_READ) ] = {
+-		/* OFFCORE_RESPONSE_0.ANY_DATA.LOCAL_CACHE */
++		/* OFFCORE_RESPONSE.ANY_DATA.LOCAL_CACHE */
+ 		[ C(RESULT_ACCESS) ] = 0x01b7,
+-		/* OFFCORE_RESPONSE_1.ANY_DATA.ANY_LLC_MISS */
+-		[ C(RESULT_MISS)   ] = 0x01bb,
++		/* OFFCORE_RESPONSE.ANY_DATA.ANY_LLC_MISS */
++		[ C(RESULT_MISS)   ] = 0x01b7,
+ 	},
+ 	[ C(OP_WRITE) ] = {
+-		/* OFFCORE_RESPONSE_0.ANY_RFO.LOCAL_CACHE */
++		/* OFFCORE_RESPONSE.ANY_RFO.LOCAL_CACHE */
+ 		[ C(RESULT_ACCESS) ] = 0x01b7,
+-		/* OFFCORE_RESPONSE_1.ANY_RFO.ANY_LLC_MISS */
+-		[ C(RESULT_MISS)   ] = 0x01bb,
++		/* OFFCORE_RESPONSE.ANY_RFO.ANY_LLC_MISS */
++		[ C(RESULT_MISS)   ] = 0x01b7,
+ 	},
+ 	[ C(OP_PREFETCH) ] = {
+-		/* OFFCORE_RESPONSE_0.PREFETCH.LOCAL_CACHE */
++		/* OFFCORE_RESPONSE.PREFETCH.LOCAL_CACHE */
+ 		[ C(RESULT_ACCESS) ] = 0x01b7,
+-		/* OFFCORE_RESPONSE_1.PREFETCH.ANY_LLC_MISS */
+-		[ C(RESULT_MISS)   ] = 0x01bb,
++		/* OFFCORE_RESPONSE.PREFETCH.ANY_LLC_MISS */
++		[ C(RESULT_MISS)   ] = 0x01b7,
+ 	},
+  },
+  [ C(DTLB) ] = {
+@@ -285,26 +282,26 @@ static __initconst const u64 westmere_hw
+  },
+  [ C(LL  ) ] = {
+ 	[ C(OP_READ) ] = {
+-		/* OFFCORE_RESPONSE_0.ANY_DATA.LOCAL_CACHE */
++		/* OFFCORE_RESPONSE.ANY_DATA.LOCAL_CACHE */
+ 		[ C(RESULT_ACCESS) ] = 0x01b7,
+-		/* OFFCORE_RESPONSE_1.ANY_DATA.ANY_LLC_MISS */
+-		[ C(RESULT_MISS)   ] = 0x01bb,
++		/* OFFCORE_RESPONSE.ANY_DATA.ANY_LLC_MISS */
++		[ C(RESULT_MISS)   ] = 0x01b7,
+ 	},
+ 	/*
+ 	 * Use RFO, not WRITEBACK, because a write miss would typically occur
+ 	 * on RFO.
+ 	 */
+ 	[ C(OP_WRITE) ] = {
+-		/* OFFCORE_RESPONSE_1.ANY_RFO.LOCAL_CACHE */
+-		[ C(RESULT_ACCESS) ] = 0x01bb,
+-		/* OFFCORE_RESPONSE_0.ANY_RFO.ANY_LLC_MISS */
++		/* OFFCORE_RESPONSE.ANY_RFO.LOCAL_CACHE */
++		[ C(RESULT_ACCESS) ] = 0x01b7,
++		/* OFFCORE_RESPONSE.ANY_RFO.ANY_LLC_MISS */
+ 		[ C(RESULT_MISS)   ] = 0x01b7,
+ 	},
+ 	[ C(OP_PREFETCH) ] = {
+-		/* OFFCORE_RESPONSE_0.PREFETCH.LOCAL_CACHE */
++		/* OFFCORE_RESPONSE.PREFETCH.LOCAL_CACHE */
+ 		[ C(RESULT_ACCESS) ] = 0x01b7,
+-		/* OFFCORE_RESPONSE_1.PREFETCH.ANY_LLC_MISS */
+-		[ C(RESULT_MISS)   ] = 0x01bb,
++		/* OFFCORE_RESPONSE.PREFETCH.ANY_LLC_MISS */
++		[ C(RESULT_MISS)   ] = 0x01b7,
+ 	},
+  },
+  [ C(DTLB) ] = {
+@@ -352,16 +349,36 @@ static __initconst const u64 westmere_hw
+ };
+ 
+ /*
+- * OFFCORE_RESPONSE MSR bits (subset), See IA32 SDM Vol 3 30.6.1.3
++ * Nehalem/Westmere MSR_OFFCORE_RESPONSE bits;
++ * See IA32 SDM Vol 3B 30.6.1.3
+  */
+ 
+-#define DMND_DATA_RD     (1 << 0)
+-#define DMND_RFO         (1 << 1)
+-#define DMND_WB          (1 << 3)
+-#define PF_DATA_RD       (1 << 4)
+-#define PF_DATA_RFO      (1 << 5)
+-#define RESP_UNCORE_HIT  (1 << 8)
+-#define RESP_MISS        (0xf600) /* non uncore hit */
++#define NHM_DMND_DATA_RD	(1 << 0)
++#define NHM_DMND_RFO		(1 << 1)
++#define NHM_DMND_IFETCH		(1 << 2)
++#define NHM_DMND_WB		(1 << 3)
++#define NHM_PF_DATA_RD		(1 << 4)
++#define NHM_PF_DATA_RFO		(1 << 5)
++#define NHM_PF_IFETCH		(1 << 6)
++#define NHM_OFFCORE_OTHER	(1 << 7)
++#define NHM_UNCORE_HIT		(1 << 8)
++#define NHM_OTHER_CORE_HIT_SNP	(1 << 9)
++#define NHM_OTHER_CORE_HITM	(1 << 10)
++        			/* reserved */
++#define NHM_REMOTE_CACHE_FWD	(1 << 12)
++#define NHM_REMOTE_DRAM		(1 << 13)
++#define NHM_LOCAL_DRAM		(1 << 14)
++#define NHM_NON_DRAM		(1 << 15)
++
++#define NHM_ALL_DRAM		(NHM_REMOTE_DRAM|NHM_LOCAL_DRAM)
++
++#define NHM_DMND_READ		(NHM_DMND_DATA_RD)
++#define NHM_DMND_WRITE		(NHM_DMND_RFO|NHM_DMND_WB)
++#define NHM_DMND_PREFETCH	(NHM_PF_DATA_RD|NHM_PF_DATA_RFO)
++
++#define NHM_L3_HIT	(NHM_UNCORE_HIT|NHM_OTHER_CORE_HIT_SNP|NHM_OTHER_CORE_HITM)
++#define NHM_L3_MISS	(NHM_NON_DRAM|NHM_ALL_DRAM|NHM_REMOTE_CACHE_FWD)
++#define NHM_L3_ACCESS	(NHM_L3_HIT|NHM_L3_MISS)
+ 
+ static __initconst const u64 nehalem_hw_cache_extra_regs
+ 				[PERF_COUNT_HW_CACHE_MAX]
+@@ -370,16 +387,16 @@ static __initconst const u64 nehalem_hw_
+ {
+  [ C(LL  ) ] = {
+ 	[ C(OP_READ) ] = {
+-		[ C(RESULT_ACCESS) ] = DMND_DATA_RD|RESP_UNCORE_HIT,
+-		[ C(RESULT_MISS)   ] = DMND_DATA_RD|RESP_MISS,
++		[ C(RESULT_ACCESS) ] = NHM_DMND_READ|NHM_L3_ACCESS,
++		[ C(RESULT_MISS)   ] = NHM_DMND_READ|NHM_L3_MISS,
+ 	},
+ 	[ C(OP_WRITE) ] = {
+-		[ C(RESULT_ACCESS) ] = DMND_RFO|DMND_WB|RESP_UNCORE_HIT,
+-		[ C(RESULT_MISS)   ] = DMND_RFO|DMND_WB|RESP_MISS,
++		[ C(RESULT_ACCESS) ] = NHM_DMND_WRITE|NHM_L3_ACCESS,
++		[ C(RESULT_MISS)   ] = NHM_DMND_WRITE|NHM_L3_MISS,
+ 	},
+ 	[ C(OP_PREFETCH) ] = {
+-		[ C(RESULT_ACCESS) ] = PF_DATA_RD|PF_DATA_RFO|RESP_UNCORE_HIT,
+-		[ C(RESULT_MISS)   ] = PF_DATA_RD|PF_DATA_RFO|RESP_MISS,
++		[ C(RESULT_ACCESS) ] = NHM_DMND_PREFETCH|NHM_L3_ACCESS,
++		[ C(RESULT_MISS)   ] = NHM_DMND_PREFETCH|NHM_L3_MISS,
+ 	},
+  }
+ };
+--- a/arch/x86/kernel/ptrace.c
++++ b/arch/x86/kernel/ptrace.c
+@@ -608,6 +608,9 @@ static int ptrace_write_dr7(struct task_
+ 	unsigned len, type;
+ 	struct perf_event *bp;
+ 
++	if (ptrace_get_breakpoints(tsk) < 0)
++		return -ESRCH;
++
+ 	data &= ~DR_CONTROL_RESERVED;
+ 	old_dr7 = ptrace_get_dr7(thread->ptrace_bps);
+ restore:
+@@ -655,6 +658,9 @@ restore:
+ 		}
+ 		goto restore;
+ 	}
++
++	ptrace_put_breakpoints(tsk);
++
+ 	return ((orig_ret < 0) ? orig_ret : rc);
+ }
+ 
+@@ -668,10 +674,17 @@ static unsigned long ptrace_get_debugreg
+ 
+ 	if (n < HBP_NUM) {
+ 		struct perf_event *bp;
++
++		if (ptrace_get_breakpoints(tsk) < 0)
++			return -ESRCH;
++
+ 		bp = thread->ptrace_bps[n];
+ 		if (!bp)
+-			return 0;
+-		val = bp->hw.info.address;
++			val = 0;
++		else
++			val = bp->hw.info.address;
++
++		ptrace_put_breakpoints(tsk);
+ 	} else if (n == 6) {
+ 		val = thread->debugreg6;
+ 	 } else if (n == 7) {
+@@ -686,6 +699,10 @@ static int ptrace_set_breakpoint_addr(st
+ 	struct perf_event *bp;
+ 	struct thread_struct *t = &tsk->thread;
+ 	struct perf_event_attr attr;
++	int err = 0;
++
++	if (ptrace_get_breakpoints(tsk) < 0)
++		return -ESRCH;
+ 
+ 	if (!t->ptrace_bps[nr]) {
+ 		ptrace_breakpoint_init(&attr);
+@@ -709,24 +726,23 @@ static int ptrace_set_breakpoint_addr(st
+ 		 * writing for the user. And anyway this is the previous
+ 		 * behaviour.
+ 		 */
+-		if (IS_ERR(bp))
+-			return PTR_ERR(bp);
++		if (IS_ERR(bp)) {
++			err = PTR_ERR(bp);
++			goto put;
++		}
+ 
+ 		t->ptrace_bps[nr] = bp;
+ 	} else {
+-		int err;
+-
+ 		bp = t->ptrace_bps[nr];
+ 
+ 		attr = bp->attr;
+ 		attr.bp_addr = addr;
+ 		err = modify_user_hw_breakpoint(bp, &attr);
+-		if (err)
+-			return err;
+ 	}
+ 
+-
+-	return 0;
++put:
++	ptrace_put_breakpoints(tsk);
++	return err;
+ }
+ 
+ /*
 --- a/drivers/block/rbd.c
 +++ b/drivers/block/rbd.c
 @@ -777,9 +777,9 @@ static int rbd_do_request(struct request
@@ -1341,6 +1651,87 @@
  #endif
  
  #endif /* __LINUX_PERCPU_H */
+--- a/include/linux/ptrace.h
++++ b/include/linux/ptrace.h
+@@ -189,6 +189,10 @@ static inline void ptrace_init_task(stru
+ 		child->ptrace = current->ptrace;
+ 		__ptrace_link(child, current->parent);
+ 	}
++
++#ifdef CONFIG_HAVE_HW_BREAKPOINT
++	atomic_set(&child->ptrace_bp_refcnt, 1);
++#endif
+ }
+ 
+ /**
+@@ -350,6 +354,13 @@ extern int task_current_syscall(struct t
+ 				unsigned long args[6], unsigned int maxargs,
+ 				unsigned long *sp, unsigned long *pc);
+ 
+-#endif
++#ifdef CONFIG_HAVE_HW_BREAKPOINT
++extern int ptrace_get_breakpoints(struct task_struct *tsk);
++extern void ptrace_put_breakpoints(struct task_struct *tsk);
++#else
++static inline void ptrace_put_breakpoints(struct task_struct *tsk) { }
++#endif /* CONFIG_HAVE_HW_BREAKPOINT */
++
++#endif /* __KERNEL */
+ 
+ #endif
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1537,6 +1537,9 @@ struct task_struct {
+ 		unsigned long memsw_nr_pages; /* uncharged mem+swap usage */
+ 	} memcg_batch;
+ #endif
++#ifdef CONFIG_HAVE_HW_BREAKPOINT
++	atomic_t ptrace_bp_refcnt;
++#endif
+ };
+ 
+ /* Future-safe accessor for struct task_struct's cpus_allowed. */
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -1016,7 +1016,7 @@ NORET_TYPE void do_exit(long code)
+ 	/*
+ 	 * FIXME: do that only when needed, using sched_exit tracepoint
+ 	 */
+-	flush_ptrace_hw_breakpoint(tsk);
++	ptrace_put_breakpoints(tsk);
+ 
+ 	exit_notify(tsk, group_dead);
+ #ifdef CONFIG_NUMA
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -22,6 +22,7 @@
+ #include <linux/syscalls.h>
+ #include <linux/uaccess.h>
+ #include <linux/regset.h>
++#include <linux/hw_breakpoint.h>
+ 
+ 
+ /*
+@@ -879,3 +880,19 @@ asmlinkage long compat_sys_ptrace(compat
+ 	return ret;
+ }
+ #endif	/* CONFIG_COMPAT */
++
++#ifdef CONFIG_HAVE_HW_BREAKPOINT
++int ptrace_get_breakpoints(struct task_struct *tsk)
++{
++	if (atomic_inc_not_zero(&tsk->ptrace_bp_refcnt))
++		return 0;
++
++	return -1;
++}
++
++void ptrace_put_breakpoints(struct task_struct *tsk)
++{
++	if (atomic_dec_and_test(&tsk->ptrace_bp_refcnt))
++		flush_ptrace_hw_breakpoint(tsk);
++}
++#endif /* CONFIG_HAVE_HW_BREAKPOINT */
 --- a/kernel/trace/trace.c
 +++ b/kernel/trace/trace.c
 @@ -1110,6 +1110,7 @@ tracing_generic_entry_update(struct trac
@@ -1575,3 +1966,40 @@
  				 GFP_KERNEL | __GFP_ZERO);
  	if (rc)
  		goto bad;
+--- a/tools/perf/Makefile
++++ b/tools/perf/Makefile
+@@ -35,15 +35,21 @@ ARCH ?= $(shell echo $(uname_M) | sed -e
+ 				  -e s/ppc.*/powerpc/ -e s/mips.*/mips/ \
+ 				  -e s/sh[234].*/sh/ )
+ 
++CC = $(CROSS_COMPILE)gcc
++AR = $(CROSS_COMPILE)ar
++
+ # Additional ARCH settings for x86
+ ifeq ($(ARCH),i386)
+         ARCH := x86
+ endif
+ ifeq ($(ARCH),x86_64)
+-	RAW_ARCH := x86_64
+-        ARCH := x86
+-	ARCH_CFLAGS := -DARCH_X86_64
+-	ARCH_INCLUDE = ../../arch/x86/lib/memcpy_64.S
++	ARCH := x86
++	IS_X86_64 := $(shell echo __x86_64__ | ${CC} -E -xc - | tail -n 1)
++	ifeq (${IS_X86_64}, 1)
++		RAW_ARCH := x86_64
++		ARCH_CFLAGS := -DARCH_X86_64
++		ARCH_INCLUDE = ../../arch/x86/lib/memcpy_64.S
++	endif
+ endif
+ 
+ #
+@@ -119,8 +125,6 @@ lib = lib
+ 
+ export prefix bindir sharedir sysconfdir
+ 
+-CC = $(CROSS_COMPILE)gcc
+-AR = $(CROSS_COMPILE)ar
+ RM = rm -f
+ MKDIR = mkdir
+ FIND = find
