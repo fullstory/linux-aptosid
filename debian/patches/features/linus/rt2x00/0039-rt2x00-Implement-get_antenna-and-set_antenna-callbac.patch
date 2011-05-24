@@ -1,0 +1,255 @@
+From 0ed7b3c04434788ef03d267190c5e9e6e3f8e9ce Mon Sep 17 00:00:00 2001
+From: Ivo van Doorn <IvDoorn@gmail.com>
+Date: Mon, 18 Apr 2011 15:35:12 +0200
+Subject: [PATCH 39/48] rt2x00: Implement get_antenna and set_antenna callback
+ functions
+
+Implement the get_antenna and set_antenna callback functions, which will
+allow clients to control the antenna for all non-11n hardware (Antenna handling
+in rt2800 is still a bit magical, so we can't use the set_antenna for those drivers
+yet).
+
+To best support the set_antenna callback some modifications are needed in the
+diversity handling. We should never look at the default antenna settings to determine
+if software diversity is enabled. Instead we should set the diversity flag when
+possible, which will allow the link_tuner to automatically pick up the tuning.
+
+Signed-off-by: Ivo van Doorn <IvDoorn@gmail.com>
+Acked-by: Gertjan van Wingerde <gwingerde@gmail.com>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+---
+ drivers/net/wireless/rt2x00/rt2400pci.c    |    2 +
+ drivers/net/wireless/rt2x00/rt2500pci.c    |    2 +
+ drivers/net/wireless/rt2x00/rt2500usb.c    |    2 +
+ drivers/net/wireless/rt2x00/rt2x00.h       |    2 +
+ drivers/net/wireless/rt2x00/rt2x00config.c |   45 +++++++++++--------
+ drivers/net/wireless/rt2x00/rt2x00link.c   |   10 ----
+ drivers/net/wireless/rt2x00/rt2x00mac.c    |   65 ++++++++++++++++++++++++++++
+ drivers/net/wireless/rt2x00/rt61pci.c      |    2 +
+ drivers/net/wireless/rt2x00/rt73usb.c      |    2 +
+ 9 files changed, 103 insertions(+), 29 deletions(-)
+
+--- a/drivers/net/wireless/rt2x00/rt2400pci.c
++++ b/drivers/net/wireless/rt2x00/rt2400pci.c
+@@ -1720,6 +1720,8 @@ static const struct ieee80211_ops rt2400
+ 	.tx_last_beacon		= rt2400pci_tx_last_beacon,
+ 	.rfkill_poll		= rt2x00mac_rfkill_poll,
+ 	.flush			= rt2x00mac_flush,
++	.set_antenna		= rt2x00mac_set_antenna,
++	.get_antenna		= rt2x00mac_get_antenna,
+ 	.get_ringparam		= rt2x00mac_get_ringparam,
+ };
+ 
+--- a/drivers/net/wireless/rt2x00/rt2500pci.c
++++ b/drivers/net/wireless/rt2x00/rt2500pci.c
+@@ -2013,6 +2013,8 @@ static const struct ieee80211_ops rt2500
+ 	.tx_last_beacon		= rt2500pci_tx_last_beacon,
+ 	.rfkill_poll		= rt2x00mac_rfkill_poll,
+ 	.flush			= rt2x00mac_flush,
++	.set_antenna		= rt2x00mac_set_antenna,
++	.get_antenna		= rt2x00mac_get_antenna,
+ 	.get_ringparam		= rt2x00mac_get_ringparam,
+ };
+ 
+--- a/drivers/net/wireless/rt2x00/rt2500usb.c
++++ b/drivers/net/wireless/rt2x00/rt2500usb.c
+@@ -1823,6 +1823,8 @@ static const struct ieee80211_ops rt2500
+ 	.conf_tx		= rt2x00mac_conf_tx,
+ 	.rfkill_poll		= rt2x00mac_rfkill_poll,
+ 	.flush			= rt2x00mac_flush,
++	.set_antenna		= rt2x00mac_set_antenna,
++	.get_antenna		= rt2x00mac_get_antenna,
+ 	.get_ringparam		= rt2x00mac_get_ringparam,
+ };
+ 
+--- a/drivers/net/wireless/rt2x00/rt2x00.h
++++ b/drivers/net/wireless/rt2x00/rt2x00.h
+@@ -1254,6 +1254,8 @@ int rt2x00mac_conf_tx(struct ieee80211_h
+ 		      const struct ieee80211_tx_queue_params *params);
+ void rt2x00mac_rfkill_poll(struct ieee80211_hw *hw);
+ void rt2x00mac_flush(struct ieee80211_hw *hw, bool drop);
++int rt2x00mac_set_antenna(struct ieee80211_hw *hw, u32 tx_ant, u32 rx_ant);
++int rt2x00mac_get_antenna(struct ieee80211_hw *hw, u32 *tx_ant, u32 *rx_ant);
+ void rt2x00mac_get_ringparam(struct ieee80211_hw *hw,
+ 			     u32 *tx, u32 *tx_max, u32 *rx, u32 *rx_max);
+ 
+--- a/drivers/net/wireless/rt2x00/rt2x00config.c
++++ b/drivers/net/wireless/rt2x00/rt2x00config.c
+@@ -109,15 +109,6 @@ void rt2x00lib_config_erp(struct rt2x00_
+ 	rt2x00dev->ops->lib->config_erp(rt2x00dev, &erp, changed);
+ }
+ 
+-static inline
+-enum antenna rt2x00lib_config_antenna_check(enum antenna current_ant,
+-					    enum antenna default_ant)
+-{
+-	if (current_ant != ANTENNA_SW_DIVERSITY)
+-		return current_ant;
+-	return (default_ant != ANTENNA_SW_DIVERSITY) ? default_ant : ANTENNA_B;
+-}
+-
+ void rt2x00lib_config_antenna(struct rt2x00_dev *rt2x00dev,
+ 			      struct antenna_setup config)
+ {
+@@ -126,19 +117,35 @@ void rt2x00lib_config_antenna(struct rt2
+ 	struct antenna_setup *active = &rt2x00dev->link.ant.active;
+ 
+ 	/*
+-	 * Failsafe: Make sure we are not sending the
+-	 * ANTENNA_SW_DIVERSITY state to the driver.
+-	 * If that happens, fallback to hardware defaults,
+-	 * or our own default.
++	 * When the caller tries to send the SW diversity,
++	 * we must update the ANTENNA_RX_DIVERSITY flag to
++	 * enable the antenna diversity in the link tuner.
++	 *
++	 * Secondly, we must guarentee we never send the
++	 * software antenna diversity command to the driver.
+ 	 */
+-	if (!(ant->flags & ANTENNA_RX_DIVERSITY))
+-		config.rx = rt2x00lib_config_antenna_check(config.rx, def->rx);
+-	else if (config.rx == ANTENNA_SW_DIVERSITY)
++	if (!(ant->flags & ANTENNA_RX_DIVERSITY)) {
++		if (config.rx == ANTENNA_SW_DIVERSITY) {
++			ant->flags |= ANTENNA_RX_DIVERSITY;
++
++			if (def->rx == ANTENNA_SW_DIVERSITY)
++				config.rx = ANTENNA_B;
++			else
++				config.rx = def->rx;
++		}
++	} else if (config.rx == ANTENNA_SW_DIVERSITY)
+ 		config.rx = active->rx;
+ 
+-	if (!(ant->flags & ANTENNA_TX_DIVERSITY))
+-		config.tx = rt2x00lib_config_antenna_check(config.tx, def->tx);
+-	else if (config.tx == ANTENNA_SW_DIVERSITY)
++	if (!(ant->flags & ANTENNA_TX_DIVERSITY)) {
++		if (config.tx == ANTENNA_SW_DIVERSITY) {
++			ant->flags |= ANTENNA_TX_DIVERSITY;
++
++			if (def->tx == ANTENNA_SW_DIVERSITY)
++				config.tx = ANTENNA_B;
++			else
++				config.tx = def->tx;
++		}
++	} else if (config.tx == ANTENNA_SW_DIVERSITY)
+ 		config.tx = active->tx;
+ 
+ 	/*
+--- a/drivers/net/wireless/rt2x00/rt2x00link.c
++++ b/drivers/net/wireless/rt2x00/rt2x00link.c
+@@ -192,17 +192,7 @@ static bool rt2x00lib_antenna_diversity(
+ 	/*
+ 	 * Determine if software diversity is enabled for
+ 	 * either the TX or RX antenna (or both).
+-	 * Always perform this check since within the link
+-	 * tuner interval the configuration might have changed.
+ 	 */
+-	ant->flags &= ~ANTENNA_RX_DIVERSITY;
+-	ant->flags &= ~ANTENNA_TX_DIVERSITY;
+-
+-	if (rt2x00dev->default_ant.rx == ANTENNA_SW_DIVERSITY)
+-		ant->flags |= ANTENNA_RX_DIVERSITY;
+-	if (rt2x00dev->default_ant.tx == ANTENNA_SW_DIVERSITY)
+-		ant->flags |= ANTENNA_TX_DIVERSITY;
+-
+ 	if (!(ant->flags & ANTENNA_RX_DIVERSITY) &&
+ 	    !(ant->flags & ANTENNA_TX_DIVERSITY)) {
+ 		ant->flags = 0;
+--- a/drivers/net/wireless/rt2x00/rt2x00mac.c
++++ b/drivers/net/wireless/rt2x00/rt2x00mac.c
+@@ -738,6 +738,71 @@ void rt2x00mac_flush(struct ieee80211_hw
+ }
+ EXPORT_SYMBOL_GPL(rt2x00mac_flush);
+ 
++int rt2x00mac_set_antenna(struct ieee80211_hw *hw, u32 tx_ant, u32 rx_ant)
++{
++	struct rt2x00_dev *rt2x00dev = hw->priv;
++	struct link_ant *ant = &rt2x00dev->link.ant;
++	struct antenna_setup *def = &rt2x00dev->default_ant;
++	struct antenna_setup setup;
++
++	// The antenna value is not supposed to be 0,
++	// or exceed the maximum number of antenna's.
++	if (!tx_ant || (tx_ant & ~3) || !rx_ant || (rx_ant & ~3))
++		return -EINVAL;
++
++	// When the client tried to configure the antenna to or from
++	// diversity mode, we must reset the default antenna as well
++	// as that controls the diversity switch.
++	if (ant->flags & ANTENNA_TX_DIVERSITY && tx_ant != 3)
++		ant->flags &= ~ANTENNA_TX_DIVERSITY;
++	if (ant->flags & ANTENNA_RX_DIVERSITY && rx_ant != 3)
++		ant->flags &= ~ANTENNA_RX_DIVERSITY;
++
++	// If diversity is being enabled, check if we need hardware
++	// or software diversity. In the latter case, reset the value,
++	// and make sure we update the antenna flags to have the
++	// link tuner pick up the diversity tuning.
++	if (tx_ant == 3 && def->tx == ANTENNA_SW_DIVERSITY) {
++		tx_ant = ANTENNA_SW_DIVERSITY;
++		ant->flags |= ANTENNA_TX_DIVERSITY;
++	}
++
++	if (rx_ant == 3 && def->rx == ANTENNA_SW_DIVERSITY) {
++		rx_ant = ANTENNA_SW_DIVERSITY;
++		ant->flags |= ANTENNA_RX_DIVERSITY;
++	}
++
++	setup.tx = tx_ant;
++	setup.rx = rx_ant;
++
++	rt2x00lib_config_antenna(rt2x00dev, setup);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(rt2x00mac_set_antenna);
++
++int rt2x00mac_get_antenna(struct ieee80211_hw *hw, u32 *tx_ant, u32 *rx_ant)
++{
++	struct rt2x00_dev *rt2x00dev = hw->priv;
++	struct link_ant *ant = &rt2x00dev->link.ant;
++	struct antenna_setup *active = &rt2x00dev->link.ant.active;
++
++	// When software diversity is active, we must report this to the
++	// client and not the current active antenna state.
++	if (ant->flags & ANTENNA_TX_DIVERSITY)
++		*tx_ant = ANTENNA_HW_DIVERSITY;
++	else
++		*tx_ant = active->tx;
++
++	if (ant->flags & ANTENNA_RX_DIVERSITY)
++		*rx_ant = ANTENNA_HW_DIVERSITY;
++	else
++		*rx_ant = active->rx;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(rt2x00mac_get_antenna);
++
+ void rt2x00mac_get_ringparam(struct ieee80211_hw *hw,
+ 			     u32 *tx, u32 *tx_max, u32 *rx, u32 *rx_max)
+ {
+--- a/drivers/net/wireless/rt2x00/rt61pci.c
++++ b/drivers/net/wireless/rt2x00/rt61pci.c
+@@ -2979,6 +2979,8 @@ static const struct ieee80211_ops rt61pc
+ 	.get_tsf		= rt61pci_get_tsf,
+ 	.rfkill_poll		= rt2x00mac_rfkill_poll,
+ 	.flush			= rt2x00mac_flush,
++	.set_antenna		= rt2x00mac_set_antenna,
++	.get_antenna		= rt2x00mac_get_antenna,
+ 	.get_ringparam		= rt2x00mac_get_ringparam,
+ };
+ 
+--- a/drivers/net/wireless/rt2x00/rt73usb.c
++++ b/drivers/net/wireless/rt2x00/rt73usb.c
+@@ -2310,6 +2310,8 @@ static const struct ieee80211_ops rt73us
+ 	.get_tsf		= rt73usb_get_tsf,
+ 	.rfkill_poll		= rt2x00mac_rfkill_poll,
+ 	.flush			= rt2x00mac_flush,
++	.set_antenna		= rt2x00mac_set_antenna,
++	.get_antenna		= rt2x00mac_get_antenna,
+ 	.get_ringparam		= rt2x00mac_get_ringparam,
+ };
+ 
