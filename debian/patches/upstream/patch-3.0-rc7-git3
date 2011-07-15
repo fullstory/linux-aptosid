@@ -16,7 +16,7 @@
  PATCHLEVEL = 0
  SUBLEVEL = 0
 -EXTRAVERSION = -rc7
-+EXTRAVERSION = -rc7-git2
++EXTRAVERSION = -rc7-git3
  NAME = Sneaky Weasel
  
  # *DOCUMENTATION*
@@ -1179,6 +1179,224 @@
  }
  
  static u32 ssb_pcie_read(struct ssb_pcicore *pc, u32 address)
+--- a/fs/gfs2/aops.c
++++ b/fs/gfs2/aops.c
+@@ -1069,6 +1069,7 @@ int gfs2_releasepage(struct page *page,
+ 		return 0;
+ 
+ 	gfs2_log_lock(sdp);
++	spin_lock(&sdp->sd_ail_lock);
+ 	head = bh = page_buffers(page);
+ 	do {
+ 		if (atomic_read(&bh->b_count))
+@@ -1080,6 +1081,7 @@ int gfs2_releasepage(struct page *page,
+ 			goto not_possible;
+ 		bh = bh->b_this_page;
+ 	} while(bh != head);
++	spin_unlock(&sdp->sd_ail_lock);
+ 	gfs2_log_unlock(sdp);
+ 
+ 	head = bh = page_buffers(page);
+@@ -1112,6 +1114,7 @@ not_possible: /* Should never happen */
+ 	WARN_ON(buffer_dirty(bh));
+ 	WARN_ON(buffer_pinned(bh));
+ cannot_release:
++	spin_unlock(&sdp->sd_ail_lock);
+ 	gfs2_log_unlock(sdp);
+ 	return 0;
+ }
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@ -47,10 +47,10 @@ static void __gfs2_ail_flush(struct gfs2
+ 				bd_ail_gl_list);
+ 		bh = bd->bd_bh;
+ 		gfs2_remove_from_ail(bd);
+-		spin_unlock(&sdp->sd_ail_lock);
+-
+ 		bd->bd_bh = NULL;
+ 		bh->b_private = NULL;
++		spin_unlock(&sdp->sd_ail_lock);
++
+ 		bd->bd_blkno = bh->b_blocknr;
+ 		gfs2_log_lock(sdp);
+ 		gfs2_assert_withdraw(sdp, !buffer_busy(bh));
+@@ -221,8 +221,10 @@ static void inode_go_inval(struct gfs2_g
+ 		}
+ 	}
+ 
+-	if (ip == GFS2_I(gl->gl_sbd->sd_rindex))
++	if (ip == GFS2_I(gl->gl_sbd->sd_rindex)) {
++		gfs2_log_flush(gl->gl_sbd, NULL);
+ 		gl->gl_sbd->sd_rindex_uptodate = 0;
++	}
+ 	if (ip && S_ISREG(ip->i_inode.i_mode))
+ 		truncate_inode_pages(ip->i_inode.i_mapping, 0);
+ }
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -17,6 +17,7 @@
+ #include <linux/buffer_head.h>
+ #include <linux/rcupdate.h>
+ #include <linux/rculist_bl.h>
++#include <linux/completion.h>
+ 
+ #define DIO_WAIT	0x00000010
+ #define DIO_METADATA	0x00000020
+@@ -546,6 +547,7 @@ struct gfs2_sbd {
+ 	struct gfs2_glock *sd_trans_gl;
+ 	wait_queue_head_t sd_glock_wait;
+ 	atomic_t sd_glock_disposal;
++	struct completion sd_locking_init;
+ 
+ 	/* Inode Stuff */
+ 
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@ -903,6 +903,7 @@ void gfs2_meta_syncfs(struct gfs2_sbd *s
+ 		if (gfs2_ail1_empty(sdp))
+ 			break;
+ 	}
++	gfs2_log_flush(sdp, NULL);
+ }
+ 
+ static inline int gfs2_jrnl_flush_reqd(struct gfs2_sbd *sdp)
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -72,6 +72,7 @@ static struct gfs2_sbd *init_sbd(struct
+ 
+ 	init_waitqueue_head(&sdp->sd_glock_wait);
+ 	atomic_set(&sdp->sd_glock_disposal, 0);
++	init_completion(&sdp->sd_locking_init);
+ 	spin_lock_init(&sdp->sd_statfs_spin);
+ 
+ 	spin_lock_init(&sdp->sd_rindex_spin);
+@@ -1017,11 +1018,13 @@ hostdata_error:
+ 		fsname++;
+ 	if (lm->lm_mount == NULL) {
+ 		fs_info(sdp, "Now mounting FS...\n");
++		complete(&sdp->sd_locking_init);
+ 		return 0;
+ 	}
+ 	ret = lm->lm_mount(sdp, fsname);
+ 	if (ret == 0)
+ 		fs_info(sdp, "Joined cluster. Now mounting FS...\n");
++	complete(&sdp->sd_locking_init);
+ 	return ret;
+ }
+ 
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -757,13 +757,17 @@ static int gfs2_write_inode(struct inode
+ 	struct timespec atime;
+ 	struct gfs2_dinode *di;
+ 	int ret = -EAGAIN;
++	int unlock_required = 0;
+ 
+ 	/* Skip timestamp update, if this is from a memalloc */
+ 	if (current->flags & PF_MEMALLOC)
+ 		goto do_flush;
+-	ret = gfs2_glock_nq_init(ip->i_gl, LM_ST_EXCLUSIVE, 0, &gh);
+-	if (ret)
+-		goto do_flush;
++	if (!gfs2_glock_is_locked_by_me(ip->i_gl)) {
++		ret = gfs2_glock_nq_init(ip->i_gl, LM_ST_EXCLUSIVE, 0, &gh);
++		if (ret)
++			goto do_flush;
++		unlock_required = 1;
++	}
+ 	ret = gfs2_trans_begin(sdp, RES_DINODE, 0);
+ 	if (ret)
+ 		goto do_unlock;
+@@ -780,7 +784,8 @@ static int gfs2_write_inode(struct inode
+ 	}
+ 	gfs2_trans_end(sdp);
+ do_unlock:
+-	gfs2_glock_dq_uninit(&gh);
++	if (unlock_required)
++		gfs2_glock_dq_uninit(&gh);
+ do_flush:
+ 	if (wbc->sync_mode == WB_SYNC_ALL)
+ 		gfs2_log_flush(GFS2_SB(inode), ip->i_gl);
+@@ -1427,7 +1432,20 @@ out:
+ 	return error;
+ }
+ 
+-/*
++/**
++ * gfs2_evict_inode - Remove an inode from cache
++ * @inode: The inode to evict
++ *
++ * There are three cases to consider:
++ * 1. i_nlink == 0, we are final opener (and must deallocate)
++ * 2. i_nlink == 0, we are not the final opener (and cannot deallocate)
++ * 3. i_nlink > 0
++ *
++ * If the fs is read only, then we have to treat all cases as per #3
++ * since we are unable to do any deallocation. The inode will be
++ * deallocated by the next read/write node to attempt an allocation
++ * in the same resource group
++ *
+  * We have to (at the moment) hold the inodes main lock to cover
+  * the gap between unlocking the shared lock on the iopen lock and
+  * taking the exclusive lock. I'd rather do a shared -> exclusive
+@@ -1470,6 +1488,8 @@ static void gfs2_evict_inode(struct inod
+ 	if (error)
+ 		goto out_truncate;
+ 
++	/* Case 1 starts here */
++
+ 	if (S_ISDIR(inode->i_mode) &&
+ 	    (ip->i_diskflags & GFS2_DIF_EXHASH)) {
+ 		error = gfs2_dir_exhash_dealloc(ip);
+@@ -1493,13 +1513,16 @@ static void gfs2_evict_inode(struct inod
+ 	goto out_unlock;
+ 
+ out_truncate:
++	/* Case 2 starts here */
+ 	error = gfs2_trans_begin(sdp, 0, sdp->sd_jdesc->jd_blocks);
+ 	if (error)
+ 		goto out_unlock;
+-	gfs2_final_release_pages(ip);
++	/* Needs to be done before glock release & also in a transaction */
++	truncate_inode_pages(&inode->i_data, 0);
+ 	gfs2_trans_end(sdp);
+ 
+ out_unlock:
++	/* Error path for case 1 */
+ 	if (test_bit(HIF_HOLDER, &ip->i_iopen_gh.gh_iflags))
+ 		gfs2_glock_dq(&ip->i_iopen_gh);
+ 	gfs2_holder_uninit(&ip->i_iopen_gh);
+@@ -1507,6 +1530,7 @@ out_unlock:
+ 	if (error && error != GLR_TRYFAILED && error != -EROFS)
+ 		fs_warn(sdp, "gfs2_evict_inode: %d\n", error);
+ out:
++	/* Case 3 starts here */
+ 	truncate_inode_pages(&inode->i_data, 0);
+ 	end_writeback(inode);
+ 
+--- a/fs/gfs2/sys.c
++++ b/fs/gfs2/sys.c
+@@ -338,6 +338,9 @@ static ssize_t lkfirst_store(struct gfs2
+ 	rv = sscanf(buf, "%u", &first);
+ 	if (rv != 1 || first > 1)
+ 		return -EINVAL;
++	rv = wait_for_completion_killable(&sdp->sd_locking_init);
++	if (rv)
++		return rv;
+ 	spin_lock(&sdp->sd_jindex_spin);
+ 	rv = -EBUSY;
+ 	if (test_bit(SDF_NOJOURNALID, &sdp->sd_flags) == 0)
+@@ -414,7 +417,9 @@ static ssize_t jid_store(struct gfs2_sbd
+ 	rv = sscanf(buf, "%d", &jid);
+ 	if (rv != 1)
+ 		return -EINVAL;
+-
++	rv = wait_for_completion_killable(&sdp->sd_locking_init);
++	if (rv)
++		return rv;
+ 	spin_lock(&sdp->sd_jindex_spin);
+ 	rv = -EINVAL;
+ 	if (sdp->sd_lockstruct.ls_ops->lm_mount == NULL)
 --- a/fs/nfs/nfs4filelayout.c
 +++ b/fs/nfs/nfs4filelayout.c
 @@ -398,7 +398,6 @@ filelayout_write_pagelist(struct nfs_wri
