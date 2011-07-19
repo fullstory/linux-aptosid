@@ -26,7 +26,7 @@
  PATCHLEVEL = 0
  SUBLEVEL = 0
 -EXTRAVERSION = -rc7
-+EXTRAVERSION = -rc7-git6
++EXTRAVERSION = -rc7-git7
  NAME = Sneaky Weasel
  
  # *DOCUMENTATION*
@@ -1367,6 +1367,81 @@
  		info->b[PSC_VOLTAGE_OUT] = 0;
  		info->R[PSC_VOLTAGE_OUT] = -1;
  	}
+--- a/drivers/hwmon/asus_atk0110.c
++++ b/drivers/hwmon/asus_atk0110.c
+@@ -674,6 +674,7 @@ static int atk_debugfs_gitm_get(void *p,
+ 	else
+ 		err = -EIO;
+ 
++	ACPI_FREE(ret);
+ 	return err;
+ }
+ 
+--- a/drivers/hwmon/it87.c
++++ b/drivers/hwmon/it87.c
+@@ -1538,7 +1538,7 @@ static struct attribute *it87_attributes
+ };
+ 
+ static const struct attribute_group it87_group_label = {
+-	.attrs = it87_attributes_vid,
++	.attrs = it87_attributes_label,
+ };
+ 
+ /* SuperIO detection - will change isa_address if a chip is found */
+--- a/drivers/hwmon/max1111.c
++++ b/drivers/hwmon/max1111.c
+@@ -40,6 +40,8 @@ struct max1111_data {
+ 	struct spi_transfer	xfer[2];
+ 	uint8_t *tx_buf;
+ 	uint8_t *rx_buf;
++	struct mutex		drvdata_lock;
++	/* protect msg, xfer and buffers from multiple access */
+ };
+ 
+ static int max1111_read(struct device *dev, int channel)
+@@ -48,6 +50,9 @@ static int max1111_read(struct device *d
+ 	uint8_t v1, v2;
+ 	int err;
+ 
++	/* writing to drvdata struct is not thread safe, wait on mutex */
++	mutex_lock(&data->drvdata_lock);
++
+ 	data->tx_buf[0] = (channel << MAX1111_CTRL_SEL_SH) |
+ 		MAX1111_CTRL_PD0 | MAX1111_CTRL_PD1 |
+ 		MAX1111_CTRL_SGL | MAX1111_CTRL_UNI | MAX1111_CTRL_STR;
+@@ -55,12 +60,15 @@ static int max1111_read(struct device *d
+ 	err = spi_sync(data->spi, &data->msg);
+ 	if (err < 0) {
+ 		dev_err(dev, "spi_sync failed with %d\n", err);
++		mutex_unlock(&data->drvdata_lock);
+ 		return err;
+ 	}
+ 
+ 	v1 = data->rx_buf[0];
+ 	v2 = data->rx_buf[1];
+ 
++	mutex_unlock(&data->drvdata_lock);
++
+ 	if ((v1 & 0xc0) || (v2 & 0x3f))
+ 		return -EINVAL;
+ 
+@@ -176,6 +184,8 @@ static int __devinit max1111_probe(struc
+ 	if (err)
+ 		goto err_free_data;
+ 
++	mutex_init(&data->drvdata_lock);
++
+ 	data->spi = spi;
+ 	spi_set_drvdata(spi, data);
+ 
+@@ -213,6 +223,7 @@ static int __devexit max1111_remove(stru
+ 
+ 	hwmon_device_unregister(data->hwmon_dev);
+ 	sysfs_remove_group(&spi->dev.kobj, &max1111_attr_group);
++	mutex_destroy(&data->drvdata_lock);
+ 	kfree(data->rx_buf);
+ 	kfree(data->tx_buf);
+ 	kfree(data);
 --- a/drivers/hwmon/pmbus_core.c
 +++ b/drivers/hwmon/pmbus_core.c
 @@ -362,8 +362,8 @@ static struct pmbus_data *pmbus_update_d
@@ -1470,6 +1545,26 @@
  	---help---
  	  Choose Y here if you have one of these FM radio cards.
  
+--- a/drivers/media/radio/si4713-i2c.c
++++ b/drivers/media/radio/si4713-i2c.c
+@@ -1033,7 +1033,7 @@ static int si4713_write_econtrol_string(
+ 		char ps_name[MAX_RDS_PS_NAME + 1];
+ 
+ 		len = control->size - 1;
+-		if (len > MAX_RDS_PS_NAME) {
++		if (len < 0 || len > MAX_RDS_PS_NAME) {
+ 			rval = -ERANGE;
+ 			goto exit;
+ 		}
+@@ -1057,7 +1057,7 @@ static int si4713_write_econtrol_string(
+ 		char radio_text[MAX_RDS_RADIO_TEXT + 1];
+ 
+ 		len = control->size - 1;
+-		if (len > MAX_RDS_RADIO_TEXT) {
++		if (len < 0 || len > MAX_RDS_RADIO_TEXT) {
+ 			rval = -ERANGE;
+ 			goto exit;
+ 		}
 --- a/drivers/media/rc/mceusb.c
 +++ b/drivers/media/rc/mceusb.c
 @@ -558,9 +558,10 @@ static void mceusb_dev_printdata(struct
@@ -1843,6 +1938,19 @@
  				PCI_DMA_FROMDEVICE);
  			dev_kfree_skb(np->rx_skbuff[i]);
  		}
+--- a/drivers/net/pppoe.c
++++ b/drivers/net/pppoe.c
+@@ -348,8 +348,9 @@ static int pppoe_device_event(struct not
+ 
+ 	/* Only look at sockets that are using this specific device. */
+ 	switch (event) {
++	case NETDEV_CHANGEADDR:
+ 	case NETDEV_CHANGEMTU:
+-		/* A change in mtu is a bad thing, requiring
++		/* A change in mtu or address is a bad thing, requiring
+ 		 * LCP re-negotiation.
+ 		 */
+ 
 --- a/drivers/net/r6040.c
 +++ b/drivers/net/r6040.c
 @@ -677,9 +677,11 @@ static irqreturn_t r6040_interrupt(int i
@@ -1875,6 +1983,40 @@
  	spin_unlock_bh(&sl->lock);
  	err = 0;
  
+--- a/drivers/net/tulip/dmfe.c
++++ b/drivers/net/tulip/dmfe.c
+@@ -879,7 +879,6 @@ static void dmfe_free_tx_pkt(struct DEVI
+ 	txptr = db->tx_remove_ptr;
+ 	while(db->tx_packet_cnt) {
+ 		tdes0 = le32_to_cpu(txptr->tdes0);
+-		pr_debug("tdes0=%x\n", tdes0);
+ 		if (tdes0 & 0x80000000)
+ 			break;
+ 
+@@ -889,7 +888,6 @@ static void dmfe_free_tx_pkt(struct DEVI
+ 
+ 		/* Transmit statistic counter */
+ 		if ( tdes0 != 0x7fffffff ) {
+-			pr_debug("tdes0=%x\n", tdes0);
+ 			dev->stats.collisions += (tdes0 >> 3) & 0xf;
+ 			dev->stats.tx_bytes += le32_to_cpu(txptr->tdes1) & 0x7ff;
+ 			if (tdes0 & TDES0_ERR_MASK) {
+@@ -986,7 +984,6 @@ static void dmfe_rx_packet(struct DEVICE
+ 			/* error summary bit check */
+ 			if (rdes0 & 0x8000) {
+ 				/* This is a error packet */
+-				pr_debug("rdes0: %x\n", rdes0);
+ 				dev->stats.rx_errors++;
+ 				if (rdes0 & 1)
+ 					dev->stats.rx_fifo_errors++;
+@@ -1638,7 +1635,6 @@ static u8 dmfe_sense_speed(struct dmfe_b
+ 		else 				/* DM9102/DM9102A */
+ 			phy_mode = phy_read(db->ioaddr,
+ 				    db->phy_addr, 17, db->chip_id) & 0xf000;
+-		pr_debug("Phy_mode %x\n", phy_mode);
+ 		switch (phy_mode) {
+ 		case 0x1000: db->op_mode = DMFE_10MHF; break;
+ 		case 0x2000: db->op_mode = DMFE_10MFD; break;
 --- a/drivers/net/usb/hso.c
 +++ b/drivers/net/usb/hso.c
 @@ -2421,10 +2421,8 @@ static void hso_free_net_device(struct h
@@ -2057,6 +2199,80 @@
  	help
  	  A software monitoring watchdog and NMI sourcing driver. This driver
  	  will detect lockups and provide a stack trace. This is a driver that
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -1438,12 +1438,15 @@ char *ceph_mdsc_build_path(struct dentry
+ 	struct dentry *temp;
+ 	char *path;
+ 	int len, pos;
++	unsigned seq;
+ 
+ 	if (dentry == NULL)
+ 		return ERR_PTR(-EINVAL);
+ 
+ retry:
+ 	len = 0;
++	seq = read_seqbegin(&rename_lock);
++	rcu_read_lock();
+ 	for (temp = dentry; !IS_ROOT(temp);) {
+ 		struct inode *inode = temp->d_inode;
+ 		if (inode && ceph_snap(inode) == CEPH_SNAPDIR)
+@@ -1455,10 +1458,12 @@ retry:
+ 			len += 1 + temp->d_name.len;
+ 		temp = temp->d_parent;
+ 		if (temp == NULL) {
++			rcu_read_unlock();
+ 			pr_err("build_path corrupt dentry %p\n", dentry);
+ 			return ERR_PTR(-EINVAL);
+ 		}
+ 	}
++	rcu_read_unlock();
+ 	if (len)
+ 		len--;  /* no leading '/' */
+ 
+@@ -1467,9 +1472,12 @@ retry:
+ 		return ERR_PTR(-ENOMEM);
+ 	pos = len;
+ 	path[pos] = 0;	/* trailing null */
++	rcu_read_lock();
+ 	for (temp = dentry; !IS_ROOT(temp) && pos != 0; ) {
+-		struct inode *inode = temp->d_inode;
++		struct inode *inode;
+ 
++		spin_lock(&temp->d_lock);
++		inode = temp->d_inode;
+ 		if (inode && ceph_snap(inode) == CEPH_SNAPDIR) {
+ 			dout("build_path path+%d: %p SNAPDIR\n",
+ 			     pos, temp);
+@@ -1478,21 +1486,26 @@ retry:
+ 			break;
+ 		} else {
+ 			pos -= temp->d_name.len;
+-			if (pos < 0)
++			if (pos < 0) {
++				spin_unlock(&temp->d_lock);
+ 				break;
++			}
+ 			strncpy(path + pos, temp->d_name.name,
+ 				temp->d_name.len);
+ 		}
++		spin_unlock(&temp->d_lock);
+ 		if (pos)
+ 			path[--pos] = '/';
+ 		temp = temp->d_parent;
+ 		if (temp == NULL) {
++			rcu_read_unlock();
+ 			pr_err("build_path corrupt dentry\n");
+ 			kfree(path);
+ 			return ERR_PTR(-EINVAL);
+ 		}
+ 	}
+-	if (pos != 0) {
++	rcu_read_unlock();
++	if (pos != 0 || read_seqretry(&rename_lock, seq)) {
+ 		pr_err("build_path did not end path lookup where "
+ 		       "expected, namelen is %d, pos is %d\n", len, pos);
+ 		/* presumably this is only possible if racing with a
 --- a/fs/cifs/cifsfs.h
 +++ b/fs/cifs/cifsfs.h
 @@ -129,5 +129,5 @@ extern long cifs_ioctl(struct file *file
@@ -2077,6 +2293,65 @@
  	vol_info->username = username;
  	vol_info->local_nls = cifs_sb->local_nls;
  	vol_info->linux_uid = fsuid;
+--- a/fs/cifs/dir.c
++++ b/fs/cifs/dir.c
+@@ -55,6 +55,7 @@ build_path_from_dentry(struct dentry *di
+ 	char dirsep;
+ 	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry->d_sb);
+ 	struct cifs_tcon *tcon = cifs_sb_master_tcon(cifs_sb);
++	unsigned seq;
+ 
+ 	if (direntry == NULL)
+ 		return NULL;  /* not much we can do if dentry is freed and
+@@ -68,22 +69,29 @@ build_path_from_dentry(struct dentry *di
+ 		dfsplen = 0;
+ cifs_bp_rename_retry:
+ 	namelen = dfsplen;
++	seq = read_seqbegin(&rename_lock);
++	rcu_read_lock();
+ 	for (temp = direntry; !IS_ROOT(temp);) {
+ 		namelen += (1 + temp->d_name.len);
+ 		temp = temp->d_parent;
+ 		if (temp == NULL) {
+ 			cERROR(1, "corrupt dentry");
++			rcu_read_unlock();
+ 			return NULL;
+ 		}
+ 	}
++	rcu_read_unlock();
+ 
+ 	full_path = kmalloc(namelen+1, GFP_KERNEL);
+ 	if (full_path == NULL)
+ 		return full_path;
+ 	full_path[namelen] = 0;	/* trailing null */
++	rcu_read_lock();
+ 	for (temp = direntry; !IS_ROOT(temp);) {
++		spin_lock(&temp->d_lock);
+ 		namelen -= 1 + temp->d_name.len;
+ 		if (namelen < 0) {
++			spin_unlock(&temp->d_lock);
+ 			break;
+ 		} else {
+ 			full_path[namelen] = dirsep;
+@@ -91,14 +99,17 @@ cifs_bp_rename_retry:
+ 				temp->d_name.len);
+ 			cFYI(0, "name: %s", full_path + namelen);
+ 		}
++		spin_unlock(&temp->d_lock);
+ 		temp = temp->d_parent;
+ 		if (temp == NULL) {
+ 			cERROR(1, "corrupt dentry");
++			rcu_read_unlock();
+ 			kfree(full_path);
+ 			return NULL;
+ 		}
+ 	}
+-	if (namelen != dfsplen) {
++	rcu_read_unlock();
++	if (namelen != dfsplen || read_seqretry(&rename_lock, seq)) {
+ 		cERROR(1, "did not end path lookup where expected namelen is %d",
+ 			namelen);
+ 		/* presumably this is only possible if racing with a rename
 --- a/fs/cifs/sess.c
 +++ b/fs/cifs/sess.c
 @@ -428,8 +428,7 @@ static void build_ntlmssp_negotiate_blob
@@ -2104,6 +2379,78 @@
  
  	tmp = pbuffer + sizeof(AUTHENTICATE_MESSAGE);
  	sec_blob->NegotiateFlags = cpu_to_le32(flags);
+--- a/fs/cramfs/inode.c
++++ b/fs/cramfs/inode.c
+@@ -37,7 +37,7 @@ static DEFINE_MUTEX(read_mutex);
+ /* These macros may change in future, to provide better st_ino semantics. */
+ #define OFFSET(x)	((x)->i_ino)
+ 
+-static unsigned long cramino(struct cramfs_inode *cino, unsigned int offset)
++static unsigned long cramino(const struct cramfs_inode *cino, unsigned int offset)
+ {
+ 	if (!cino->offset)
+ 		return offset + 1;
+@@ -61,7 +61,7 @@ static unsigned long cramino(struct cram
+ }
+ 
+ static struct inode *get_cramfs_inode(struct super_block *sb,
+-	struct cramfs_inode *cramfs_inode, unsigned int offset)
++	const struct cramfs_inode *cramfs_inode, unsigned int offset)
+ {
+ 	struct inode *inode;
+ 	static struct timespec zerotime;
+@@ -317,7 +317,7 @@ static int cramfs_fill_super(struct supe
+ 	/* Set it all up.. */
+ 	sb->s_op = &cramfs_ops;
+ 	root = get_cramfs_inode(sb, &super.root, 0);
+-	if (!root)
++	if (IS_ERR(root))
+ 		goto out;
+ 	sb->s_root = d_alloc_root(root);
+ 	if (!sb->s_root) {
+@@ -423,6 +423,7 @@ static int cramfs_readdir(struct file *f
+ static struct dentry * cramfs_lookup(struct inode *dir, struct dentry *dentry, struct nameidata *nd)
+ {
+ 	unsigned int offset = 0;
++	struct inode *inode = NULL;
+ 	int sorted;
+ 
+ 	mutex_lock(&read_mutex);
+@@ -449,8 +450,8 @@ static struct dentry * cramfs_lookup(str
+ 
+ 		for (;;) {
+ 			if (!namelen) {
+-				mutex_unlock(&read_mutex);
+-				return ERR_PTR(-EIO);
++				inode = ERR_PTR(-EIO);
++				goto out;
+ 			}
+ 			if (name[namelen-1])
+ 				break;
+@@ -462,17 +463,18 @@ static struct dentry * cramfs_lookup(str
+ 		if (retval > 0)
+ 			continue;
+ 		if (!retval) {
+-			struct cramfs_inode entry = *de;
+-			mutex_unlock(&read_mutex);
+-			d_add(dentry, get_cramfs_inode(dir->i_sb, &entry, dir_off));
+-			return NULL;
++			inode = get_cramfs_inode(dir->i_sb, de, dir_off);
++			break;
+ 		}
+ 		/* else (retval < 0) */
+ 		if (sorted)
+ 			break;
+ 	}
++out:
+ 	mutex_unlock(&read_mutex);
+-	d_add(dentry, NULL);
++	if (IS_ERR(inode))
++		return ERR_CAST(inode);
++	d_add(dentry, inode);
+ 	return NULL;
+ }
+ 
 --- a/fs/dcache.c
 +++ b/fs/dcache.c
 @@ -2213,14 +2213,15 @@ static void dentry_unlock_parents_for_mo
@@ -2215,6 +2562,17 @@
  			if (IS_ERR(actual))
  				dput(alias);
  			goto out_nolock;
+--- a/fs/exofs/super.c
++++ b/fs/exofs/super.c
+@@ -913,7 +913,7 @@ struct dentry *exofs_get_parent(struct d
+ 	unsigned long ino = exofs_parent_ino(child);
+ 
+ 	if (!ino)
+-		return NULL;
++		return ERR_PTR(-ESTALE);
+ 
+ 	return d_obtain_alias(exofs_iget(child->d_inode->i_sb, ino));
+ }
 --- a/fs/gfs2/aops.c
 +++ b/fs/gfs2/aops.c
 @@ -1069,6 +1069,7 @@ int gfs2_releasepage(struct page *page,
@@ -2433,6 +2791,88 @@
  	spin_lock(&sdp->sd_jindex_spin);
  	rv = -EINVAL;
  	if (sdp->sd_lockstruct.ls_ops->lm_mount == NULL)
+--- a/fs/hppfs/hppfs.c
++++ b/fs/hppfs/hppfs.c
+@@ -139,7 +139,8 @@ static int file_removed(struct dentry *d
+ static struct dentry *hppfs_lookup(struct inode *ino, struct dentry *dentry,
+ 				   struct nameidata *nd)
+ {
+-	struct dentry *proc_dentry, *new, *parent;
++	struct dentry *proc_dentry, *parent;
++	struct qstr *name = &dentry->d_name;
+ 	struct inode *inode;
+ 	int err, deleted;
+ 
+@@ -149,23 +150,9 @@ static struct dentry *hppfs_lookup(struc
+ 	else if (deleted)
+ 		return ERR_PTR(-ENOENT);
+ 
+-	err = -ENOMEM;
+ 	parent = HPPFS_I(ino)->proc_dentry;
+ 	mutex_lock(&parent->d_inode->i_mutex);
+-	proc_dentry = d_lookup(parent, &dentry->d_name);
+-	if (proc_dentry == NULL) {
+-		proc_dentry = d_alloc(parent, &dentry->d_name);
+-		if (proc_dentry == NULL) {
+-			mutex_unlock(&parent->d_inode->i_mutex);
+-			goto out;
+-		}
+-		new = (*parent->d_inode->i_op->lookup)(parent->d_inode,
+-						       proc_dentry, NULL);
+-		if (new) {
+-			dput(proc_dentry);
+-			proc_dentry = new;
+-		}
+-	}
++	proc_dentry = lookup_one_len(name->name, parent, name->len);
+ 	mutex_unlock(&parent->d_inode->i_mutex);
+ 
+ 	if (IS_ERR(proc_dentry))
+@@ -174,13 +161,11 @@ static struct dentry *hppfs_lookup(struc
+ 	err = -ENOMEM;
+ 	inode = get_inode(ino->i_sb, proc_dentry);
+ 	if (!inode)
+-		goto out_dput;
++		goto out;
+ 
+  	d_add(dentry, inode);
+ 	return NULL;
+ 
+- out_dput:
+-	dput(proc_dentry);
+  out:
+ 	return ERR_PTR(err);
+ }
+@@ -690,8 +675,10 @@ static struct inode *get_inode(struct su
+ 	struct inode *proc_ino = dentry->d_inode;
+ 	struct inode *inode = new_inode(sb);
+ 
+-	if (!inode)
++	if (!inode) {
++		dput(dentry);
+ 		return ERR_PTR(-ENOMEM);
++	}
+ 
+ 	if (S_ISDIR(dentry->d_inode->i_mode)) {
+ 		inode->i_op = &hppfs_dir_iops;
+@@ -704,7 +691,7 @@ static struct inode *get_inode(struct su
+ 		inode->i_fop = &hppfs_file_fops;
+ 	}
+ 
+-	HPPFS_I(inode)->proc_dentry = dget(dentry);
++	HPPFS_I(inode)->proc_dentry = dentry;
+ 
+ 	inode->i_uid = proc_ino->i_uid;
+ 	inode->i_gid = proc_ino->i_gid;
+@@ -737,7 +724,7 @@ static int hppfs_fill_super(struct super
+ 	sb->s_fs_info = proc_mnt;
+ 
+ 	err = -ENOMEM;
+-	root_inode = get_inode(sb, proc_mnt->mnt_sb->s_root);
++	root_inode = get_inode(sb, dget(proc_mnt->mnt_sb->s_root));
+ 	if (!root_inode)
+ 		goto out_mntput;
+ 
 --- a/fs/namei.c
 +++ b/fs/namei.c
 @@ -433,6 +433,8 @@ static int unlazy_walk(struct nameidata
@@ -2476,6 +2916,29 @@
  	data->args.pgbase = req->wb_pgbase + offset;
  	data->args.pages  = data->pagevec;
  	data->args.count  = count;
+--- a/fs/ufs/namei.c
++++ b/fs/ufs/namei.c
+@@ -56,16 +56,12 @@ static struct dentry *ufs_lookup(struct
+ 
+ 	lock_ufs(dir->i_sb);
+ 	ino = ufs_inode_by_name(dir, &dentry->d_name);
+-	if (ino) {
++	if (ino)
+ 		inode = ufs_iget(dir->i_sb, ino);
+-		if (IS_ERR(inode)) {
+-			unlock_ufs(dir->i_sb);
+-			return ERR_CAST(inode);
+-		}
+-	}
+ 	unlock_ufs(dir->i_sb);
+-	d_add(dentry, inode);
+-	return NULL;
++	if (IS_ERR(inode))
++		return ERR_CAST(inode);
++	return d_splice_alias(inode, dentry);
+ }
+ 
+ /*
 --- a/include/acpi/acpi_bus.h
 +++ b/include/acpi/acpi_bus.h
 @@ -210,7 +210,7 @@ struct acpi_device_power_state {
@@ -2606,6 +3069,21 @@
  	/*
  	 * If one device supports one of these features, then enable them
  	 * for all in netdev_increment_features.
+--- a/include/linux/sdla.h
++++ b/include/linux/sdla.h
+@@ -112,11 +112,7 @@ struct sdla_dlci_conf {
+    short Tb_max;
+ };
+ 
+-#ifndef __KERNEL__
+-
+-void sdla(void *cfg_info, char *dev, struct frad_conf *conf, int quiet);
+-
+-#else
++#ifdef __KERNEL__
+ 
+ /* important Z80 window addresses */
+ #define SDLA_CONTROL_WND		0xE000
 --- a/include/net/sctp/command.h
 +++ b/include/net/sctp/command.h
 @@ -63,6 +63,7 @@ typedef enum {
@@ -3470,3 +3948,138 @@
  if $depmod_hack_needed; then
  	symlink="$INSTALL_MOD_PATH/lib/modules/99.98.$KERNELRELEASE"
  	ln -s "$KERNELRELEASE" "$symlink"
+--- a/sound/soc/codecs/wm8994.c
++++ b/sound/soc/codecs/wm8994.c
+@@ -1190,7 +1190,6 @@ SND_SOC_DAPM_INPUT("DMIC1DAT"),
+ SND_SOC_DAPM_INPUT("DMIC2DAT"),
+ SND_SOC_DAPM_INPUT("Clock"),
+ 
+-SND_SOC_DAPM_MICBIAS("MICBIAS", WM8994_MICBIAS, 2, 0),
+ SND_SOC_DAPM_SUPPLY_S("MICBIAS Supply", 1, SND_SOC_NOPM, 0, 0, micbias_ev,
+ 		      SND_SOC_DAPM_PRE_PMU),
+ 
+@@ -1509,8 +1508,10 @@ static const struct snd_soc_dapm_route w
+ 	{ "AIF2DACDAT", NULL, "AIF1DACDAT" },
+ 	{ "AIF1ADCDAT", NULL, "AIF2ADCDAT" },
+ 	{ "AIF2ADCDAT", NULL, "AIF1ADCDAT" },
+-	{ "MICBIAS", NULL, "CLK_SYS" },
+-	{ "MICBIAS", NULL, "MICBIAS Supply" },
++	{ "MICBIAS1", NULL, "CLK_SYS" },
++	{ "MICBIAS1", NULL, "MICBIAS Supply" },
++	{ "MICBIAS2", NULL, "CLK_SYS" },
++	{ "MICBIAS2", NULL, "MICBIAS Supply" },
+ };
+ 
+ static const struct snd_soc_dapm_route wm8994_intercon[] = {
+@@ -2763,7 +2764,7 @@ static void wm8958_default_micdet(u16 st
+ 	report = SND_JACK_MICROPHONE;
+ 
+ 	/* Everything else is buttons; just assign slots */
+-	if (status & 0x1c0)
++	if (status & 0x1c)
+ 		report |= SND_JACK_BTN_0;
+ 
+ done:
+--- a/sound/soc/sh/fsi-ak4642.c
++++ b/sound/soc/sh/fsi-ak4642.c
+@@ -97,7 +97,7 @@ static int fsi_ak4642_remove(struct plat
+ 
+ static struct fsi_ak4642_data fsi_a_ak4642 = {
+ 	.name		= "AK4642",
+-	.card		= "FSIA (AK4642)",
++	.card		= "FSIA-AK4642",
+ 	.cpu_dai	= "fsia-dai",
+ 	.codec		= "ak4642-codec.0-0012",
+ 	.platform	= "sh_fsi.0",
+@@ -106,7 +106,7 @@ static struct fsi_ak4642_data fsi_a_ak46
+ 
+ static struct fsi_ak4642_data fsi_b_ak4642 = {
+ 	.name		= "AK4642",
+-	.card		= "FSIB (AK4642)",
++	.card		= "FSIB-AK4642",
+ 	.cpu_dai	= "fsib-dai",
+ 	.codec		= "ak4642-codec.0-0012",
+ 	.platform	= "sh_fsi.0",
+@@ -115,7 +115,7 @@ static struct fsi_ak4642_data fsi_b_ak46
+ 
+ static struct fsi_ak4642_data fsi_a_ak4643 = {
+ 	.name		= "AK4643",
+-	.card		= "FSIA (AK4643)",
++	.card		= "FSIA-AK4643",
+ 	.cpu_dai	= "fsia-dai",
+ 	.codec		= "ak4642-codec.0-0013",
+ 	.platform	= "sh_fsi.0",
+@@ -124,7 +124,7 @@ static struct fsi_ak4642_data fsi_a_ak46
+ 
+ static struct fsi_ak4642_data fsi_b_ak4643 = {
+ 	.name		= "AK4643",
+-	.card		= "FSIB (AK4643)",
++	.card		= "FSIB-AK4643",
+ 	.cpu_dai	= "fsib-dai",
+ 	.codec		= "ak4642-codec.0-0013",
+ 	.platform	= "sh_fsi.0",
+@@ -133,7 +133,7 @@ static struct fsi_ak4642_data fsi_b_ak46
+ 
+ static struct fsi_ak4642_data fsi2_a_ak4642 = {
+ 	.name		= "AK4642",
+-	.card		= "FSI2A (AK4642)",
++	.card		= "FSI2A-AK4642",
+ 	.cpu_dai	= "fsia-dai",
+ 	.codec		= "ak4642-codec.0-0012",
+ 	.platform	= "sh_fsi2",
+@@ -142,7 +142,7 @@ static struct fsi_ak4642_data fsi2_a_ak4
+ 
+ static struct fsi_ak4642_data fsi2_b_ak4642 = {
+ 	.name		= "AK4642",
+-	.card		= "FSI2B (AK4642)",
++	.card		= "FSI2B-AK4642",
+ 	.cpu_dai	= "fsib-dai",
+ 	.codec		= "ak4642-codec.0-0012",
+ 	.platform	= "sh_fsi2",
+@@ -151,7 +151,7 @@ static struct fsi_ak4642_data fsi2_b_ak4
+ 
+ static struct fsi_ak4642_data fsi2_a_ak4643 = {
+ 	.name		= "AK4643",
+-	.card		= "FSI2A (AK4643)",
++	.card		= "FSI2A-AK4643",
+ 	.cpu_dai	= "fsia-dai",
+ 	.codec		= "ak4642-codec.0-0013",
+ 	.platform	= "sh_fsi2",
+@@ -160,7 +160,7 @@ static struct fsi_ak4642_data fsi2_a_ak4
+ 
+ static struct fsi_ak4642_data fsi2_b_ak4643 = {
+ 	.name		= "AK4643",
+-	.card		= "FSI2B (AK4643)",
++	.card		= "FSI2B-AK4643",
+ 	.cpu_dai	= "fsib-dai",
+ 	.codec		= "ak4642-codec.0-0013",
+ 	.platform	= "sh_fsi2",
+--- a/sound/soc/sh/fsi-da7210.c
++++ b/sound/soc/sh/fsi-da7210.c
+@@ -42,7 +42,7 @@ static struct snd_soc_dai_link fsi_da721
+ };
+ 
+ static struct snd_soc_card fsi_soc_card = {
+-	.name		= "FSI (DA7210)",
++	.name		= "FSI-DA7210",
+ 	.dai_link	= &fsi_da7210_dai,
+ 	.num_links	= 1,
+ };
+--- a/sound/soc/sh/fsi-hdmi.c
++++ b/sound/soc/sh/fsi-hdmi.c
+@@ -83,13 +83,13 @@ static int fsi_hdmi_remove(struct platfo
+ 
+ static struct fsi_hdmi_data fsi2_a_hdmi = {
+ 	.cpu_dai	= "fsia-dai",
+-	.card		= "FSI2A (SH MOBILE HDMI)",
++	.card		= "FSI2A-HDMI",
+ 	.id		= FSI_PORT_A,
+ };
+ 
+ static struct fsi_hdmi_data fsi2_b_hdmi = {
+ 	.cpu_dai	= "fsib-dai",
+-	.card		= "FSI2B (SH MOBILE HDMI)",
++	.card		= "FSI2B-HDMI",
+ 	.id		= FSI_PORT_B,
+ };
+ 
