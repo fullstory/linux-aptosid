@@ -26,15 +26,89 @@
  PATCHLEVEL = 0
  SUBLEVEL = 0
 -EXTRAVERSION = -rc7
-+EXTRAVERSION = -rc7-git7
++EXTRAVERSION = -rc7-git8
  NAME = Sneaky Weasel
  
  # *DOCUMENTATION*
+--- a/arch/arm/mach-davinci/board-dm365-evm.c
++++ b/arch/arm/mach-davinci/board-dm365-evm.c
+@@ -520,7 +520,7 @@ fail:
+ 	 */
+ 	if (have_imager()) {
+ 		label = "HD imager";
+-		mux |= 1;
++		mux |= 2;
+ 
+ 		/* externally mux MMC1/ENET/AIC33 to imager */
+ 		mux |= BIT(6) | BIT(5) | BIT(3);
+@@ -540,7 +540,7 @@ fail:
+ 		resets &= ~BIT(1);
+ 
+ 		if (have_tvp7002()) {
+-			mux |= 2;
++			mux |= 1;
+ 			resets &= ~BIT(2);
+ 			label = "tvp7002 HD";
+ 		} else {
+--- a/arch/arm/mach-davinci/gpio.c
++++ b/arch/arm/mach-davinci/gpio.c
+@@ -254,8 +254,10 @@ gpio_irq_handler(unsigned irq, struct ir
+ {
+ 	struct davinci_gpio_regs __iomem *g;
+ 	u32 mask = 0xffff;
++	struct davinci_gpio_controller *d;
+ 
+-	g = (__force struct davinci_gpio_regs __iomem *) irq_desc_get_handler_data(desc);
++	d = (struct davinci_gpio_controller *)irq_desc_get_handler_data(desc);
++	g = (struct davinci_gpio_regs __iomem *)d->regs;
+ 
+ 	/* we only care about one bank */
+ 	if (irq & 1)
+@@ -274,11 +276,14 @@ gpio_irq_handler(unsigned irq, struct ir
+ 		if (!status)
+ 			break;
+ 		__raw_writel(status, &g->intstat);
+-		if (irq & 1)
+-			status >>= 16;
+ 
+ 		/* now demux them to the right lowlevel handler */
+-		n = (int)irq_get_handler_data(irq);
++		n = d->irq_base;
++		if (irq & 1) {
++			n += 16;
++			status >>= 16;
++		}
++
+ 		while (status) {
+ 			res = ffs(status);
+ 			n += res;
+@@ -424,7 +429,13 @@ static int __init davinci_gpio_irq_setup
+ 
+ 		/* set up all irqs in this bank */
+ 		irq_set_chained_handler(bank_irq, gpio_irq_handler);
+-		irq_set_handler_data(bank_irq, (__force void *)g);
++
++		/*
++		 * Each chip handles 32 gpios, and each irq bank consists of 16
++		 * gpio irqs. Pass the irq bank's corresponding controller to
++		 * the chained irq handler.
++		 */
++		irq_set_handler_data(bank_irq, &chips[gpio / 32]);
+ 
+ 		for (i = 0; i < 16 && gpio < ngpio; i++, irq++, gpio++) {
+ 			irq_set_chip(irq, &gpio_irqchip);
 --- a/arch/arm/mach-davinci/irq.c
 +++ b/arch/arm/mach-davinci/irq.c
-@@ -53,7 +53,7 @@ davinci_alloc_gc(void __iomem *base, uns
+@@ -52,8 +52,14 @@ davinci_alloc_gc(void __iomem *base, uns
+ 	struct irq_chip_type *ct;
  
  	gc = irq_alloc_generic_chip("AINTC", 1, irq_start, base, handle_edge_irq);
++	if (!gc) {
++		pr_err("%s: irq_alloc_generic_chip for IRQ %u failed\n",
++		       __func__, irq_start);
++		return;
++	}
++
  	ct = gc->chip_types;
 -	ct->chip.irq_ack = irq_gc_ack;
 +	ct->chip.irq_ack = irq_gc_ack_set_bit;
@@ -2273,6 +2347,133 @@
  		pr_err("build_path did not end path lookup where "
  		       "expected, namelen is %d, pos is %d\n", len, pos);
  		/* presumably this is only possible if racing with a
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -35,6 +35,7 @@
+ #include <linux/delay.h>
+ #include <linux/kthread.h>
+ #include <linux/freezer.h>
++#include <linux/namei.h>
+ #include <net/ipv6.h>
+ #include "cifsfs.h"
+ #include "cifspdu.h"
+@@ -542,14 +543,12 @@ static const struct super_operations cif
+ static struct dentry *
+ cifs_get_root(struct smb_vol *vol, struct super_block *sb)
+ {
+-	int xid, rc;
+-	struct inode *inode;
+-	struct qstr name;
+-	struct dentry *dparent = NULL, *dchild = NULL, *alias;
++	struct dentry *dentry;
+ 	struct cifs_sb_info *cifs_sb = CIFS_SB(sb);
+-	unsigned int i, full_len, len;
+-	char *full_path = NULL, *pstart;
++	char *full_path = NULL;
++	char *s, *p;
+ 	char sep;
++	int xid;
+ 
+ 	full_path = cifs_build_path_to_root(vol, cifs_sb,
+ 					    cifs_sb_master_tcon(cifs_sb));
+@@ -560,73 +559,32 @@ cifs_get_root(struct smb_vol *vol, struc
+ 
+ 	xid = GetXid();
+ 	sep = CIFS_DIR_SEP(cifs_sb);
+-	dparent = dget(sb->s_root);
+-	full_len = strlen(full_path);
+-	full_path[full_len] = sep;
+-	pstart = full_path + 1;
+-
+-	for (i = 1, len = 0; i <= full_len; i++) {
+-		if (full_path[i] != sep || !len) {
+-			len++;
+-			continue;
+-		}
+-
+-		full_path[i] = 0;
+-		cFYI(1, "get dentry for %s", pstart);
+-
+-		name.name = pstart;
+-		name.len = len;
+-		name.hash = full_name_hash(pstart, len);
+-		dchild = d_lookup(dparent, &name);
+-		if (dchild == NULL) {
+-			cFYI(1, "not exists");
+-			dchild = d_alloc(dparent, &name);
+-			if (dchild == NULL) {
+-				dput(dparent);
+-				dparent = ERR_PTR(-ENOMEM);
+-				goto out;
+-			}
+-		}
+-
+-		cFYI(1, "get inode");
+-		if (dchild->d_inode == NULL) {
+-			cFYI(1, "not exists");
+-			inode = NULL;
+-			if (cifs_sb_master_tcon(CIFS_SB(sb))->unix_ext)
+-				rc = cifs_get_inode_info_unix(&inode, full_path,
+-							      sb, xid);
+-			else
+-				rc = cifs_get_inode_info(&inode, full_path,
+-							 NULL, sb, xid, NULL);
+-			if (rc) {
+-				dput(dchild);
+-				dput(dparent);
+-				dparent = ERR_PTR(rc);
+-				goto out;
+-			}
+-			alias = d_materialise_unique(dchild, inode);
+-			if (alias != NULL) {
+-				dput(dchild);
+-				if (IS_ERR(alias)) {
+-					dput(dparent);
+-					dparent = ERR_PTR(-EINVAL); /* XXX */
+-					goto out;
+-				}
+-				dchild = alias;
+-			}
+-		}
+-		cFYI(1, "parent %p, child %p", dparent, dchild);
+-
+-		dput(dparent);
+-		dparent = dchild;
+-		len = 0;
+-		pstart = full_path + i + 1;
+-		full_path[i] = sep;
+-	}
+-out:
++	dentry = dget(sb->s_root);
++	p = s = full_path;
++
++	do {
++		struct inode *dir = dentry->d_inode;
++		struct dentry *child;
++
++		/* skip separators */
++		while (*s == sep)
++			s++;
++		if (!*s)
++			break;
++		p = s++;
++		/* next separator */
++		while (*s && *s != sep)
++			s++;
++
++		mutex_lock(&dir->i_mutex);
++		child = lookup_one_len(p, dentry, s - p);
++		mutex_unlock(&dir->i_mutex);
++		dput(dentry);
++		dentry = child;
++	} while (!IS_ERR(dentry));
+ 	_FreeXid(xid);
+ 	kfree(full_path);
+-	return dparent;
++	return dentry;
+ }
+ 
+ static int cifs_set_super(struct super_block *sb, void *data)
 --- a/fs/cifs/cifsfs.h
 +++ b/fs/cifs/cifsfs.h
 @@ -129,5 +129,5 @@ extern long cifs_ioctl(struct file *file
@@ -2873,6 +3074,17 @@
  	if (!root_inode)
  		goto out_mntput;
  
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@ -822,7 +822,7 @@ ssize_t simple_attr_write(struct file *f
+ 		goto out;
+ 
+ 	attr->set_buf[size] = '\0';
+-	val = simple_strtol(attr->set_buf, NULL, 0);
++	val = simple_strtoll(attr->set_buf, NULL, 0);
+ 	ret = attr->set(attr->data, val);
+ 	if (ret == 0)
+ 		ret = len; /* on success, claim we got the whole input */
 --- a/fs/namei.c
 +++ b/fs/namei.c
 @@ -433,6 +433,8 @@ static int unlazy_walk(struct nameidata
@@ -2884,6 +3096,27 @@
  		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
  		if (!__d_rcu_to_refcount(dentry, nd->seq))
  			goto err_child;
+@@ -940,7 +942,6 @@ static bool __follow_mount_rcu(struct na
+ 		 * Don't forget we might have a non-mountpoint managed dentry
+ 		 * that wants to block transit.
+ 		 */
+-		*inode = path->dentry->d_inode;
+ 		if (unlikely(managed_dentry_might_block(path->dentry)))
+ 			return false;
+ 
+@@ -953,6 +954,12 @@ static bool __follow_mount_rcu(struct na
+ 		path->mnt = mounted;
+ 		path->dentry = mounted->mnt_root;
+ 		nd->seq = read_seqcount_begin(&path->dentry->d_seq);
++		/*
++		 * Update the inode too. We don't need to re-check the
++		 * dentry sequence number here after this d_inode read,
++		 * because a mount-point is always pinned.
++		 */
++		*inode = path->dentry->d_inode;
+ 	}
+ 	return true;
+ }
 --- a/fs/nfs/nfs4filelayout.c
 +++ b/fs/nfs/nfs4filelayout.c
 @@ -398,7 +398,6 @@ filelayout_write_pagelist(struct nfs_wri
@@ -3256,6 +3489,18 @@
  }
  
  static void init_rt_rq(struct rt_rq *rt_rq, struct rq *rq)
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2310,7 +2310,8 @@ static bool pgdat_balanced(pg_data_t *pg
+ 	for (i = 0; i <= classzone_idx; i++)
+ 		present_pages += pgdat->node_zones[i].present_pages;
+ 
+-	return balanced_pages > (present_pages >> 2);
++	/* A special case here: if zone has no page, we think it's balanced */
++	return balanced_pages >= (present_pages >> 2);
+ }
+ 
+ /* is kswapd sleeping prematurely? */
 --- a/net/8021q/vlan_dev.c
 +++ b/net/8021q/vlan_dev.c
 @@ -528,7 +528,11 @@ static int vlan_dev_init(struct net_devi
@@ -3395,6 +3640,35 @@
  				} else {
  					sk->sk_state = BT_CONFIG;
  					res = L2CAP_CR_SUCCESS;
+--- a/net/ceph/ceph_fs.c
++++ b/net/ceph/ceph_fs.c
+@@ -36,16 +36,19 @@ int ceph_flags_to_mode(int flags)
+ 	if ((flags & O_DIRECTORY) == O_DIRECTORY)
+ 		return CEPH_FILE_MODE_PIN;
+ #endif
+-	if ((flags & O_APPEND) == O_APPEND)
+-		flags |= O_WRONLY;
+ 
+-	if ((flags & O_ACCMODE) == O_RDWR)
+-		mode = CEPH_FILE_MODE_RDWR;
+-	else if ((flags & O_ACCMODE) == O_WRONLY)
++	switch (flags & O_ACCMODE) {
++	case O_WRONLY:
+ 		mode = CEPH_FILE_MODE_WR;
+-	else
++		break;
++	case O_RDONLY:
+ 		mode = CEPH_FILE_MODE_RD;
+-
++		break;
++	case O_RDWR:
++	case O_ACCMODE: /* this is what the VFS does */
++		mode = CEPH_FILE_MODE_RDWR;
++		break;
++	}
+ #ifdef O_LAZY
+ 	if (flags & O_LAZY)
+ 		mode |= CEPH_FILE_MODE_LAZY;
 --- a/net/mac80211/scan.c
 +++ b/net/mac80211/scan.c
 @@ -877,7 +877,8 @@ int ieee80211_request_sched_scan_start(s

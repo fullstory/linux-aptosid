@@ -9318,7 +9318,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/f_op.c
-@@ -0,0 +1,733 @@
+@@ -0,0 +1,731 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -9644,8 +9644,11 @@
 +	err = -EINVAL;
 +	h_file = au_hf_top(file);
 +	if (au_test_loopback_kthread()) {
-+		file->f_mapping = h_file->f_mapping;
-+		smp_mb(); /* unnecessary? */
++		au_warn_loopback(h_file->f_dentry->d_sb);
++		if (file->f_mapping != h_file->f_mapping) {
++			file->f_mapping = h_file->f_mapping;
++			smp_mb(); /* unnecessary? */
++		}
 +	}
 +	err = vfsub_splice_to(h_file, ppos, pipe, len, flags);
 +	/* todo: necessasry? */
@@ -10018,12 +10021,7 @@
 +
 +const struct file_operations aufs_file_fop = {
 +	.owner		= THIS_MODULE,
-+	/*
-+	 * while generic_file_llseek/_unlocked() don't use BKL,
-+	 * don't use it since it operates file->f_mapping->host.
-+	 * in aufs, it may be a real file and may confuse users by UDBA.
-+	 */
-+	/* .llseek		= generic_file_llseek, */
++
 +	.llseek		= default_llseek,
 +
 +	.read		= aufs_read,
@@ -16733,7 +16731,7 @@
 +endif
 --- /dev/null
 +++ b/fs/aufs/loop.c
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,133 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -16797,9 +16795,79 @@
 +
 +	return ret;
 +}
++
++/* ---------------------------------------------------------------------- */
++
++#define au_warn_loopback_step	16
++static int au_warn_loopback_nelem = au_warn_loopback_step;
++static unsigned long *au_warn_loopback_array;
++
++void au_warn_loopback(struct super_block *h_sb)
++{
++	int i, new_nelem;
++	unsigned long *a, magic;
++	static DEFINE_SPINLOCK(spin);
++
++	magic = h_sb->s_magic;
++	spin_lock(&spin);
++	a = au_warn_loopback_array;
++	for (i = 0; i < au_warn_loopback_nelem && *a; i++)
++		if (a[i] == magic) {
++			spin_unlock(&spin);
++			return;
++		}
++
++	/* h_sb is new to us, print it */
++	if (i < au_warn_loopback_nelem) {
++		a[i] = magic;
++		goto pr;
++	}
++
++	/* expand the array */
++	new_nelem = au_warn_loopback_nelem + au_warn_loopback_step;
++	a = au_kzrealloc(au_warn_loopback_array,
++			 au_warn_loopback_nelem * sizeof(unsigned long),
++			 new_nelem * sizeof(unsigned long), GFP_ATOMIC);
++	if (a) {
++		au_warn_loopback_nelem = new_nelem;
++		au_warn_loopback_array = a;
++		a[i] = magic;
++		goto pr;
++	}
++
++	spin_unlock(&spin);
++	AuWarn1("realloc failed, ignored\n");
++	return;
++
++pr:
++	spin_unlock(&spin);
++	pr_warning("you may want to try another patch for loopback file "
++		   "on %s(0x%lx) branch\n", au_sbtype(h_sb), magic);
++}
++
++int au_loopback_init(void)
++{
++	int err;
++	struct super_block *sb __maybe_unused;
++
++	AuDebugOn(sizeof(sb->s_magic) != sizeof(unsigned long));
++
++	err = 0;
++	au_warn_loopback_array = kcalloc(au_warn_loopback_step,
++					 sizeof(unsigned long), GFP_NOFS);
++	if (unlikely(!au_warn_loopback_array))
++		err = -ENOMEM;
++
++	return err;
++}
++
++void au_loopback_fin(void)
++{
++	kfree(au_warn_loopback_array);
++}
 --- /dev/null
 +++ b/fs/aufs/loop.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,50 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -16834,10 +16902,18 @@
 +/* loop.c */
 +int au_test_loopback_overlap(struct super_block *sb, struct dentry *h_adding);
 +int au_test_loopback_kthread(void);
++void au_warn_loopback(struct super_block *h_sb);
++
++int au_loopback_init(void);
++void au_loopback_fin(void);
 +#else
 +AuStubInt0(au_test_loopback_overlap, struct super_block *sb,
 +	   struct dentry *h_adding)
 +AuStubInt0(au_test_loopback_kthread, void)
++AuStubVoid(au_warn_loopback, struct super_block *h_sb)
++
++AuStubInt0(au_loopback_init, void)
++AuStubVoid(au_loopback_fin, void)
 +#endif /* BLK_DEV_LOOP */
 +
 +#endif /* __KERNEL__ */
@@ -16942,7 +17018,7 @@
 +aufs-$(CONFIG_AUFS_MAGIC_SYSRQ) += sysrq.o
 --- /dev/null
 +++ b/fs/aufs/module.c
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,189 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -17079,9 +17155,12 @@
 +	err = au_wkq_init();
 +	if (unlikely(err))
 +		goto out_procfs;
-+	err = au_hnotify_init();
++	err = au_loopback_init();
 +	if (unlikely(err))
 +		goto out_wkq;
++	err = au_hnotify_init();
++	if (unlikely(err))
++		goto out_loopback;
 +	err = au_sysrq_init();
 +	if (unlikely(err))
 +		goto out_hin;
@@ -17101,6 +17180,8 @@
 +	au_sysrq_fin();
 +out_hin:
 +	au_hnotify_fin();
++out_loopback:
++	au_loopback_fin();
 +out_wkq:
 +	au_wkq_fin();
 +out_procfs:
@@ -17118,6 +17199,7 @@
 +	au_cache_fin();
 +	au_sysrq_fin();
 +	au_hnotify_fin();
++	au_loopback_fin();
 +	au_wkq_fin();
 +	au_procfs_fin();
 +	sysaufs_fin();
@@ -17220,57 +17302,6 @@
 +
 +#endif /* __KERNEL__ */
 +#endif /* __AUFS_MODULE_H__ */
---- /dev/null
-+++ b/fs/aufs/mtx.h
-@@ -0,0 +1,48 @@
-+/*
-+ * Copyright (C) 2010-2011 Junjiro R. Okajima
-+ *
-+ * This program, aufs is free software; you can redistribute it and/or modify
-+ * it under the terms of the GNU General Public License as published by
-+ * the Free Software Foundation; either version 2 of the License, or
-+ * (at your option) any later version.
-+ *
-+ * This program is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ * GNU General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU General Public License
-+ * along with this program; if not, write to the Free Software
-+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
-+ */
-+
-+/*
-+ * very ugly approach for aufs_mmap()
-+ * never include this file from other than f_op.c.
-+ * see f_op.c in detail.
-+ */
-+
-+#ifndef __AUFS_MTX_H__
-+#define __AUFS_MTX_H__
-+
-+#ifdef __KERNEL__
-+
-+/* copied from ../kernel/mutex{,-debug}.h */
-+struct mutex;
-+struct thread_info;
-+#ifdef CONFIG_DEBUG_MUTEXES
-+static inline void mutex_set_owner(struct mutex *lock)
-+{
-+	lock->owner = current_thread_info();
-+}
-+#else
-+static inline void mutex_set_owner(struct mutex *lock)
-+{
-+#ifdef CONFIG_SMP
-+	lock->owner = current_thread_info();
-+#endif
-+}
-+#endif
-+
-+#endif /* __KERNEL__ */
-+#endif /* __AUFS_MTX_H__ */
 --- /dev/null
 +++ b/fs/aufs/opts.c
 @@ -0,0 +1,1595 @@
@@ -28346,7 +28377,7 @@
 +#include <linux/limits.h>
 +#include <linux/types.h>
 +
-+#define AUFS_VERSION	"2.1-standalone.tree-39-20110704"
++#define AUFS_VERSION	"2.1-standalone.tree-3.0-rcN-20110718"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
