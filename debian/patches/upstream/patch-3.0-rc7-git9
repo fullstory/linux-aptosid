@@ -19,6 +19,17 @@
  	If your machine is a loaded WEB server,
  	you should think about lowering this value, such sockets
  	may consume significant resources. Cf. tcp_max_orphans.
+--- a/Documentation/x86/boot.txt
++++ b/Documentation/x86/boot.txt
+@@ -674,7 +674,7 @@ Protocol:	2.10+
+ 
+ Field name:	init_size
+ Type:		read
+-Offset/size:	0x25c/4
++Offset/size:	0x260/4
+ 
+   This field indicates the amount of linear contiguous memory starting
+   at the kernel runtime start address that the kernel needs before it
 --- a/Makefile
 +++ b/Makefile
 @@ -1,7 +1,7 @@
@@ -26,7 +37,7 @@
  PATCHLEVEL = 0
  SUBLEVEL = 0
 -EXTRAVERSION = -rc7
-+EXTRAVERSION = -rc7-git8
++EXTRAVERSION = -rc7-git9
  NAME = Sneaky Weasel
  
  # *DOCUMENTATION*
@@ -829,6 +840,34 @@
  {
  	int flush_needed = -1;
  	unsigned int ssize, sets;
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1170,7 +1170,7 @@ comment "NUMA (Summit) requires SMP, 64G
+ config AMD_NUMA
+ 	def_bool y
+ 	prompt "Old style AMD Opteron NUMA detection"
+-	depends on NUMA && PCI
++	depends on X86_64 && NUMA && PCI
+ 	---help---
+ 	  Enable AMD NUMA node topology detection.  You should say Y here if
+ 	  you have a multi processor AMD system. This uses an old method to
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -419,6 +419,14 @@ static struct dmi_system_id __initdata p
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "iMac9,1"),
+ 		},
+ 	},
++	{	/* Handle problems with rebooting on the Latitude E6320. */
++		.callback = set_pci_reboot,
++		.ident = "Dell Latitude E6320",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Latitude E6320"),
++		},
++	},
+ 	{ }
+ };
+ 
 --- a/arch/x86/mm/init_64.c
 +++ b/arch/x86/mm/init_64.c
 @@ -28,6 +28,7 @@
@@ -3302,6 +3341,52 @@
  	/*
  	 * If one device supports one of these features, then enable them
  	 * for all in netdev_increment_features.
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -844,6 +844,7 @@ enum cpu_idle_type {
+ #define SD_SERIALIZE		0x0400	/* Only a single load balancing instance */
+ #define SD_ASYM_PACKING		0x0800  /* Place busy groups earlier in the domain */
+ #define SD_PREFER_SIBLING	0x1000	/* Prefer to place tasks in a sibling domain */
++#define SD_OVERLAP		0x2000	/* sched_domains of this level overlap */
+ 
+ enum powersavings_balance_level {
+ 	POWERSAVINGS_BALANCE_NONE = 0,  /* No power saving load balance */
+@@ -893,16 +894,21 @@ static inline int sd_power_saving_flags(
+ 	return 0;
+ }
+ 
+-struct sched_group {
+-	struct sched_group *next;	/* Must be a circular list */
++struct sched_group_power {
+ 	atomic_t ref;
+-
+ 	/*
+ 	 * CPU power of this group, SCHED_LOAD_SCALE being max power for a
+ 	 * single CPU.
+ 	 */
+-	unsigned int cpu_power, cpu_power_orig;
++	unsigned int power, power_orig;
++};
++
++struct sched_group {
++	struct sched_group *next;	/* Must be a circular list */
++	atomic_t ref;
++
+ 	unsigned int group_weight;
++	struct sched_group_power *sgp;
+ 
+ 	/*
+ 	 * The CPUs this group covers.
+@@ -1254,6 +1260,9 @@ struct task_struct {
+ #ifdef CONFIG_PREEMPT_RCU
+ 	int rcu_read_lock_nesting;
+ 	char rcu_read_unlock_special;
++#if defined(CONFIG_RCU_BOOST) && defined(CONFIG_TREE_PREEMPT_RCU)
++	int rcu_boosted;
++#endif /* #if defined(CONFIG_RCU_BOOST) && defined(CONFIG_TREE_PREEMPT_RCU) */
+ 	struct list_head rcu_node_entry;
+ #endif /* #ifdef CONFIG_PREEMPT_RCU */
+ #ifdef CONFIG_TREE_PREEMPT_RCU
 --- a/include/linux/sdla.h
 +++ b/include/linux/sdla.h
 @@ -112,11 +112,7 @@ struct sdla_dlci_conf {
@@ -3427,7 +3512,147 @@
  		return;
 --- a/kernel/rcutree_plugin.h
 +++ b/kernel/rcutree_plugin.h
-@@ -1532,7 +1532,7 @@ static int __cpuinit rcu_spawn_one_cpu_k
+@@ -68,6 +68,7 @@ struct rcu_state rcu_preempt_state = RCU
+ DEFINE_PER_CPU(struct rcu_data, rcu_preempt_data);
+ static struct rcu_state *rcu_state = &rcu_preempt_state;
+ 
++static void rcu_read_unlock_special(struct task_struct *t);
+ static int rcu_preempted_readers_exp(struct rcu_node *rnp);
+ 
+ /*
+@@ -147,7 +148,7 @@ static void rcu_preempt_note_context_swi
+ 	struct rcu_data *rdp;
+ 	struct rcu_node *rnp;
+ 
+-	if (t->rcu_read_lock_nesting &&
++	if (t->rcu_read_lock_nesting > 0 &&
+ 	    (t->rcu_read_unlock_special & RCU_READ_UNLOCK_BLOCKED) == 0) {
+ 
+ 		/* Possibly blocking in an RCU read-side critical section. */
+@@ -190,6 +191,14 @@ static void rcu_preempt_note_context_swi
+ 				rnp->gp_tasks = &t->rcu_node_entry;
+ 		}
+ 		raw_spin_unlock_irqrestore(&rnp->lock, flags);
++	} else if (t->rcu_read_lock_nesting < 0 &&
++		   t->rcu_read_unlock_special) {
++
++		/*
++		 * Complete exit from RCU read-side critical section on
++		 * behalf of preempted instance of __rcu_read_unlock().
++		 */
++		rcu_read_unlock_special(t);
+ 	}
+ 
+ 	/*
+@@ -284,7 +293,7 @@ static struct list_head *rcu_next_node_e
+  * notify RCU core processing or task having blocked during the RCU
+  * read-side critical section.
+  */
+-static void rcu_read_unlock_special(struct task_struct *t)
++static noinline void rcu_read_unlock_special(struct task_struct *t)
+ {
+ 	int empty;
+ 	int empty_exp;
+@@ -309,7 +318,7 @@ static void rcu_read_unlock_special(stru
+ 	}
+ 
+ 	/* Hardware IRQ handlers cannot block. */
+-	if (in_irq()) {
++	if (in_irq() || in_serving_softirq()) {
+ 		local_irq_restore(flags);
+ 		return;
+ 	}
+@@ -342,6 +351,11 @@ static void rcu_read_unlock_special(stru
+ #ifdef CONFIG_RCU_BOOST
+ 		if (&t->rcu_node_entry == rnp->boost_tasks)
+ 			rnp->boost_tasks = np;
++		/* Snapshot and clear ->rcu_boosted with rcu_node lock held. */
++		if (t->rcu_boosted) {
++			special |= RCU_READ_UNLOCK_BOOSTED;
++			t->rcu_boosted = 0;
++		}
+ #endif /* #ifdef CONFIG_RCU_BOOST */
+ 		t->rcu_blocked_node = NULL;
+ 
+@@ -358,7 +372,6 @@ static void rcu_read_unlock_special(stru
+ #ifdef CONFIG_RCU_BOOST
+ 		/* Unboost if we were boosted. */
+ 		if (special & RCU_READ_UNLOCK_BOOSTED) {
+-			t->rcu_read_unlock_special &= ~RCU_READ_UNLOCK_BOOSTED;
+ 			rt_mutex_unlock(t->rcu_boost_mutex);
+ 			t->rcu_boost_mutex = NULL;
+ 		}
+@@ -387,13 +400,22 @@ void __rcu_read_unlock(void)
+ 	struct task_struct *t = current;
+ 
+ 	barrier();  /* needed if we ever invoke rcu_read_unlock in rcutree.c */
+-	--t->rcu_read_lock_nesting;
+-	barrier();  /* decrement before load of ->rcu_read_unlock_special */
+-	if (t->rcu_read_lock_nesting == 0 &&
+-	    unlikely(ACCESS_ONCE(t->rcu_read_unlock_special)))
+-		rcu_read_unlock_special(t);
++	if (t->rcu_read_lock_nesting != 1)
++		--t->rcu_read_lock_nesting;
++	else {
++		t->rcu_read_lock_nesting = INT_MIN;
++		barrier();  /* assign before ->rcu_read_unlock_special load */
++		if (unlikely(ACCESS_ONCE(t->rcu_read_unlock_special)))
++			rcu_read_unlock_special(t);
++		barrier();  /* ->rcu_read_unlock_special load before assign */
++		t->rcu_read_lock_nesting = 0;
++	}
+ #ifdef CONFIG_PROVE_LOCKING
+-	WARN_ON_ONCE(ACCESS_ONCE(t->rcu_read_lock_nesting) < 0);
++	{
++		int rrln = ACCESS_ONCE(t->rcu_read_lock_nesting);
++
++		WARN_ON_ONCE(rrln < 0 && rrln > INT_MIN / 2);
++	}
+ #endif /* #ifdef CONFIG_PROVE_LOCKING */
+ }
+ EXPORT_SYMBOL_GPL(__rcu_read_unlock);
+@@ -589,7 +611,8 @@ static void rcu_preempt_check_callbacks(
+ 		rcu_preempt_qs(cpu);
+ 		return;
+ 	}
+-	if (per_cpu(rcu_preempt_data, cpu).qs_pending)
++	if (t->rcu_read_lock_nesting > 0 &&
++	    per_cpu(rcu_preempt_data, cpu).qs_pending)
+ 		t->rcu_read_unlock_special |= RCU_READ_UNLOCK_NEED_QS;
+ }
+ 
+@@ -695,9 +718,12 @@ static void rcu_report_exp_rnp(struct rc
+ 
+ 	raw_spin_lock_irqsave(&rnp->lock, flags);
+ 	for (;;) {
+-		if (!sync_rcu_preempt_exp_done(rnp))
++		if (!sync_rcu_preempt_exp_done(rnp)) {
++			raw_spin_unlock_irqrestore(&rnp->lock, flags);
+ 			break;
++		}
+ 		if (rnp->parent == NULL) {
++			raw_spin_unlock_irqrestore(&rnp->lock, flags);
+ 			wake_up(&sync_rcu_preempt_exp_wq);
+ 			break;
+ 		}
+@@ -707,7 +733,6 @@ static void rcu_report_exp_rnp(struct rc
+ 		raw_spin_lock(&rnp->lock); /* irqs already disabled */
+ 		rnp->expmask &= ~mask;
+ 	}
+-	raw_spin_unlock_irqrestore(&rnp->lock, flags);
+ }
+ 
+ /*
+@@ -1174,7 +1199,7 @@ static int rcu_boost(struct rcu_node *rn
+ 	t = container_of(tb, struct task_struct, rcu_node_entry);
+ 	rt_mutex_init_proxy_locked(&mtx, t);
+ 	t->rcu_boost_mutex = &mtx;
+-	t->rcu_read_unlock_special |= RCU_READ_UNLOCK_BOOSTED;
++	t->rcu_boosted = 1;
+ 	raw_spin_unlock_irqrestore(&rnp->lock, flags);
+ 	rt_mutex_lock(&mtx);  /* Side effect: boosts task t's priority. */
+ 	rt_mutex_unlock(&mtx);  /* Keep lockdep happy. */
+@@ -1532,7 +1557,7 @@ static int __cpuinit rcu_spawn_one_cpu_k
  	struct sched_param sp;
  	struct task_struct *t;
  
@@ -3436,7 +3661,7 @@
  	    per_cpu(rcu_cpu_kthread_task, cpu) != NULL)
  		return 0;
  	t = kthread_create(rcu_cpu_kthread, (void *)(long)cpu, "rcuc%d", cpu);
-@@ -1639,7 +1639,7 @@ static int __cpuinit rcu_spawn_one_node_
+@@ -1639,7 +1664,7 @@ static int __cpuinit rcu_spawn_one_node_
  	struct sched_param sp;
  	struct task_struct *t;
  
@@ -3445,7 +3670,7 @@
  	    rnp->qsmaskinit == 0)
  		return 0;
  	if (rnp->node_kthread_task == NULL) {
-@@ -1665,7 +1665,7 @@ static int __init rcu_spawn_kthreads(voi
+@@ -1665,7 +1690,7 @@ static int __init rcu_spawn_kthreads(voi
  	int cpu;
  	struct rcu_node *rnp;
  
@@ -3454,7 +3679,7 @@
  	for_each_possible_cpu(cpu) {
  		per_cpu(rcu_cpu_has_work, cpu) = 0;
  		if (cpu_online(cpu))
-@@ -1687,7 +1687,7 @@ static void __cpuinit rcu_prepare_kthrea
+@@ -1687,7 +1712,7 @@ static void __cpuinit rcu_prepare_kthrea
  	struct rcu_node *rnp = rdp->mynode;
  
  	/* Fire up the incoming CPU's kthread and leaf rcu_node kthread. */
@@ -3463,7 +3688,7 @@
  		(void)rcu_spawn_one_cpu_kthread(cpu);
  		if (rnp->node_kthread_task == NULL)
  			(void)rcu_spawn_one_node_kthread(rcu_state, rnp);
-@@ -1726,6 +1726,13 @@ static void rcu_cpu_kthread_setrt(int cp
+@@ -1726,6 +1751,13 @@ static void rcu_cpu_kthread_setrt(int cp
  {
  }
  
@@ -3479,7 +3704,413 @@
  }
 --- a/kernel/sched.c
 +++ b/kernel/sched.c
-@@ -7757,6 +7757,9 @@ static void init_cfs_rq(struct cfs_rq *c
+@@ -2544,13 +2544,9 @@ static int ttwu_remote(struct task_struc
+ }
+ 
+ #ifdef CONFIG_SMP
+-static void sched_ttwu_pending(void)
++static void sched_ttwu_do_pending(struct task_struct *list)
+ {
+ 	struct rq *rq = this_rq();
+-	struct task_struct *list = xchg(&rq->wake_list, NULL);
+-
+-	if (!list)
+-		return;
+ 
+ 	raw_spin_lock(&rq->lock);
+ 
+@@ -2563,9 +2559,45 @@ static void sched_ttwu_pending(void)
+ 	raw_spin_unlock(&rq->lock);
+ }
+ 
++#ifdef CONFIG_HOTPLUG_CPU
++
++static void sched_ttwu_pending(void)
++{
++	struct rq *rq = this_rq();
++	struct task_struct *list = xchg(&rq->wake_list, NULL);
++
++	if (!list)
++		return;
++
++	sched_ttwu_do_pending(list);
++}
++
++#endif /* CONFIG_HOTPLUG_CPU */
++
+ void scheduler_ipi(void)
+ {
+-	sched_ttwu_pending();
++	struct rq *rq = this_rq();
++	struct task_struct *list = xchg(&rq->wake_list, NULL);
++
++	if (!list)
++		return;
++
++	/*
++	 * Not all reschedule IPI handlers call irq_enter/irq_exit, since
++	 * traditionally all their work was done from the interrupt return
++	 * path. Now that we actually do some work, we need to make sure
++	 * we do call them.
++	 *
++	 * Some archs already do call them, luckily irq_enter/exit nest
++	 * properly.
++	 *
++	 * Arguably we should visit all archs and update all handlers,
++	 * however a fair share of IPIs are still resched only so this would
++	 * somewhat pessimize the simple resched case.
++	 */
++	irq_enter();
++	sched_ttwu_do_pending(list);
++	irq_exit();
+ }
+ 
+ static void ttwu_queue_remote(struct task_struct *p, int cpu)
+@@ -6557,7 +6589,7 @@ static int sched_domain_debug_one(struct
+ 			break;
+ 		}
+ 
+-		if (!group->cpu_power) {
++		if (!group->sgp->power) {
+ 			printk(KERN_CONT "\n");
+ 			printk(KERN_ERR "ERROR: domain->cpu_power not "
+ 					"set\n");
+@@ -6581,9 +6613,9 @@ static int sched_domain_debug_one(struct
+ 		cpulist_scnprintf(str, sizeof(str), sched_group_cpus(group));
+ 
+ 		printk(KERN_CONT " %s", str);
+-		if (group->cpu_power != SCHED_POWER_SCALE) {
++		if (group->sgp->power != SCHED_POWER_SCALE) {
+ 			printk(KERN_CONT " (cpu_power = %d)",
+-				group->cpu_power);
++				group->sgp->power);
+ 		}
+ 
+ 		group = group->next;
+@@ -6774,11 +6806,39 @@ static struct root_domain *alloc_rootdom
+ 	return rd;
+ }
+ 
++static void free_sched_groups(struct sched_group *sg, int free_sgp)
++{
++	struct sched_group *tmp, *first;
++
++	if (!sg)
++		return;
++
++	first = sg;
++	do {
++		tmp = sg->next;
++
++		if (free_sgp && atomic_dec_and_test(&sg->sgp->ref))
++			kfree(sg->sgp);
++
++		kfree(sg);
++		sg = tmp;
++	} while (sg != first);
++}
++
+ static void free_sched_domain(struct rcu_head *rcu)
+ {
+ 	struct sched_domain *sd = container_of(rcu, struct sched_domain, rcu);
+-	if (atomic_dec_and_test(&sd->groups->ref))
++
++	/*
++	 * If its an overlapping domain it has private groups, iterate and
++	 * nuke them all.
++	 */
++	if (sd->flags & SD_OVERLAP) {
++		free_sched_groups(sd->groups, 1);
++	} else if (atomic_dec_and_test(&sd->groups->ref)) {
++		kfree(sd->groups->sgp);
+ 		kfree(sd->groups);
++	}
+ 	kfree(sd);
+ }
+ 
+@@ -6945,6 +7005,7 @@ int sched_smt_power_savings = 0, sched_m
+ struct sd_data {
+ 	struct sched_domain **__percpu sd;
+ 	struct sched_group **__percpu sg;
++	struct sched_group_power **__percpu sgp;
+ };
+ 
+ struct s_data {
+@@ -6964,15 +7025,73 @@ struct sched_domain_topology_level;
+ typedef struct sched_domain *(*sched_domain_init_f)(struct sched_domain_topology_level *tl, int cpu);
+ typedef const struct cpumask *(*sched_domain_mask_f)(int cpu);
+ 
++#define SDTL_OVERLAP	0x01
++
+ struct sched_domain_topology_level {
+ 	sched_domain_init_f init;
+ 	sched_domain_mask_f mask;
++	int		    flags;
+ 	struct sd_data      data;
+ };
+ 
+-/*
+- * Assumes the sched_domain tree is fully constructed
+- */
++static int
++build_overlap_sched_groups(struct sched_domain *sd, int cpu)
++{
++	struct sched_group *first = NULL, *last = NULL, *groups = NULL, *sg;
++	const struct cpumask *span = sched_domain_span(sd);
++	struct cpumask *covered = sched_domains_tmpmask;
++	struct sd_data *sdd = sd->private;
++	struct sched_domain *child;
++	int i;
++
++	cpumask_clear(covered);
++
++	for_each_cpu(i, span) {
++		struct cpumask *sg_span;
++
++		if (cpumask_test_cpu(i, covered))
++			continue;
++
++		sg = kzalloc_node(sizeof(struct sched_group) + cpumask_size(),
++				GFP_KERNEL, cpu_to_node(i));
++
++		if (!sg)
++			goto fail;
++
++		sg_span = sched_group_cpus(sg);
++
++		child = *per_cpu_ptr(sdd->sd, i);
++		if (child->child) {
++			child = child->child;
++			cpumask_copy(sg_span, sched_domain_span(child));
++		} else
++			cpumask_set_cpu(i, sg_span);
++
++		cpumask_or(covered, covered, sg_span);
++
++		sg->sgp = *per_cpu_ptr(sdd->sgp, cpumask_first(sg_span));
++		atomic_inc(&sg->sgp->ref);
++
++		if (cpumask_test_cpu(cpu, sg_span))
++			groups = sg;
++
++		if (!first)
++			first = sg;
++		if (last)
++			last->next = sg;
++		last = sg;
++		last->next = first;
++	}
++	sd->groups = groups;
++
++	return 0;
++
++fail:
++	free_sched_groups(first, 0);
++
++	return -ENOMEM;
++}
++
+ static int get_group(int cpu, struct sd_data *sdd, struct sched_group **sg)
+ {
+ 	struct sched_domain *sd = *per_cpu_ptr(sdd->sd, cpu);
+@@ -6981,24 +7100,24 @@ static int get_group(int cpu, struct sd_
+ 	if (child)
+ 		cpu = cpumask_first(sched_domain_span(child));
+ 
+-	if (sg)
++	if (sg) {
+ 		*sg = *per_cpu_ptr(sdd->sg, cpu);
++		(*sg)->sgp = *per_cpu_ptr(sdd->sgp, cpu);
++		atomic_set(&(*sg)->sgp->ref, 1); /* for claim_allocations */
++	}
+ 
+ 	return cpu;
+ }
+ 
+ /*
+- * build_sched_groups takes the cpumask we wish to span, and a pointer
+- * to a function which identifies what group(along with sched group) a CPU
+- * belongs to. The return value of group_fn must be a >= 0 and < nr_cpu_ids
+- * (due to the fact that we keep track of groups covered with a struct cpumask).
+- *
+  * build_sched_groups will build a circular linked list of the groups
+  * covered by the given span, and will set each group's ->cpumask correctly,
+  * and ->cpu_power to 0.
++ *
++ * Assumes the sched_domain tree is fully constructed
+  */
+-static void
+-build_sched_groups(struct sched_domain *sd)
++static int
++build_sched_groups(struct sched_domain *sd, int cpu)
+ {
+ 	struct sched_group *first = NULL, *last = NULL;
+ 	struct sd_data *sdd = sd->private;
+@@ -7006,6 +7125,12 @@ build_sched_groups(struct sched_domain *
+ 	struct cpumask *covered;
+ 	int i;
+ 
++	get_group(cpu, sdd, &sd->groups);
++	atomic_inc(&sd->groups->ref);
++
++	if (cpu != cpumask_first(sched_domain_span(sd)))
++		return 0;
++
+ 	lockdep_assert_held(&sched_domains_mutex);
+ 	covered = sched_domains_tmpmask;
+ 
+@@ -7020,7 +7145,7 @@ build_sched_groups(struct sched_domain *
+ 			continue;
+ 
+ 		cpumask_clear(sched_group_cpus(sg));
+-		sg->cpu_power = 0;
++		sg->sgp->power = 0;
+ 
+ 		for_each_cpu(j, span) {
+ 			if (get_group(j, sdd, NULL) != group)
+@@ -7037,6 +7162,8 @@ build_sched_groups(struct sched_domain *
+ 		last = sg;
+ 	}
+ 	last->next = first;
++
++	return 0;
+ }
+ 
+ /*
+@@ -7051,12 +7178,17 @@ build_sched_groups(struct sched_domain *
+  */
+ static void init_sched_groups_power(int cpu, struct sched_domain *sd)
+ {
+-	WARN_ON(!sd || !sd->groups);
++	struct sched_group *sg = sd->groups;
+ 
+-	if (cpu != group_first_cpu(sd->groups))
+-		return;
++	WARN_ON(!sd || !sg);
+ 
+-	sd->groups->group_weight = cpumask_weight(sched_group_cpus(sd->groups));
++	do {
++		sg->group_weight = cpumask_weight(sched_group_cpus(sg));
++		sg = sg->next;
++	} while (sg != sd->groups);
++
++	if (cpu != group_first_cpu(sg))
++		return;
+ 
+ 	update_group_power(sd, cpu);
+ }
+@@ -7177,15 +7309,15 @@ static enum s_alloc __visit_domain_alloc
+ static void claim_allocations(int cpu, struct sched_domain *sd)
+ {
+ 	struct sd_data *sdd = sd->private;
+-	struct sched_group *sg = sd->groups;
+ 
+ 	WARN_ON_ONCE(*per_cpu_ptr(sdd->sd, cpu) != sd);
+ 	*per_cpu_ptr(sdd->sd, cpu) = NULL;
+ 
+-	if (cpu == cpumask_first(sched_group_cpus(sg))) {
+-		WARN_ON_ONCE(*per_cpu_ptr(sdd->sg, cpu) != sg);
++	if (atomic_read(&(*per_cpu_ptr(sdd->sg, cpu))->ref))
+ 		*per_cpu_ptr(sdd->sg, cpu) = NULL;
+-	}
++
++	if (atomic_read(&(*per_cpu_ptr(sdd->sgp, cpu))->ref))
++		*per_cpu_ptr(sdd->sgp, cpu) = NULL;
+ }
+ 
+ #ifdef CONFIG_SCHED_SMT
+@@ -7210,7 +7342,7 @@ static struct sched_domain_topology_leve
+ #endif
+ 	{ sd_init_CPU, cpu_cpu_mask, },
+ #ifdef CONFIG_NUMA
+-	{ sd_init_NODE, cpu_node_mask, },
++	{ sd_init_NODE, cpu_node_mask, SDTL_OVERLAP, },
+ 	{ sd_init_ALLNODES, cpu_allnodes_mask, },
+ #endif
+ 	{ NULL, },
+@@ -7234,9 +7366,14 @@ static int __sdt_alloc(const struct cpum
+ 		if (!sdd->sg)
+ 			return -ENOMEM;
+ 
++		sdd->sgp = alloc_percpu(struct sched_group_power *);
++		if (!sdd->sgp)
++			return -ENOMEM;
++
+ 		for_each_cpu(j, cpu_map) {
+ 			struct sched_domain *sd;
+ 			struct sched_group *sg;
++			struct sched_group_power *sgp;
+ 
+ 		       	sd = kzalloc_node(sizeof(struct sched_domain) + cpumask_size(),
+ 					GFP_KERNEL, cpu_to_node(j));
+@@ -7251,6 +7388,13 @@ static int __sdt_alloc(const struct cpum
+ 				return -ENOMEM;
+ 
+ 			*per_cpu_ptr(sdd->sg, j) = sg;
++
++			sgp = kzalloc_node(sizeof(struct sched_group_power),
++					GFP_KERNEL, cpu_to_node(j));
++			if (!sgp)
++				return -ENOMEM;
++
++			*per_cpu_ptr(sdd->sgp, j) = sgp;
+ 		}
+ 	}
+ 
+@@ -7266,11 +7410,15 @@ static void __sdt_free(const struct cpum
+ 		struct sd_data *sdd = &tl->data;
+ 
+ 		for_each_cpu(j, cpu_map) {
+-			kfree(*per_cpu_ptr(sdd->sd, j));
++			struct sched_domain *sd = *per_cpu_ptr(sdd->sd, j);
++			if (sd && (sd->flags & SD_OVERLAP))
++				free_sched_groups(sd->groups, 0);
+ 			kfree(*per_cpu_ptr(sdd->sg, j));
++			kfree(*per_cpu_ptr(sdd->sgp, j));
+ 		}
+ 		free_percpu(sdd->sd);
+ 		free_percpu(sdd->sg);
++		free_percpu(sdd->sgp);
+ 	}
+ }
+ 
+@@ -7316,8 +7464,13 @@ static int build_sched_domains(const str
+ 		struct sched_domain_topology_level *tl;
+ 
+ 		sd = NULL;
+-		for (tl = sched_domain_topology; tl->init; tl++)
++		for (tl = sched_domain_topology; tl->init; tl++) {
+ 			sd = build_sched_domain(tl, &d, cpu_map, attr, sd, i);
++			if (tl->flags & SDTL_OVERLAP || sched_feat(FORCE_SD_OVERLAP))
++				sd->flags |= SD_OVERLAP;
++			if (cpumask_equal(cpu_map, sched_domain_span(sd)))
++				break;
++		}
+ 
+ 		while (sd->child)
+ 			sd = sd->child;
+@@ -7329,13 +7482,13 @@ static int build_sched_domains(const str
+ 	for_each_cpu(i, cpu_map) {
+ 		for (sd = *per_cpu_ptr(d.sd, i); sd; sd = sd->parent) {
+ 			sd->span_weight = cpumask_weight(sched_domain_span(sd));
+-			get_group(i, sd->private, &sd->groups);
+-			atomic_inc(&sd->groups->ref);
+-
+-			if (i != cpumask_first(sched_domain_span(sd)))
+-				continue;
+-
+-			build_sched_groups(sd);
++			if (sd->flags & SD_OVERLAP) {
++				if (build_overlap_sched_groups(sd, i))
++					goto error;
++			} else {
++				if (build_sched_groups(sd, i))
++					goto error;
++			}
+ 		}
+ 	}
+ 
+@@ -7757,6 +7910,9 @@ static void init_cfs_rq(struct cfs_rq *c
  #endif
  #endif
  	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
@@ -3489,6 +4120,232 @@
  }
  
  static void init_rt_rq(struct rt_rq *rt_rq, struct rq *rq)
+--- a/kernel/sched_fair.c
++++ b/kernel/sched_fair.c
+@@ -1585,7 +1585,7 @@ find_idlest_group(struct sched_domain *s
+ 		}
+ 
+ 		/* Adjust by relative CPU power of the group */
+-		avg_load = (avg_load * SCHED_POWER_SCALE) / group->cpu_power;
++		avg_load = (avg_load * SCHED_POWER_SCALE) / group->sgp->power;
+ 
+ 		if (local_group) {
+ 			this_load = avg_load;
+@@ -2631,7 +2631,7 @@ static void update_cpu_power(struct sche
+ 		power >>= SCHED_POWER_SHIFT;
+ 	}
+ 
+-	sdg->cpu_power_orig = power;
++	sdg->sgp->power_orig = power;
+ 
+ 	if (sched_feat(ARCH_POWER))
+ 		power *= arch_scale_freq_power(sd, cpu);
+@@ -2647,7 +2647,7 @@ static void update_cpu_power(struct sche
+ 		power = 1;
+ 
+ 	cpu_rq(cpu)->cpu_power = power;
+-	sdg->cpu_power = power;
++	sdg->sgp->power = power;
+ }
+ 
+ static void update_group_power(struct sched_domain *sd, int cpu)
+@@ -2665,11 +2665,11 @@ static void update_group_power(struct sc
+ 
+ 	group = child->groups;
+ 	do {
+-		power += group->cpu_power;
++		power += group->sgp->power;
+ 		group = group->next;
+ 	} while (group != child->groups);
+ 
+-	sdg->cpu_power = power;
++	sdg->sgp->power = power;
+ }
+ 
+ /*
+@@ -2691,7 +2691,7 @@ fix_small_capacity(struct sched_domain *
+ 	/*
+ 	 * If ~90% of the cpu_power is still there, we're good.
+ 	 */
+-	if (group->cpu_power * 32 > group->cpu_power_orig * 29)
++	if (group->sgp->power * 32 > group->sgp->power_orig * 29)
+ 		return 1;
+ 
+ 	return 0;
+@@ -2771,7 +2771,7 @@ static inline void update_sg_lb_stats(st
+ 	}
+ 
+ 	/* Adjust by relative CPU power of the group */
+-	sgs->avg_load = (sgs->group_load*SCHED_POWER_SCALE) / group->cpu_power;
++	sgs->avg_load = (sgs->group_load*SCHED_POWER_SCALE) / group->sgp->power;
+ 
+ 	/*
+ 	 * Consider the group unbalanced when the imbalance is larger
+@@ -2788,7 +2788,7 @@ static inline void update_sg_lb_stats(st
+ 	if ((max_cpu_load - min_cpu_load) >= avg_load_per_task && max_nr_running > 1)
+ 		sgs->group_imb = 1;
+ 
+-	sgs->group_capacity = DIV_ROUND_CLOSEST(group->cpu_power,
++	sgs->group_capacity = DIV_ROUND_CLOSEST(group->sgp->power,
+ 						SCHED_POWER_SCALE);
+ 	if (!sgs->group_capacity)
+ 		sgs->group_capacity = fix_small_capacity(sd, group);
+@@ -2877,7 +2877,7 @@ static inline void update_sd_lb_stats(st
+ 			return;
+ 
+ 		sds->total_load += sgs.group_load;
+-		sds->total_pwr += sg->cpu_power;
++		sds->total_pwr += sg->sgp->power;
+ 
+ 		/*
+ 		 * In case the child domain prefers tasks go to siblings
+@@ -2962,7 +2962,7 @@ static int check_asym_packing(struct sch
+ 	if (this_cpu > busiest_cpu)
+ 		return 0;
+ 
+-	*imbalance = DIV_ROUND_CLOSEST(sds->max_load * sds->busiest->cpu_power,
++	*imbalance = DIV_ROUND_CLOSEST(sds->max_load * sds->busiest->sgp->power,
+ 				       SCHED_POWER_SCALE);
+ 	return 1;
+ }
+@@ -2993,7 +2993,7 @@ static inline void fix_small_imbalance(s
+ 
+ 	scaled_busy_load_per_task = sds->busiest_load_per_task
+ 					 * SCHED_POWER_SCALE;
+-	scaled_busy_load_per_task /= sds->busiest->cpu_power;
++	scaled_busy_load_per_task /= sds->busiest->sgp->power;
+ 
+ 	if (sds->max_load - sds->this_load + scaled_busy_load_per_task >=
+ 			(scaled_busy_load_per_task * imbn)) {
+@@ -3007,28 +3007,28 @@ static inline void fix_small_imbalance(s
+ 	 * moving them.
+ 	 */
+ 
+-	pwr_now += sds->busiest->cpu_power *
++	pwr_now += sds->busiest->sgp->power *
+ 			min(sds->busiest_load_per_task, sds->max_load);
+-	pwr_now += sds->this->cpu_power *
++	pwr_now += sds->this->sgp->power *
+ 			min(sds->this_load_per_task, sds->this_load);
+ 	pwr_now /= SCHED_POWER_SCALE;
+ 
+ 	/* Amount of load we'd subtract */
+ 	tmp = (sds->busiest_load_per_task * SCHED_POWER_SCALE) /
+-		sds->busiest->cpu_power;
++		sds->busiest->sgp->power;
+ 	if (sds->max_load > tmp)
+-		pwr_move += sds->busiest->cpu_power *
++		pwr_move += sds->busiest->sgp->power *
+ 			min(sds->busiest_load_per_task, sds->max_load - tmp);
+ 
+ 	/* Amount of load we'd add */
+-	if (sds->max_load * sds->busiest->cpu_power <
++	if (sds->max_load * sds->busiest->sgp->power <
+ 		sds->busiest_load_per_task * SCHED_POWER_SCALE)
+-		tmp = (sds->max_load * sds->busiest->cpu_power) /
+-			sds->this->cpu_power;
++		tmp = (sds->max_load * sds->busiest->sgp->power) /
++			sds->this->sgp->power;
+ 	else
+ 		tmp = (sds->busiest_load_per_task * SCHED_POWER_SCALE) /
+-			sds->this->cpu_power;
+-	pwr_move += sds->this->cpu_power *
++			sds->this->sgp->power;
++	pwr_move += sds->this->sgp->power *
+ 			min(sds->this_load_per_task, sds->this_load + tmp);
+ 	pwr_move /= SCHED_POWER_SCALE;
+ 
+@@ -3074,7 +3074,7 @@ static inline void calculate_imbalance(s
+ 
+ 		load_above_capacity *= (SCHED_LOAD_SCALE * SCHED_POWER_SCALE);
+ 
+-		load_above_capacity /= sds->busiest->cpu_power;
++		load_above_capacity /= sds->busiest->sgp->power;
+ 	}
+ 
+ 	/*
+@@ -3090,8 +3090,8 @@ static inline void calculate_imbalance(s
+ 	max_pull = min(sds->max_load - sds->avg_load, load_above_capacity);
+ 
+ 	/* How much load to actually move to equalise the imbalance */
+-	*imbalance = min(max_pull * sds->busiest->cpu_power,
+-		(sds->avg_load - sds->this_load) * sds->this->cpu_power)
++	*imbalance = min(max_pull * sds->busiest->sgp->power,
++		(sds->avg_load - sds->this_load) * sds->this->sgp->power)
+ 			/ SCHED_POWER_SCALE;
+ 
+ 	/*
+--- a/kernel/sched_features.h
++++ b/kernel/sched_features.h
+@@ -70,3 +70,5 @@ SCHED_FEAT(NONIRQ_POWER, 1)
+  * using the scheduler IPI. Reduces rq->lock contention/bounces.
+  */
+ SCHED_FEAT(TTWU_QUEUE, 1)
++
++SCHED_FEAT(FORCE_SD_OVERLAP, 0)
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -1178,18 +1178,25 @@ struct sighand_struct *__lock_task_sigha
+ {
+ 	struct sighand_struct *sighand;
+ 
+-	rcu_read_lock();
+ 	for (;;) {
++		local_irq_save(*flags);
++		rcu_read_lock();
+ 		sighand = rcu_dereference(tsk->sighand);
+-		if (unlikely(sighand == NULL))
++		if (unlikely(sighand == NULL)) {
++			rcu_read_unlock();
++			local_irq_restore(*flags);
+ 			break;
++		}
+ 
+-		spin_lock_irqsave(&sighand->siglock, *flags);
+-		if (likely(sighand == tsk->sighand))
++		spin_lock(&sighand->siglock);
++		if (likely(sighand == tsk->sighand)) {
++			rcu_read_unlock();
+ 			break;
+-		spin_unlock_irqrestore(&sighand->siglock, *flags);
++		}
++		spin_unlock(&sighand->siglock);
++		rcu_read_unlock();
++		local_irq_restore(*flags);
+ 	}
+-	rcu_read_unlock();
+ 
+ 	return sighand;
+ }
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -315,16 +315,24 @@ static inline void invoke_softirq(void)
+ {
+ 	if (!force_irqthreads)
+ 		__do_softirq();
+-	else
++	else {
++		__local_bh_disable((unsigned long)__builtin_return_address(0),
++				SOFTIRQ_OFFSET);
+ 		wakeup_softirqd();
++		__local_bh_enable(SOFTIRQ_OFFSET);
++	}
+ }
+ #else
+ static inline void invoke_softirq(void)
+ {
+ 	if (!force_irqthreads)
+ 		do_softirq();
+-	else
++	else {
++		__local_bh_disable((unsigned long)__builtin_return_address(0),
++				SOFTIRQ_OFFSET);
+ 		wakeup_softirqd();
++		__local_bh_enable(SOFTIRQ_OFFSET);
++	}
+ }
+ #endif
+ 
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -2310,7 +2310,8 @@ static bool pgdat_balanced(pg_data_t *pg
