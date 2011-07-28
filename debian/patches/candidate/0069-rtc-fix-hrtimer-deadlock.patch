@@ -1,0 +1,126 @@
+From 64f4e764a3b9fc9d58e30f763789e6b8716dc3f9 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Tue, 26 Jul 2011 16:08:20 -0700
+Subject: [PATCH 69/71] rtc: fix hrtimer deadlock
+
+Ben reported a lockup related to rtc. The lockup happens due to:
+
+CPU0                                        CPU1
+
+rtc_irq_set_state()			    __run_hrtimer()
+  spin_lock_irqsave(&rtc->irq_task_lock)    rtc_handle_legacy_irq();
+					      spin_lock(&rtc->irq_task_lock);
+  hrtimer_cancel()
+    while (callback_running);
+
+So the running callback never finishes as it's blocked on
+rtc->irq_task_lock.
+
+Use hrtimer_try_to_cancel() instead and drop rtc->irq_task_lock while
+waiting for the callback.  Fix this for both rtc_irq_set_state() and
+rtc_irq_set_freq().
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reported-by: Ben Greear <greearb@candelatech.com>
+Cc: John Stultz <john.stultz@linaro.org>
+Cc: Ingo Molnar <mingo@elte.hu>
+Cc: <stable@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Conflicts:
+
+	drivers/rtc/interface.c
+---
+ drivers/rtc/interface.c |   53 ++++++++++++++++++++++++++++++++--------------
+ 1 files changed, 37 insertions(+), 16 deletions(-)
+
+--- a/drivers/rtc/interface.c
++++ b/drivers/rtc/interface.c
+@@ -636,6 +636,29 @@ void rtc_irq_unregister(struct rtc_devic
+ }
+ EXPORT_SYMBOL_GPL(rtc_irq_unregister);
+ 
++static int rtc_update_hrtimer(struct rtc_device *rtc, int enabled)
++{
++	/*
++	 * We unconditionally cancel the timer here, because otherwise
++	 * we could run into BUG_ON(timer->state != HRTIMER_STATE_CALLBACK);
++	 * when we manage to start the timer before the callback
++	 * returns HRTIMER_RESTART.
++	 *
++	 * We cannot use hrtimer_cancel() here as a running callback
++	 * could be blocked on rtc->irq_task_lock and hrtimer_cancel()
++	 * would spin forever.
++	 */
++	if (hrtimer_try_to_cancel(&rtc->pie_timer) < 0)
++		return -1;
++
++	if (enabled) {
++		ktime_t period = ktime_set(0, NSEC_PER_SEC / rtc->irq_freq);
++
++		hrtimer_start(&rtc->pie_timer, period, HRTIMER_MODE_REL);
++	}
++	return 0;
++}
++
+ /**
+  * rtc_irq_set_state - enable/disable 2^N Hz periodic IRQs
+  * @rtc: the rtc device
+@@ -651,21 +674,21 @@ int rtc_irq_set_state(struct rtc_device
+ 	int err = 0;
+ 	unsigned long flags;
+ 
++retry:
+ 	spin_lock_irqsave(&rtc->irq_task_lock, flags);
+ 	if (rtc->irq_task != NULL && task == NULL)
+ 		err = -EBUSY;
+ 	if (rtc->irq_task != task)
+ 		err = -EACCES;
+-
+-	if (enabled) {
+-		ktime_t period = ktime_set(0, NSEC_PER_SEC/rtc->irq_freq);
+-		hrtimer_start(&rtc->pie_timer, period, HRTIMER_MODE_REL);
+-	} else {
+-		hrtimer_cancel(&rtc->pie_timer);
++	if (!err) {
++		if (rtc_update_hrtimer(rtc, enabled) < 0) {
++			spin_unlock_irqrestore(&rtc->irq_task_lock, flags);
++			cpu_relax();
++			goto retry;
++		}
++		rtc->pie_enabled = enabled;
+ 	}
+-	rtc->pie_enabled = enabled;
+ 	spin_unlock_irqrestore(&rtc->irq_task_lock, flags);
+-
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(rtc_irq_set_state);
+@@ -687,20 +710,18 @@ int rtc_irq_set_freq(struct rtc_device *
+ 
+ 	if (freq <= 0 || freq > 5000)
+ 		return -EINVAL;
+-
++retry:
+ 	spin_lock_irqsave(&rtc->irq_task_lock, flags);
+ 	if (rtc->irq_task != NULL && task == NULL)
+ 		err = -EBUSY;
+ 	if (rtc->irq_task != task)
+ 		err = -EACCES;
+-	if (err == 0) {
++	if (!err) {
+ 		rtc->irq_freq = freq;
+-		if (rtc->pie_enabled) {
+-			ktime_t period;
+-			hrtimer_cancel(&rtc->pie_timer);
+-			period = ktime_set(0, NSEC_PER_SEC/rtc->irq_freq);
+-			hrtimer_start(&rtc->pie_timer, period,
+-					HRTIMER_MODE_REL);
++		if (rtc->pie_enabled && rtc_update_hrtimer(rtc, 1) < 0) {
++			spin_unlock_irqrestore(&rtc->irq_task_lock, flags);
++			cpu_relax();
++			goto retry;
+ 		}
+ 	}
+ 	spin_unlock_irqrestore(&rtc->irq_task_lock, flags);
