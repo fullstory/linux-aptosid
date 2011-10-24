@@ -7442,7 +7442,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/dir.c
-@@ -0,0 +1,624 @@
+@@ -0,0 +1,627 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -7766,16 +7766,18 @@
 +/*
 + * @file may be NULL
 + */
-+static int aufs_fsync_dir(struct file *file, int datasync)
++static int aufs_fsync_dir(struct file *file, loff_t start, loff_t end,
++			  int datasync)
 +{
 +	int err;
 +	struct dentry *dentry;
 +	struct super_block *sb;
-+
-+	dentry = file->f_dentry;
-+	IMustLock(dentry->d_inode);
++	struct mutex *mtx;
 +
 +	err = 0;
++	dentry = file->f_dentry;
++	mtx = &dentry->d_inode->i_mutex;
++	mutex_lock(mtx);
 +	sb = dentry->d_sb;
 +	si_noflush_read_lock(sb);
 +	if (file)
@@ -7790,6 +7792,7 @@
 +		fi_write_unlock(file);
 +
 +	si_read_unlock(sb);
++	mutex_unlock(mtx);
 +	return err;
 +}
 +
@@ -10618,7 +10621,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/f_op.c
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,711 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -11155,7 +11158,8 @@
 +
 +/* ---------------------------------------------------------------------- */
 +
-+static int aufs_fsync_nondir(struct file *file, int datasync)
++static int aufs_fsync_nondir(struct file *file, loff_t start, loff_t end,
++			     int datasync)
 +{
 +	int err;
 +	struct au_pin pin;
@@ -11166,14 +11170,8 @@
 +
 +	dentry = file->f_dentry;
 +	inode = dentry->d_inode;
-+	IMustLock(file->f_mapping->host);
-+	if (inode != file->f_mapping->host) {
-+		mutex_unlock(&file->f_mapping->host->i_mutex);
-+		mutex_lock(&inode->i_mutex);
-+	}
-+	IMustLock(inode);
-+
 +	sb = dentry->d_sb;
++	mutex_lock(&inode->i_mutex);
 +	err = si_read_lock(sb, AuLock_FLUSH | AuLock_NOPLM);
 +	if (unlikely(err))
 +		goto out;
@@ -11202,10 +11200,7 @@
 +out_si:
 +	si_read_unlock(sb);
 +out:
-+	if (inode != file->f_mapping->host) {
-+		mutex_unlock(&inode->i_mutex);
-+		mutex_lock(&file->f_mapping->host->i_mutex);
-+	}
++	mutex_unlock(&inode->i_mutex);
 +	return err;
 +}
 +
@@ -15343,7 +15338,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/i_op.c
-@@ -0,0 +1,976 @@
+@@ -0,0 +1,974 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -15374,7 +15369,7 @@
 +#include <linux/uaccess.h>
 +#include "aufs.h"
 +
-+static int h_permission(struct inode *h_inode, int mask, unsigned int flags,
++static int h_permission(struct inode *h_inode, int mask,
 +			struct vfsmount *h_mnt, int brperm)
 +{
 +	int err;
@@ -15398,11 +15393,10 @@
 +		&& write_mask && !(mask & MAY_READ))
 +	    || !h_inode->i_op->permission) {
 +		/* AuLabel(generic_permission); */
-+		err = generic_permission(h_inode, mask, flags,
-+					 h_inode->i_op->check_acl);
++		err = generic_permission(h_inode, mask);
 +	} else {
 +		/* AuLabel(h_inode->permission); */
-+		err = h_inode->i_op->permission(h_inode, mask, flags);
++		err = h_inode->i_op->permission(h_inode, mask);
 +		AuTraceErr(err);
 +	}
 +
@@ -15428,7 +15422,7 @@
 +	return err;
 +}
 +
-+static int aufs_permission(struct inode *inode, int mask, unsigned int flags)
++static int aufs_permission(struct inode *inode, int mask)
 +{
 +	int err;
 +	aufs_bindex_t bindex, bend;
@@ -15439,7 +15433,7 @@
 +	struct au_branch *br;
 +
 +	/* todo: support rcu-walk? */
-+	if (flags & IPERM_FLAG_RCU)
++	if (mask & MAY_NOT_BLOCK)
 +		return -ECHILD;
 +
 +	sb = inode->i_sb;
@@ -15462,8 +15456,7 @@
 +		err = 0;
 +		bindex = au_ibstart(inode);
 +		br = au_sbr(sb, bindex);
-+		err = h_permission(h_inode, mask, flags, br->br_mnt,
-+				   br->br_perm);
++		err = h_permission(h_inode, mask, br->br_mnt, br->br_perm);
 +		if (write_mask
 +		    && !err
 +		    && !special_file(h_inode->i_mode)) {
@@ -15489,7 +15482,7 @@
 +				break;
 +
 +			br = au_sbr(sb, bindex);
-+			err = h_permission(h_inode, mask, flags, br->br_mnt,
++			err = h_permission(h_inode, mask, br->br_mnt,
 +					   br->br_perm);
 +		}
 +	}
@@ -18316,7 +18309,7 @@
 +aufs-$(CONFIG_AUFS_MAGIC_SYSRQ) += sysrq.o
 --- /dev/null
 +++ b/fs/aufs/module.c
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,193 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -18397,6 +18390,10 @@
 +int au_dir_roflags;
 +
 +#ifdef CONFIG_AUFS_SBILIST
++/*
++ * iterate_supers_type() doesn't protect us from
++ * remounting (branch management)
++ */
 +struct au_splhead au_sbilist;
 +#endif
 +
@@ -22157,7 +22154,7 @@
 +#endif /* __AUFS_SPL_H__ */
 --- /dev/null
 +++ b/fs/aufs/super.c
-@@ -0,0 +1,930 @@
+@@ -0,0 +1,931 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -23072,6 +23069,7 @@
 +		if (au_opt_test(sbinfo->si_mntflags, PLINK))
 +			au_plink_put(sb, /*verbose*/1);
 +		au_xino_clr(sb);
++		sbinfo->si_sb = NULL;
 +		aufs_write_unlock(sb->s_root);
 +		au_nwt_flush(&sbinfo->si_nowait);
 +	}
@@ -29734,7 +29732,7 @@
 +#include <linux/limits.h>
 +#include <linux/types.h>
 +
-+#define AUFS_VERSION	"3.0-20110919"
++#define AUFS_VERSION	"3.x-rcN-20111010"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
@@ -29921,7 +29919,7 @@
 +#endif /* __AUFS_TYPE_H__ */
 --- a/include/linux/Kbuild
 +++ b/include/linux/Kbuild
-@@ -399,3 +399,4 @@ header-y += wireless.h
+@@ -400,3 +400,4 @@ header-y += wireless.h
  header-y += x25.h
  header-y += xattr.h
  header-y += xfrm.h
