@@ -2586,7 +2586,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/branch.h
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,232 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -2684,30 +2684,29 @@
 +
 +/* ---------------------------------------------------------------------- */
 +
-+/* branch permission and attribute */
-+enum {
-+	AuBrPerm_RW,		/* writable, linkable wh */
-+	AuBrPerm_RO,		/* readonly, no wh */
-+	AuBrPerm_RR,		/* natively readonly, no wh */
++/* branch permissions and attributes */
++#define AuBrPerm_RW		1		/* writable, hardlinkable wh */
++#define AuBrPerm_RO		(1 << 1)	/* readonly */
++#define AuBrPerm_RR		(1 << 2)	/* natively readonly */
++#define AuBrPerm_Mask		(AuBrPerm_RW | AuBrPerm_RO | AuBrPerm_RR)
 +
-+	AuBrPerm_RWNoLinkWH,	/* un-linkable whiteouts */
++#define AuBrRAttr_WH		(1 << 3)	/* whiteout-able */
 +
-+	AuBrPerm_ROWH,		/* whiteout-able */
-+	AuBrPerm_RRWH,		/* whiteout-able */
-+
-+	AuBrPerm_Last
-+};
++#define AuBrWAttr_NoLinkWH	(1 << 4)	/* un-hardlinkable whiteouts */
 +
 +static inline int au_br_writable(int brperm)
 +{
-+	return brperm == AuBrPerm_RW || brperm == AuBrPerm_RWNoLinkWH;
++	return brperm & AuBrPerm_RW;
 +}
 +
 +static inline int au_br_whable(int brperm)
 +{
-+	return brperm == AuBrPerm_RW
-+		|| brperm == AuBrPerm_ROWH
-+		|| brperm == AuBrPerm_RRWH;
++	return brperm & (AuBrPerm_RW | AuBrRAttr_WH);
++}
++
++static inline int au_br_wh_linkable(int brperm)
++{
++	return !(brperm & AuBrWAttr_NoLinkWH);
 +}
 +
 +static inline int au_br_rdonly(struct au_branch *br)
@@ -2720,7 +2719,7 @@
 +static inline int au_br_hnotifyable(int brperm __maybe_unused)
 +{
 +#ifdef CONFIG_AUFS_HNOTIFY
-+	return brperm != AuBrPerm_RR && brperm != AuBrPerm_RRWH;
++	return !(brperm & AuBrPerm_RR);
 +#else
 +	return 0;
 +#endif
@@ -4768,7 +4767,7 @@
 +#endif /* __AUFS_DCSUB_H__ */
 --- /dev/null
 +++ b/fs/aufs/debug.c
-@@ -0,0 +1,486 @@
+@@ -0,0 +1,490 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -5035,11 +5034,11 @@
 +	if (!sb || IS_ERR(sb))
 +		goto out;
 +
-+	dpri("s%d: {perm 0x%x, cnt %d, wbr %p}, "
++	dpri("s%d: {perm 0x%x, id %d, cnt %d, wbr %p}, "
 +	     "%s, dev 0x%02x%02x, flags 0x%lx, cnt %d, active %d, "
 +	     "xino %d\n",
-+	     bindex, br->br_perm, atomic_read(&br->br_count), br->br_wbr,
-+	     au_sbtype(sb), MAJOR(sb->s_dev), MINOR(sb->s_dev),
++	     bindex, br->br_perm, br->br_id, atomic_read(&br->br_count),
++	     br->br_wbr, au_sbtype(sb), MAJOR(sb->s_dev), MINOR(sb->s_dev),
 +	     sb->s_flags, sb->s_count,
 +	     atomic_read(&sb->s_active), !!br->br_xino.xi_file);
 +	return 0;
@@ -5208,7 +5207,11 @@
 +{
 +	if (au_wkq_test()) {
 +		au_dbg_blocked();
-+		WARN_ON(1);
++		/*
++		 * It may be recursive, but udba=notify between two aufs mounts,
++		 * where a single ro branch is shared, is not a problem.
++		 */
++		/* WARN_ON(1); */
 +	}
 +}
 +
@@ -14463,7 +14466,7 @@
 +#endif /* __AUFS_INODE_H__ */
 --- /dev/null
 +++ b/fs/aufs/ioctl.c
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,197 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -14491,46 +14494,84 @@
 +#include <linux/file.h>
 +#include "aufs.h"
 +
-+static int au_wbr_fd(struct path *path)
++static int au_wbr_fd(struct path *path, struct aufs_wbr_fd __user *arg)
 +{
 +	int err, fd;
 +	aufs_bindex_t wbi, bindex, bend;
 +	struct file *h_file;
 +	struct super_block *sb;
 +	struct dentry *root;
-+	struct au_branch *wbr;
++	struct au_branch *br;
++	struct aufs_wbr_fd wbrfd = {
++		.oflags	= au_dir_roflags,
++		.brid	= -1
++	};
++	const int valid = O_RDONLY | O_NONBLOCK | O_LARGEFILE | O_DIRECTORY
++		| O_NOATIME | O_CLOEXEC;
 +
-+	err = get_unused_fd();
-+	if (unlikely(err < 0))
++	AuDebugOn(wbrfd.oflags & ~valid);
++
++	if (arg) {
++		err = copy_from_user(&wbrfd, arg, sizeof(wbrfd));
++		if (unlikely(err)) {
++			err = -EFAULT;
++			goto out;
++		}
++
++		err = -EINVAL;
++		AuDbg("wbrfd{0%o, %d}\n", wbrfd.oflags, wbrfd.brid);
++		wbrfd.oflags |= au_dir_roflags;
++		AuDbg("0%o\n", wbrfd.oflags);
++		if (unlikely(wbrfd.oflags & ~valid))
++			goto out;
++	}
++
++	fd = get_unused_fd();
++	err = fd;
++	if (unlikely(fd < 0))
 +		goto out;
-+	fd = err;
 +
++	h_file = ERR_PTR(-EINVAL);
 +	wbi = 0;
++	br = NULL;
 +	sb = path->dentry->d_sb;
 +	root = sb->s_root;
 +	aufs_read_lock(root, AuLock_IR);
-+	wbr = au_sbr(sb, wbi);
-+	if (!(path->mnt->mnt_flags & MNT_READONLY)
-+	    && !au_br_writable(wbr->br_perm)) {
-+		bend = au_sbend(sb);
-+		for (bindex = 1; bindex <= bend; bindex++) {
-+			wbr = au_sbr(sb, bindex);
-+			if (au_br_writable(wbr->br_perm)) {
++	bend = au_sbend(sb);
++	if (wbrfd.brid >= 0) {
++		wbi = au_br_index(sb, wbrfd.brid);
++		if (unlikely(wbi < 0 || wbi > bend))
++			goto out_unlock;
++	}
++
++	h_file = ERR_PTR(-ENOENT);
++	br = au_sbr(sb, wbi);
++	if (!au_br_writable(br->br_perm)) {
++		if (arg)
++			goto out_unlock;
++
++		bindex = wbi + 1;
++		wbi = -1;
++		for (; bindex <= bend; bindex++) {
++			br = au_sbr(sb, bindex);
++			if (au_br_writable(br->br_perm)) {
 +				wbi = bindex;
++				br = au_sbr(sb, wbi);
 +				break;
 +			}
 +		}
-+		wbr = au_sbr(sb, wbi);
 +	}
 +	AuDbg("wbi %d\n", wbi);
-+	h_file = au_h_open(root, wbi, O_RDONLY | O_DIRECTORY | O_LARGEFILE,
-+			   NULL);
++	if (wbi >= 0)
++		h_file = au_h_open(root, wbi, wbrfd.oflags, NULL);
++
++out_unlock:
 +	aufs_read_unlock(root, AuLock_IR);
 +	err = PTR_ERR(h_file);
 +	if (IS_ERR(h_file))
 +		goto out_fd;
 +
-+	atomic_dec(&wbr->br_count); /* cf. au_h_open() */
++	atomic_dec(&br->br_count); /* cf. au_h_open() */
 +	fd_install(fd, h_file);
 +	err = fd;
 +	goto out; /* success */
@@ -14538,6 +14579,7 @@
 +out_fd:
 +	put_unused_fd(fd);
 +out:
++	AuTraceErr(err);
 +	return err;
 +}
 +
@@ -14554,7 +14596,7 @@
 +		break;
 +
 +	case AUFS_CTL_WBR_FD:
-+		err = au_wbr_fd(&file->f_path);
++		err = au_wbr_fd(&file->f_path, (void __user *)arg);
 +		break;
 +
 +	case AUFS_CTL_IBUSY:
@@ -14577,7 +14619,7 @@
 +
 +	switch (cmd) {
 +	case AUFS_CTL_WBR_FD:
-+		err = au_wbr_fd(&file->f_path);
++		err = au_wbr_fd(&file->f_path, (void __user *)arg);
 +		break;
 +
 +	default:
@@ -15005,7 +15047,7 @@
 +		err = PTR_ERR(h_file);
 +		h_file = NULL;
 +	} else
-+		err = au_sio_cpup_simple(src_dentry, a->bdst, a->bsrc,
++		err = au_sio_cpup_simple(src_dentry, a->bdst, -1,
 +					 AuCpup_DTIME /* | AuCpup_KEEPLINO */);
 +	mutex_unlock(h_mtx);
 +	au_h_open_post(src_dentry, a->bsrc, h_file);
@@ -18599,7 +18641,7 @@
 +#endif /* __AUFS_MODULE_H__ */
 --- /dev/null
 +++ b/fs/aufs/opts.c
-@@ -0,0 +1,1595 @@
+@@ -0,0 +1,1679 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -18783,31 +18825,127 @@
 +
 +/* ---------------------------------------------------------------------- */
 +
-+static match_table_t brperms = {
++static match_table_t brperm = {
 +	{AuBrPerm_RO, AUFS_BRPERM_RO},
 +	{AuBrPerm_RR, AUFS_BRPERM_RR},
 +	{AuBrPerm_RW, AUFS_BRPERM_RW},
-+
-+	{AuBrPerm_ROWH, AUFS_BRPERM_ROWH},
-+	{AuBrPerm_RRWH, AUFS_BRPERM_RRWH},
-+	{AuBrPerm_RWNoLinkWH, AUFS_BRPERM_RWNLWH},
-+
-+	{AuBrPerm_ROWH, "nfsro"},
-+	{AuBrPerm_RO, NULL}
++	{0, NULL}
 +};
++
++static match_table_t brrattr = {
++	{AuBrRAttr_WH, AUFS_BRRATTR_WH},
++	{0, NULL}
++};
++
++static match_table_t brwattr = {
++	{AuBrWAttr_NoLinkWH, AUFS_BRWATTR_NLWH},
++	{0, NULL}
++};
++
++#define AuBrStr_LONGEST	AUFS_BRPERM_RW "+" AUFS_BRWATTR_NLWH
++
++static int br_attr_val(char *str, match_table_t table, substring_t args[])
++{
++	int attr, v;
++	char *p;
++
++	attr = 0;
++	do {
++		p = strchr(str, '+');
++		if (p)
++			*p = 0;
++		v = match_token(str, table, args);
++		if (v)
++			attr |= v;
++		else {
++			if (p)
++				*p = '+';
++			pr_warning("ignored branch attribute %s\n", str);
++			break;
++		}
++		if (p)
++			str = p + 1;
++	} while (p);
++
++	return attr;
++}
 +
 +static int noinline_for_stack br_perm_val(char *perm)
 +{
 +	int val;
++	char *p;
 +	substring_t args[MAX_OPT_ARGS];
 +
-+	val = match_token(perm, brperms, args);
++	p = strchr(perm, '+');
++	if (p)
++		*p = 0;
++	val = match_token(perm, brperm, args);
++	if (!val) {
++		if (p)
++			*p = '+';
++		pr_warning("ignored branch permission %s\n", perm);
++		val = AuBrPerm_RO;
++		goto out;
++	}
++	if (!p)
++		goto out;
++
++	switch (val) {
++	case AuBrPerm_RO:
++	case AuBrPerm_RR:
++		val |= br_attr_val(p + 1, brrattr, args);
++		break;
++	case AuBrPerm_RW:
++		val |= br_attr_val(p + 1, brwattr, args);
++		break;
++	}
++
++out:
 +	return val;
 +}
 +
-+const char *au_optstr_br_perm(int brperm)
++/* Caller should free the return value */
++char *au_optstr_br_perm(int brperm)
 +{
-+	return au_parser_pattern(brperm, (void *)brperms);
++	char *p, a[sizeof(AuBrStr_LONGEST)];
++	int sz;
++
++#define SetPerm(str) do {			\
++		sz = sizeof(str);		\
++		memcpy(a, str, sz);		\
++		p = a + sz - 1;			\
++	} while (0)
++
++#define AppendAttr(flag, str) do {			\
++		if (brperm & flag) {		\
++			sz = sizeof(str);	\
++			*p++ = '+';		\
++			memcpy(p, str, sz);	\
++			p += sz - 1;		\
++		}				\
++	} while (0)
++
++	switch (brperm & AuBrPerm_Mask) {
++	case AuBrPerm_RO:
++		SetPerm(AUFS_BRPERM_RO);
++		break;
++	case AuBrPerm_RR:
++		SetPerm(AUFS_BRPERM_RR);
++		break;
++	case AuBrPerm_RW:
++		SetPerm(AUFS_BRPERM_RW);
++		break;
++	default:
++		AuDebugOn(1);
++	}
++
++	AppendAttr(AuBrRAttr_WH, AUFS_BRRATTR_WH);
++	AppendAttr(AuBrWAttr_NoLinkWH, AUFS_BRWATTR_NLWH);
++
++	AuDebugOn(strlen(a) >= sizeof(a));
++	return kstrdup(a, GFP_NOFS);
++#undef SetPerm
++#undef AppendAttr
 +}
 +
 +/* ---------------------------------------------------------------------- */
@@ -19198,7 +19336,7 @@
 +	char *p;
 +
 +	add->bindex = bindex;
-+	add->perm = AuBrPerm_Last;
++	add->perm = AuBrPerm_RO;
 +	add->pathname = opt_str;
 +	p = strchr(opt_str, '=');
 +	if (p) {
@@ -19991,19 +20129,13 @@
 +		if (wbr)
 +			wbr_wh_read_lock(wbr);
 +
-+		switch (br->br_perm) {
-+		case AuBrPerm_RO:
-+		case AuBrPerm_ROWH:
-+		case AuBrPerm_RR:
-+		case AuBrPerm_RRWH:
++		if (!au_br_writable(br->br_perm)) {
 +			do_free = !!wbr;
 +			skip = (!wbr
 +				|| (!wbr->wbr_whbase
 +				    && !wbr->wbr_plink
 +				    && !wbr->wbr_orph));
-+			break;
-+
-+		case AuBrPerm_RWNoLinkWH:
++		} else if (!au_br_wh_linkable(br->br_perm)) {
 +			/* skip = (!br->br_whbase && !br->br_orph); */
 +			skip = (!wbr || !wbr->wbr_whbase);
 +			if (skip && wbr) {
@@ -20012,9 +20144,7 @@
 +				else
 +					skip = !wbr->wbr_plink;
 +			}
-+			break;
-+
-+		case AuBrPerm_RW:
++		} else {
 +			/* skip = (br->br_whbase && br->br_ohph); */
 +			skip = (wbr && wbr->wbr_whbase);
 +			if (skip) {
@@ -20023,10 +20153,6 @@
 +				else
 +					skip = !wbr->wbr_plink;
 +			}
-+			break;
-+
-+		default:
-+			BUG();
 +		}
 +		if (wbr)
 +			wbr_wh_read_unlock(wbr);
@@ -20390,7 +20516,7 @@
 +
 +/* ---------------------------------------------------------------------- */
 +
-+const char *au_optstr_br_perm(int brperm);
++char *au_optstr_br_perm(int brperm);
 +const char *au_optstr_udba(int udba);
 +const char *au_optstr_wbr_copyup(int wbr_copyup);
 +const char *au_optstr_wbr_create(int wbr_create);
@@ -22154,7 +22280,7 @@
 +#endif /* __AUFS_SPL_H__ */
 --- /dev/null
 +++ b/fs/aufs/super.c
-@@ -0,0 +1,931 @@
+@@ -0,0 +1,939 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -22255,6 +22381,7 @@
 +	struct path path;
 +	struct au_hdentry *hdp;
 +	struct au_branch *br;
++	char *perm;
 +
 +	err = 0;
 +	bend = au_sbend(sb);
@@ -22264,9 +22391,16 @@
 +		path.mnt = br->br_mnt;
 +		path.dentry = hdp[bindex].hd_dentry;
 +		err = au_seq_path(seq, &path);
-+		if (err > 0)
-+			err = seq_printf(seq, "=%s",
-+					 au_optstr_br_perm(br->br_perm));
++		if (err > 0) {
++			perm = au_optstr_br_perm(br->br_perm);
++			if (perm) {
++				err = seq_printf(seq, "=%s", perm);
++				kfree(perm);
++				if (err == -1)
++					err = -E2BIG;
++			} else
++				err = -ENOMEM;
++		}
 +		if (!err && bindex != bend)
 +			err = seq_putc(seq, ':');
 +	}
@@ -23856,7 +23990,7 @@
 +#endif /* __SYSAUFS_H__ */
 --- /dev/null
 +++ b/fs/aufs/sysfs.c
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,260 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -23942,12 +24076,15 @@
 +static int sysaufs_si_br(struct seq_file *seq, struct super_block *sb,
 +			 aufs_bindex_t bindex)
 +{
++	int err;
 +	struct path path;
 +	struct dentry *root;
 +	struct au_branch *br;
++	char *perm;
 +
 +	AuDbg("b%d\n", bindex);
 +
++	err = 0;
 +	root = sb->s_root;
 +	di_read_lock_parent(root, !AuLock_IR);
 +	br = au_sbr(sb, bindex);
@@ -23955,8 +24092,15 @@
 +	path.dentry = au_h_dptr(root, bindex);
 +	au_seq_path(seq, &path);
 +	di_read_unlock(root, !AuLock_IR);
-+	seq_printf(seq, "=%s\n", au_optstr_br_perm(br->br_perm));
-+	return 0;
++	perm = au_optstr_br_perm(br->br_perm);
++	if (perm) {
++		err = seq_printf(seq, "=%s\n", perm);
++		kfree(perm);
++		if (err == -1)
++			err = -E2BIG;
++	} else
++		err = -ENOMEM;
++	return err;
 +}
 +
 +/* ---------------------------------------------------------------------- */
@@ -26929,7 +27073,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/whout.c
-@@ -0,0 +1,1062 @@
+@@ -0,0 +1,1050 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -27434,33 +27578,21 @@
 +		}
 +
 +	err = 0;
-+	switch (br->br_perm) {
-+	case AuBrPerm_RO:
-+	case AuBrPerm_ROWH:
-+	case AuBrPerm_RR:
-+	case AuBrPerm_RRWH:
++	if (!au_br_writable(br->br_perm)) {
 +		h_dir = h_root->d_inode;
 +		au_wh_init_ro(h_dir, base, &path);
-+		break;
-+
-+	case AuBrPerm_RWNoLinkWH:
++	} else if (!au_br_wh_linkable(br->br_perm)) {
 +		err = au_wh_init_rw_nolink(h_root, wbr, do_plink, base, &path);
 +		if (err > 0)
 +			goto out;
 +		else if (err)
 +			goto out_err;
-+		break;
-+
-+	case AuBrPerm_RW:
++	} else {
 +		err = au_wh_init_rw(h_root, wbr, do_plink, base, &path);
 +		if (err > 0)
 +			goto out;
 +		else if (err)
 +			goto out_err;
-+		break;
-+
-+	default:
-+		BUG();
 +	}
 +	goto out; /* success */
 +
@@ -29705,7 +29837,7 @@
 +}
 --- /dev/null
 +++ b/include/linux/aufs_type.h
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,220 @@
 +/*
 + * Copyright (C) 2005-2011 Junjiro R. Okajima
 + *
@@ -29732,7 +29864,7 @@
 +#include <linux/limits.h>
 +#include <linux/types.h>
 +
-+#define AUFS_VERSION	"3.x-rcN-20111010"
++#define AUFS_VERSION	"3.x-rcN-20111024"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
@@ -29807,15 +29939,12 @@
 +#define AUFS_WH_PLINKDIR	AUFS_WH_PFX AUFS_PLINKDIR_NAME
 +#define AUFS_WH_ORPHDIR		AUFS_WH_PFX AUFS_ORPHDIR_NAME
 +
-+/* branch permission */
++/* branch permissions and attributes */
 +#define AUFS_BRPERM_RW		"rw"
 +#define AUFS_BRPERM_RO		"ro"
 +#define AUFS_BRPERM_RR		"rr"
-+#define AUFS_BRPERM_WH		"wh"
-+#define AUFS_BRPERM_NLWH	"nolwh"
-+#define AUFS_BRPERM_ROWH	AUFS_BRPERM_RO "+" AUFS_BRPERM_WH
-+#define AUFS_BRPERM_RRWH	AUFS_BRPERM_RR "+" AUFS_BRPERM_WH
-+#define AUFS_BRPERM_RWNLWH	AUFS_BRPERM_RW "+" AUFS_BRPERM_NLWH
++#define AUFS_BRRATTR_WH		"wh"
++#define AUFS_BRWATTR_NLWH	"nolwh"
 +
 +/* ---------------------------------------------------------------------- */
 +
@@ -29905,15 +30034,27 @@
 +	struct au_rdu_cookie	cookie;
 +} __aligned(8);
 +
-+struct aufs_ibusy {
-+	__u64		ino, h_ino;
-+	__s16		bindex;
++/* ---------------------------------------------------------------------- */
++
++struct aufs_wbr_fd {
++	__u32	oflags;
++	__s16	brid;
 +} __aligned(8);
++
++/* ---------------------------------------------------------------------- */
++
++struct aufs_ibusy {
++	__u64	ino, h_ino;
++	__s16	bindex;
++} __aligned(8);
++
++/* ---------------------------------------------------------------------- */
 +
 +#define AuCtlType		'A'
 +#define AUFS_CTL_RDU		_IOWR(AuCtlType, AuCtl_RDU, struct aufs_rdu)
 +#define AUFS_CTL_RDU_INO	_IOWR(AuCtlType, AuCtl_RDU_INO, struct aufs_rdu)
-+#define AUFS_CTL_WBR_FD		_IO(AuCtlType, AuCtl_WBR_FD)
++#define AUFS_CTL_WBR_FD		_IOW(AuCtlType, AuCtl_WBR_FD, \
++				     struct aufs_wbr_fd)
 +#define AUFS_CTL_IBUSY		_IOWR(AuCtlType, AuCtl_IBUSY, struct aufs_ibusy)
 +
 +#endif /* __AUFS_TYPE_H__ */
