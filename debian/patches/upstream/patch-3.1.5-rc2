@@ -6,7 +6,7 @@
 -SUBLEVEL = 4
 -EXTRAVERSION =
 +SUBLEVEL = 5
-+EXTRAVERSION = -rc1
++EXTRAVERSION = -rc2
  NAME = "Divemaster Edition"
  
  # *DOCUMENTATION*
@@ -1701,6 +1701,48 @@
  
  	mutex_unlock(&rtc->ops_lock);
  }
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@ -2740,11 +2740,13 @@ int inline qeth_l3_get_cast_type(struct
+ 	struct neighbour *n = NULL;
+ 	struct dst_entry *dst;
+ 
++	rcu_read_lock();
+ 	dst = skb_dst(skb);
+ 	if (dst)
+ 		n = dst_get_neighbour(dst);
+ 	if (n) {
+ 		cast_type = n->type;
++		rcu_read_unlock();
+ 		if ((cast_type == RTN_BROADCAST) ||
+ 		    (cast_type == RTN_MULTICAST) ||
+ 		    (cast_type == RTN_ANYCAST))
+@@ -2752,6 +2754,8 @@ int inline qeth_l3_get_cast_type(struct
+ 		else
+ 			return RTN_UNSPEC;
+ 	}
++	rcu_read_unlock();
++
+ 	/* try something else */
+ 	if (skb->protocol == ETH_P_IPV6)
+ 		return (skb_network_header(skb)[24] == 0xff) ?
+@@ -2807,6 +2811,8 @@ static void qeth_l3_fill_header(struct q
+ 	}
+ 
+ 	hdr->hdr.l3.length = skb->len - sizeof(struct qeth_hdr);
++
++	rcu_read_lock();
+ 	dst = skb_dst(skb);
+ 	if (dst)
+ 		n = dst_get_neighbour(dst);
+@@ -2853,6 +2859,7 @@ static void qeth_l3_fill_header(struct q
+ 				QETH_CAST_UNICAST | QETH_HDR_PASSTHRU;
+ 		}
+ 	}
++	rcu_read_unlock();
+ }
+ 
+ static inline void qeth_l3_hdr_csum(struct qeth_card *card,
 --- a/drivers/scsi/scsi_lib.c
 +++ b/drivers/scsi/scsi_lib.c
 @@ -1408,6 +1408,8 @@ static void scsi_kill_request(struct req
@@ -2696,6 +2738,64 @@
  }
  
  extern int process_sigma_firmware(struct i2c_client *client, const char *name);
+--- a/include/net/inetpeer.h
++++ b/include/net/inetpeer.h
+@@ -35,6 +35,7 @@ struct inet_peer {
+ 
+ 	u32			metrics[RTAX_MAX];
+ 	u32			rate_tokens;	/* rate limiting for ICMP */
++	int			redirect_genid;
+ 	unsigned long		rate_last;
+ 	unsigned long		pmtu_expires;
+ 	u32			pmtu_orig;
+--- a/include/net/red.h
++++ b/include/net/red.h
+@@ -116,7 +116,7 @@ struct red_parms {
+ 	u32		qR;		/* Cached random number */
+ 
+ 	unsigned long	qavg;		/* Average queue length: A scaled */
+-	psched_time_t	qidlestart;	/* Start of current idle period */
++	ktime_t		qidlestart;	/* Start of current idle period */
+ };
+ 
+ static inline u32 red_rmask(u8 Plog)
+@@ -148,17 +148,17 @@ static inline void red_set_parms(struct
+ 
+ static inline int red_is_idling(struct red_parms *p)
+ {
+-	return p->qidlestart != PSCHED_PASTPERFECT;
++	return p->qidlestart.tv64 != 0;
+ }
+ 
+ static inline void red_start_of_idle_period(struct red_parms *p)
+ {
+-	p->qidlestart = psched_get_time();
++	p->qidlestart = ktime_get();
+ }
+ 
+ static inline void red_end_of_idle_period(struct red_parms *p)
+ {
+-	p->qidlestart = PSCHED_PASTPERFECT;
++	p->qidlestart.tv64 = 0;
+ }
+ 
+ static inline void red_restart(struct red_parms *p)
+@@ -170,13 +170,10 @@ static inline void red_restart(struct re
+ 
+ static inline unsigned long red_calc_qavg_from_idle_time(struct red_parms *p)
+ {
+-	psched_time_t now;
+-	long us_idle;
++	s64 delta = ktime_us_delta(ktime_get(), p->qidlestart);
++	long us_idle = min_t(s64, delta, p->Scell_max);
+ 	int  shift;
+ 
+-	now = psched_get_time();
+-	us_idle = psched_tdiff_bounded(now, p->qidlestart, p->Scell_max);
+-
+ 	/*
+ 	 * The problem: ideally, average length queue recalcultion should
+ 	 * be done over constant clock intervals. This is too expensive, so
 --- a/kernel/cgroup_freezer.c
 +++ b/kernel/cgroup_freezer.c
 @@ -153,6 +153,13 @@ static void freezer_destroy(struct cgrou
@@ -3081,6 +3181,364 @@
  
  	icmp6_type = icmp6_hdr(skb2)->icmp6_type;
  
+--- a/net/ipv4/ah4.c
++++ b/net/ipv4/ah4.c
+@@ -136,8 +136,6 @@ static void ah_output_done(struct crypto
+ 		memcpy(top_iph+1, iph+1, top_iph->ihl*4 - sizeof(struct iphdr));
+ 	}
+ 
+-	err = ah->nexthdr;
+-
+ 	kfree(AH_SKB_CB(skb)->tmp);
+ 	xfrm_output_resume(skb, err);
+ }
+@@ -264,12 +262,12 @@ static void ah_input_done(struct crypto_
+ 	if (err)
+ 		goto out;
+ 
++	err = ah->nexthdr;
++
+ 	skb->network_header += ah_hlen;
+ 	memcpy(skb_network_header(skb), work_iph, ihl);
+ 	__skb_pull(skb, ah_hlen + ihl);
+ 	skb_set_transport_header(skb, -ihl);
+-
+-	err = ah->nexthdr;
+ out:
+ 	kfree(AH_SKB_CB(skb)->tmp);
+ 	xfrm_input_resume(skb, err);
+--- a/net/ipv4/ip_options.c
++++ b/net/ipv4/ip_options.c
+@@ -640,6 +640,7 @@ int ip_options_rcv_srr(struct sk_buff *s
+ 	}
+ 	if (srrptr <= srrspace) {
+ 		opt->srr_is_hit = 1;
++		iph->daddr = nexthop;
+ 		opt->is_changed = 1;
+ 	}
+ 	return 0;
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -112,7 +112,7 @@
+ #include <net/secure_seq.h>
+ 
+ #define RT_FL_TOS(oldflp4) \
+-    ((u32)(oldflp4->flowi4_tos & (IPTOS_RT_MASK | RTO_ONLINK)))
++	((oldflp4)->flowi4_tos & (IPTOS_RT_MASK | RTO_ONLINK))
+ 
+ #define IP_MAX_MTU	0xFFF0
+ 
+@@ -132,6 +132,7 @@ static int ip_rt_mtu_expires __read_most
+ static int ip_rt_min_pmtu __read_mostly		= 512 + 20 + 20;
+ static int ip_rt_min_advmss __read_mostly	= 256;
+ static int rt_chain_length_max __read_mostly	= 20;
++static int redirect_genid;
+ 
+ /*
+  *	Interface to generic destination cache.
+@@ -417,9 +418,13 @@ static int rt_cache_seq_show(struct seq_
+ 	else {
+ 		struct rtable *r = v;
+ 		struct neighbour *n;
+-		int len;
++		int len, HHUptod;
+ 
++		rcu_read_lock();
+ 		n = dst_get_neighbour(&r->dst);
++		HHUptod = (n && (n->nud_state & NUD_CONNECTED)) ? 1 : 0;
++		rcu_read_unlock();
++
+ 		seq_printf(seq, "%s\t%08X\t%08X\t%8X\t%d\t%u\t%d\t"
+ 			      "%08X\t%d\t%u\t%u\t%02X\t%d\t%1d\t%08X%n",
+ 			r->dst.dev ? r->dst.dev->name : "*",
+@@ -433,7 +438,7 @@ static int rt_cache_seq_show(struct seq_
+ 			      dst_metric(&r->dst, RTAX_RTTVAR)),
+ 			r->rt_key_tos,
+ 			-1,
+-			(n && (n->nud_state & NUD_CONNECTED)) ? 1 : 0,
++			HHUptod,
+ 			r->rt_spec_dst, &len);
+ 
+ 		seq_printf(seq, "%*s\n", 127 - len, "");
+@@ -838,6 +843,7 @@ static void rt_cache_invalidate(struct n
+ 
+ 	get_random_bytes(&shuffle, sizeof(shuffle));
+ 	atomic_add(shuffle + 1U, &net->ipv4.rt_genid);
++	redirect_genid++;
+ }
+ 
+ /*
+@@ -1305,11 +1311,40 @@ static void rt_del(unsigned hash, struct
+ 	spin_unlock_bh(rt_hash_lock_addr(hash));
+ }
+ 
++static void check_peer_redir(struct dst_entry *dst, struct inet_peer *peer)
++{
++	struct rtable *rt = (struct rtable *) dst;
++	__be32 orig_gw = rt->rt_gateway;
++	struct neighbour *n, *old_n;
++
++	dst_confirm(&rt->dst);
++
++	rt->rt_gateway = peer->redirect_learned.a4;
++
++	n = ipv4_neigh_lookup(&rt->dst, &rt->rt_gateway);
++	if (IS_ERR(n)) {
++		rt->rt_gateway = orig_gw;
++		return;
++	}
++	old_n = xchg(&rt->dst._neighbour, n);
++	if (old_n)
++		neigh_release(old_n);
++	if (!(n->nud_state & NUD_VALID)) {
++		neigh_event_send(n, NULL);
++	} else {
++		rt->rt_flags |= RTCF_REDIRECTED;
++		call_netevent_notifiers(NETEVENT_NEIGH_UPDATE, n);
++	}
++}
++
+ /* called in rcu_read_lock() section */
+ void ip_rt_redirect(__be32 old_gw, __be32 daddr, __be32 new_gw,
+ 		    __be32 saddr, struct net_device *dev)
+ {
++	int s, i;
+ 	struct in_device *in_dev = __in_dev_get_rcu(dev);
++	__be32 skeys[2] = { saddr, 0 };
++	int    ikeys[2] = { dev->ifindex, 0 };
+ 	struct inet_peer *peer;
+ 	struct net *net;
+ 
+@@ -1332,13 +1367,45 @@ void ip_rt_redirect(__be32 old_gw, __be3
+ 			goto reject_redirect;
+ 	}
+ 
+-	peer = inet_getpeer_v4(daddr, 1);
+-	if (peer) {
+-		peer->redirect_learned.a4 = new_gw;
++	for (s = 0; s < 2; s++) {
++		for (i = 0; i < 2; i++) {
++			unsigned int hash;
++			struct rtable __rcu **rthp;
++			struct rtable *rt;
++
++			hash = rt_hash(daddr, skeys[s], ikeys[i], rt_genid(net));
++
++			rthp = &rt_hash_table[hash].chain;
++
++			while ((rt = rcu_dereference(*rthp)) != NULL) {
++				rthp = &rt->dst.rt_next;
++
++				if (rt->rt_key_dst != daddr ||
++				    rt->rt_key_src != skeys[s] ||
++				    rt->rt_oif != ikeys[i] ||
++				    rt_is_input_route(rt) ||
++				    rt_is_expired(rt) ||
++				    !net_eq(dev_net(rt->dst.dev), net) ||
++				    rt->dst.error ||
++				    rt->dst.dev != dev ||
++				    rt->rt_gateway != old_gw)
++					continue;
+ 
+-		inet_putpeer(peer);
++				if (!rt->peer)
++					rt_bind_peer(rt, rt->rt_dst, 1);
+ 
+-		atomic_inc(&__rt_peer_genid);
++				peer = rt->peer;
++				if (peer) {
++					if (peer->redirect_learned.a4 != new_gw ||
++					    peer->redirect_genid != redirect_genid) {
++						peer->redirect_learned.a4 = new_gw;
++						peer->redirect_genid = redirect_genid;
++						atomic_inc(&__rt_peer_genid);
++					}
++					check_peer_redir(&rt->dst, peer);
++				}
++			}
++		}
+ 	}
+ 	return;
+ 
+@@ -1568,11 +1635,10 @@ unsigned short ip_rt_frag_needed(struct
+ 			est_mtu = mtu;
+ 			peer->pmtu_learned = mtu;
+ 			peer->pmtu_expires = pmtu_expires;
++			atomic_inc(&__rt_peer_genid);
+ 		}
+ 
+ 		inet_putpeer(peer);
+-
+-		atomic_inc(&__rt_peer_genid);
+ 	}
+ 	return est_mtu ? : new_mtu;
+ }
+@@ -1625,40 +1691,9 @@ static void ip_rt_update_pmtu(struct dst
+ 	}
+ }
+ 
+-static int check_peer_redir(struct dst_entry *dst, struct inet_peer *peer)
+-{
+-	struct rtable *rt = (struct rtable *) dst;
+-	__be32 orig_gw = rt->rt_gateway;
+-	struct neighbour *n, *old_n;
+-
+-	dst_confirm(&rt->dst);
+ 
+-	rt->rt_gateway = peer->redirect_learned.a4;
+-
+-	n = ipv4_neigh_lookup(&rt->dst, &rt->rt_gateway);
+-	if (IS_ERR(n))
+-		return PTR_ERR(n);
+-	old_n = xchg(&rt->dst._neighbour, n);
+-	if (old_n)
+-		neigh_release(old_n);
+-	if (!n || !(n->nud_state & NUD_VALID)) {
+-		if (n)
+-			neigh_event_send(n, NULL);
+-		rt->rt_gateway = orig_gw;
+-		return -EAGAIN;
+-	} else {
+-		rt->rt_flags |= RTCF_REDIRECTED;
+-		call_netevent_notifiers(NETEVENT_NEIGH_UPDATE, n);
+-	}
+-	return 0;
+-}
+-
+-static struct dst_entry *ipv4_dst_check(struct dst_entry *dst, u32 cookie)
++static void ipv4_validate_peer(struct rtable *rt)
+ {
+-	struct rtable *rt = (struct rtable *) dst;
+-
+-	if (rt_is_expired(rt))
+-		return NULL;
+ 	if (rt->rt_peer_genid != rt_peer_genid()) {
+ 		struct inet_peer *peer;
+ 
+@@ -1667,17 +1702,26 @@ static struct dst_entry *ipv4_dst_check(
+ 
+ 		peer = rt->peer;
+ 		if (peer) {
+-			check_peer_pmtu(dst, peer);
++			check_peer_pmtu(&rt->dst, peer);
+ 
++			if (peer->redirect_genid != redirect_genid)
++				peer->redirect_learned.a4 = 0;
+ 			if (peer->redirect_learned.a4 &&
+-			    peer->redirect_learned.a4 != rt->rt_gateway) {
+-				if (check_peer_redir(dst, peer))
+-					return NULL;
+-			}
++			    peer->redirect_learned.a4 != rt->rt_gateway)
++				check_peer_redir(&rt->dst, peer);
+ 		}
+ 
+ 		rt->rt_peer_genid = rt_peer_genid();
+ 	}
++}
++
++static struct dst_entry *ipv4_dst_check(struct dst_entry *dst, u32 cookie)
++{
++	struct rtable *rt = (struct rtable *) dst;
++
++	if (rt_is_expired(rt))
++		return NULL;
++	ipv4_validate_peer(rt);
+ 	return dst;
+ }
+ 
+@@ -1820,6 +1864,8 @@ static void rt_init_metrics(struct rtabl
+ 		dst_init_metrics(&rt->dst, peer->metrics, false);
+ 
+ 		check_peer_pmtu(&rt->dst, peer);
++		if (peer->redirect_genid != redirect_genid)
++			peer->redirect_learned.a4 = 0;
+ 		if (peer->redirect_learned.a4 &&
+ 		    peer->redirect_learned.a4 != rt->rt_gateway) {
+ 			rt->rt_gateway = peer->redirect_learned.a4;
+@@ -2325,6 +2371,7 @@ int ip_route_input_common(struct sk_buff
+ 		    rth->rt_mark == skb->mark &&
+ 		    net_eq(dev_net(rth->dst.dev), net) &&
+ 		    !rt_is_expired(rth)) {
++			ipv4_validate_peer(rth);
+ 			if (noref) {
+ 				dst_use_noref(&rth->dst, jiffies);
+ 				skb_dst_set_noref(skb, &rth->dst);
+@@ -2383,11 +2430,11 @@ EXPORT_SYMBOL(ip_route_input_common);
+ static struct rtable *__mkroute_output(const struct fib_result *res,
+ 				       const struct flowi4 *fl4,
+ 				       __be32 orig_daddr, __be32 orig_saddr,
+-				       int orig_oif, struct net_device *dev_out,
++				       int orig_oif, __u8 orig_rtos,
++				       struct net_device *dev_out,
+ 				       unsigned int flags)
+ {
+ 	struct fib_info *fi = res->fi;
+-	u32 tos = RT_FL_TOS(fl4);
+ 	struct in_device *in_dev;
+ 	u16 type = res->type;
+ 	struct rtable *rth;
+@@ -2438,7 +2485,7 @@ static struct rtable *__mkroute_output(c
+ 	rth->rt_genid = rt_genid(dev_net(dev_out));
+ 	rth->rt_flags	= flags;
+ 	rth->rt_type	= type;
+-	rth->rt_key_tos	= tos;
++	rth->rt_key_tos	= orig_rtos;
+ 	rth->rt_dst	= fl4->daddr;
+ 	rth->rt_src	= fl4->saddr;
+ 	rth->rt_route_iif = 0;
+@@ -2488,7 +2535,7 @@ static struct rtable *__mkroute_output(c
+ static struct rtable *ip_route_output_slow(struct net *net, struct flowi4 *fl4)
+ {
+ 	struct net_device *dev_out = NULL;
+-	u32 tos	= RT_FL_TOS(fl4);
++	__u8 tos = RT_FL_TOS(fl4);
+ 	unsigned int flags = 0;
+ 	struct fib_result res;
+ 	struct rtable *rth;
+@@ -2664,7 +2711,7 @@ static struct rtable *ip_route_output_sl
+ 
+ make_route:
+ 	rth = __mkroute_output(&res, fl4, orig_daddr, orig_saddr, orig_oif,
+-			       dev_out, flags);
++			       tos, dev_out, flags);
+ 	if (!IS_ERR(rth)) {
+ 		unsigned int hash;
+ 
+@@ -2700,6 +2747,7 @@ struct rtable *__ip_route_output_key(str
+ 			    (IPTOS_RT_MASK | RTO_ONLINK)) &&
+ 		    net_eq(dev_net(rth->dst.dev), net) &&
+ 		    !rt_is_expired(rth)) {
++			ipv4_validate_peer(rth);
+ 			dst_use(&rth->dst, jiffies);
+ 			RT_CACHE_STAT_INC(out_hit);
+ 			rcu_read_unlock_bh();
+--- a/net/ipv6/ah6.c
++++ b/net/ipv6/ah6.c
+@@ -324,8 +324,6 @@ static void ah6_output_done(struct crypt
+ #endif
+ 	}
+ 
+-	err = ah->nexthdr;
+-
+ 	kfree(AH_SKB_CB(skb)->tmp);
+ 	xfrm_output_resume(skb, err);
+ }
+@@ -466,12 +464,12 @@ static void ah6_input_done(struct crypto
+ 	if (err)
+ 		goto out;
+ 
++	err = ah->nexthdr;
++
+ 	skb->network_header += ah_hlen;
+ 	memcpy(skb_network_header(skb), work_iph, hdr_len);
+ 	__skb_pull(skb, ah_hlen + hdr_len);
+ 	skb_set_transport_header(skb, -hdr_len);
+-
+-	err = ah->nexthdr;
+ out:
+ 	kfree(AH_SKB_CB(skb)->tmp);
+ 	xfrm_input_resume(skb, err);
 --- a/net/mac80211/agg-tx.c
 +++ b/net/mac80211/agg-tx.c
 @@ -162,6 +162,12 @@ int ___ieee80211_stop_tx_ba_session(stru
@@ -3179,6 +3637,79 @@
  	/* if low-level driver supports AP, we also support VLAN */
  	if (local->hw.wiphy->interface_modes & BIT(NL80211_IFTYPE_AP)) {
  		hw->wiphy->interface_modes |= BIT(NL80211_IFTYPE_AP_VLAN);
+--- a/net/sched/sch_red.c
++++ b/net/sched/sch_red.c
+@@ -209,8 +209,8 @@ static int red_change(struct Qdisc *sch,
+ 				 ctl->Plog, ctl->Scell_log,
+ 				 nla_data(tb[TCA_RED_STAB]));
+ 
+-	if (skb_queue_empty(&sch->q))
+-		red_end_of_idle_period(&q->parms);
++	if (!q->qdisc->q.qlen)
++		red_start_of_idle_period(&q->parms);
+ 
+ 	sch_tree_unlock(sch);
+ 	return 0;
+--- a/net/sched/sch_teql.c
++++ b/net/sched/sch_teql.c
+@@ -225,11 +225,11 @@ static int teql_qdisc_init(struct Qdisc
+ 
+ 
+ static int
+-__teql_resolve(struct sk_buff *skb, struct sk_buff *skb_res, struct net_device *dev)
++__teql_resolve(struct sk_buff *skb, struct sk_buff *skb_res,
++	       struct net_device *dev, struct netdev_queue *txq,
++	       struct neighbour *mn)
+ {
+-	struct netdev_queue *dev_queue = netdev_get_tx_queue(dev, 0);
+-	struct teql_sched_data *q = qdisc_priv(dev_queue->qdisc);
+-	struct neighbour *mn = dst_get_neighbour(skb_dst(skb));
++	struct teql_sched_data *q = qdisc_priv(txq->qdisc);
+ 	struct neighbour *n = q->ncache;
+ 
+ 	if (mn->tbl == NULL)
+@@ -262,17 +262,26 @@ __teql_resolve(struct sk_buff *skb, stru
+ }
+ 
+ static inline int teql_resolve(struct sk_buff *skb,
+-			       struct sk_buff *skb_res, struct net_device *dev)
++			       struct sk_buff *skb_res,
++			       struct net_device *dev,
++			       struct netdev_queue *txq)
+ {
+-	struct netdev_queue *txq = netdev_get_tx_queue(dev, 0);
++	struct dst_entry *dst = skb_dst(skb);
++	struct neighbour *mn;
++	int res;
++
+ 	if (txq->qdisc == &noop_qdisc)
+ 		return -ENODEV;
+ 
+-	if (dev->header_ops == NULL ||
+-	    skb_dst(skb) == NULL ||
+-	    dst_get_neighbour(skb_dst(skb)) == NULL)
++	if (!dev->header_ops || !dst)
+ 		return 0;
+-	return __teql_resolve(skb, skb_res, dev);
++
++	rcu_read_lock();
++	mn = dst_get_neighbour(dst);
++	res = mn ? __teql_resolve(skb, skb_res, dev, txq, mn) : 0;
++	rcu_read_unlock();
++
++	return res;
+ }
+ 
+ static netdev_tx_t teql_master_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -307,7 +316,7 @@ restart:
+ 			continue;
+ 		}
+ 
+-		switch (teql_resolve(skb, skb_res, slave)) {
++		switch (teql_resolve(skb, skb_res, slave, slave_txq)) {
+ 		case 0:
+ 			if (__netif_tx_trylock(slave_txq)) {
+ 				unsigned int length = qdisc_pkt_len(skb);
 --- a/net/sunrpc/xprtsock.c
 +++ b/net/sunrpc/xprtsock.c
 @@ -496,7 +496,7 @@ static int xs_nospace(struct rpc_task *t
