@@ -76,10 +76,12 @@ class Gencontrol(Base):
                       (arch, makeflags)])
 
         # Add udebs using kernel-wedge
-        installer_dir = 'debian/installer/' + arch
-        if os.path.isdir(installer_dir):
+        installer_def_dir = 'debian/installer'
+        installer_arch_dir = os.path.join(installer_def_dir, arch)
+        if os.path.isdir(installer_arch_dir):
             kw_env = os.environ.copy()
-            kw_env['KW_CONFIG_DIR'] = installer_dir
+            kw_env['KW_DEFCONFIG_DIR'] = installer_def_dir
+            kw_env['KW_CONFIG_DIR'] = installer_arch_dir
             kw_proc = subprocess.Popen(
                 ['kernel-wedge', 'gen-control',
                  self.abiname],
@@ -352,27 +354,25 @@ class Gencontrol(Base):
                 packages.append(new_package)
 
     def process_changelog(self):
-        act_upstream = self.changelog[0].version.linux_upstream
+        act_upstream = self.changelog[0].version.upstream
         versions = []
         for i in self.changelog:
-            if i.version.linux_upstream != act_upstream:
+            if i.version.upstream != act_upstream:
                 break
             versions.append(i.version)
         self.versions = versions
         version = self.version = self.changelog[0].version
         if self.version.linux_modifier is not None:
-            self.abiname = self.version.linux_upstream
             self.abiname_part = ''
         else:
             self.abiname_part = '-%s' % self.config['abi',]['abiname']
-            """
-            # XXX: We need to add another part before Wheezy
-            if self.version.linux_upstream in ('3.0', '3.1'):
-                self.abiname = self.version.linux_upstream + '.0' + self.abiname_part
-            else:
-            """
-            if True: #aptosid
-                self.abiname = self.version.linux_upstream + self.abiname_part
+        """
+        # XXX: We need to add another part until after wheezy
+        self.abiname = (re.sub('^(\d+\.\d+)(?=-|$)', r'\1.0',
+                               self.version.linux_upstream)
+                        + self.abiname_part)
+        """
+        self.abiname = self.version.linux_upstream + self.abiname_part #aptosid
         self.vars = {
             'upstreamversion': self.version.linux_upstream,
             'version': self.version.linux_version,
