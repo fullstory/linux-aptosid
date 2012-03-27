@@ -2942,7 +2942,7 @@
 +	 * h_inode->i_mutex is not held, but it is harmless since once i_nlink
 +	 * reaches 0, it will never become positive.
 +	 */
-+	vfsub_set_nlink(inode, h_inode->i_nlink);
++	set_nlink(inode, h_inode->i_nlink);
 +
 +	/*
 +	 * fewer nlink makes find(1) noisy, but larger nlink doesn't.
@@ -7483,7 +7483,7 @@
 +	if (h_dir->i_nlink < 2)
 +		nlink += 2;
 +	/* 0 can happen in revaliding */
-+	vfsub_set_nlink(dir, nlink);
++	set_nlink(dir, nlink);
 +}
 +
 +void au_sub_nlink(struct inode *dir, struct inode *h_dir)
@@ -7496,7 +7496,7 @@
 +	nlink -= h_dir->i_nlink - 2;
 +	if (h_dir->i_nlink < 2)
 +		nlink -= 2;
-+	/* no vfsub version. nlink == 0 means the branch-fs is broken */
++	/* nlink == 0 means the branch-fs is broken */
 +	set_nlink(dir, nlink);
 +}
 +
@@ -16184,7 +16184,7 @@
 +		n -= nlink;
 +		n += st->nlink;
 +		/* 0 can happen */
-+		vfsub_set_nlink(inode, n);
++		set_nlink(inode, n);
 +	}
 +
 +	spin_lock(&inode->i_lock);
@@ -22356,7 +22356,7 @@
 +#endif /* __AUFS_SPL_H__ */
 --- /dev/null
 +++ b/fs/aufs/super.c
-@@ -0,0 +1,936 @@
+@@ -0,0 +1,966 @@
 +/*
 + * Copyright (C) 2005-2012 Junjiro R. Okajima
 + *
@@ -22662,7 +22662,18 @@
 +
 +	old = a;
 +	a += b;
-+	if (old < a)
++	if (old <= a)
++		return a;
++	return ULLONG_MAX;
++}
++
++static u64 au_mul_till_max(u64 a, long mul)
++{
++	u64 old;
++
++	old = a;
++	a *= mul;
++	if (old <= a)
 +		return a;
 +	return ULLONG_MAX;
 +}
@@ -22670,25 +22681,26 @@
 +static int au_statfs_sum(struct super_block *sb, struct kstatfs *buf)
 +{
 +	int err;
++	long bsize, factor;
 +	u64 blocks, bfree, bavail, files, ffree;
 +	aufs_bindex_t bend, bindex, i;
 +	unsigned char shared;
 +	struct path h_path;
 +	struct super_block *h_sb;
 +
++	err = 0;
++	bsize = LONG_MAX;
++	files = 0;
++	ffree = 0;
 +	blocks = 0;
 +	bfree = 0;
 +	bavail = 0;
-+	files = 0;
-+	ffree = 0;
-+
-+	err = 0;
 +	bend = au_sbend(sb);
-+	for (bindex = bend; bindex >= 0; bindex--) {
++	for (bindex = 0; bindex <= bend; bindex++) {
 +		h_path.mnt = au_sbr_mnt(sb, bindex);
 +		h_sb = h_path.mnt->mnt_sb;
 +		shared = 0;
-+		for (i = bindex + 1; !shared && i <= bend; i++)
++		for (i = 0; !shared && i < bindex; i++)
 +			shared = (au_sbr_sb(sb, i) == h_sb);
 +		if (shared)
 +			continue;
@@ -22699,18 +22711,36 @@
 +		if (unlikely(err))
 +			goto out;
 +
-+		blocks = au_add_till_max(blocks, buf->f_blocks);
-+		bfree = au_add_till_max(bfree, buf->f_bfree);
-+		bavail = au_add_till_max(bavail, buf->f_bavail);
++		if (bsize > buf->f_bsize) {
++			/*
++			 * we will reduce bsize, so we have to expand blocks
++			 * etc. to match them again
++			 */
++			factor = (bsize / buf->f_bsize);
++			blocks = au_mul_till_max(blocks, factor);
++			bfree = au_mul_till_max(bfree, factor);
++			bavail = au_mul_till_max(bavail, factor);
++			bsize = buf->f_bsize;
++		}
++
++		factor = (buf->f_bsize / bsize);
++		blocks = au_add_till_max(blocks,
++				au_mul_till_max(buf->f_blocks, factor));
++		bfree = au_add_till_max(bfree,
++				au_mul_till_max(buf->f_bfree, factor));
++		bavail = au_add_till_max(bavail,
++				au_mul_till_max(buf->f_bavail, factor));
 +		files = au_add_till_max(files, buf->f_files);
 +		ffree = au_add_till_max(ffree, buf->f_ffree);
 +	}
 +
++	buf->f_bsize = bsize;
 +	buf->f_blocks = blocks;
 +	buf->f_bfree = bfree;
 +	buf->f_bavail = bavail;
 +	buf->f_files = files;
 +	buf->f_ffree = ffree;
++	buf->f_frsize = 0;
 +
 +out:
 +	return err;
@@ -26193,7 +26223,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/vfsub.h
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,232 @@
 +/*
 + * Copyright (C) 2005-2012 Junjiro R. Okajima
 + *
@@ -26294,14 +26324,6 @@
 +	AuDebugOn(!S_ISDIR(inode->i_mode));
 +	inode->i_flags |= S_DEAD;
 +	clear_nlink(inode);
-+}
-+
-+static inline void vfsub_set_nlink(struct inode *inode, unsigned int nlink)
-+{
-+	if (nlink)
-+		set_nlink(inode, nlink);
-+	else
-+		clear_nlink(inode);
 +}
 +
 +/* ---------------------------------------------------------------------- */
@@ -29903,7 +29925,7 @@
 +
 +#include <linux/limits.h>
 +
-+#define AUFS_VERSION	"3.x-rcN-20120312"
++#define AUFS_VERSION	"3.3-20120326"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
