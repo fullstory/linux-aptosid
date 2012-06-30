@@ -1,0 +1,2176 @@
+From 8aa9f6e033c9bbeb3beb7a181453aae570c8a2bf Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Tue, 17 Apr 2012 14:12:29 +0100
+Subject: [PATCH 1/5] drm/kms: driver for virtual cirrus under qemu
+
+This is the initial driver for emulated cirrus GPU found in qemu.
+This driver only supports the emulated GPU and doesn't attempt
+to bind to any real cirrus GPUs.
+
+This driver is intended to be used with xf86-video-modesetting in userspace.
+It requires at least version 0.3.0
+
+This follow the same design as ast and mgag200, and is based on work
+done by Matthew Garrett previously.
+
+This GPU has no hw cursor, and it can't scanout 32-bpp, only packed 24-bpp.
+i.e. it sucks.
+
+Reviewed-by: Adam Jackson <ajax@redhat.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Stefan Lippers-Hollmann <s.l-h@gmx.de>
+---
+ drivers/gpu/drm/Kconfig               |    2 +
+ drivers/gpu/drm/Makefile              |    1 +
+ drivers/gpu/drm/cirrus/Kconfig        |   11 +
+ drivers/gpu/drm/cirrus/Makefile       |    5 +
+ drivers/gpu/drm/cirrus/cirrus_drv.c   |  106 ++++++
+ drivers/gpu/drm/cirrus/cirrus_drv.h   |  246 +++++++++++++
+ drivers/gpu/drm/cirrus/cirrus_fbdev.c |  307 ++++++++++++++++
+ drivers/gpu/drm/cirrus/cirrus_main.c  |  335 ++++++++++++++++++
+ drivers/gpu/drm/cirrus/cirrus_mode.c  |  629 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/cirrus/cirrus_ttm.c   |  453 ++++++++++++++++++++++++
+ 10 files changed, 2095 insertions(+)
+ create mode 100644 drivers/gpu/drm/cirrus/Kconfig
+ create mode 100644 drivers/gpu/drm/cirrus/Makefile
+ create mode 100644 drivers/gpu/drm/cirrus/cirrus_drv.c
+ create mode 100644 drivers/gpu/drm/cirrus/cirrus_drv.h
+ create mode 100644 drivers/gpu/drm/cirrus/cirrus_fbdev.c
+ create mode 100644 drivers/gpu/drm/cirrus/cirrus_main.c
+ create mode 100644 drivers/gpu/drm/cirrus/cirrus_mode.c
+ create mode 100644 drivers/gpu/drm/cirrus/cirrus_ttm.c
+
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -186,3 +186,5 @@ source "drivers/gpu/drm/vmwgfx/Kconfig"
+ source "drivers/gpu/drm/gma500/Kconfig"
+ 
+ source "drivers/gpu/drm/udl/Kconfig"
++
++source "drivers/gpu/drm/cirrus/Kconfig"
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -34,6 +34,7 @@ obj-$(CONFIG_DRM_RADEON)+= radeon/
+ obj-$(CONFIG_DRM_MGA)	+= mga/
+ obj-$(CONFIG_DRM_I810)	+= i810/
+ obj-$(CONFIG_DRM_I915)  += i915/
++obj-$(CONFIG_DRM_CIRRUS_QEMU) += cirrus/
+ obj-$(CONFIG_DRM_SIS)   += sis/
+ obj-$(CONFIG_DRM_SAVAGE)+= savage/
+ obj-$(CONFIG_DRM_VMWGFX)+= vmwgfx/
+--- /dev/null
++++ b/drivers/gpu/drm/cirrus/Kconfig
+@@ -0,0 +1,11 @@
++config DRM_CIRRUS_QEMU
++	tristate "Cirrus driver for QEMU emulated device"
++	depends on DRM && PCI && EXPERIMENTAL
++	select FB_CFB_FILLRECT
++	select FB_CFB_COPYAREA
++	select FB_CFB_IMAGEBLIT
++	select DRM_KMS_HELPER
++	help
++	 This is a KMS driver for emulated cirrus device in qemu.
++	 It is *NOT* intended for real cirrus devices. This requires
++	 the modesetting userspace X.org driver.
+--- /dev/null
++++ b/drivers/gpu/drm/cirrus/Makefile
+@@ -0,0 +1,5 @@
++ccflags-y := -Iinclude/drm
++cirrus-y  := cirrus_main.o cirrus_mode.o \
++	cirrus_drv.o cirrus_fbdev.o cirrus_ttm.o
++
++obj-$(CONFIG_DRM_CIRRUS_QEMU) += cirrus.o
+--- /dev/null
++++ b/drivers/gpu/drm/cirrus/cirrus_drv.c
+@@ -0,0 +1,106 @@
++/*
++ * Copyright 2012 Red Hat <mjg@redhat.com>
++ *
++ * This file is subject to the terms and conditions of the GNU General
++ * Public License version 2. See the file COPYING in the main
++ * directory of this archive for more details.
++ *
++ * Authors: Matthew Garrett
++ *          Dave Airlie
++ */
++#include <linux/module.h>
++#include <linux/console.h>
++#include "drmP.h"
++#include "drm.h"
++
++#include "cirrus_drv.h"
++
++int cirrus_modeset = -1;
++
++MODULE_PARM_DESC(modeset, "Disable/Enable modesetting");
++module_param_named(modeset, cirrus_modeset, int, 0400);
++
++/*
++ * This is the generic driver code. This binds the driver to the drm core,
++ * which then performs further device association and calls our graphics init
++ * functions
++ */
++
++static struct drm_driver driver;
++
++/* only bind to the cirrus chip in qemu */
++static DEFINE_PCI_DEVICE_TABLE(pciidlist) = {
++	{ PCI_VENDOR_ID_CIRRUS, PCI_DEVICE_ID_CIRRUS_5446, 0x1af4, 0x1100, 0,
++	  0, 0 },
++	{0,}
++};
++
++static int __devinit
++cirrus_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
++{
++	return drm_get_pci_dev(pdev, ent, &driver);
++}
++
++static void cirrus_pci_remove(struct pci_dev *pdev)
++{
++	struct drm_device *dev = pci_get_drvdata(pdev);
++
++	drm_put_dev(dev);
++}
++
++static const struct file_operations cirrus_driver_fops = {
++	.owner = THIS_MODULE,
++	.open = drm_open,
++	.release = drm_release,
++	.unlocked_ioctl = drm_ioctl,
++	.mmap = cirrus_mmap,
++	.poll = drm_poll,
++	.fasync = drm_fasync,
++};
++static struct drm_driver driver = {
++	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_USE_MTRR,
++	.load = cirrus_driver_load,
++	.unload = cirrus_driver_unload,
++	.fops = &cirrus_driver_fops,
++	.name = DRIVER_NAME,
++	.desc = DRIVER_DESC,
++	.date = DRIVER_DATE,
++	.major = DRIVER_MAJOR,
++	.minor = DRIVER_MINOR,
++	.patchlevel = DRIVER_PATCHLEVEL,
++	.gem_init_object = cirrus_gem_init_object,
++	.gem_free_object = cirrus_gem_free_object,
++	.dumb_create = cirrus_dumb_create,
++	.dumb_map_offset = cirrus_dumb_mmap_offset,
++	.dumb_destroy = cirrus_dumb_destroy,
++};
++
++static struct pci_driver cirrus_pci_driver = {
++	.name = DRIVER_NAME,
++	.id_table = pciidlist,
++	.probe = cirrus_pci_probe,
++	.remove = cirrus_pci_remove,
++};
++
++static int __init cirrus_init(void)
++{
++	if (vgacon_text_force() && cirrus_modeset == -1)
++		return -EINVAL;
++
++	if (cirrus_modeset == 0)
++		return -EINVAL;
++	return drm_pci_init(&driver, &cirrus_pci_driver);
++}
++
++static void __exit cirrus_exit(void)
++{
++	drm_pci_exit(&driver, &cirrus_pci_driver);
++}
++
++module_init(cirrus_init);
++module_exit(cirrus_exit);
++
++MODULE_DEVICE_TABLE(pci, pciidlist);
++MODULE_AUTHOR(DRIVER_AUTHOR);
++MODULE_DESCRIPTION(DRIVER_DESC);
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/gpu/drm/cirrus/cirrus_drv.h
+@@ -0,0 +1,246 @@
++/*
++ * Copyright 2012 Red Hat
++ *
++ * This file is subject to the terms and conditions of the GNU General
++ * Public License version 2. See the file COPYING in the main
++ * directory of this archive for more details.
++ *
++ * Authors: Matthew Garrett
++ *          Dave Airlie
++ */
++#ifndef __CIRRUS_DRV_H__
++#define __CIRRUS_DRV_H__
++
++#include <video/vga.h>
++
++#include <drm/drm_fb_helper.h>
++
++#include "ttm/ttm_bo_api.h"
++#include "ttm/ttm_bo_driver.h"
++#include "ttm/ttm_placement.h"
++#include "ttm/ttm_memory.h"
++#include "ttm/ttm_module.h"
++
++#define DRIVER_AUTHOR		"Matthew Garrett"
++
++#define DRIVER_NAME		"cirrus"
++#define DRIVER_DESC		"qemu Cirrus emulation"
++#define DRIVER_DATE		"20110418"
++
++#define DRIVER_MAJOR		1
++#define DRIVER_MINOR		0
++#define DRIVER_PATCHLEVEL	0
++
++#define CIRRUSFB_CONN_LIMIT 1
++
++#define RREG8(reg) ioread8(((void __iomem *)cdev->rmmio) + (reg))
++#define WREG8(reg, v) iowrite8(v, ((void __iomem *)cdev->rmmio) + (reg))
++#define RREG32(reg) ioread32(((void __iomem *)cdev->rmmio) + (reg))
++#define WREG32(reg, v) iowrite32(v, ((void __iomem *)cdev->rmmio) + (reg))
++
++#define SEQ_INDEX 4
++#define SEQ_DATA 5
++
++#define WREG_SEQ(reg, v)					\
++	do {							\
++		WREG8(SEQ_INDEX, reg);				\
++		WREG8(SEQ_DATA, v);				\
++	} while (0)						\
++
++#define CRT_INDEX 0x14
++#define CRT_DATA 0x15
++
++#define WREG_CRT(reg, v)					\
++	do {							\
++		WREG8(CRT_INDEX, reg);				\
++		WREG8(CRT_DATA, v);				\
++	} while (0)						\
++
++#define GFX_INDEX 0xe
++#define GFX_DATA 0xf
++
++#define WREG_GFX(reg, v)					\
++	do {							\
++		WREG8(GFX_INDEX, reg);				\
++		WREG8(GFX_DATA, v);				\
++	} while (0)						\
++
++/*
++ * Cirrus has a "hidden" DAC register that can be accessed by writing to
++ * the pixel mask register to reset the state, then reading from the register
++ * four times. The next write will then pass to the DAC
++ */
++#define VGA_DAC_MASK 0x6
++
++#define WREG_HDR(v)						\
++	do {							\
++		RREG8(VGA_DAC_MASK);					\
++		RREG8(VGA_DAC_MASK);					\
++		RREG8(VGA_DAC_MASK);					\
++		RREG8(VGA_DAC_MASK);					\
++		WREG8(VGA_DAC_MASK, v);					\
++	} while (0)						\
++
++
++#define CIRRUS_MAX_FB_HEIGHT 4096
++#define CIRRUS_MAX_FB_WIDTH 4096
++
++#define CIRRUS_DPMS_CLEARED (-1)
++
++#define to_cirrus_crtc(x) container_of(x, struct cirrus_crtc, base)
++#define to_cirrus_encoder(x) container_of(x, struct cirrus_encoder, base)
++#define to_cirrus_framebuffer(x) container_of(x, struct cirrus_framebuffer, base)
++
++struct cirrus_crtc {
++	struct drm_crtc			base;
++	u8				lut_r[256], lut_g[256], lut_b[256];
++	int				last_dpms;
++	bool				enabled;
++};
++
++struct cirrus_fbdev;
++struct cirrus_mode_info {
++	bool				mode_config_initialized;
++	struct cirrus_crtc		*crtc;
++	/* pointer to fbdev info structure */
++	struct cirrus_fbdev		*gfbdev;
++};
++
++struct cirrus_encoder {
++	struct drm_encoder		base;
++	int				last_dpms;
++};
++
++struct cirrus_connector {
++	struct drm_connector		base;
++};
++
++struct cirrus_framebuffer {
++	struct drm_framebuffer		base;
++	struct drm_gem_object *obj;
++};
++
++struct cirrus_mc {
++	resource_size_t			vram_size;
++	resource_size_t			vram_base;
++};
++
++struct cirrus_device {
++	struct drm_device		*dev;
++	unsigned long			flags;
++
++	resource_size_t			rmmio_base;
++	resource_size_t			rmmio_size;
++	void __iomem			*rmmio;
++
++	struct cirrus_mc			mc;
++	struct cirrus_mode_info		mode_info;
++
++	int				num_crtc;
++	int fb_mtrr;
++
++	struct {
++		struct drm_global_reference mem_global_ref;
++		struct ttm_bo_global_ref bo_global_ref;
++		struct ttm_bo_device bdev;
++		atomic_t validate_sequence;
++	} ttm;
++
++};
++
++
++struct cirrus_fbdev {
++	struct drm_fb_helper helper;
++	struct cirrus_framebuffer gfb;
++	struct list_head fbdev_list;
++	void *sysram;
++	int size;
++};
++
++struct cirrus_bo {
++	struct ttm_buffer_object bo;
++	struct ttm_placement placement;
++	struct ttm_bo_kmap_obj kmap;
++	struct drm_gem_object gem;
++	u32 placements[3];
++	int pin_count;
++};
++#define gem_to_cirrus_bo(gobj) container_of((gobj), struct cirrus_bo, gem)
++
++static inline struct cirrus_bo *
++cirrus_bo(struct ttm_buffer_object *bo)
++{
++	return container_of(bo, struct cirrus_bo, bo);
++}
++
++
++#define to_cirrus_obj(x) container_of(x, struct cirrus_gem_object, base)
++#define DRM_FILE_PAGE_OFFSET (0x100000000ULL >> PAGE_SHIFT)
++
++				/* cirrus_mode.c */
++void cirrus_crtc_fb_gamma_set(struct drm_crtc *crtc, u16 red, u16 green,
++			     u16 blue, int regno);
++void cirrus_crtc_fb_gamma_get(struct drm_crtc *crtc, u16 *red, u16 *green,
++			     u16 *blue, int regno);
++
++
++				/* cirrus_main.c */
++int cirrus_device_init(struct cirrus_device *cdev,
++		      struct drm_device *ddev,
++		      struct pci_dev *pdev,
++		      uint32_t flags);
++void cirrus_device_fini(struct cirrus_device *cdev);
++int cirrus_gem_init_object(struct drm_gem_object *obj);
++void cirrus_gem_free_object(struct drm_gem_object *obj);
++int cirrus_dumb_mmap_offset(struct drm_file *file,
++			    struct drm_device *dev,
++			    uint32_t handle,
++			    uint64_t *offset);
++int cirrus_gem_create(struct drm_device *dev,
++		   u32 size, bool iskernel,
++		      struct drm_gem_object **obj);
++int cirrus_dumb_create(struct drm_file *file,
++		    struct drm_device *dev,
++		       struct drm_mode_create_dumb *args);
++int cirrus_dumb_destroy(struct drm_file *file,
++		     struct drm_device *dev,
++			uint32_t handle);
++
++int cirrus_framebuffer_init(struct drm_device *dev,
++			   struct cirrus_framebuffer *gfb,
++			    struct drm_mode_fb_cmd2 *mode_cmd,
++			    struct drm_gem_object *obj);
++
++				/* cirrus_display.c */
++int cirrus_modeset_init(struct cirrus_device *cdev);
++void cirrus_modeset_fini(struct cirrus_device *cdev);
++
++				/* cirrus_fbdev.c */
++int cirrus_fbdev_init(struct cirrus_device *cdev);
++void cirrus_fbdev_fini(struct cirrus_device *cdev);
++
++
++
++				/* cirrus_irq.c */
++void cirrus_driver_irq_preinstall(struct drm_device *dev);
++int cirrus_driver_irq_postinstall(struct drm_device *dev);
++void cirrus_driver_irq_uninstall(struct drm_device *dev);
++irqreturn_t cirrus_driver_irq_handler(DRM_IRQ_ARGS);
++
++				/* cirrus_kms.c */
++int cirrus_driver_load(struct drm_device *dev, unsigned long flags);
++int cirrus_driver_unload(struct drm_device *dev);
++extern struct drm_ioctl_desc cirrus_ioctls[];
++extern int cirrus_max_ioctl;
++
++int cirrus_mm_init(struct cirrus_device *cirrus);
++void cirrus_mm_fini(struct cirrus_device *cirrus);
++void cirrus_ttm_placement(struct cirrus_bo *bo, int domain);
++int cirrus_bo_create(struct drm_device *dev, int size, int align,
++		     uint32_t flags, struct cirrus_bo **pcirrusbo);
++int cirrus_mmap(struct file *filp, struct vm_area_struct *vma);
++int cirrus_bo_reserve(struct cirrus_bo *bo, bool no_wait);
++void cirrus_bo_unreserve(struct cirrus_bo *bo);
++int cirrus_bo_push_sysram(struct cirrus_bo *bo);
++int cirrus_bo_pin(struct cirrus_bo *bo, u32 pl_flag, u64 *gpu_addr);
++#endif				/* __CIRRUS_DRV_H__ */
+--- /dev/null
++++ b/drivers/gpu/drm/cirrus/cirrus_fbdev.c
+@@ -0,0 +1,307 @@
++/*
++ * Copyright 2012 Red Hat
++ *
++ * This file is subject to the terms and conditions of the GNU General
++ * Public License version 2. See the file COPYING in the main
++ * directory of this archive for more details.
++ *
++ * Authors: Matthew Garrett
++ *          Dave Airlie
++ */
++#include <linux/module.h>
++#include "drmP.h"
++#include "drm.h"
++#include "drm_fb_helper.h"
++
++#include <linux/fb.h>
++
++#include "cirrus_drv.h"
++
++static void cirrus_dirty_update(struct cirrus_fbdev *afbdev,
++			     int x, int y, int width, int height)
++{
++	int i;
++	struct drm_gem_object *obj;
++	struct cirrus_bo *bo;
++	int src_offset, dst_offset;
++	int bpp = (afbdev->gfb.base.bits_per_pixel + 7)/8;
++	int ret;
++	bool unmap = false;
++
++	obj = afbdev->gfb.obj;
++	bo = gem_to_cirrus_bo(obj);
++
++	ret = cirrus_bo_reserve(bo, true);
++	if (ret) {
++		DRM_ERROR("failed to reserve fb bo\n");
++		return;
++	}
++
++	if (!bo->kmap.virtual) {
++		ret = ttm_bo_kmap(&bo->bo, 0, bo->bo.num_pages, &bo->kmap);
++		if (ret) {
++			DRM_ERROR("failed to kmap fb updates\n");
++			cirrus_bo_unreserve(bo);
++			return;
++		}
++		unmap = true;
++	}
++	for (i = y; i < y + height; i++) {
++		/* assume equal stride for now */
++		src_offset = dst_offset = i * afbdev->gfb.base.pitches[0] + (x * bpp);
++		memcpy_toio(bo->kmap.virtual + src_offset, afbdev->sysram + src_offset, width * bpp);
++
++	}
++	if (unmap)
++		ttm_bo_kunmap(&bo->kmap);
++
++	cirrus_bo_unreserve(bo);
++}
++
++static void cirrus_fillrect(struct fb_info *info,
++			 const struct fb_fillrect *rect)
++{
++	struct cirrus_fbdev *afbdev = info->par;
++	sys_fillrect(info, rect);
++	cirrus_dirty_update(afbdev, rect->dx, rect->dy, rect->width,
++			 rect->height);
++}
++
++static void cirrus_copyarea(struct fb_info *info,
++			 const struct fb_copyarea *area)
++{
++	struct cirrus_fbdev *afbdev = info->par;
++	sys_copyarea(info, area);
++	cirrus_dirty_update(afbdev, area->dx, area->dy, area->width,
++			 area->height);
++}
++
++static void cirrus_imageblit(struct fb_info *info,
++			  const struct fb_image *image)
++{
++	struct cirrus_fbdev *afbdev = info->par;
++	sys_imageblit(info, image);
++	cirrus_dirty_update(afbdev, image->dx, image->dy, image->width,
++			 image->height);
++}
++
++
++static struct fb_ops cirrusfb_ops = {
++	.owner = THIS_MODULE,
++	.fb_check_var = drm_fb_helper_check_var,
++	.fb_set_par = drm_fb_helper_set_par,
++	.fb_fillrect = cirrus_fillrect,
++	.fb_copyarea = cirrus_copyarea,
++	.fb_imageblit = cirrus_imageblit,
++	.fb_pan_display = drm_fb_helper_pan_display,
++	.fb_blank = drm_fb_helper_blank,
++	.fb_setcmap = drm_fb_helper_setcmap,
++};
++
++static int cirrusfb_create_object(struct cirrus_fbdev *afbdev,
++			       struct drm_mode_fb_cmd2 *mode_cmd,
++			       struct drm_gem_object **gobj_p)
++{
++	struct drm_device *dev = afbdev->helper.dev;
++	u32 bpp, depth;
++	u32 size;
++	struct drm_gem_object *gobj;
++
++	int ret = 0;
++	drm_fb_get_bpp_depth(mode_cmd->pixel_format, &depth, &bpp);
++
++	if (bpp > 24)
++		return -EINVAL;
++	size = mode_cmd->pitches[0] * mode_cmd->height;
++	ret = cirrus_gem_create(dev, size, true, &gobj);
++	if (ret)
++		return ret;
++
++	*gobj_p = gobj;
++	return ret;
++}
++
++static int cirrusfb_create(struct cirrus_fbdev *gfbdev,
++			   struct drm_fb_helper_surface_size *sizes)
++{
++	struct drm_device *dev = gfbdev->helper.dev;
++	struct cirrus_device *cdev = gfbdev->helper.dev->dev_private;
++	struct fb_info *info;
++	struct drm_framebuffer *fb;
++	struct drm_mode_fb_cmd2 mode_cmd;
++	struct device *device = &dev->pdev->dev;
++	void *sysram;
++	struct drm_gem_object *gobj = NULL;
++	struct cirrus_bo *bo = NULL;
++	int size, ret;
++
++	mode_cmd.width = sizes->surface_width;
++	mode_cmd.height = sizes->surface_height;
++	mode_cmd.pitches[0] = mode_cmd.width * ((sizes->surface_bpp + 7) / 8);
++	mode_cmd.pixel_format = drm_mode_legacy_fb_format(sizes->surface_bpp,
++							  sizes->surface_depth);
++	size = mode_cmd.pitches[0] * mode_cmd.height;
++
++	ret = cirrusfb_create_object(gfbdev, &mode_cmd, &gobj);
++	if (ret) {
++		DRM_ERROR("failed to create fbcon backing object %d\n", ret);
++		return ret;
++	}
++
++	bo = gem_to_cirrus_bo(gobj);
++
++	sysram = vmalloc(size);
++	if (!sysram)
++		return -ENOMEM;
++
++	info = framebuffer_alloc(0, device);
++	if (info == NULL)
++		return -ENOMEM;
++
++	info->par = gfbdev;
++
++	ret = cirrus_framebuffer_init(cdev->dev, &gfbdev->gfb, &mode_cmd, gobj);
++	if (ret)
++		return ret;
++
++	gfbdev->sysram = sysram;
++	gfbdev->size = size;
++
++	fb = &gfbdev->gfb.base;
++	if (!fb) {
++		DRM_INFO("fb is NULL\n");
++		return -EINVAL;
++	}
++
++	/* setup helper */
++	gfbdev->helper.fb = fb;
++	gfbdev->helper.fbdev = info;
++
++	strcpy(info->fix.id, "cirrusdrmfb");
++
++
++	info->flags = FBINFO_DEFAULT;
++	info->fbops = &cirrusfb_ops;
++
++	drm_fb_helper_fill_fix(info, fb->pitches[0], fb->depth);
++	drm_fb_helper_fill_var(info, &gfbdev->helper, sizes->fb_width,
++			       sizes->fb_height);
++
++	/* setup aperture base/size for vesafb takeover */
++	info->apertures = alloc_apertures(1);
++	if (!info->apertures) {
++		ret = -ENOMEM;
++		goto out_iounmap;
++	}
++	info->apertures->ranges[0].base = cdev->dev->mode_config.fb_base;
++	info->apertures->ranges[0].size = cdev->mc.vram_size;
++
++	info->screen_base = sysram;
++	info->screen_size = size;
++
++	info->fix.mmio_start = 0;
++	info->fix.mmio_len = 0;
++
++	ret = fb_alloc_cmap(&info->cmap, 256, 0);
++	if (ret) {
++		DRM_ERROR("%s: can't allocate color map\n", info->fix.id);
++		ret = -ENOMEM;
++		goto out_iounmap;
++	}
++
++	DRM_INFO("fb mappable at 0x%lX\n", info->fix.smem_start);
++	DRM_INFO("vram aper at 0x%lX\n", (unsigned long)info->fix.smem_start);
++	DRM_INFO("size %lu\n", (unsigned long)info->fix.smem_len);
++	DRM_INFO("fb depth is %d\n", fb->depth);
++	DRM_INFO("   pitch is %d\n", fb->pitches[0]);
++
++	return 0;
++out_iounmap:
++	return ret;
++}
++
++static int cirrus_fb_find_or_create_single(struct drm_fb_helper *helper,
++					   struct drm_fb_helper_surface_size
++					   *sizes)
++{
++	struct cirrus_fbdev *gfbdev = (struct cirrus_fbdev *)helper;
++	int new_fb = 0;
++	int ret;
++
++	if (!helper->fb) {
++		ret = cirrusfb_create(gfbdev, sizes);
++		if (ret)
++			return ret;
++		new_fb = 1;
++	}
++	return new_fb;
++}
++
++static int cirrus_fbdev_destroy(struct drm_device *dev,
++				struct cirrus_fbdev *gfbdev)
++{
++	struct fb_info *info;
++	struct cirrus_framebuffer *gfb = &gfbdev->gfb;
++
++	if (gfbdev->helper.fbdev) {
++		info = gfbdev->helper.fbdev;
++
++		unregister_framebuffer(info);
++		if (info->cmap.len)
++			fb_dealloc_cmap(&info->cmap);
++		framebuffer_release(info);
++	}
++
++	if (gfb->obj) {
++		drm_gem_object_unreference_unlocked(gfb->obj);
++		gfb->obj = NULL;
++	}
++
++	vfree(gfbdev->sysram);
++	drm_fb_helper_fini(&gfbdev->helper);
++	drm_framebuffer_cleanup(&gfb->base);
++
++	return 0;
++}
++
++static struct drm_fb_helper_funcs cirrus_fb_helper_funcs = {
++	.gamma_set = cirrus_crtc_fb_gamma_set,
++	.gamma_get = cirrus_crtc_fb_gamma_get,
++	.fb_probe = cirrus_fb_find_or_create_single,
++};
++
++int cirrus_fbdev_init(struct cirrus_device *cdev)
++{
++	struct cirrus_fbdev *gfbdev;
++	int ret;
++	int bpp_sel = 24;
++
++	/*bpp_sel = 8;*/
++	gfbdev = kzalloc(sizeof(struct cirrus_fbdev), GFP_KERNEL);
++	if (!gfbdev)
++		return -ENOMEM;
++
++	cdev->mode_info.gfbdev = gfbdev;
++	gfbdev->helper.funcs = &cirrus_fb_helper_funcs;
++
++	ret = drm_fb_helper_init(cdev->dev, &gfbdev->helper,
++				 cdev->num_crtc, CIRRUSFB_CONN_LIMIT);
++	if (ret) {
++		kfree(gfbdev);
++		return ret;
++	}
++	drm_fb_helper_single_add_all_connectors(&gfbdev->helper);
++	drm_fb_helper_initial_config(&gfbdev->helper, bpp_sel);
++
++	return 0;
++}
++
++void cirrus_fbdev_fini(struct cirrus_device *cdev)
++{
++	if (!cdev->mode_info.gfbdev)
++		return;
++
++	cirrus_fbdev_destroy(cdev->dev, cdev->mode_info.gfbdev);
++	kfree(cdev->mode_info.gfbdev);
++	cdev->mode_info.gfbdev = NULL;
++}
+--- /dev/null
++++ b/drivers/gpu/drm/cirrus/cirrus_main.c
+@@ -0,0 +1,335 @@
++/*
++ * Copyright 2012 Red Hat
++ *
++ * This file is subject to the terms and conditions of the GNU General
++ * Public License version 2. See the file COPYING in the main
++ * directory of this archive for more details.
++ *
++ * Authors: Matthew Garrett
++ *          Dave Airlie
++ */
++#include "drmP.h"
++#include "drm.h"
++#include "drm_crtc_helper.h"
++
++#include "cirrus_drv.h"
++
++
++static void cirrus_user_framebuffer_destroy(struct drm_framebuffer *fb)
++{
++	struct cirrus_framebuffer *cirrus_fb = to_cirrus_framebuffer(fb);
++	if (cirrus_fb->obj)
++		drm_gem_object_unreference_unlocked(cirrus_fb->obj);
++	drm_framebuffer_cleanup(fb);
++	kfree(fb);
++}
++
++static int cirrus_user_framebuffer_create_handle(struct drm_framebuffer *fb,
++						 struct drm_file *file_priv,
++						 unsigned int *handle)
++{
++	return 0;
++}
++
++static const struct drm_framebuffer_funcs cirrus_fb_funcs = {
++	.destroy = cirrus_user_framebuffer_destroy,
++	.create_handle = cirrus_user_framebuffer_create_handle,
++};
++
++int cirrus_framebuffer_init(struct drm_device *dev,
++			    struct cirrus_framebuffer *gfb,
++			    struct drm_mode_fb_cmd2 *mode_cmd,
++			    struct drm_gem_object *obj)
++{
++	int ret;
++
++	ret = drm_framebuffer_init(dev, &gfb->base, &cirrus_fb_funcs);
++	if (ret) {
++		DRM_ERROR("drm_framebuffer_init failed: %d\n", ret);
++		return ret;
++	}
++	drm_helper_mode_fill_fb_struct(&gfb->base, mode_cmd);
++	gfb->obj = obj;
++	return 0;
++}
++
++static struct drm_framebuffer *
++cirrus_user_framebuffer_create(struct drm_device *dev,
++			       struct drm_file *filp,
++			       struct drm_mode_fb_cmd2 *mode_cmd)
++{
++	struct drm_gem_object *obj;
++	struct cirrus_framebuffer *cirrus_fb;
++	int ret;
++	u32 bpp, depth;
++
++	drm_fb_get_bpp_depth(mode_cmd->pixel_format, &depth, &bpp);
++	/* cirrus can't handle > 24bpp framebuffers at all */
++	if (bpp > 24)
++		return ERR_PTR(-EINVAL);
++
++	obj = drm_gem_object_lookup(dev, filp, mode_cmd->handles[0]);
++	if (obj == NULL)
++		return ERR_PTR(-ENOENT);
++
++	cirrus_fb = kzalloc(sizeof(*cirrus_fb), GFP_KERNEL);
++	if (!cirrus_fb) {
++		drm_gem_object_unreference_unlocked(obj);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	ret = cirrus_framebuffer_init(dev, cirrus_fb, mode_cmd, obj);
++	if (ret) {
++		drm_gem_object_unreference_unlocked(obj);
++		kfree(cirrus_fb);
++		return ERR_PTR(ret);
++	}
++	return &cirrus_fb->base;
++}
++
++static const struct drm_mode_config_funcs cirrus_mode_funcs = {
++	.fb_create = cirrus_user_framebuffer_create,
++};
++
++/* Unmap the framebuffer from the core and release the memory */
++static void cirrus_vram_fini(struct cirrus_device *cdev)
++{
++	iounmap(cdev->rmmio);
++	cdev->rmmio = NULL;
++	if (cdev->mc.vram_base)
++		release_mem_region(cdev->mc.vram_base, cdev->mc.vram_size);
++}
++
++/* Map the framebuffer from the card and configure the core */
++static int cirrus_vram_init(struct cirrus_device *cdev)
++{
++	/* BAR 0 is VRAM */
++	cdev->mc.vram_base = pci_resource_start(cdev->dev->pdev, 0);
++	/* We have 4MB of VRAM */
++	cdev->mc.vram_size = 4 * 1024 * 1024;
++
++	if (!request_mem_region(cdev->mc.vram_base, cdev->mc.vram_size,
++				"cirrusdrmfb_vram")) {
++		DRM_ERROR("can't reserve VRAM\n");
++		return -ENXIO;
++	}
++
++	return 0;
++}
++
++/*
++ * Our emulated hardware has two sets of memory. One is video RAM and can
++ * simply be used as a linear framebuffer - the other provides mmio access
++ * to the display registers. The latter can also be accessed via IO port
++ * access, but we map the range and use mmio to program them instead
++ */
++
++int cirrus_device_init(struct cirrus_device *cdev,
++		       struct drm_device *ddev,
++		       struct pci_dev *pdev, uint32_t flags)
++{
++	int ret;
++
++	cdev->dev = ddev;
++	cdev->flags = flags;
++
++	/* Hardcode the number of CRTCs to 1 */
++	cdev->num_crtc = 1;
++
++	/* BAR 0 is the framebuffer, BAR 1 contains registers */
++	cdev->rmmio_base = pci_resource_start(cdev->dev->pdev, 1);
++	cdev->rmmio_size = pci_resource_len(cdev->dev->pdev, 1);
++
++	if (!request_mem_region(cdev->rmmio_base, cdev->rmmio_size,
++				"cirrusdrmfb_mmio")) {
++		DRM_ERROR("can't reserve mmio registers\n");
++		return -ENOMEM;
++	}
++
++	cdev->rmmio = ioremap(cdev->rmmio_base, cdev->rmmio_size);
++
++	if (cdev->rmmio == NULL)
++		return -ENOMEM;
++
++	ret = cirrus_vram_init(cdev);
++	if (ret) {
++		release_mem_region(cdev->rmmio_base, cdev->rmmio_size);
++		return ret;
++	}
++
++	return 0;
++}
++
++void cirrus_device_fini(struct cirrus_device *cdev)
++{
++	release_mem_region(cdev->rmmio_base, cdev->rmmio_size);
++	cirrus_vram_fini(cdev);
++}
++
++/*
++ * Functions here will be called by the core once it's bound the driver to
++ * a PCI device
++ */
++
++int cirrus_driver_load(struct drm_device *dev, unsigned long flags)
++{
++	struct cirrus_device *cdev;
++	int r;
++
++	cdev = kzalloc(sizeof(struct cirrus_device), GFP_KERNEL);
++	if (cdev == NULL)
++		return -ENOMEM;
++	dev->dev_private = (void *)cdev;
++
++	r = cirrus_device_init(cdev, dev, dev->pdev, flags);
++	if (r) {
++		dev_err(&dev->pdev->dev, "Fatal error during GPU init: %d\n", r);
++		goto out;
++	}
++
++	r = cirrus_mm_init(cdev);
++	if (r)
++		dev_err(&dev->pdev->dev, "fatal err on mm init\n");
++
++	r = cirrus_modeset_init(cdev);
++	if (r)
++		dev_err(&dev->pdev->dev, "Fatal error during modeset init: %d\n", r);
++
++	dev->mode_config.funcs = (void *)&cirrus_mode_funcs;
++out:
++	if (r)
++		cirrus_driver_unload(dev);
++	return r;
++}
++
++int cirrus_driver_unload(struct drm_device *dev)
++{
++	struct cirrus_device *cdev = dev->dev_private;
++
++	if (cdev == NULL)
++		return 0;
++	cirrus_modeset_fini(cdev);
++	cirrus_mm_fini(cdev);
++	cirrus_device_fini(cdev);
++	kfree(cdev);
++	dev->dev_private = NULL;
++	return 0;
++}
++
++int cirrus_gem_create(struct drm_device *dev,
++		   u32 size, bool iskernel,
++		   struct drm_gem_object **obj)
++{
++	struct cirrus_bo *cirrusbo;
++	int ret;
++
++	*obj = NULL;
++
++	size = roundup(size, PAGE_SIZE);
++	if (size == 0)
++		return -EINVAL;
++
++	ret = cirrus_bo_create(dev, size, 0, 0, &cirrusbo);
++	if (ret) {
++		if (ret != -ERESTARTSYS)
++			DRM_ERROR("failed to allocate GEM object\n");
++		return ret;
++	}
++	*obj = &cirrusbo->gem;
++	return 0;
++}
++
++int cirrus_dumb_create(struct drm_file *file,
++		    struct drm_device *dev,
++		    struct drm_mode_create_dumb *args)
++{
++	int ret;
++	struct drm_gem_object *gobj;
++	u32 handle;
++
++	args->pitch = args->width * ((args->bpp + 7) / 8);
++	args->size = args->pitch * args->height;
++
++	ret = cirrus_gem_create(dev, args->size, false,
++			     &gobj);
++	if (ret)
++		return ret;
++
++	ret = drm_gem_handle_create(file, gobj, &handle);
++	drm_gem_object_unreference_unlocked(gobj);
++	if (ret)
++		return ret;
++
++	args->handle = handle;
++	return 0;
++}
++
++int cirrus_dumb_destroy(struct drm_file *file,
++		     struct drm_device *dev,
++		     uint32_t handle)
++{
++	return drm_gem_handle_delete(file, handle);
++}
++
++int cirrus_gem_init_object(struct drm_gem_object *obj)
++{
++	BUG();
++	return 0;
++}
++
++void cirrus_bo_unref(struct cirrus_bo **bo)
++{
++	struct ttm_buffer_object *tbo;
++
++	if ((*bo) == NULL)
++		return;
++
++	tbo = &((*bo)->bo);
++	ttm_bo_unref(&tbo);
++	if (tbo == NULL)
++		*bo = NULL;
++
++}
++
++void cirrus_gem_free_object(struct drm_gem_object *obj)
++{
++	struct cirrus_bo *cirrus_bo = gem_to_cirrus_bo(obj);
++
++	if (!cirrus_bo)
++		return;
++	cirrus_bo_unref(&cirrus_bo);
++}
++
++
++static inline u64 cirrus_bo_mmap_offset(struct cirrus_bo *bo)
++{
++	return bo->bo.addr_space_offset;
++}
++
++int
++cirrus_dumb_mmap_offset(struct drm_file *file,
++		     struct drm_device *dev,
++		     uint32_t handle,
++		     uint64_t *offset)
++{
++	struct drm_gem_object *obj;
++	int ret;
++	struct cirrus_bo *bo;
++
++	mutex_lock(&dev->struct_mutex);
++	obj = drm_gem_object_lookup(dev, file, handle);
++	if (obj == NULL) {
++		ret = -ENOENT;
++		goto out_unlock;
++	}
++
++	bo = gem_to_cirrus_bo(obj);
++	*offset = cirrus_bo_mmap_offset(bo);
++
++	drm_gem_object_unreference(obj);
++	ret = 0;
++out_unlock:
++	mutex_unlock(&dev->struct_mutex);
++	return ret;
++
++}
+--- /dev/null
++++ b/drivers/gpu/drm/cirrus/cirrus_mode.c
+@@ -0,0 +1,629 @@
++
++/*
++ * Copyright 2012 Red Hat
++ *
++ * This file is subject to the terms and conditions of the GNU General
++ * Public License version 2. See the file COPYING in the main
++ * directory of this archive for more details.
++ *
++ * Authors: Matthew Garrett
++ *          Dave Airlie
++ *
++ * Portions of this code derived from cirrusfb.c:
++ * drivers/video/cirrusfb.c - driver for Cirrus Logic chipsets
++ *
++ * Copyright 1999-2001 Jeff Garzik <jgarzik@pobox.com>
++ */
++#include "drmP.h"
++#include "drm.h"
++#include "drm_crtc_helper.h"
++
++#include <video/cirrus.h>
++
++#include "cirrus_drv.h"
++
++#define CIRRUS_LUT_SIZE 256
++
++#define PALETTE_INDEX 0x8
++#define PALETTE_DATA 0x9
++
++/*
++ * This file contains setup code for the CRTC.
++ */
++
++static void cirrus_crtc_load_lut(struct drm_crtc *crtc)
++{
++	struct cirrus_crtc *cirrus_crtc = to_cirrus_crtc(crtc);
++	struct drm_device *dev = crtc->dev;
++	struct cirrus_device *cdev = dev->dev_private;
++	int i;
++
++	if (!crtc->enabled)
++		return;
++
++	for (i = 0; i < CIRRUS_LUT_SIZE; i++) {
++		/* VGA registers */
++		WREG8(PALETTE_INDEX, i);
++		WREG8(PALETTE_DATA, cirrus_crtc->lut_r[i]);
++		WREG8(PALETTE_DATA, cirrus_crtc->lut_g[i]);
++		WREG8(PALETTE_DATA, cirrus_crtc->lut_b[i]);
++	}
++}
++
++/*
++ * The DRM core requires DPMS functions, but they make little sense in our
++ * case and so are just stubs
++ */
++
++static void cirrus_crtc_dpms(struct drm_crtc *crtc, int mode)
++{
++	struct drm_device *dev = crtc->dev;
++	struct cirrus_device *cdev = dev->dev_private;
++	u8 sr01, gr0e;
++
++	switch (mode) {
++	case DRM_MODE_DPMS_ON:
++		sr01 = 0x00;
++		gr0e = 0x00;
++		break;
++	case DRM_MODE_DPMS_STANDBY:
++		sr01 = 0x20;
++		gr0e = 0x02;
++		break;
++	case DRM_MODE_DPMS_SUSPEND:
++		sr01 = 0x20;
++		gr0e = 0x04;
++		break;
++	case DRM_MODE_DPMS_OFF:
++		sr01 = 0x20;
++		gr0e = 0x06;
++		break;
++	default:
++		return;
++	}
++
++	WREG8(SEQ_INDEX, 0x1);
++	sr01 |= RREG8(SEQ_DATA) & ~0x20;
++	WREG_SEQ(0x1, sr01);
++
++	WREG8(GFX_INDEX, 0xe);
++	gr0e |= RREG8(GFX_DATA) & ~0x06;
++	WREG_GFX(0xe, gr0e);
++}
++
++/*
++ * The core passes the desired mode to the CRTC code to see whether any
++ * CRTC-specific modifications need to be made to it. We're in a position
++ * to just pass that straight through, so this does nothing
++ */
++static bool cirrus_crtc_mode_fixup(struct drm_crtc *crtc,
++				   struct drm_display_mode *mode,
++				   struct drm_display_mode *adjusted_mode)
++{
++	return true;
++}
++
++void cirrus_set_start_address(struct drm_crtc *crtc, unsigned offset)
++{
++	struct cirrus_device *cdev = crtc->dev->dev_private;
++	u32 addr;
++	u8 tmp;
++
++	addr = offset >> 2;
++	WREG_CRT(0x0c, (u8)((addr >> 8) & 0xff));
++	WREG_CRT(0x0d, (u8)(addr & 0xff));
++
++	WREG8(CRT_INDEX, 0x1b);
++	tmp = RREG8(CRT_DATA);
++	tmp &= 0xf2;
++	tmp |= (addr >> 16) & 0x01;
++	tmp |= (addr >> 15) & 0x0c;
++	WREG_CRT(0x1b, tmp);
++	WREG8(CRT_INDEX, 0x1d);
++	tmp = RREG8(CRT_DATA);
++	tmp &= 0x7f;
++	tmp |= (addr >> 12) & 0x80;
++	WREG_CRT(0x1d, tmp);
++}
++
++/* cirrus is different - we will force move buffers out of VRAM */
++static int cirrus_crtc_do_set_base(struct drm_crtc *crtc,
++				struct drm_framebuffer *fb,
++				int x, int y, int atomic)
++{
++	struct cirrus_device *cdev = crtc->dev->dev_private;
++	struct drm_gem_object *obj;
++	struct cirrus_framebuffer *cirrus_fb;
++	struct cirrus_bo *bo;
++	int ret;
++	u64 gpu_addr;
++
++	/* push the previous fb to system ram */
++	if (!atomic && fb) {
++		cirrus_fb = to_cirrus_framebuffer(fb);
++		obj = cirrus_fb->obj;
++		bo = gem_to_cirrus_bo(obj);
++		ret = cirrus_bo_reserve(bo, false);
++		if (ret)
++			return ret;
++		cirrus_bo_push_sysram(bo);
++		cirrus_bo_unreserve(bo);
++	}
++
++	cirrus_fb = to_cirrus_framebuffer(crtc->fb);
++	obj = cirrus_fb->obj;
++	bo = gem_to_cirrus_bo(obj);
++
++	ret = cirrus_bo_reserve(bo, false);
++	if (ret)
++		return ret;
++
++	ret = cirrus_bo_pin(bo, TTM_PL_FLAG_VRAM, &gpu_addr);
++	if (ret) {
++		cirrus_bo_unreserve(bo);
++		return ret;
++	}
++
++	if (&cdev->mode_info.gfbdev->gfb == cirrus_fb) {
++		/* if pushing console in kmap it */
++		ret = ttm_bo_kmap(&bo->bo, 0, bo->bo.num_pages, &bo->kmap);
++		if (ret)
++			DRM_ERROR("failed to kmap fbcon\n");
++	}
++	cirrus_bo_unreserve(bo);
++
++	cirrus_set_start_address(crtc, (u32)gpu_addr);
++	return 0;
++}
++
++static int cirrus_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
++			     struct drm_framebuffer *old_fb)
++{
++	return cirrus_crtc_do_set_base(crtc, old_fb, x, y, 0);
++}
++
++/*
++ * The meat of this driver. The core passes us a mode and we have to program
++ * it. The modesetting here is the bare minimum required to satisfy the qemu
++ * emulation of this hardware, and running this against a real device is
++ * likely to result in an inadequately programmed mode. We've already had
++ * the opportunity to modify the mode, so whatever we receive here should
++ * be something that can be correctly programmed and displayed
++ */
++static int cirrus_crtc_mode_set(struct drm_crtc *crtc,
++				struct drm_display_mode *mode,
++				struct drm_display_mode *adjusted_mode,
++				int x, int y, struct drm_framebuffer *old_fb)
++{
++	struct drm_device *dev = crtc->dev;
++	struct cirrus_device *cdev = dev->dev_private;
++	int hsyncstart, hsyncend, htotal, hdispend;
++	int vtotal, vdispend;
++	int tmp;
++	int sr07 = 0, hdr = 0;
++
++	htotal = mode->htotal / 8;
++	hsyncend = mode->hsync_end / 8;
++	hsyncstart = mode->hsync_start / 8;
++	hdispend = mode->hdisplay / 8;
++
++	vtotal = mode->vtotal;
++	vdispend = mode->vdisplay;
++
++	vdispend -= 1;
++	vtotal -= 2;
++
++	htotal -= 5;
++	hdispend -= 1;
++	hsyncstart += 1;
++	hsyncend += 1;
++
++	WREG_CRT(VGA_CRTC_V_SYNC_END, 0x20);
++	WREG_CRT(VGA_CRTC_H_TOTAL, htotal);
++	WREG_CRT(VGA_CRTC_H_DISP, hdispend);
++	WREG_CRT(VGA_CRTC_H_SYNC_START, hsyncstart);
++	WREG_CRT(VGA_CRTC_H_SYNC_END, hsyncend);
++	WREG_CRT(VGA_CRTC_V_TOTAL, vtotal & 0xff);
++	WREG_CRT(VGA_CRTC_V_DISP_END, vdispend & 0xff);
++
++	tmp = 0x40;
++	if ((vdispend + 1) & 512)
++		tmp |= 0x20;
++	WREG_CRT(VGA_CRTC_MAX_SCAN, tmp);
++
++	/*
++	 * Overflow bits for values that don't fit in the standard registers
++	 */
++	tmp = 16;
++	if (vtotal & 256)
++		tmp |= 1;
++	if (vdispend & 256)
++		tmp |= 2;
++	if ((vdispend + 1) & 256)
++		tmp |= 8;
++	if (vtotal & 512)
++		tmp |= 32;
++	if (vdispend & 512)
++		tmp |= 64;
++	WREG_CRT(VGA_CRTC_OVERFLOW, tmp);
++
++	tmp = 0;
++
++	/* More overflow bits */
++
++	if ((htotal + 5) & 64)
++		tmp |= 16;
++	if ((htotal + 5) & 128)
++		tmp |= 32;
++	if (vtotal & 256)
++		tmp |= 64;
++	if (vtotal & 512)
++		tmp |= 128;
++
++	WREG_CRT(CL_CRT1A, tmp);
++
++	/* Disable Hercules/CGA compatibility */
++	WREG_CRT(VGA_CRTC_MODE, 0x03);
++
++	WREG8(SEQ_INDEX, 0x7);
++	sr07 = RREG8(SEQ_DATA);
++	sr07 &= 0xe0;
++	hdr = 0;
++	switch (crtc->fb->bits_per_pixel) {
++	case 8:
++		sr07 |= 0x11;
++		break;
++	case 16:
++		sr07 |= 0xc1;
++		hdr = 0xc0;
++		break;
++	case 24:
++		sr07 |= 0x15;
++		hdr = 0xc5;
++		break;
++	case 32:
++		sr07 |= 0x19;
++		hdr = 0xc5;
++		break;
++	default:
++		return -1;
++	}
++
++	WREG_SEQ(0x7, sr07);
++
++	/* Program the pitch */
++	tmp = crtc->fb->pitches[0] / 8;
++	WREG_CRT(VGA_CRTC_OFFSET, tmp);
++
++	/* Enable extended blanking and pitch bits, and enable full memory */
++	tmp = 0x22;
++	tmp |= (crtc->fb->pitches[0] >> 7) & 0x10;
++	tmp |= (crtc->fb->pitches[0] >> 6) & 0x40;
++	WREG_CRT(0x1b, tmp);
++
++	/* Enable high-colour modes */
++	WREG_GFX(VGA_GFX_MODE, 0x40);
++
++	/* And set graphics mode */
++	WREG_GFX(VGA_GFX_MISC, 0x01);
++
++	WREG_HDR(hdr);
++	cirrus_crtc_do_set_base(crtc, old_fb, x, y, 0);
++	return 0;
++}
++
++/*
++ * This is called before a mode is programmed. A typical use might be to
++ * enable DPMS during the programming to avoid seeing intermediate stages,
++ * but that's not relevant to us
++ */
++static void cirrus_crtc_prepare(struct drm_crtc *crtc)
++{
++}
++
++/*
++ * This is called after a mode is programmed. It should reverse anything done
++ * by the prepare function
++ */
++static void cirrus_crtc_commit(struct drm_crtc *crtc)
++{
++}
++
++/*
++ * The core can pass us a set of gamma values to program. We actually only
++ * use this for 8-bit mode so can't perform smooth fades on deeper modes,
++ * but it's a requirement that we provide the function
++ */
++static void cirrus_crtc_gamma_set(struct drm_crtc *crtc, u16 *red, u16 *green,
++				  u16 *blue, uint32_t start, uint32_t size)
++{
++	struct cirrus_crtc *cirrus_crtc = to_cirrus_crtc(crtc);
++	int i;
++
++	if (size != CIRRUS_LUT_SIZE)
++		return;
++
++	for (i = 0; i < CIRRUS_LUT_SIZE; i++) {
++		cirrus_crtc->lut_r[i] = red[i];
++		cirrus_crtc->lut_g[i] = green[i];
++		cirrus_crtc->lut_b[i] = blue[i];
++	}
++	cirrus_crtc_load_lut(crtc);
++}
++
++/* Simple cleanup function */
++static void cirrus_crtc_destroy(struct drm_crtc *crtc)
++{
++	struct cirrus_crtc *cirrus_crtc = to_cirrus_crtc(crtc);
++
++	drm_crtc_cleanup(crtc);
++	kfree(cirrus_crtc);
++}
++
++/* These provide the minimum set of functions required to handle a CRTC */
++static const struct drm_crtc_funcs cirrus_crtc_funcs = {
++	.gamma_set = cirrus_crtc_gamma_set,
++	.set_config = drm_crtc_helper_set_config,
++	.destroy = cirrus_crtc_destroy,
++};
++
++static const struct drm_crtc_helper_funcs cirrus_helper_funcs = {
++	.dpms = cirrus_crtc_dpms,
++	.mode_fixup = cirrus_crtc_mode_fixup,
++	.mode_set = cirrus_crtc_mode_set,
++	.mode_set_base = cirrus_crtc_mode_set_base,
++	.prepare = cirrus_crtc_prepare,
++	.commit = cirrus_crtc_commit,
++	.load_lut = cirrus_crtc_load_lut,
++};
++
++/* CRTC setup */
++static void cirrus_crtc_init(struct drm_device *dev)
++{
++	struct cirrus_device *cdev = dev->dev_private;
++	struct cirrus_crtc *cirrus_crtc;
++	int i;
++
++	cirrus_crtc = kzalloc(sizeof(struct cirrus_crtc) +
++			      (CIRRUSFB_CONN_LIMIT * sizeof(struct drm_connector *)),
++			      GFP_KERNEL);
++
++	if (cirrus_crtc == NULL)
++		return;
++
++	drm_crtc_init(dev, &cirrus_crtc->base, &cirrus_crtc_funcs);
++
++	drm_mode_crtc_set_gamma_size(&cirrus_crtc->base, CIRRUS_LUT_SIZE);
++	cdev->mode_info.crtc = cirrus_crtc;
++
++	for (i = 0; i < CIRRUS_LUT_SIZE; i++) {
++		cirrus_crtc->lut_r[i] = i;
++		cirrus_crtc->lut_g[i] = i;
++		cirrus_crtc->lut_b[i] = i;
++	}
++
++	drm_crtc_helper_add(&cirrus_crtc->base, &cirrus_helper_funcs);
++}
++
++/** Sets the color ramps on behalf of fbcon */
++void cirrus_crtc_fb_gamma_set(struct drm_crtc *crtc, u16 red, u16 green,
++			      u16 blue, int regno)
++{
++	struct cirrus_crtc *cirrus_crtc = to_cirrus_crtc(crtc);
++
++	cirrus_crtc->lut_r[regno] = red;
++	cirrus_crtc->lut_g[regno] = green;
++	cirrus_crtc->lut_b[regno] = blue;
++}
++
++/** Gets the color ramps on behalf of fbcon */
++void cirrus_crtc_fb_gamma_get(struct drm_crtc *crtc, u16 *red, u16 *green,
++			      u16 *blue, int regno)
++{
++	struct cirrus_crtc *cirrus_crtc = to_cirrus_crtc(crtc);
++
++	*red = cirrus_crtc->lut_r[regno];
++	*green = cirrus_crtc->lut_g[regno];
++	*blue = cirrus_crtc->lut_b[regno];
++}
++
++
++static bool cirrus_encoder_mode_fixup(struct drm_encoder *encoder,
++				  struct drm_display_mode *mode,
++				  struct drm_display_mode *adjusted_mode)
++{
++	return true;
++}
++
++static void cirrus_encoder_mode_set(struct drm_encoder *encoder,
++				struct drm_display_mode *mode,
++				struct drm_display_mode *adjusted_mode)
++{
++}
++
++static void cirrus_encoder_dpms(struct drm_encoder *encoder, int state)
++{
++	return;
++}
++
++static void cirrus_encoder_prepare(struct drm_encoder *encoder)
++{
++}
++
++static void cirrus_encoder_commit(struct drm_encoder *encoder)
++{
++}
++
++void cirrus_encoder_destroy(struct drm_encoder *encoder)
++{
++	struct cirrus_encoder *cirrus_encoder = to_cirrus_encoder(encoder);
++	drm_encoder_cleanup(encoder);
++	kfree(cirrus_encoder);
++}
++
++static const struct drm_encoder_helper_funcs cirrus_encoder_helper_funcs = {
++	.dpms = cirrus_encoder_dpms,
++	.mode_fixup = cirrus_encoder_mode_fixup,
++	.mode_set = cirrus_encoder_mode_set,
++	.prepare = cirrus_encoder_prepare,
++	.commit = cirrus_encoder_commit,
++};
++
++static const struct drm_encoder_funcs cirrus_encoder_encoder_funcs = {
++	.destroy = cirrus_encoder_destroy,
++};
++
++static struct drm_encoder *cirrus_encoder_init(struct drm_device *dev)
++{
++	struct drm_encoder *encoder;
++	struct cirrus_encoder *cirrus_encoder;
++
++	cirrus_encoder = kzalloc(sizeof(struct cirrus_encoder), GFP_KERNEL);
++	if (!cirrus_encoder)
++		return NULL;
++
++	encoder = &cirrus_encoder->base;
++	encoder->possible_crtcs = 0x1;
++
++	drm_encoder_init(dev, encoder, &cirrus_encoder_encoder_funcs,
++			 DRM_MODE_ENCODER_DAC);
++	drm_encoder_helper_add(encoder, &cirrus_encoder_helper_funcs);
++
++	return encoder;
++}
++
++
++int cirrus_vga_get_modes(struct drm_connector *connector)
++{
++	/* Just add a static list of modes */
++	drm_add_modes_noedid(connector, 640, 480);
++	drm_add_modes_noedid(connector, 800, 600);
++	drm_add_modes_noedid(connector, 1024, 768);
++	drm_add_modes_noedid(connector, 1280, 1024);
++
++	return 4;
++}
++
++static int cirrus_vga_mode_valid(struct drm_connector *connector,
++				 struct drm_display_mode *mode)
++{
++	/* Any mode we've added is valid */
++	return MODE_OK;
++}
++
++struct drm_encoder *cirrus_connector_best_encoder(struct drm_connector
++						  *connector)
++{
++	int enc_id = connector->encoder_ids[0];
++	struct drm_mode_object *obj;
++	struct drm_encoder *encoder;
++
++	/* pick the encoder ids */
++	if (enc_id) {
++		obj =
++		    drm_mode_object_find(connector->dev, enc_id,
++					 DRM_MODE_OBJECT_ENCODER);
++		if (!obj)
++			return NULL;
++		encoder = obj_to_encoder(obj);
++		return encoder;
++	}
++	return NULL;
++}
++
++static enum drm_connector_status cirrus_vga_detect(struct drm_connector
++						   *connector, bool force)
++{
++	return connector_status_connected;
++}
++
++static void cirrus_connector_destroy(struct drm_connector *connector)
++{
++	drm_connector_cleanup(connector);
++	kfree(connector);
++}
++
++struct drm_connector_helper_funcs cirrus_vga_connector_helper_funcs = {
++	.get_modes = cirrus_vga_get_modes,
++	.mode_valid = cirrus_vga_mode_valid,
++	.best_encoder = cirrus_connector_best_encoder,
++};
++
++struct drm_connector_funcs cirrus_vga_connector_funcs = {
++	.dpms = drm_helper_connector_dpms,
++	.detect = cirrus_vga_detect,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.destroy = cirrus_connector_destroy,
++};
++
++static struct drm_connector *cirrus_vga_init(struct drm_device *dev)
++{
++	struct drm_connector *connector;
++	struct cirrus_connector *cirrus_connector;
++
++	cirrus_connector = kzalloc(sizeof(struct cirrus_connector), GFP_KERNEL);
++	if (!cirrus_connector)
++		return NULL;
++
++	connector = &cirrus_connector->base;
++
++	drm_connector_init(dev, connector,
++			   &cirrus_vga_connector_funcs, DRM_MODE_CONNECTOR_VGA);
++
++	drm_connector_helper_add(connector, &cirrus_vga_connector_helper_funcs);
++
++	return connector;
++}
++
++
++int cirrus_modeset_init(struct cirrus_device *cdev)
++{
++	struct drm_encoder *encoder;
++	struct drm_connector *connector;
++	int ret;
++
++	drm_mode_config_init(cdev->dev);
++	cdev->mode_info.mode_config_initialized = true;
++
++	cdev->dev->mode_config.max_width = CIRRUS_MAX_FB_WIDTH;
++	cdev->dev->mode_config.max_height = CIRRUS_MAX_FB_HEIGHT;
++
++	cdev->dev->mode_config.fb_base = cdev->mc.vram_base;
++	cdev->dev->mode_config.preferred_depth = 24;
++	/* don't prefer a shadow on virt GPU */
++	cdev->dev->mode_config.prefer_shadow = 0;
++
++	cirrus_crtc_init(cdev->dev);
++
++	encoder = cirrus_encoder_init(cdev->dev);
++	if (!encoder) {
++		DRM_ERROR("cirrus_encoder_init failed\n");
++		return -1;
++	}
++
++	connector = cirrus_vga_init(cdev->dev);
++	if (!connector) {
++		DRM_ERROR("cirrus_vga_init failed\n");
++		return -1;
++	}
++
++	drm_mode_connector_attach_encoder(connector, encoder);
++
++	ret = cirrus_fbdev_init(cdev);
++	if (ret) {
++		DRM_ERROR("cirrus_fbdev_init failed\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++void cirrus_modeset_fini(struct cirrus_device *cdev)
++{
++	cirrus_fbdev_fini(cdev);
++
++	if (cdev->mode_info.mode_config_initialized) {
++		drm_mode_config_cleanup(cdev->dev);
++		cdev->mode_info.mode_config_initialized = false;
++	}
++}
+--- /dev/null
++++ b/drivers/gpu/drm/cirrus/cirrus_ttm.c
+@@ -0,0 +1,453 @@
++/*
++ * Copyright 2012 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sub license, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDERS, AUTHORS AND/OR ITS SUPPLIERS BE LIABLE FOR ANY CLAIM,
++ * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
++ * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
++ * USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial portions
++ * of the Software.
++ *
++ */
++/*
++ * Authors: Dave Airlie <airlied@redhat.com>
++ */
++#include "drmP.h"
++#include "cirrus_drv.h"
++#include <ttm/ttm_page_alloc.h>
++
++static inline struct cirrus_device *
++cirrus_bdev(struct ttm_bo_device *bd)
++{
++	return container_of(bd, struct cirrus_device, ttm.bdev);
++}
++
++static int
++cirrus_ttm_mem_global_init(struct drm_global_reference *ref)
++{
++	return ttm_mem_global_init(ref->object);
++}
++
++static void
++cirrus_ttm_mem_global_release(struct drm_global_reference *ref)
++{
++	ttm_mem_global_release(ref->object);
++}
++
++static int cirrus_ttm_global_init(struct cirrus_device *cirrus)
++{
++	struct drm_global_reference *global_ref;
++	int r;
++
++	global_ref = &cirrus->ttm.mem_global_ref;
++	global_ref->global_type = DRM_GLOBAL_TTM_MEM;
++	global_ref->size = sizeof(struct ttm_mem_global);
++	global_ref->init = &cirrus_ttm_mem_global_init;
++	global_ref->release = &cirrus_ttm_mem_global_release;
++	r = drm_global_item_ref(global_ref);
++	if (r != 0) {
++		DRM_ERROR("Failed setting up TTM memory accounting "
++			  "subsystem.\n");
++		return r;
++	}
++
++	cirrus->ttm.bo_global_ref.mem_glob =
++		cirrus->ttm.mem_global_ref.object;
++	global_ref = &cirrus->ttm.bo_global_ref.ref;
++	global_ref->global_type = DRM_GLOBAL_TTM_BO;
++	global_ref->size = sizeof(struct ttm_bo_global);
++	global_ref->init = &ttm_bo_global_init;
++	global_ref->release = &ttm_bo_global_release;
++	r = drm_global_item_ref(global_ref);
++	if (r != 0) {
++		DRM_ERROR("Failed setting up TTM BO subsystem.\n");
++		drm_global_item_unref(&cirrus->ttm.mem_global_ref);
++		return r;
++	}
++	return 0;
++}
++
++void
++cirrus_ttm_global_release(struct cirrus_device *cirrus)
++{
++	if (cirrus->ttm.mem_global_ref.release == NULL)
++		return;
++
++	drm_global_item_unref(&cirrus->ttm.bo_global_ref.ref);
++	drm_global_item_unref(&cirrus->ttm.mem_global_ref);
++	cirrus->ttm.mem_global_ref.release = NULL;
++}
++
++
++static void cirrus_bo_ttm_destroy(struct ttm_buffer_object *tbo)
++{
++	struct cirrus_bo *bo;
++
++	bo = container_of(tbo, struct cirrus_bo, bo);
++
++	drm_gem_object_release(&bo->gem);
++	kfree(bo);
++}
++
++bool cirrus_ttm_bo_is_cirrus_bo(struct ttm_buffer_object *bo)
++{
++	if (bo->destroy == &cirrus_bo_ttm_destroy)
++		return true;
++	return false;
++}
++
++static int
++cirrus_bo_init_mem_type(struct ttm_bo_device *bdev, uint32_t type,
++		     struct ttm_mem_type_manager *man)
++{
++	switch (type) {
++	case TTM_PL_SYSTEM:
++		man->flags = TTM_MEMTYPE_FLAG_MAPPABLE;
++		man->available_caching = TTM_PL_MASK_CACHING;
++		man->default_caching = TTM_PL_FLAG_CACHED;
++		break;
++	case TTM_PL_VRAM:
++		man->func = &ttm_bo_manager_func;
++		man->flags = TTM_MEMTYPE_FLAG_FIXED |
++			TTM_MEMTYPE_FLAG_MAPPABLE;
++		man->available_caching = TTM_PL_FLAG_UNCACHED |
++			TTM_PL_FLAG_WC;
++		man->default_caching = TTM_PL_FLAG_WC;
++		break;
++	default:
++		DRM_ERROR("Unsupported memory type %u\n", (unsigned)type);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static void
++cirrus_bo_evict_flags(struct ttm_buffer_object *bo, struct ttm_placement *pl)
++{
++	struct cirrus_bo *cirrusbo = cirrus_bo(bo);
++
++	if (!cirrus_ttm_bo_is_cirrus_bo(bo))
++		return;
++
++	cirrus_ttm_placement(cirrusbo, TTM_PL_FLAG_SYSTEM);
++	*pl = cirrusbo->placement;
++}
++
++static int cirrus_bo_verify_access(struct ttm_buffer_object *bo, struct file *filp)
++{
++	return 0;
++}
++
++static int cirrus_ttm_io_mem_reserve(struct ttm_bo_device *bdev,
++				  struct ttm_mem_reg *mem)
++{
++	struct ttm_mem_type_manager *man = &bdev->man[mem->mem_type];
++	struct cirrus_device *cirrus = cirrus_bdev(bdev);
++
++	mem->bus.addr = NULL;
++	mem->bus.offset = 0;
++	mem->bus.size = mem->num_pages << PAGE_SHIFT;
++	mem->bus.base = 0;
++	mem->bus.is_iomem = false;
++	if (!(man->flags & TTM_MEMTYPE_FLAG_MAPPABLE))
++		return -EINVAL;
++	switch (mem->mem_type) {
++	case TTM_PL_SYSTEM:
++		/* system memory */
++		return 0;
++	case TTM_PL_VRAM:
++		mem->bus.offset = mem->start << PAGE_SHIFT;
++		mem->bus.base = pci_resource_start(cirrus->dev->pdev, 0);
++		mem->bus.is_iomem = true;
++		break;
++	default:
++		return -EINVAL;
++		break;
++	}
++	return 0;
++}
++
++static void cirrus_ttm_io_mem_free(struct ttm_bo_device *bdev, struct ttm_mem_reg *mem)
++{
++}
++
++static int cirrus_bo_move(struct ttm_buffer_object *bo,
++		       bool evict, bool interruptible,
++		       bool no_wait_reserve, bool no_wait_gpu,
++		       struct ttm_mem_reg *new_mem)
++{
++	int r;
++	r = ttm_bo_move_memcpy(bo, evict, no_wait_reserve, no_wait_gpu, new_mem);
++	return r;
++}
++
++
++static void cirrus_ttm_backend_destroy(struct ttm_tt *tt)
++{
++	ttm_tt_fini(tt);
++	kfree(tt);
++}
++
++static struct ttm_backend_func cirrus_tt_backend_func = {
++	.destroy = &cirrus_ttm_backend_destroy,
++};
++
++
++struct ttm_tt *cirrus_ttm_tt_create(struct ttm_bo_device *bdev,
++				 unsigned long size, uint32_t page_flags,
++				 struct page *dummy_read_page)
++{
++	struct ttm_tt *tt;
++
++	tt = kzalloc(sizeof(struct ttm_tt), GFP_KERNEL);
++	if (tt == NULL)
++		return NULL;
++	tt->func = &cirrus_tt_backend_func;
++	if (ttm_tt_init(tt, bdev, size, page_flags, dummy_read_page)) {
++		kfree(tt);
++		return NULL;
++	}
++	return tt;
++}
++
++static int cirrus_ttm_tt_populate(struct ttm_tt *ttm)
++{
++	return ttm_pool_populate(ttm);
++}
++
++static void cirrus_ttm_tt_unpopulate(struct ttm_tt *ttm)
++{
++	ttm_pool_unpopulate(ttm);
++}
++
++struct ttm_bo_driver cirrus_bo_driver = {
++	.ttm_tt_create = cirrus_ttm_tt_create,
++	.ttm_tt_populate = cirrus_ttm_tt_populate,
++	.ttm_tt_unpopulate = cirrus_ttm_tt_unpopulate,
++	.init_mem_type = cirrus_bo_init_mem_type,
++	.evict_flags = cirrus_bo_evict_flags,
++	.move = cirrus_bo_move,
++	.verify_access = cirrus_bo_verify_access,
++	.io_mem_reserve = &cirrus_ttm_io_mem_reserve,
++	.io_mem_free = &cirrus_ttm_io_mem_free,
++};
++
++int cirrus_mm_init(struct cirrus_device *cirrus)
++{
++	int ret;
++	struct drm_device *dev = cirrus->dev;
++	struct ttm_bo_device *bdev = &cirrus->ttm.bdev;
++
++	ret = cirrus_ttm_global_init(cirrus);
++	if (ret)
++		return ret;
++
++	ret = ttm_bo_device_init(&cirrus->ttm.bdev,
++				 cirrus->ttm.bo_global_ref.ref.object,
++				 &cirrus_bo_driver, DRM_FILE_PAGE_OFFSET,
++				 true);
++	if (ret) {
++		DRM_ERROR("Error initialising bo driver; %d\n", ret);
++		return ret;
++	}
++
++	ret = ttm_bo_init_mm(bdev, TTM_PL_VRAM,
++			     cirrus->mc.vram_size >> PAGE_SHIFT);
++	if (ret) {
++		DRM_ERROR("Failed ttm VRAM init: %d\n", ret);
++		return ret;
++	}
++
++	cirrus->fb_mtrr = drm_mtrr_add(pci_resource_start(dev->pdev, 0),
++				    pci_resource_len(dev->pdev, 0),
++				    DRM_MTRR_WC);
++
++	return 0;
++}
++
++void cirrus_mm_fini(struct cirrus_device *cirrus)
++{
++	struct drm_device *dev = cirrus->dev;
++	ttm_bo_device_release(&cirrus->ttm.bdev);
++
++	cirrus_ttm_global_release(cirrus);
++
++	if (cirrus->fb_mtrr >= 0) {
++		drm_mtrr_del(cirrus->fb_mtrr,
++			     pci_resource_start(dev->pdev, 0),
++			     pci_resource_len(dev->pdev, 0), DRM_MTRR_WC);
++		cirrus->fb_mtrr = -1;
++	}
++}
++
++void cirrus_ttm_placement(struct cirrus_bo *bo, int domain)
++{
++	u32 c = 0;
++	bo->placement.fpfn = 0;
++	bo->placement.lpfn = 0;
++	bo->placement.placement = bo->placements;
++	bo->placement.busy_placement = bo->placements;
++	if (domain & TTM_PL_FLAG_VRAM)
++		bo->placements[c++] = TTM_PL_FLAG_WC | TTM_PL_FLAG_UNCACHED | TTM_PL_FLAG_VRAM;
++	if (domain & TTM_PL_FLAG_SYSTEM)
++		bo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++	if (!c)
++		bo->placements[c++] = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
++	bo->placement.num_placement = c;
++	bo->placement.num_busy_placement = c;
++}
++
++int cirrus_bo_reserve(struct cirrus_bo *bo, bool no_wait)
++{
++	int ret;
++
++	ret = ttm_bo_reserve(&bo->bo, true, no_wait, false, 0);
++	if (ret) {
++		if (ret != -ERESTARTSYS)
++			DRM_ERROR("reserve failed %p\n", bo);
++		return ret;
++	}
++	return 0;
++}
++
++void cirrus_bo_unreserve(struct cirrus_bo *bo)
++{
++	ttm_bo_unreserve(&bo->bo);
++}
++
++int cirrus_bo_create(struct drm_device *dev, int size, int align,
++		  uint32_t flags, struct cirrus_bo **pcirrusbo)
++{
++	struct cirrus_device *cirrus = dev->dev_private;
++	struct cirrus_bo *cirrusbo;
++	size_t acc_size;
++	int ret;
++
++	cirrusbo = kzalloc(sizeof(struct cirrus_bo), GFP_KERNEL);
++	if (!cirrusbo)
++		return -ENOMEM;
++
++	ret = drm_gem_object_init(dev, &cirrusbo->gem, size);
++	if (ret) {
++		kfree(cirrusbo);
++		return ret;
++	}
++
++	cirrusbo->gem.driver_private = NULL;
++	cirrusbo->bo.bdev = &cirrus->ttm.bdev;
++
++	cirrus_ttm_placement(cirrusbo, TTM_PL_FLAG_VRAM | TTM_PL_FLAG_SYSTEM);
++
++	acc_size = ttm_bo_dma_acc_size(&cirrus->ttm.bdev, size,
++				       sizeof(struct cirrus_bo));
++
++	ret = ttm_bo_init(&cirrus->ttm.bdev, &cirrusbo->bo, size,
++			  ttm_bo_type_device, &cirrusbo->placement,
++			  align >> PAGE_SHIFT, 0, false, NULL, acc_size,
++			  cirrus_bo_ttm_destroy);
++	if (ret)
++		return ret;
++
++	*pcirrusbo = cirrusbo;
++	return 0;
++}
++
++static inline u64 cirrus_bo_gpu_offset(struct cirrus_bo *bo)
++{
++	return bo->bo.offset;
++}
++
++int cirrus_bo_pin(struct cirrus_bo *bo, u32 pl_flag, u64 *gpu_addr)
++{
++	int i, ret;
++
++	if (bo->pin_count) {
++		bo->pin_count++;
++		if (gpu_addr)
++			*gpu_addr = cirrus_bo_gpu_offset(bo);
++	}
++
++	cirrus_ttm_placement(bo, pl_flag);
++	for (i = 0; i < bo->placement.num_placement; i++)
++		bo->placements[i] |= TTM_PL_FLAG_NO_EVICT;
++	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false, false);
++	if (ret)
++		return ret;
++
++	bo->pin_count = 1;
++	if (gpu_addr)
++		*gpu_addr = cirrus_bo_gpu_offset(bo);
++	return 0;
++}
++
++int cirrus_bo_unpin(struct cirrus_bo *bo)
++{
++	int i, ret;
++	if (!bo->pin_count) {
++		DRM_ERROR("unpin bad %p\n", bo);
++		return 0;
++	}
++	bo->pin_count--;
++	if (bo->pin_count)
++		return 0;
++
++	for (i = 0; i < bo->placement.num_placement ; i++)
++		bo->placements[i] &= ~TTM_PL_FLAG_NO_EVICT;
++	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false, false);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++int cirrus_bo_push_sysram(struct cirrus_bo *bo)
++{
++	int i, ret;
++	if (!bo->pin_count) {
++		DRM_ERROR("unpin bad %p\n", bo);
++		return 0;
++	}
++	bo->pin_count--;
++	if (bo->pin_count)
++		return 0;
++
++	if (bo->kmap.virtual)
++		ttm_bo_kunmap(&bo->kmap);
++
++	cirrus_ttm_placement(bo, TTM_PL_FLAG_SYSTEM);
++	for (i = 0; i < bo->placement.num_placement ; i++)
++		bo->placements[i] |= TTM_PL_FLAG_NO_EVICT;
++
++	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false, false);
++	if (ret) {
++		DRM_ERROR("pushing to VRAM failed\n");
++		return ret;
++	}
++	return 0;
++}
++
++int cirrus_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	struct drm_file *file_priv;
++	struct cirrus_device *cirrus;
++
++	if (unlikely(vma->vm_pgoff < DRM_FILE_PAGE_OFFSET))
++		return drm_mmap(filp, vma);
++
++	file_priv = filp->private_data;
++	cirrus = file_priv->minor->dev->dev_private;
++	return ttm_bo_mmap(filp, vma, &cirrus->ttm.bdev);
++}
