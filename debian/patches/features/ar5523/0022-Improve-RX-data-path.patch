@@ -1,0 +1,322 @@
+From 5c20f3c3e28d88e3f627eedcd562cbc33999f0f6 Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Sat, 8 Sep 2012 11:10:42 +0200
+Subject: [PATCH 22/68] Improve RX data path
+
+Move skb allocation and urb submission to wq to avoid atomic
+allocations.
+---
+ ar5523.c |  166 ++++++++++++++++++++++++++++++++++++++------------------------
+ 1 file changed, 101 insertions(+), 65 deletions(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -101,6 +101,7 @@ enum {
+ 	AR5523_TX_DATA_COUNT	= 16,
+ 	AR5523_TX_DATA_RESTART_COUNT = 8,
+ 	AR5523_RX_DATA_COUNT	= 16,
++	AR5523_RX_DATA_REFILL_COUNT = 8,
+ };
+ 
+ enum AR5523_flags {
+@@ -133,6 +134,7 @@ struct ar5523_tx_data {
+ };
+ 
+ struct ar5523_rx_data {
++	struct	list_head	list;
+ 	struct ar5523		*ar;
+ 	struct urb		*urb;
+ 	struct sk_buff		*skb;
+@@ -149,15 +151,20 @@ struct ar5523 {
+ 	spinlock_t		tx_cmd_list_lock;
+ 	struct	list_head	tx_cmd_free;
+ 	struct	list_head	tx_cmd_used;
++	atomic_t		tx_data_queued;
+ 
+ 	struct ar5523_rx_data	rx_data[AR5523_RX_DATA_COUNT];
+-	atomic_t		tx_data_queued;
++	spinlock_t		rx_data_list_lock;
++	struct	list_head	rx_data_free;
++	struct	list_head	rx_data_used;
++	atomic_t		rx_data_free_cnt;
+ 
+ 	u8			serial[16];
+ 
+ 	struct timer_list	stat_timer;
+ 	struct completion	ready;
+ 	struct work_struct	stat_work;
++	struct work_struct	rx_refill_work;
+ 
+ 	int			rxbufsz;
+ 
+@@ -735,7 +742,7 @@ static void ar5523_data_rx_cb(struct urb
+ 	u32 rxlen;
+ 	int usblen = urb->actual_length;
+ 	int hdrlen, pad;
+-	int error;
++	unsigned long flags;
+ 
+ 	/* sync/async unlink faults aren't errors */
+ 	if (urb->status && (urb->status != -ENOENT &&
+@@ -808,42 +815,83 @@ static void ar5523_data_rx_cb(struct urb
+ 
+ 	ieee80211_rx_irqsafe(hw, data->skb);
+ 
+-	data->skb = __dev_alloc_skb(ar->rxbufsz, GFP_ATOMIC);
+-	if (!data->skb) {
+-		ar5523_err(ar, "could not allocate rx skbuff\n");
+-		return;
++
++skip:
++	data->skb = NULL;
++	spin_lock_irqsave(&ar->rx_data_list_lock, flags);
++	list_move(&data->list, &ar->rx_data_free);
++	spin_unlock_irqrestore(&ar->rx_data_list_lock, flags);
++	if (atomic_inc_return(&ar->rx_data_free_cnt) >=
++	    AR5523_RX_DATA_REFILL_COUNT) {
++		ieee80211_queue_work(ar->hw, &ar->rx_refill_work);
+ 	}
+ 
+- skip:
+-	/* re-submit the urb */
+-	usb_fill_bulk_urb(data->urb, ar->dev, ar5523_data_rx_pipe(ar->dev),
+-			  data->skb->data, ar->rxbufsz, ar5523_data_rx_cb,
+-			  data);
++}
+ 
+-	error = usb_submit_urb(urb, GFP_ATOMIC);
+-	if (error) {
+-		/* XXX: handle */
+-		ar5523_err(ar, "error %d when resubmitting rx data urb\n",
+-			       error);
++static void ar5523_rx_refill_work(struct work_struct *work)
++{
++	struct ar5523 *ar = container_of(work, struct ar5523, rx_refill_work);
++	struct ar5523_rx_data *data;
++	unsigned long flags;
++	int error;
++
++	while (!list_empty(&ar->rx_data_free)) {
++		data = (struct ar5523_rx_data *) ar->rx_data_free.next;
++
++		data->skb = dev_alloc_skb(ar->rxbufsz);
++		if (!data->skb) {
++			ar5523_err(ar, "could not allocate rx skbuff\n");
++			return;
++		}
++
++		usb_fill_bulk_urb(data->urb, ar->dev,
++				  ar5523_data_rx_pipe(ar->dev), data->skb->data,
++				  ar->rxbufsz, ar5523_data_rx_cb, data);
++
++
++		error = usb_submit_urb(data->urb, GFP_KERNEL);
++		if (error) {
++			ar5523_err(ar, "error %d when submitting rx data urb\n",
++				       error);
++			return;
++		}
++
++		spin_lock_irqsave(&ar->rx_data_list_lock, flags);
++		list_move(&data->list, &ar->rx_data_used);
++		spin_unlock_irqrestore(&ar->rx_data_list_lock, flags);
++		atomic_dec(&ar->rx_data_free_cnt);
++	}
++}
++
++static void ar5523_cancel_rx_bufs(struct ar5523 *ar)
++{
++	struct ar5523_rx_data *data;
++
++	while (!list_empty(&ar->rx_data_used)) {
++		data = (struct ar5523_rx_data *) ar->rx_data_used.next;
++		usb_kill_urb(data->urb);
++		kfree_skb(data->skb);
++		data->skb = NULL;
++		list_move(&data->list, &ar->rx_data_free);
++		atomic_inc(&ar->rx_data_free_cnt);
+ 	}
+ }
+ 
+ static void ar5523_free_rx_bufs(struct ar5523 *ar)
+ {
+-	int i;
++	struct ar5523_rx_data *data;
+ 
+-	for (i = 0; i < AR5523_RX_DATA_COUNT; i++) {
+-		struct ar5523_rx_data *data = &ar->rx_data[i];
++	ar5523_cancel_rx_bufs(ar);
+ 
+-		usb_kill_urb(data->urb);
++	while (!list_empty(&ar->rx_data_free)) {
++		data = (struct ar5523_rx_data *) ar->rx_data_free.next;
++		list_del(&data->list);
+ 		usb_free_urb(data->urb);
+-		kfree_skb(data->skb);
+ 	}
+ }
+ 
+ static int ar5523_alloc_rx_bufs(struct ar5523 *ar)
+ {
+-	int error = -ENOMEM;
+ 	int i;
+ 
+ 	for (i = 0; i < AR5523_RX_DATA_COUNT; i++) {
+@@ -853,42 +901,17 @@ static int ar5523_alloc_rx_bufs(struct a
+ 		data->urb = usb_alloc_urb(0, GFP_KERNEL);
+ 		if (!data->urb) {
+ 			ar5523_err(ar, "could not allocate rx data urb\n");
+-			goto out;
+-		}
+-
+-		data->skb = dev_alloc_skb(ar->rxbufsz);
+-		if (!data->skb) {
+-			ar5523_err(ar, "could not allocate rx skbuff\n");
+-			usb_free_urb(data->urb);
+-			goto out;
+-		}
+-
+-		usb_fill_bulk_urb(data->urb, ar->dev,
+-				  ar5523_data_rx_pipe(ar->dev), data->skb->data,
+-				  ar->rxbufsz, ar5523_data_rx_cb, data);
+-
+-		error = usb_submit_urb(data->urb, GFP_KERNEL);
+-		if (error) {
+-			ar5523_err(ar, "error %d when submitting rx data urb\n",
+-				       error);
+-			kfree_skb(data->skb);
+-			usb_free_urb(data->urb);
+-			return error;
++			goto err;
+ 		}
++		list_add_tail(&data->list, &ar->rx_data_free);
++		atomic_inc(&ar->rx_data_free_cnt);
+ 	}
+ 
+ 	return 0;
+ 
+-out:
+-	while (--i >= 0) {
+-		struct ar5523_rx_data *data = &ar->rx_data[i];
+-
+-		usb_kill_urb(data->urb);
+-		usb_free_urb(data->urb);
+-		kfree_skb(data->skb);
+-	}
+-
+-	return error;
++err:
++	ar5523_free_rx_bufs(ar);
++	return -ENOMEM;
+ }
+ 
+ /*
+@@ -926,12 +949,6 @@ static int ar5523_start(struct ieee80211
+ 	ar5523_config(ar, CFG_PROTECTION_TYPE, 0x00000000);
+ 	ar5523_config(ar, CFG_MODE_CTS, 0x00000002);
+ 
+-	error = ar5523_alloc_rx_bufs(ar);
+-	if (error) {
+-		ar5523_err(ar, "Could not allocate rx buffers\n");
+-		goto err;
+-	}
+-
+ 	error = ar5523_cmd_read(ar, WDCMSG_TARGET_START, NULL, 0,
+ 	    &val, sizeof(val), AR5523_CMD_FLAG_MAGIC);
+ 	if (error) {
+@@ -953,6 +970,9 @@ static int ar5523_start(struct ieee80211
+ 	/* XXX? check */
+ 	ar5523_cmd_write(ar, WDCMSG_RESET_KEY_CACHE, NULL, 0, 0);
+ 
++
++	ieee80211_queue_work(ar->hw, &ar->rx_refill_work);
++
+ 	/* enable Rx */
+ 	ar5523_set_rxfilter(ar, 0, UATH_FILTER_OP_INIT);
+ 	ar5523_set_rxfilter(ar,
+@@ -981,7 +1001,8 @@ static void ar5523_stop(struct ieee80211
+ 
+ 	ar5523_cmd_write(ar, WDCMSG_TARGET_STOP, NULL, 0, 0);
+ 
+-	ar5523_free_rx_bufs(ar);
++	cancel_work_sync(&ar->rx_refill_work);
++	ar5523_cancel_rx_bufs(ar);
+ 	mutex_unlock(&ar->mutex);
+ }
+ 
+@@ -1699,15 +1720,27 @@ static int ar5523_probe(struct usb_inter
+ 	init_completion(&ar->ready);
+ 	init_waitqueue_head(&ar->tx_cmd_wait);
+ 	atomic_set(&ar->tx_data_queued, 0);
++	atomic_set(&ar->rx_data_free_cnt, 0);
+ 	INIT_WORK(&ar->stat_work, ar5523_stat_work);
++	INIT_WORK(&ar->rx_refill_work, ar5523_rx_refill_work);
+ 	INIT_LIST_HEAD(&ar->tx_cmd_free);
+ 	INIT_LIST_HEAD(&ar->tx_cmd_used);
+ 	spin_lock_init(&ar->tx_cmd_list_lock);
+ 
++	INIT_LIST_HEAD(&ar->rx_data_free);
++	INIT_LIST_HEAD(&ar->rx_data_used);
++	spin_lock_init(&ar->rx_data_list_lock);
++
++	error = ar5523_alloc_rx_bufs(ar);
++	if (error) {
++		ar5523_err(ar, "Could not allocate rx buffers\n");
++		goto out_free_ar;
++	}
++
+ 	error = ar5523_alloc_tx_cmds(ar);
+ 	if (error) {
+ 		ar5523_err(ar, "Could not allocate tx command buffers\n");
+-		goto out_free_ar;
++		goto out_free_rx_bufs;
+ 	}
+ 
+ 	/*
+@@ -1716,25 +1749,25 @@ static int ar5523_probe(struct usb_inter
+ 	error = ar5523_host_available(ar);
+ 	if (error) {
+ 		ar5523_err(ar, "could not initialize adapter\n");
+-		goto out_free_tx_cmds;
++		goto out_free_rx_bufs;
+ 	}
+ 
+ 	error = ar5523_get_max_rxsz(ar);
+ 	if (error) {
+ 		ar5523_err(ar, "could not get caps from adapter\n");
+-		goto out_free_tx_cmds;
++		goto out_free_rx_bufs;
+ 	}
+ 
+ 	error = ar5523_get_devcap(ar);
+ 	if (error) {
+ 		ar5523_err(ar, "could not get caps from adapter\n");
+-		goto out_free_tx_cmds;
++		goto out_free_rx_bufs;
+ 	}
+ 
+ 	error = ar5523_get_devstatus(ar);
+ 	if (error != 0) {
+ 		ar5523_err(ar, "could not get device status\n");
+-		goto out_free_tx_cmds;
++		goto out_free_rx_bufs;
+ 	}
+ 
+ 	ar5523_info(ar, "MAC/BBP AR5523, RF AR%c112\n",
+@@ -1766,6 +1799,8 @@ static int ar5523_probe(struct usb_inter
+ 
+ out_free_tx_cmds:
+ 	ar5523_free_tx_cmds(ar);
++out_free_rx_bufs:
++	ar5523_free_rx_bufs(ar);
+ out_free_ar:
+ 	ieee80211_free_hw(hw);
+ out:
+@@ -1784,6 +1819,7 @@ static void ar5523_disconnect(struct usb
+ 	del_timer_sync(&ar->stat_timer);
+ 
+ 	ar5523_free_tx_cmds(ar);
++	ar5523_free_rx_bufs(ar);
+ 
+ 	ieee80211_free_hw(hw);
+ 	usb_set_intfdata(intf, NULL);

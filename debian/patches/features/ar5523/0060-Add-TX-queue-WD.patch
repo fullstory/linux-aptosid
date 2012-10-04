@@ -1,0 +1,98 @@
+From 864488fd1d2ead6bf57a50c5ffb810ef31f11fab Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Mon, 1 Oct 2012 17:45:12 +0200
+Subject: [PATCH 60/68] Add TX queue WD
+
+Detect a stuck TX queue and reset the FW to recover.
+---
+ ar5523.c |   42 ++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 41 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -135,6 +135,8 @@ struct ar5523 {
+ 	struct mutex		mutex;
+ 	struct ar5523_tx_cmd	tx_cmd;
+ 
++	struct timer_list	tx_wd_timer;
++	struct work_struct	tx_wd_work;
+ 	struct work_struct	tx_work;
+ 	struct list_head	tx_queue_pending;
+ 	struct list_head	tx_queue_submitted;
+@@ -859,8 +861,10 @@ err:
+ static void ar5523_data_tx_pkt_put(struct ar5523 *ar)
+ {
+ 	atomic_dec(&ar->tx_nr_total);
+-	if (!atomic_dec_return(&ar->tx_nr_pending))
++	if (!atomic_dec_return(&ar->tx_nr_pending)) {
++		del_timer(&ar->tx_wd_timer);
+ 		wake_up(&ar->tx_flush_waitq);
++	}
+ 
+ 	if (atomic_read(&ar->tx_nr_total) < AR5523_TX_DATA_RESTART_COUNT) {
+ 		ar5523_dbg(ar, "restart tx queue\n");
+@@ -1007,8 +1011,10 @@ static void ar5523_tx_work_locked(struct
+ 			atomic_dec(&ar->tx_nr_total);
+ 			usb_free_urb(urb);
+ 			ieee80211_free_txskb(ar->hw, skb);
+-		} else
++		} else {
++			mod_timer(&ar->tx_wd_timer, jiffies + HZ*2);
+ 			atomic_inc(&ar->tx_nr_pending);
++		}
+ 	} while (true);
+ }
+ 
+@@ -1021,6 +1027,33 @@ static void ar5523_tx_work(struct work_s
+ 	mutex_unlock(&ar->mutex);
+ }
+ 
++static void ar5523_tx_wd_timer(unsigned long arg)
++{
++	struct ar5523 *ar = (struct ar5523 *) arg;
++
++	ar5523_dbg(ar, "TX watchdog timer triggered\n");
++	ieee80211_queue_work(ar->hw, &ar->tx_wd_work);
++}
++
++static void ar5523_tx_wd_work(struct work_struct *work)
++{
++	struct ar5523 *ar = container_of(work, struct ar5523, tx_wd_work);
++
++	/* Occasionally the TX queues stop responding. The only way to
++	 * recover seems to be to reset the dongle.
++	 */
++
++	mutex_lock(&ar->mutex);
++	ar5523_err(ar, "TX queue stuck (tot %d pend %d)\n",
++		   atomic_read(&ar->tx_nr_total),
++		   atomic_read(&ar->tx_nr_pending));
++
++	ar5523_err(ar, "Will restart dongle.\n");
++	ar5523_cmd_write(ar, WDCMSG_TARGET_RESET, NULL, 0, 0);
++
++	mutex_unlock(&ar->mutex);
++}
++
+ static void ar5523_flush_tx(struct ar5523 *ar)
+ {
+ 	ar5523_tx_work_locked(ar);
+@@ -1118,6 +1151,8 @@ static void ar5523_stop(struct ieee80211
+ 
+ 	ar5523_cmd_write(ar, WDCMSG_TARGET_STOP, NULL, 0, 0);
+ 
++	del_timer_sync(&ar->tx_wd_timer);
++	cancel_work_sync(&ar->tx_wd_work);
+ 	cancel_work_sync(&ar->rx_refill_work);
+ 	ar5523_cancel_rx_bufs(ar);
+ 	mutex_unlock(&ar->mutex);
+@@ -1683,6 +1718,9 @@ static int ar5523_probe(struct usb_inter
+ 	ar->dev = dev;
+ 	mutex_init(&ar->mutex);
+ 
++	init_timer(&ar->tx_wd_timer);
++	setup_timer(&ar->tx_wd_timer, ar5523_tx_wd_timer, (unsigned long) ar);
++	INIT_WORK(&ar->tx_wd_work, ar5523_tx_wd_work);
+ 	INIT_WORK(&ar->tx_work, ar5523_tx_work);
+ 	INIT_LIST_HEAD(&ar->tx_queue_pending);
+ 	INIT_LIST_HEAD(&ar->tx_queue_submitted);

@@ -1,0 +1,118 @@
+From 7e9c505483c760f4f40ddedc492808e5b0a3e412 Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Tue, 11 Sep 2012 21:30:25 +0200
+Subject: [PATCH 36/68] Misc fixes.
+
+Keep track of connection state and set the connection id based on that.
+
+Remove TX data from list if urb submission fails.
+---
+ ar5523.c |   37 ++++++++++++++++++-------------------
+ 1 file changed, 18 insertions(+), 19 deletions(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -105,7 +105,8 @@ enum {
+ 
+ enum AR5523_flags {
+ 	AR5523_HW_UP,
+-	AR5523_TX_QUEUE_STOPPED
++	AR5523_TX_QUEUE_STOPPED,
++	AR5523_CONNECTED
+ };
+ 
+ struct ar5523_tx_cmd {
+@@ -872,7 +873,6 @@ static void ar5523_cancel_tx_urbs(struct
+ 	struct ar5523_tx_data *data = NULL;
+ 	unsigned long flags;
+ 
+-	printk("%s\n", __func__);
+ 	do {
+ 		spin_lock_irqsave(&ar->tx_data_list_lock, flags);
+ 		if (list_empty(&ar->tx_data_list))
+@@ -1035,7 +1035,6 @@ out:
+ 
+ static void ar5523_tx(struct ieee80211_hw *hw, struct sk_buff *skb)
+ {
+-	struct ieee80211_hdr *wh = (struct ieee80211_hdr *)skb->data;
+ 	struct ieee80211_tx_info *txi = IEEE80211_SKB_CB(skb);
+ 	struct ar5523 *ar = hw->priv;
+ 	struct ar5523_tx_data *data = (struct ar5523_tx_data *)
+@@ -1082,34 +1081,31 @@ static void ar5523_tx(struct ieee80211_h
+ 	desc->type   = cpu_to_be32(WDCMSG_SEND);
+ 	desc->flags  = 0;
+ 
+-	/*
+-	 * XXX(hch): is there a better way to check this than poking into
+-	 *	     the frame?
+-	 */
+-	if (is_multicast_ether_addr(wh->addr1)) {
++	if (test_bit(AR5523_CONNECTED, &ar->flags))
+ 		desc->connid  = cpu_to_be32(AR5523_ID_BROADCAST);
+-		txqid = 3;
+-	} else {
++	else
+ 		desc->connid  = cpu_to_be32(AR5523_ID_BSS);
+-		txqid = 1;
+-	}
+ 
+ 	if (txi->flags & IEEE80211_TX_CTL_USE_MINRATE)
+ 		txqid |= UATH_TXQID_MINRATE;
+ 
+-	desc->txqid = cpu_to_be32(txqid);
++	desc->txqid = cpu_to_be32(1);
+ 
+ 	usb_fill_bulk_urb(urb, ar->dev, ar5523_data_tx_pipe(ar->dev),
+ 			  skb->data, skb->len, ar5523_data_tx_cb, skb);
+ 
+-	spin_lock_irqsave(&ar->rx_data_list_lock, flags);
++	spin_lock_irqsave(&ar->tx_data_list_lock, flags);
+ 	list_add_tail(&data->list, &ar->tx_data_list);
++	spin_unlock_irqrestore(&ar->tx_data_list_lock, flags);
+ 	atomic_inc(&ar->tx_data_queued);
+-	spin_unlock_irqrestore(&ar->rx_data_list_lock, flags);
+ 
+ 	error = usb_submit_urb(urb, GFP_ATOMIC);
+ 	if (error) {
+ 		ar5523_err(ar, "error %d when submitting tx urb\n", error);
++		spin_lock_irqsave(&ar->tx_data_list_lock, flags);
++		list_del(&data->list);
++		spin_unlock_irqrestore(&ar->tx_data_list_lock, flags);
++		atomic_dec(&ar->tx_data_queued);
+ 		goto out_free_urb;
+ 	}
+ 
+@@ -1313,26 +1309,29 @@ static void ar5523_bss_info_changed(stru
+ 		error = ar5523_create_connection(ar, vif, bss);
+ 		if (error) {
+ 			ar5523_err(ar, "could not create connection\n");
+-			return;
++			goto out_unlock;
+ 		}
+ 
+ 		error = ar5523_set_basic_rates(ar, bss);
+ 		if (error) {
+ 			ar5523_err(ar, "could not set negotiated rate set\n");
+-			return;
++			goto out_unlock;
+ 		}
+ 
+ 		error = ar5523_write_associd(ar, bss);
+ 		if (error) {
+ 			ar5523_err(ar, "could not set association\n");
+-			return;
++			goto out_unlock;
+ 		}
+ 
+ 		/* turn link LED on */
+ 		ar5523_set_ledsteady(ar, UATH_LED_LINK, UATH_LED_ON);
++		set_bit(AR5523_CONNECTED, &ar->flags); 
+ 
+-	} else
++	} else {
++		clear_bit(AR5523_CONNECTED, &ar->flags); 
+ 		ar5523_set_ledsteady(ar, UATH_LED_LINK, UATH_LED_OFF);
++	}
+ 
+ out_unlock:
+ 	mutex_unlock(&ar->mutex);

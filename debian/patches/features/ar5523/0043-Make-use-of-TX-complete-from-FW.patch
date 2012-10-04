@@ -1,0 +1,251 @@
+From 4a812ace2165012dbf248daf86dbe1cfa03bb504 Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Sat, 22 Sep 2012 16:01:57 +0200
+Subject: [PATCH 43/68] Make use of TX complete from FW.
+
+Use the TX complete from FW to keep track on when TX is done. This
+makes TX flush work better.
+---
+ ar5523.c |  104 +++++++++++++++++++++++++++++++++++++++-----------------------
+ 1 file changed, 65 insertions(+), 39 deletions(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -96,12 +96,13 @@ enum {
+ 	AR5523_TX_CMD_COUNT	= 2,
+ 
+ 	AR5523_TX_DATA_COUNT	= 16,
+-	AR5523_TX_DATA_RESTART_COUNT = 8,
++	AR5523_TX_DATA_RESTART_COUNT = 4,
+ 	AR5523_RX_DATA_COUNT	= 16,
+ 	AR5523_RX_DATA_REFILL_COUNT = 8,
+ };
+ 
+ #define AR5523_CMD_ID	1
++#define AR5523_DATA_ID	2
+ 
+ enum AR5523_flags {
+ 	AR5523_HW_UP,
+@@ -152,9 +153,14 @@ struct ar5523 {
+ 	struct list_head	tx_queue_pending;
+ 	struct list_head	tx_queue_submitted;
+ 	spinlock_t		tx_data_list_lock;
+-	atomic_t		tx_data_queued;
+ 	wait_queue_head_t	tx_flush_waitq;
+ 
++	/* Queued + Submitted TX frames */
++	atomic_t		tx_nr_total;
++
++	/* Submitted TX frames */
++	atomic_t		tx_nr_pending;
++
+ 	void			*rx_cmd_buf;
+ 	struct urb		*rx_cmd_urb;
+ 
+@@ -199,6 +205,8 @@ enum {
+ 	dev_info(&(ar)->dev->dev, format, ## arg)
+ 
+ static int ar5523_submit_rx_cmd(struct ar5523 *ar);
++static void ar5523_data_tx_pkt_put(struct ar5523 *ar);
++
+ /*
+  * TX/RX command handling.
+  */
+@@ -293,6 +301,12 @@ static void ar5523_cmd_rx_cb(struct urb
+ 		complete(&cmd->done);
+ 		break;
+ 
++	case WDCMSG_SEND_COMPLETE:
++		ar5523_dbg(ar, "WDCMSG_SEND_COMPLETE: %d pending\n", 
++			atomic_read(&ar->tx_nr_pending));
++		ar5523_data_tx_pkt_put(ar);
++		break;
++
+ 	case WDCMSG_TARGET_START:
+ 		/* This command returns a bogus id so it needs special
+ 		   handling */
+@@ -747,7 +761,6 @@ static void ar5523_data_rx_cb(struct urb
+ 
+ 	ieee80211_rx_irqsafe(hw, data->skb);
+ 
+-
+ skip:
+ 	data->skb = NULL;
+ 	spin_lock_irqsave(&ar->rx_data_list_lock, flags);
+@@ -847,6 +860,22 @@ err:
+ 	return -ENOMEM;
+ }
+ 
++
++static void ar5523_data_tx_pkt_put(struct ar5523 *ar)
++{
++	atomic_dec(&ar->tx_nr_total);
++	if (!atomic_dec_return(&ar->tx_nr_pending))
++		wake_up(&ar->tx_flush_waitq);
++
++	if (atomic_read(&ar->tx_nr_total) < AR5523_TX_DATA_RESTART_COUNT) {
++		if (test_and_clear_bit(AR5523_TX_QUEUE_STOPPED, &ar->flags) &&
++		    test_bit(AR5523_HW_UP, &ar->flags)) {
++			ar5523_dbg(ar, "restart tx queue\n");
++			ieee80211_wake_queues(ar->hw);
++		}
++	}
++}
++
+ static void ar5523_data_tx_cb(struct urb *urb)
+ {
+ 	struct sk_buff *skb = urb->context;
+@@ -867,28 +896,14 @@ static void ar5523_data_tx_cb(struct urb
+ 	    urb->status != -ECONNRESET && urb->status != -ESHUTDOWN)) {
+ 		ar5523_dbg(ar, "%s: nonzero write bulk status received: %d\n",
+ 			   __func__, urb->status);
+-		goto out;
++		ar5523_data_tx_pkt_put(ar);
++		ieee80211_free_txskb(ar->hw, skb);
+ 	}
+-
+-	skb_pull(skb, sizeof(struct ar5523_tx_desc) + sizeof(__be32));
+-
+-	txi->flags |= IEEE80211_TX_STAT_ACK;
+-	ieee80211_tx_status_irqsafe(ar->hw, skb);
+-out:
+-	atomic_dec(&ar->tx_data_queued);
+-
+-	if (atomic_read(&ar->tx_data_queued) < AR5523_TX_DATA_RESTART_COUNT) {
+-		if (test_and_clear_bit(AR5523_TX_QUEUE_STOPPED, &ar->flags) &&
+-		    test_bit(AR5523_HW_UP, &ar->flags)) {
+-			ar5523_dbg(ar, "restart tx queue\n");
+-			ieee80211_wake_queues(ar->hw);
+-			ar5523_dbg(ar, "restart tx queue done\n");
+-		}
++	else {
++		skb_pull(skb, sizeof(struct ar5523_tx_desc) + sizeof(__be32));
++		ieee80211_tx_status_irqsafe(ar->hw, skb);
+ 	}
+ 
+-	if (!atomic_read(&ar->tx_data_queued))
+-		wake_up(&ar->tx_flush_waitq);
+-
+ 	usb_free_urb(urb);
+ }
+ 
+@@ -902,10 +917,12 @@ static void ar5523_tx(struct ieee80211_h
+ 
+ 	ar5523_dbg(ar, "tx called\n");
+ 
+-	if (atomic_read(&ar->tx_data_queued) >= (AR5523_TX_DATA_COUNT - 1)) {
++	if (atomic_inc_return(&ar->tx_nr_total) >= AR5523_TX_DATA_COUNT) {
+ 		ar5523_dbg(ar, "tx queue full\n");
+ 		if (!test_and_set_bit(AR5523_TX_QUEUE_STOPPED, &ar->flags)) {
+-			ar5523_dbg(ar, "stop queues\n");
++			ar5523_dbg(ar, "stop queues (tot %d pend %d)\n",
++				   atomic_read(&ar->tx_nr_total),
++				   atomic_read(&ar->tx_nr_pending));
+ 			ieee80211_stop_queues(hw);
+ 		}
+ 	}
+@@ -915,14 +932,12 @@ static void ar5523_tx(struct ieee80211_h
+ 	spin_lock_irqsave(&ar->tx_data_list_lock, flags);
+ 	list_add_tail(&data->list, &ar->tx_queue_pending);
+ 	spin_unlock_irqrestore(&ar->tx_data_list_lock, flags);
+-	atomic_inc(&ar->tx_data_queued);
+ 
+ 	ieee80211_queue_work(ar->hw, &ar->tx_work);
+ }
+ 
+-static void ar5523_tx_work(struct work_struct *work)
++static void ar5523_tx_work_locked(struct ar5523 *ar)
+ {
+-	struct ar5523 *ar = container_of(work, struct ar5523, tx_work);
+ 	struct ar5523_tx_data *data;
+ 	struct ar5523_tx_desc *desc;
+ 	struct ieee80211_tx_info *txi;
+@@ -934,7 +949,6 @@ static void ar5523_tx_work(struct work_s
+ 	unsigned long flags;
+ 
+ 	ar5523_dbg(ar, "%s\n", __func__);
+-	mutex_lock(&ar->mutex);
+ 	do {
+ 		spin_lock_irqsave(&ar->tx_data_list_lock, flags);
+ 		if (!list_empty(&ar->tx_queue_pending)) {
+@@ -969,11 +983,11 @@ static void ar5523_tx_work(struct work_s
+ 		/* fill Tx descriptor */
+ 		*hdr = AR5523_MAKECTL(1, skb->len - sizeof(__be32));
+ 
+-		desc->msglen  = cpu_to_be32(skb->len);
+-		desc->msgid   = 0;
++		desc->msglen = cpu_to_be32(skb->len);
++		desc->msgid  = AR5523_DATA_ID;
+ 		desc->buflen = cpu_to_be32(paylen);
+ 		desc->type   = cpu_to_be32(WDCMSG_SEND);
+-		desc->flags  = 0;
++		desc->flags  = cpu_to_be32(UATH_TX_NOTIFY);
+ 
+ 		if (test_bit(AR5523_CONNECTED, &ar->flags))
+ 			desc->connid = cpu_to_be32(AR5523_ID_BSS);
+@@ -998,22 +1012,33 @@ static void ar5523_tx_work(struct work_s
+ 			spin_lock_irqsave(&ar->tx_data_list_lock, flags);
+ 			list_del(&data->list);
+ 			spin_unlock_irqrestore(&ar->tx_data_list_lock, flags);
+-			atomic_dec(&ar->tx_data_queued);
++			atomic_dec(&ar->tx_nr_total);
+ 			usb_free_urb(urb);
+ 			ieee80211_free_txskb(ar->hw, skb);
+-		}
++		} else
++			atomic_inc(&ar->tx_nr_pending);
+ 	} while (true);
+ 
++}
++
++static void ar5523_tx_work(struct work_struct *work)
++{
++	struct ar5523 *ar = container_of(work, struct ar5523, tx_work);
++
++	mutex_lock(&ar->mutex);
++	ar5523_tx_work_locked(ar);
+ 	mutex_unlock(&ar->mutex);
+ }
+ 
+ static void ar5523_flush_tx(struct ar5523 *ar)
+ {
+-	if (cancel_work_sync(&ar->tx_work))
+-		ar5523_tx_work(&ar->tx_work);
++	ar5523_tx_work_locked(ar);
++
+ 	if (!wait_event_timeout(ar->tx_flush_waitq,
+-			   atomic_read(&ar->tx_data_queued) == 0, HZ * 2))
+-		ar5523_err(ar, "flush timeout\n");
++	    !atomic_read(&ar->tx_nr_pending), HZ * 3))
++		ar5523_dbg(ar, "flush timeout (tot %d pend %d)\n",
++			   atomic_read(&ar->tx_nr_total),
++			   atomic_read(&ar->tx_nr_pending));
+ }
+ 
+ /*
+@@ -1096,7 +1121,6 @@ static void ar5523_stop(struct ieee80211
+ 
+ 	ar5523_dbg(ar, "stop called\n");
+ 
+- 	ar5523_flush_tx(ar);
+ 	mutex_lock(&ar->mutex);
+ 	clear_bit(AR5523_HW_UP, &ar->flags);
+ 
+@@ -1174,6 +1198,7 @@ static int ar5523_hwconfig(struct ieee80
+ 	ar5523_dbg(ar, "config called\n");
+ 	if (changed & IEEE80211_CONF_CHANGE_CHANNEL) {
+ 		ar5523_dbg(ar, "Do channel switch\n");
++		ar5523_flush_tx(ar);
+ 		error = ar5523_set_chan(ar);
+ 		if (error) {
+ 			ar5523_err(ar, "could not reset Tx queues, error %d\n", error);
+@@ -1691,7 +1716,8 @@ static int ar5523_probe(struct usb_inter
+ 	INIT_LIST_HEAD(&ar->tx_queue_pending);
+ 	INIT_LIST_HEAD(&ar->tx_queue_submitted);
+ 	spin_lock_init(&ar->tx_data_list_lock);
+-	atomic_set(&ar->tx_data_queued, 0);
++	atomic_set(&ar->tx_nr_total, 0);
++	atomic_set(&ar->tx_nr_pending, 0);
+ 	init_waitqueue_head(&ar->tx_flush_waitq);
+ 
+ 	atomic_set(&ar->rx_data_free_cnt, 0);

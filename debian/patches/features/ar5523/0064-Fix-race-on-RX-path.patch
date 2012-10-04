@@ -1,0 +1,95 @@
+From 71626f2a8b11d575e99fd268451d9d7a540040fe Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Tue, 2 Oct 2012 22:32:21 +0200
+Subject: [PATCH 64/68] Fix race on RX path.
+
+The RX metadata was linked on the rx_data_used after
+submitting the URB. The the completion callback wins the race
+the entry can end up on the wrong list.
+---
+ ar5523.c |   30 ++++++++++++++++++++----------
+ 1 file changed, 20 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -661,6 +661,15 @@ out_err:
+ 	return error;
+ }
+ 
++static void ar5523_rx_data_put(struct ar5523 *ar,
++				struct ar5523_rx_data *data)
++{
++	unsigned long flags;
++	spin_lock_irqsave(&ar->rx_data_list_lock, flags);
++	list_move(&data->list, &ar->rx_data_free);
++	spin_unlock_irqrestore(&ar->rx_data_list_lock, flags);
++}
++
+ static void ar5523_data_rx_cb(struct urb *urb)
+ {
+ 	struct ar5523_rx_data *data = urb->context;
+@@ -672,7 +681,6 @@ static void ar5523_data_rx_cb(struct urb
+ 	u32 rxlen;
+ 	int usblen = urb->actual_length;
+ 	int hdrlen, pad;
+-	unsigned long flags;
+ 
+ 	ar5523_dbg(ar, "%s\n", __func__);
+ 	/* sync/async unlink faults aren't errors */
+@@ -692,7 +700,7 @@ static void ar5523_data_rx_cb(struct urb
+ 
+ 	if (((chunk->flags & UATH_CFLAGS_FINAL) == 0 ) ||
+ 		chunk->seqnum != 0) {
+-		ar5523_err(ar, "RX: No final flag "
++		ar5523_dbg(ar, "RX: No final flag "
+ 			   "seq: %d flags: %02x len: %d\n",
+ 			   chunk->seqnum, chunk->flags,
+ 			   be16_to_cpu(chunk->length));
+@@ -721,7 +729,7 @@ static void ar5523_data_rx_cb(struct urb
+ 		goto skip;
+ 	}
+ 
+-	skb_reserve(data->skb, sizeof(__be32));
++	skb_reserve(data->skb, sizeof(*chunk));
+ 
+ 	skb_put(data->skb, rxlen - sizeof(struct ar5523_rx_desc));
+ 
+@@ -747,9 +755,8 @@ skip:
+ 		dev_kfree_skb_irq(data->skb);
+ 		data->skb = NULL;
+ 	}
+-	spin_lock_irqsave(&ar->rx_data_list_lock, flags);
+-	list_move(&data->list, &ar->rx_data_free);
+-	spin_unlock_irqrestore(&ar->rx_data_list_lock, flags);
++
++	ar5523_rx_data_put(ar, data);
+ 	if (atomic_inc_return(&ar->rx_data_free_cnt) >=
+ 	    AR5523_RX_DATA_REFILL_COUNT &&
+ 	    test_bit(AR5523_HW_UP, &ar->flags))
+@@ -787,19 +794,22 @@ static void ar5523_rx_refill_work(struct
+ 				  ar5523_data_rx_pipe(ar->dev), data->skb->data,
+ 				  ar->rxbufsz, ar5523_data_rx_cb, data);
+ 
++		spin_lock_irqsave(&ar->rx_data_list_lock, flags);
++		list_move(&data->list, &ar->rx_data_used);
++		spin_unlock_irqrestore(&ar->rx_data_list_lock, flags);
++		atomic_dec(&ar->rx_data_free_cnt);
++
+ 		error = usb_submit_urb(data->urb, GFP_KERNEL);
+ 		if (error) {
+ 			kfree_skb(data->skb);
+ 			if (error != -ENODEV)
+ 				ar5523_err(ar, "Err sending rx data urb %d\n",
+ 					   error);
++			ar5523_rx_data_put(ar, data);
++			atomic_inc(&ar->rx_data_free_cnt);
+ 			return;
+ 		}
+ 
+-		spin_lock_irqsave(&ar->rx_data_list_lock, flags);
+-		list_move(&data->list, &ar->rx_data_used);
+-		spin_unlock_irqrestore(&ar->rx_data_list_lock, flags);
+-		atomic_dec(&ar->rx_data_free_cnt);
+ 	} while (true);
+ done:
+ 	return;

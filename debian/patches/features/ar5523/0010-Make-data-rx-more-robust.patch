@@ -1,0 +1,162 @@
+From 5761bd30a1c5c1bf0caa685e3f71f2309bf8f099 Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Sun, 2 Sep 2012 12:20:42 +0200
+Subject: [PATCH 10/68] Make data rx more robust
+
+---
+ ar5523.c |   43 +++++++++++++++++++++++++++++++------------
+ ar5523.h |   35 +++++++++++++++++++++++++++++------
+ 2 files changed, 60 insertions(+), 18 deletions(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -708,13 +708,14 @@ static void ar5523_data_rx_cb(struct urb
+ 	struct ar5523_rx_data *data = urb->context;
+ 	struct ar5523 *ar = data->ar;
+ 	struct ar5523_rx_desc *desc;
++	struct ar5523_chunk *chunk;
+ 	struct ieee80211_hw *hw = ar->hw;
+ 	struct ieee80211_rx_status *rx_status;
+-	int len = urb->actual_length;
++	u32 rxlen;
++	int usblen = urb->actual_length;
+ 	int hdrlen, pad;
+ 	int error;
+ 
+-	printk("RX\n");
+ 	/* sync/async unlink faults aren't errors */
+ 	if (urb->status && (urb->status != -ENOENT &&
+ 	    urb->status != -ECONNRESET && urb->status != -ESHUTDOWN)) {
+@@ -729,25 +730,43 @@ static void ar5523_data_rx_cb(struct urb
+ 		return;
+ 	}
+ 
+-	if (len < AR5523_MIN_RXBUFSZ) {
+-		ar5523_err(ar, "wrong xfer size (len=%d)\n", len);
++	if (usblen < AR5523_MIN_RXBUFSZ) {
++		ar5523_err(ar, "wrong xfer size (usblen=%d)\n", usblen);
++		goto skip;
++	}
++
++	chunk = (struct ar5523_chunk *) data->skb->data;
++
++	if (chunk->flags != UATH_CFLAGS_FINAL)
++		printk("chunk seq: %d flags: %02x len: %d\n", chunk->seqnum, chunk->flags, be16_to_cpu(chunk->length));
++
++	if ((chunk->flags & UATH_CFLAGS_FINAL) == 0) {
++		ar5523_err(ar, "No final in RX frame\n");
+ 		goto skip;
+ 	}
+ 
+ 	/* Rx descriptor is located at the end, 32-bit aligned */
+ 	desc = (struct ar5523_rx_desc *)
+-		(data->skb->data + len - sizeof(struct ar5523_rx_desc));
++		(data->skb->data + usblen - sizeof(struct ar5523_rx_desc));
+ 
+-	if (be32_to_cpu(desc->len) > ar->rxbufsz) {
++	rxlen = be32_to_cpu(desc->len);
++	if (rxlen > ar->rxbufsz) {
+ 		ar5523_err(ar, "bad descriptor (len=%d)\n",
+ 			       be32_to_cpu(desc->len));
+ 		goto skip;
+ 	}
+ 
++	if (!rxlen)
++		goto skip;
++
++	if (be32_to_cpu(desc->status) != 0) {
++		ar5523_err(ar, "Bad RX status (0x%x). Skip\n", be32_to_cpu(desc->status));
++		goto skip;
++	}
++
+ 	skb_reserve(data->skb, sizeof(__be32));
+ 
+-	skb_put(data->skb, be32_to_cpu(desc->len) -
+-			sizeof(struct ar5523_rx_desc));
++	skb_put(data->skb, rxlen - sizeof(struct ar5523_rx_desc));
+ 
+ 	hdrlen = ieee80211_get_hdrlen_from_skb(data->skb);
+ 	if (hdrlen & 3) {
+@@ -757,10 +776,9 @@ static void ar5523_data_rx_cb(struct urb
+ 		skb_pull(data->skb, pad);
+ 	}
+ 
+-
+ 	rx_status = IEEE80211_SKB_RXCB(data->skb);
+ 	memset(rx_status, 0, sizeof(*rx_status));
+-	rx_status->freq = be32_to_cpu(desc->freq);
++	rx_status->freq = be32_to_cpu(desc->channel);
+ 	rx_status->band = hw->conf.channel->band;
+ 	rx_status->signal = -95 + be32_to_cpu(desc->rssi);
+ 
+@@ -931,6 +949,7 @@ static void ar5523_stop(struct ieee80211
+ 	struct ar5523 *ar = hw->priv;
+ 	__be32 val;
+ 
++	printk("STOP!\n");
+ 	ar5523_dbg(ar, "stop called\n");
+ 
+ 	mutex_lock(&ar->mutex);
+@@ -1006,7 +1025,6 @@ static void ar5523_tx(struct ieee80211_h
+ 	int error = 0;
+ 	__be32 *hdr;
+ 
+-	printk("TX!\n");
+ 	ar5523_dbg(ar, "tx called\n");
+ 
+ 	if (atomic_read(&ar->tx_data_queued) >= AR5523_TX_DATA_COUNT) {
+@@ -1471,7 +1489,8 @@ static int ar5523_load_firmware(struct u
+ 	int error = -ENXIO;
+ 	
+ 	if (request_firmware(&fw, AR5523_FIRMWARE_FILE, &dev->dev)) {
+-		dev_err(&dev->dev, "no firmware found\n");
++		dev_err(&dev->dev, "no firmware found: %s\n",
++			AR5523_FIRMWARE_FILE);
+ 		return -ENOENT;
+ 	}
+ 
+--- a/drivers/net/wireless/ar5523.h
++++ b/drivers/net/wireless/ar5523.h
+@@ -169,13 +169,36 @@ struct ar5523_chunk {
+ } __packed;
+ 
+ 
++/*
++ * Message format for a WDCMSG_DATA_AVAIL message from Target to Host.
++ */
+ struct ar5523_rx_desc {
+-	__be32		len;
+-	__be32		reserved1[8];
+-	__be32		rssi;
+-	__be32		freq;
+-	__be32		reserved2[5];
+-};
++	__be32	len;		/* msg length including header */
++	__be32	code;		/* WDCMSG_DATA_AVAIL */
++	__be32	gennum;		/* generation number */
++	__be32	status;		/* start of RECEIVE_INFO */
++#define	UATH_STATUS_OK			0
++#define	UATH_STATUS_STOP_IN_PROGRESS	1
++#define	UATH_STATUS_CRC_ERR		2
++#define	UATH_STATUS_PHY_ERR		3
++#define	UATH_STATUS_DECRYPT_CRC_ERR	4
++#define	UATH_STATUS_DECRYPT_MIC_ERR	5
++#define	UATH_STATUS_DECOMP_ERR		6
++#define	UATH_STATUS_KEY_ERR		7
++#define	UATH_STATUS_ERR			8
++	__be32	tstamp_low;	/* low-order 32-bits of rx timestamp */
++	__be32	tstamp_high;	/* high-order 32-bits of rx timestamp */
++	__be32	framelen;	/* frame length */
++	__be32	rate;		/* rx rate code */
++	__be32	antenna;
++	__be32	rssi;
++	__be32	channel;
++	__be32	phyerror;
++	__be32	connix;		/* key table ix for bss traffic */
++	__be32	decrypterror;
++	__be32	keycachemiss;
++	__be32	pad;		/* XXX? */
++} __packed;
+ 
+ #define AR5523_MAKECTL(qid, len)	cpu_to_be32((qid) << 16 | (len))
+ 

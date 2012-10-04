@@ -1,0 +1,654 @@
+From 98502b7a9ebc337a311d86ce3b5877ea3a846b8f Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Sat, 1 Sep 2012 11:07:57 +0200
+Subject: [PATCH 08/68] part2
+
+---
+ ar5523.c |  330 ++++++++++++++++++++++++++++++++------------------------------
+ ar5523.h |   16 +++
+ 2 files changed, 185 insertions(+), 161 deletions(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -79,7 +79,7 @@ enum {
+ 	AR5523_TX_CMD_COUNT	= 2,
+ 
+ 	AR5523_TX_DATA_COUNT	= 16,
+-	AR5523_RX_DATA_COUNT	= 128,
++	AR5523_RX_DATA_COUNT	= 16,
+ };
+ 
+ struct ar5523_tx_cmd {
+@@ -93,6 +93,7 @@ struct ar5523_tx_cmd {
+ 	void			*odata;
+ 	int			olen;
+ 	int			flags;
++	int			res;
+ 	struct completion	done;
+ };
+ 
+@@ -116,6 +117,7 @@ struct ar5523 {
+ 	struct usb_device	*dev;
+ 	struct ieee80211_hw	*hw;
+ 
++	struct mutex		mutex;
+ 	struct ar5523_tx_cmd	tx_cmd[AR5523_TX_CMD_COUNT];
+ 	wait_queue_head_t	tx_cmd_wait;
+ 	spinlock_t		tx_cmd_list_lock;
+@@ -125,6 +127,8 @@ struct ar5523 {
+ 	struct ar5523_rx_data	rx_data[AR5523_RX_DATA_COUNT];
+ 	atomic_t		tx_data_queued;
+ 
++	u8			serial[16];
++
+ 	struct timer_list	stat_timer;
+ 	struct completion	ready;
+ 	struct work_struct	stat_work;
+@@ -173,10 +177,6 @@ static void ar5523_read_reply(struct ar5
+ 	int dlen, olen;
+ 	u32 *rp;
+ 
+-	hdr->code = be32_to_cpu(hdr->code);
+-	hdr->len = be32_to_cpu(hdr->len);
+-	hdr->magic = be32_to_cpu(hdr->magic);	/* target status on return */
+-
+ 	dlen = hdr->len - sizeof(*hdr);
+ 
+ 	if (dlen < 0) {
+@@ -198,10 +198,14 @@ static void ar5523_read_reply(struct ar5
+ 		olen = 0;
+ 
+ 	if (cmd->odata) {
+-		if (cmd->olen < olen)
++		if (cmd->olen < olen) {
+ 			WARN_ON(1);
+-		else
++			cmd->olen = 0;
++		}
++		else {
++			cmd->olen = olen;
+ 			memcpy(cmd->odata, &rp[1], olen);
++		}
+ 	}
+ 
+ out:
+@@ -225,6 +229,7 @@ static void ar5523_cmd_rx_cb(struct urb
+ 	struct ar5523_tx_cmd *cmd = urb->context;
+ 	struct ar5523_cmd_hdr *hdr = cmd->buf_rx;
+ 	struct ar5523 *ar = cmd->ar;
++	int dlen;
+ 
+ 	free_tx_cmd(ar, cmd);
+ 
+@@ -234,26 +239,48 @@ static void ar5523_cmd_rx_cb(struct urb
+ 		ar5523_dbg(ar,
+ 			   "nonzero write bulk status received: %d\n",
+ 			   urb->status);
++		cmd->res = urb->status;
++		complete(&cmd->done);
+ 		return;
+ 	}
+ 
+ 	if (urb->status) {
+ 		ar5523_err(ar, "RX USB error %d.\n", urb->status);
++		cmd->res = urb->status;
++		complete(&cmd->done);
+ 		return;
+ 	}
+ 
+ 	if (urb->actual_length < sizeof(struct ar5523_cmd_hdr)) {
+ 		ar5523_err(ar, "RX USB to short.\n");
++		cmd->res = -1;
++		complete(&cmd->done);
+ 		return;
+ 	}
+ 
+ 	ar5523_dbg(ar, "%s code %02x priv %d\n", __func__, be32_to_cpu(hdr->code) & 0xff, hdr->priv);
+ 
+-	switch (be32_to_cpu(hdr->code) & 0xff) {
++	hdr->code = be32_to_cpu(hdr->code);
++	hdr->len = be32_to_cpu(hdr->len);
++	hdr->magic = be32_to_cpu(hdr->magic);	/* target status on return */
++
++	switch (hdr->code & 0xff) {
+ 	default:
+ 		/* reply to a read command */
+ 		ar5523_read_reply(ar, hdr, cmd);
+ 		break;
++
++	case WDCMSG_TARGET_START:
++		printk("WDCMSG_TARGET_START\n");
++		dlen = hdr->len - sizeof(*hdr);
++		if (dlen != (int)sizeof(u32)) {
++			ar5523_err(ar, "Invalid reply to WDCMSG_TARGET_START");
++			return;
++		}
++		memcpy(cmd->odata, hdr+1, sizeof(u32));
++		cmd->olen = sizeof(u32);
++		complete(&cmd->done);
++		break;
+ 	}
+ }
+ 
+@@ -263,18 +290,20 @@ static void ar5523_cmd_rx_cb(struct urb
+ static void ar5523_cmd_tx_cb(struct urb *urb)
+ {
+ 	struct ar5523_tx_cmd *cmd = urb->context;
+-	struct ar5523_cmd_hdr *hdr = cmd->buf_tx;
+ 	struct ar5523 *ar = cmd->ar;
+ 
+-	ar5523_dbg(ar, "cmd tx urb %d completed. Status =%d\n", hdr->priv, urb->status);
+-
+ 	if (urb->status) {
+-		ar5523_err(ar, "Failed to TX command\n");
++		ar5523_err(ar, "Failed to TX command. Status = %d\n", urb->status);
++		cmd->res = urb->status;
++		free_tx_cmd(ar, cmd);
++		complete(&cmd->done);
++		return;
+ 	}
+ 
+ 	if (!(cmd->flags & AR5523_CMD_FLAG_READ)) {
+-		printk("Free cmd in tx cb\n");
++		cmd->res = 0;
+ 		free_tx_cmd(ar, cmd);
++		complete(&cmd->done);
+ 	}
+ 
+ }
+@@ -288,7 +317,6 @@ static int ar5523_cmd(struct ar5523 *ar,
+ 	unsigned long irqflags;
+ 
+ 
+-	
+ 	do {
+ 		spin_lock_irqsave(&ar->tx_cmd_list_lock, irqflags);
+ 		if (!list_empty(&ar->tx_cmd_free)) {
+@@ -327,8 +355,10 @@ static int ar5523_cmd(struct ar5523 *ar,
+ 
+ 	error = usb_submit_urb(cmd->urb_tx, GFP_KERNEL);
+ 	if (error) {
++		free_tx_cmd(ar, cmd);
+ 		ar5523_err(ar, "could not send command 0x%x, error=%d\n",
+ 			       code, error);
++		
+ 		return error;
+ 	}
+ 	printk("Submitted cmd %02x id=%d\n", hdr->code, hdr->priv);
+@@ -341,22 +371,22 @@ static int ar5523_cmd(struct ar5523 *ar,
+ 		cmd->urb_rx->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+ 
+ 		error = usb_submit_urb(cmd->urb_rx, GFP_KERNEL);
++		//TODO cancel tx urb
+ 		if (error) {
+ 			ar5523_err(ar, "error %d when submitting rx urb\n",
+ 				       error);
+ 			return error;
+ 		}
++	}
+ 
+-		if (!wait_for_completion_timeout(&cmd->done, 2 * HZ)) {
+-			cmd->odata = NULL;
+-			ar5523_err(ar, "timeout waiting for command "
+-					"%02x reply\n", code);
+-			return -EIO;
+-		}
++	if (!wait_for_completion_timeout(&cmd->done, 2 * HZ)) {
+ 		cmd->odata = NULL;
++		ar5523_err(ar, "timeout waiting for command "
++				"%02x reply\n", code);
++		cmd->res = -EIO;
+ 	}
+ 
+-	return 0;
++	return cmd->res;
+ }
+ 
+ static int ar5523_cmd_write(struct ar5523 *ar, u32 code, const void *data,
+@@ -430,6 +460,8 @@ ar5523_config_multi(struct ar5523 *ar, u
+ 	return error;
+ }
+ 
++#if 0
++
+ static int ar5523_write_multi(struct ar5523 *ar, u32 reg,
+ 		const void *data, int len)
+ {
+@@ -452,7 +484,6 @@ static int ar5523_write_multi(struct ar5
+ 	return error;
+ }
+ 
+-#if 0
+ static int ar5523_read_reg(struct ar5523 *ar, u32 reg, u32 *val)
+ {
+ 	struct ar5523_read_mac read;
+@@ -662,8 +693,29 @@ static int ar5523_reset_tx_queues(struct
+ 	return error;
+ }
+ 
+-static int ar5523_set_chan(struct ar5523 *ar, struct ieee80211_conf *conf)
++static int ar5523_set_chan(struct ar5523 *ar)
+ {
++	struct ieee80211_conf *conf = &ar->hw->conf;
++
++	struct ar5523_cmd_reset reset;
++
++	memset(&reset, 0, sizeof(reset));
++	reset.flags |= cpu_to_be32(UATH_CHAN_2GHZ);
++	reset.flags |= cpu_to_be32(UATH_CHAN_OFDM);
++	reset.freq = cpu_to_be32(conf->channel->center_freq);
++	reset.maxrdpower = cpu_to_be32(50);	/* XXX */
++	reset.channelchange = cpu_to_be32(1);
++	reset.keeprccontent = cpu_to_be32(0);
++
++	ar5523_dbg(ar, "set chan flags 0x%x freq %d\n",
++		   be32_to_cpu(reset.flags),
++		   conf->channel->center_freq);
++	return ar5523_cmd_write(ar, WDCMSG_RESET, &reset, sizeof reset, 0);
++
++#if 0
++
++
++
+ 	struct ar5523_set_chan chan;
+ 
+ 	memset(&chan, 0, sizeof(chan));
+@@ -678,6 +730,8 @@ static int ar5523_set_chan(struct ar5523
+ 
+ 	return ar5523_cmd_write(ar, AR5523_CMD_SET_CHAN,
+ 				&chan, sizeof(chan), 0);
++
++#endif
+ }
+ 
+ static int ar5523_wme_init(struct ar5523 *ar)
+@@ -718,6 +772,50 @@ static int ar5523_wme_init(struct ar5523
+ 	return error;
+ }
+ 
++static int
++ar5523_switch_channel(struct ar5523 *ar)
++{
++	int error;
++
++
++	printk("%s\n", __func__);
++	/* set radio frequency */
++	error = ar5523_set_chan(ar);
++	if (error) {
++		ar5523_err(ar, "could not set channel, error %d\n", error);
++		goto failed;
++	}
++	/* reset Tx rings */
++	error = ar5523_reset_tx_queues(ar);
++	if (error) {
++		ar5523_err(ar, "could not reset Tx queues, error %d\n", error);
++		goto failed;
++	}
++	/* set Tx rings WME properties */
++	error = ar5523_wme_init(ar);
++	if (error) {
++		ar5523_err(ar, "could not init Tx queues, error %d\n", error);
++		goto failed;
++	}
++#if 0
++	error = ar5523_set_ledstate(ar, 0);
++	if (error) {
++		ar5523_err(ar, "could not set led state, error %d\n", error);
++		goto failed;
++	}
++
++
++	error = ar5523_flush(sar);
++	if (error) {
++		ar5523_err(ar, "could not flush pipes, error %d\n", error);
++		goto failed;
++	}
++#endif
++failed:
++	return error;
++}
++
++
+ static int ar5523_tx_null(struct ar5523 *ar)
+ {
+ 	struct {
+@@ -767,10 +865,11 @@ static void ar5523_data_rx_cb(struct urb
+ 	/* sync/async unlink faults aren't errors */
+ 	if (urb->status && (urb->status != -ENOENT &&
+ 	    urb->status != -ECONNRESET && urb->status != -ESHUTDOWN)) {
+-		ar5523_dbg(ar,
+-			   "nonzero write bulk status received: %d\n",
+-			   urb->status);
+-		goto skip;
++		ar5523_dbg(ar, "%s: nonzero write bulk status received: %d\n",
++			   __func__, urb->status);
++
++		return;
++//		goto skip;
+ 	}
+ 
+ 	if (urb->status) {
+@@ -934,6 +1033,12 @@ static int ar5523_start(struct ieee80211
+ 	ar5523_config(ar, CFG_PROTECTION_TYPE, 0x00000000);
+ 	ar5523_config(ar, CFG_MODE_CTS, 0x00000002);
+ 
++	error = ar5523_alloc_rx_bufs(ar);
++	if (error) {
++		ar5523_err(ar, "Could not allocate rx buffers\n");
++		goto err;
++	}
++
+ 	error = ar5523_cmd_read(ar, WDCMSG_TARGET_START, NULL, 0,
+ 	    &val, sizeof(val), AR5523_CMD_FLAG_MAGIC);
+ 	if (error) {
+@@ -943,16 +1048,13 @@ static int ar5523_start(struct ieee80211
+ 	ar5523_dbg(ar, "%s returns handle: 0x%x\n",
+ 	    "WDCMSG_TARGET_START", be32_to_cpu(val));
+ 
+-
+-#if 0
+ 	/* set default channel */
+-	error = ar5523_switch_channel(ar, ic->ic_curchan);
++	error = ar5523_switch_channel(ar);
+ 	if (error) {
+-		ar5523_err(ar,
+-		    "could not switch channel, error %d\n", error);
+-		goto fail;
++		ar5523_err(ar, "could not switch channel, error %d\n", error);
++		goto err;
+ 	}
+-#endif
++
+ 
+ 	val = cpu_to_be32(TARGET_DEVICE_AWAKE);
+ 	ar5523_cmd_write(ar, WDCMSG_SET_PWR_MODE, &val, sizeof val, 0);
+@@ -966,14 +1068,12 @@ static int ar5523_start(struct ieee80211
+ 	    UATH_FILTER_RX_BCAST | UATH_FILTER_RX_BEACON,
+ 	    UATH_FILTER_OP_SET);
+ 
+-
+-	return -4;
++	ar5523_dbg(ar, "start OK\n");
+ 
+ err:
+ 	return error;
+ 
+ 
+-
+ #if 0
+ 
+ 
+@@ -1091,9 +1191,8 @@ static void ar5523_data_tx_cb(struct urb
+ 	/* sync/async unlink faults aren't errors */
+ 	if (urb->status && (urb->status != -ENOENT &&
+ 	    urb->status != -ECONNRESET && urb->status != -ESHUTDOWN)) {
+-		ar5523_dbg(ar,
+-			   "nonzero write bulk status received: %d\n",
+-			   urb->status);
++		ar5523_dbg(ar, "%s: nonzero write bulk status received: %d\n",
++			   __func__, urb->status);
+ 		goto out;
+ 	}
+ 
+@@ -1213,14 +1312,22 @@ static void ar5523_remove_interface(stru
+ 	ar->mode = NL80211_IFTYPE_MONITOR;
+ }
+ 
++
++
++
+ static int ar5523_hwconfig(struct ieee80211_hw *hw, u32 changed)
+ {
+ 	struct ar5523 *ar = hw->priv;
+-	struct ieee80211_conf *conf = &hw->conf;
+-	__be32 val;
+-	int error;
+ 
+ 	ar5523_dbg(ar, "config called\n");
++	if (changed & IEEE80211_CONF_CHANGE_CHANNEL) {
++		ar5523_dbg(ar, "Do channel switch\n");
++		ar5523_switch_channel(ar);
++	}
++
++	return 0;
++
++#if 0
+ 
+ 	/* set radio frequency */
+ 	error = ar5523_set_chan(ar, conf);
+@@ -1258,6 +1365,7 @@ static int ar5523_hwconfig(struct ieee80
+ 	}
+ 
+ 	return 0;
++#endif
+ }
+ 
+ static void ar5523_create_rateset(struct ar5523 *ar,
+@@ -1527,76 +1635,6 @@ static int ar5523_alloc_tx_cmds(struct a
+ 	return error;
+ }
+ 
+-#if 0
+-static void ar5523_free_rx_cmds(struct ar5523 *ar)
+-{
+-	int i;
+-
+-	for (i = 0; i < AR5523_RX_CMD_COUNT; i++) {
+-		struct ar5523_rx_cmd *cmd = &ar->rx_cmd[i];
+-
+-		usb_kill_urb(cmd->urb);
+-		usb_free_coherent(ar->dev, AR5523_MAX_RXCMDSZ,
+-				  cmd->buf, cmd->urb->transfer_dma);
+-		usb_free_urb(cmd->urb);
+-	}
+-}
+-
+-static int ar5523_alloc_rx_cmds(struct ar5523 *ar)
+-{
+-	int error = -ENOMEM;
+-        int i;
+-
+-	for (i = 0; i < AR5523_RX_CMD_COUNT; i++) {
+-		struct ar5523_rx_cmd *cmd = &ar->rx_cmd[i];
+-
+-		cmd->ar = ar;
+-		cmd->urb = usb_alloc_urb(0, GFP_KERNEL);
+-		if (!cmd->urb) {
+-			ar5523_err(ar, "could not allocate rx urb\n");
+-			goto out;
+-		}
+-		cmd->buf = usb_alloc_coherent(ar->dev, AR5523_MAX_TXCMDSZ,
+-					      GFP_KERNEL,
+-					      &cmd->urb->transfer_dma);
+-		if (!cmd->buf) {
+-			ar5523_err(ar, "could not allocate rx buffer\n");
+-			usb_free_urb(cmd->urb);
+-			goto out;
+-		}
+-
+-		usb_fill_bulk_urb(cmd->urb, ar->dev,
+-				  ar5523_cmd_rx_pipe(ar->dev), cmd->buf,
+-				  AR5523_MAX_RXCMDSZ, ar5523_cmd_rx_cb, cmd);
+-		cmd->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+-
+-		error = usb_submit_urb(cmd->urb, GFP_KERNEL);
+-		if (error) {
+-			ar5523_err(ar, "error %d when submitting rx urb\n",
+-				       error);
+-			usb_free_coherent(ar->dev, AR5523_MAX_RXCMDSZ,
+-					  cmd->buf, cmd->urb->transfer_dma);
+-			usb_free_urb(cmd->urb);
+-			return error;
+-		}
+-	}
+-
+-	return 0;
+-
+- out:
+- 	while (--i >= 0) {
+-		struct ar5523_rx_cmd *cmd = &ar->rx_cmd[i];
+-
+-		usb_kill_urb(cmd->urb);
+-
+-		usb_free_coherent(ar->dev, AR5523_MAX_RXCMDSZ,
+-				  cmd->buf, cmd->urb->transfer_dma);
+-		usb_free_urb(cmd->urb);
+-	}
+-
+-	return error;
+-}
+-#endif
+ 
+ static int ar5523_host_available(struct ar5523 *ar)
+ {
+@@ -1612,34 +1650,6 @@ static int ar5523_host_available(struct
+ }
+ 
+ 
+-#if 0
+-
+-/*
+- * Device initialization and teardown.
+- */
+-static int ar5523_reset(struct ar5523 *ar)
+-{
+-//        struct ar5523_cmd_setup setup;
+-	u32 reg, val;
+-	int error;
+-
+-	error = ar5523_host_available(ar);
+-
+-		
+-	/* read PHY registers */
+-	for (reg = 0x09; reg <= 0x24; reg++) {
+-		if (reg == 0x0b || reg == 0x0c)
+-			continue;
+-		udelay(100);
+-		error = ar5523_read_reg(ar, reg, &val);
+-		if (error)
+-			return error;
+-		ar5523_dbg(ar, "reg 0x%02x=0x%08x\n", reg, val);
+-	}
+-
+-	return error;
+-}
+-#endif
+ 
+ 
+ static int
+@@ -1652,28 +1662,22 @@ ar5523_get_devstatus(struct ar5523 *ar)
+ 	error = ar5523_get_status(ar, ST_MAC_ADDR, macaddr, ETH_ALEN);
+ 	if (error != 0) {
+ 		ar5523_err(ar, "could not read MAC address\n");
+-		return (error);
++		return error;
+ 	}
+ 
+ 	SET_IEEE80211_PERM_ADDR(ar->hw, macaddr);
+ 
+-#if 0
+-
+-	error = uath_get_status(sc, ST_SERIAL_NUMBER,
+-	    &sc->sc_serial[0], sizeof(sc->sc_serial));
+-	if (error != 0) {
+-		ar5523_err(ar,
+-		    "could not read device serial number\n");
+-		return (error);
++	error = ar5523_get_status(ar, ST_SERIAL_NUMBER,
++	    &ar->serial[0], sizeof(ar->serial));
++	if (error) {
++		ar5523_err(ar, "could not read device serial number\n");
++		return error;
+ 	}
+-#endif
++
+ 	return 0;
+ }
+ 
+ 
+-
+-
+-
+ /*
+  * This is copied from rtl818x, but we should probably move this
+  * to common code as in OpenBSD.
+@@ -1849,6 +1853,7 @@ static int ar5523_probe(struct usb_inter
+ 	ar = hw->priv;
+ 	ar->hw = hw;
+ 	ar->dev = dev;
++	mutex_init(&ar->mutex);
+ 	init_completion(&ar->ready);
+ 	init_waitqueue_head(&ar->tx_cmd_wait);
+ 	atomic_set(&ar->tx_data_queued, 0);
+@@ -1857,9 +1862,13 @@ static int ar5523_probe(struct usb_inter
+ 	INIT_LIST_HEAD(&ar->tx_cmd_used);
+ 	spin_lock_init(&ar->tx_cmd_list_lock);
+ 
++	ar->rxbufsz = 2000;	//TODO
++
+ 	error = ar5523_alloc_tx_cmds(ar);
+-	if (error)
++	if (error) {
++		ar5523_err(ar, "Could not allocate tx command buffers\n");
+ 		goto out_free_ar;
++	}
+ 
+ 	/*
+ 	 * We're now ready to send/receive firmware commands.
+@@ -1867,7 +1876,7 @@ static int ar5523_probe(struct usb_inter
+ 	error = ar5523_host_available(ar);
+ 	if (error) {
+ 		ar5523_err(ar, "could not initialize adapter\n");
+-		goto out_free_rx_cmds;
++		goto out_free_tx_cmds;
+ 	}
+ 
+ 	error = ar5523_get_devcap(ar);
+@@ -1905,17 +1914,16 @@ static int ar5523_probe(struct usb_inter
+ 	error = ieee80211_register_hw(hw);
+ 	if (error) {
+ 		ar5523_err(ar, "could not register device\n");
+-		goto out_free_rx_cmds;
++		goto out_free_tx_cmds;
+ 	}
+ 
+ 	return 0;
+ 
+- out_free_rx_cmds:
+- out_free_tx_cmds:
++out_free_tx_cmds:
+ 	ar5523_free_tx_cmds(ar);
+- out_free_ar:
++out_free_ar:
+ 	ieee80211_free_hw(hw);
+- out:
++out:
+ 	return error;
+ }
+ 
+--- a/drivers/net/wireless/ar5523.h
++++ b/drivers/net/wireless/ar5523.h
+@@ -239,6 +239,22 @@ struct ar5523_cmd_set_associd {		/* AR55
+ 	__u8	bssid[6];
+ } __packed;
+ 
++/* structure for command WDCMSG_RESET */
++struct ar5523_cmd_reset {
++	__be32	flags;		/* channel flags */
++#define	UATH_CHAN_TURBO	0x0100
++#define	UATH_CHAN_CCK	0x0200
++#define	UATH_CHAN_OFDM	0x0400
++#define	UATH_CHAN_2GHZ	0x1000
++#define	UATH_CHAN_5GHZ	0x2000
++	__be32	freq;		/* channel frequency */
++	__be32	maxrdpower;
++	__be32	cfgctl;
++	__be32	twiceantennareduction;
++	__be32	channelchange;
++	__be32	keeprccontent;
++} __packed;
++
+ 
+ /* structure for command WDCMSG_SET_BASIC_RATE */
+ struct ar5523_cmd_rates {

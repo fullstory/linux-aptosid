@@ -1,0 +1,487 @@
+From 37b13a0eda7846ea301a881adb6a3431139a8609 Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Sat, 8 Sep 2012 15:43:23 +0200
+Subject: [PATCH 23/68] Improve command handling
+
+There is no need for more than one command at a time. Change RX command
+to work with events if that should be needed.
+---
+ ar5523.c |  268 ++++++++++++++++++++++++++++++--------------------------------
+ 1 file changed, 128 insertions(+), 140 deletions(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -104,18 +104,16 @@ enum {
+ 	AR5523_RX_DATA_REFILL_COUNT = 8,
+ };
+ 
++#define AR5523_CMD_ID	1
++
+ enum AR5523_flags {
+ 	AR5523_TX_QUEUE_STOPPED
+ };
+ 
+ struct ar5523_tx_cmd {
+-	struct	list_head	list;
+-	int			id;
+ 	struct ar5523		*ar;
+ 	struct urb		*urb_tx;
+-	struct urb		*urb_rx;
+ 	void			*buf_tx;
+-	void			*buf_rx;
+ 	void			*odata;
+ 	int			olen;
+ 	int			flags;
+@@ -146,13 +144,12 @@ struct ar5523 {
+ 
+ 	unsigned long		flags;
+ 	struct mutex		mutex;
+-	struct ar5523_tx_cmd	tx_cmd[AR5523_TX_CMD_COUNT];
+-	wait_queue_head_t	tx_cmd_wait;
+-	spinlock_t		tx_cmd_list_lock;
+-	struct	list_head	tx_cmd_free;
+-	struct	list_head	tx_cmd_used;
++	struct ar5523_tx_cmd	tx_cmd;
+ 	atomic_t		tx_data_queued;
+ 
++	void			*rx_cmd_buf;
++	struct urb		*rx_cmd_urb;
++
+ 	struct ar5523_rx_data	rx_data[AR5523_RX_DATA_COUNT];
+ 	spinlock_t		rx_data_list_lock;
+ 	struct	list_head	rx_data_free;
+@@ -198,6 +195,7 @@ enum {
+ #define ar5523_info(ar, format, arg...)	\
+ 	dev_info(&(ar)->dev->dev, format, ## arg)
+ 
++static int ar5523_submit_rx_cmd(struct ar5523 *ar);
+ /*
+  * TX/RX command handling.
+  */
+@@ -244,26 +242,13 @@ out:
+ 	complete(&cmd->done);
+ }
+ 
+-static void free_tx_cmd(struct ar5523 *ar, struct ar5523_tx_cmd *cmd)
+-{
+-	unsigned long irqflags;
+-
+-	ar5523_dbg(ar, "return tx cmd %d\n", cmd->id);
+-
+-	spin_lock_irqsave(&ar->tx_cmd_list_lock, irqflags);
+-	list_move(&cmd->list, &ar->tx_cmd_free);
+-	spin_unlock_irqrestore(&ar->tx_cmd_list_lock, irqflags);
+-}
+-
+ static void ar5523_cmd_rx_cb(struct urb *urb)
+ {
+-	struct ar5523_tx_cmd *cmd = urb->context;
+-	struct ar5523_cmd_hdr *hdr = cmd->buf_rx;
+-	struct ar5523 *ar = cmd->ar;
++	struct ar5523 *ar = urb->context;
++	struct ar5523_tx_cmd *cmd = &ar->tx_cmd;
++	struct ar5523_cmd_hdr *hdr = ar->rx_cmd_buf;
+ 	int dlen;
+ 
+-	free_tx_cmd(ar, cmd);
+-
+ 	/* sync/async unlink faults aren't errors */
+ 	if (urb->status && (urb->status != -ENOENT &&
+ 	    urb->status != -ECONNRESET && urb->status != -ESHUTDOWN)) {
+@@ -294,15 +279,27 @@ static void ar5523_cmd_rx_cb(struct urb
+ 
+ 	hdr->code = be32_to_cpu(hdr->code);
+ 	hdr->len = be32_to_cpu(hdr->len);
+-	hdr->magic = be32_to_cpu(hdr->magic);	/* target status on return */
+ 
+ 	switch (hdr->code & 0xff) {
+ 	default:
+ 		/* reply to a read command */
++		if (hdr->priv != AR5523_CMD_ID) {
++			ar5523_err(ar, "Unexpected command id\n");
++			goto skip;
++		}
+ 		ar5523_read_reply(ar, hdr, cmd);
+ 		break;
+ 
++	case WDCMSG_DEVICE_AVAIL:
++		ar5523_dbg(ar, "WDCMSG_DEVICE_AVAIL\n");
++		cmd->res = 0;
++		cmd->olen = 0;
++		complete(&cmd->done);
++		break;
++
+ 	case WDCMSG_TARGET_START:
++		/* This command returns a bogus id so it needs special
++		   handling */
+ 		dlen = hdr->len - sizeof(*hdr);
+ 		if (dlen != (int)sizeof(u32)) {
+ 			ar5523_err(ar, "Invalid reply to WDCMSG_TARGET_START");
+@@ -314,6 +311,56 @@ static void ar5523_cmd_rx_cb(struct urb
+ 		complete(&cmd->done);
+ 		break;
+ 	}
++
++skip:
++	ar5523_submit_rx_cmd(ar);
++}
++
++static int ar5523_alloc_rx_cmd(struct ar5523 *ar)
++{
++	ar->rx_cmd_urb = usb_alloc_urb(0, GFP_KERNEL);
++	if (!ar->rx_cmd_urb)
++		return -ENOMEM;
++
++	ar->rx_cmd_buf = usb_alloc_coherent(ar->dev, AR5523_MAX_RXCMDSZ,
++					    GFP_KERNEL,
++					    &ar->rx_cmd_urb->transfer_dma);
++	if (!ar->rx_cmd_buf) {
++		usb_free_urb(ar->rx_cmd_urb);
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++static void ar5523_cancel_rx_cmd(struct ar5523 *ar)
++{
++	usb_kill_urb(ar->rx_cmd_urb);
++}
++
++static void ar5523_free_rx_cmd(struct ar5523 *ar)
++{
++	usb_free_coherent(ar->dev, AR5523_MAX_RXCMDSZ,
++			  ar->rx_cmd_buf, ar->rx_cmd_urb->transfer_dma);
++	usb_free_urb(ar->rx_cmd_urb);
++}
++
++static int ar5523_submit_rx_cmd(struct ar5523 *ar)
++{
++	int error;
++
++	usb_fill_bulk_urb(ar->rx_cmd_urb, ar->dev,
++			  ar5523_cmd_rx_pipe(ar->dev), ar->rx_cmd_buf,
++			  AR5523_MAX_RXCMDSZ, ar5523_cmd_rx_cb, ar);
++	ar->rx_cmd_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
++
++	error = usb_submit_urb(ar->rx_cmd_urb, GFP_ATOMIC);
++	if (error) {
++		ar5523_err(ar, "error %d when submitting rx urb\n",
++			       error);
++		return error;
++	}
++	return 0;
+ }
+ 
+ /*
+@@ -328,51 +375,31 @@ static void ar5523_cmd_tx_cb(struct urb
+ 		ar5523_err(ar, "Failed to TX command. Status = %d\n",
+ 			   urb->status);
+ 		cmd->res = urb->status;
+-		free_tx_cmd(ar, cmd);
+ 		complete(&cmd->done);
+ 		return;
+ 	}
+ 
+ 	if (!(cmd->flags & AR5523_CMD_FLAG_READ)) {
+ 		cmd->res = 0;
+-		free_tx_cmd(ar, cmd);
+ 		complete(&cmd->done);
+ 	}
+-
+ }
+ 
+ static int ar5523_cmd(struct ar5523 *ar, u32 code, const void *idata,
+ 		int ilen, void *odata, int olen, int flags)
+ {
+ 	struct ar5523_cmd_hdr *hdr;
+-	struct ar5523_tx_cmd *cmd = NULL;
++	struct ar5523_tx_cmd *cmd = &ar->tx_cmd;
+ 	int xferlen, error;
+-	unsigned long irqflags;
+-
+-
+-	do {
+-		spin_lock_irqsave(&ar->tx_cmd_list_lock, irqflags);
+-		if (!list_empty(&ar->tx_cmd_free)) {
+-			cmd = (struct ar5523_tx_cmd *) ar->tx_cmd_free.next;
+-			list_move(&cmd->list, &ar->tx_cmd_used);
+-		}
+-		spin_unlock_irqrestore(&ar->tx_cmd_list_lock, irqflags);
+-		if (!cmd) {
+-			ar5523_info(ar, "No free tx cmd available. Sleep\n");
+-			msleep(3000);
+-			wait_event(ar->tx_cmd_wait, 1);
+-		}
+-	} while (!cmd);
+-
+ 
+ 	/* always bulk-out a multiple of 4 bytes */
+ 	xferlen = (sizeof(struct ar5523_cmd_hdr) + ilen + 3) & ~3;
+ 
+ 	hdr = (struct ar5523_cmd_hdr *)cmd->buf_tx;
+ 	memset(hdr, 0, sizeof(struct ar5523_cmd_hdr));
+-	hdr->len   = cpu_to_be32(xferlen);
+-	hdr->code  = cpu_to_be32(code);
+-	hdr->priv  = cmd->id;	/* don't care about endianness */
++	hdr->len  = cpu_to_be32(xferlen);
++	hdr->code = cpu_to_be32(code);
++	hdr->priv = AR5523_CMD_ID;
+ 
+ 	if (flags & AR5523_CMD_FLAG_MAGIC)
+ 		hdr->magic = cpu_to_be32(1 << 24);
+@@ -382,41 +409,24 @@ static int ar5523_cmd(struct ar5523 *ar,
+ 	cmd->olen = olen;
+ 	cmd->flags = flags;
+ 
++	ar5523_dbg(ar, "do cmd %02x\n", code);
++
+ 	usb_fill_bulk_urb(cmd->urb_tx, ar->dev, ar5523_cmd_tx_pipe(ar->dev),
+ 			  cmd->buf_tx, xferlen, ar5523_cmd_tx_cb, cmd);
+ 	cmd->urb_tx->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+ 
+ 	error = usb_submit_urb(cmd->urb_tx, GFP_KERNEL);
+ 	if (error) {
+-		free_tx_cmd(ar, cmd);
+ 		ar5523_err(ar, "could not send command 0x%x, error=%d\n",
+ 			       code, error);
+-
+ 		return error;
+ 	}
+ 
+-	if (flags & AR5523_CMD_FLAG_READ) {
+-		ar5523_dbg(ar, "Read CMD. Submit RX urb %p %p\n", cmd, ar);
+-		usb_fill_bulk_urb(cmd->urb_rx, ar->dev,
+-				  ar5523_cmd_rx_pipe(ar->dev), cmd->buf_rx,
+-				  AR5523_MAX_RXCMDSZ, ar5523_cmd_rx_cb, cmd);
+-		cmd->urb_rx->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+-
+-		error = usb_submit_urb(cmd->urb_rx, GFP_KERNEL);
+-		//TODO cancel tx urb
+-		if (error) {
+-			ar5523_err(ar, "error %d when submitting rx urb\n",
+-				       error);
+-			return error;
+-		}
+-	}
+-
+ 	if (!wait_for_completion_timeout(&cmd->done, 2 * HZ)) {
+ 		cmd->odata = NULL;
+ 		ar5523_err(ar, "timeout waiting for command %02x reply\n",
+ 			   code);
+-		cmd->res = -EIO;
+-		free_tx_cmd(ar, cmd);
++		cmd->res = -ETIMEDOUT;
+ 	}
+ 
+ 	return cmd->res;
+@@ -970,7 +980,6 @@ static int ar5523_start(struct ieee80211
+ 	/* XXX? check */
+ 	ar5523_cmd_write(ar, WDCMSG_RESET_KEY_CACHE, NULL, 0, 0);
+ 
+-
+ 	ieee80211_queue_work(ar->hw, &ar->rx_refill_work);
+ 
+ 	/* enable Rx */
+@@ -1408,71 +1417,36 @@ static const struct ieee80211_ops ar5523
+ 	.configure_filter	= ar5523_configure_filter,
+ };
+ 
+-static void ar5523_free_tx_cmds(struct ar5523 *ar)
++static void ar5523_free_tx_cmd(struct ar5523 *ar)
+ {
+-	int i;
++	struct ar5523_tx_cmd *cmd = &ar->tx_cmd;
+ 
+-	for (i = 0; i < AR5523_TX_CMD_COUNT; i++) {
+-		struct ar5523_tx_cmd *cmd = &ar->tx_cmd[i];
+-
+-		list_del(&cmd->list);
+-		usb_kill_urb(cmd->urb_rx);
+-		usb_kill_urb(cmd->urb_tx);
+-		usb_free_coherent(ar->dev, AR5523_MAX_TXCMDSZ,
+-				  cmd->buf_rx, cmd->urb_rx->transfer_dma);
+-		usb_free_coherent(ar->dev, AR5523_MAX_RXCMDSZ,
+-				  cmd->buf_tx, cmd->urb_rx->transfer_dma);
+-		usb_free_urb(cmd->urb_rx);
+-		usb_free_urb(cmd->urb_tx);
+-	}
++	usb_free_coherent(ar->dev, AR5523_MAX_RXCMDSZ,
++			  cmd->buf_tx, cmd->urb_tx->transfer_dma);
++	usb_free_urb(cmd->urb_tx);
+ }
+ 
+-static int ar5523_alloc_tx_cmds(struct ar5523 *ar)
++static int ar5523_alloc_tx_cmd(struct ar5523 *ar)
+ {
+-	int error = -ENOMEM;
+-	int i;
++	struct ar5523_tx_cmd *cmd = &ar->tx_cmd;
+ 
+-	for (i = 0; i < AR5523_TX_CMD_COUNT; i++) {
+-		struct ar5523_tx_cmd *cmd = &ar->tx_cmd[i];
++	cmd->ar = ar;
++	init_completion(&cmd->done);
+ 
+-		cmd->ar = ar;
+-		cmd->id = i;
+-		cmd->urb_rx = usb_alloc_urb(0, GFP_KERNEL);
+-		cmd->urb_tx = usb_alloc_urb(0, GFP_KERNEL);
+-		if (!cmd->urb_rx || !cmd->urb_tx) {
+-			ar5523_err(ar, "could not allocate urb\n");
+-			goto out;
+-		}
+-		cmd->buf_rx = usb_alloc_coherent(ar->dev, AR5523_MAX_RXCMDSZ,
+-					      GFP_KERNEL,
+-					    &cmd->urb_rx->transfer_dma);
+-		cmd->buf_tx = usb_alloc_coherent(ar->dev, AR5523_MAX_TXCMDSZ,
+-					      GFP_KERNEL,
+-					    &cmd->urb_tx->transfer_dma);
+-		if (!cmd->buf_rx) { //TODO
+-			ar5523_err(ar, "could not allocate tx buffer\n");
+-			usb_free_urb(cmd->urb_rx);
+-			goto out;
+-		}
+-		init_completion(&cmd->done);
+-		list_add_tail(&cmd->list, &ar->tx_cmd_free);
++	cmd->urb_tx = usb_alloc_urb(0, GFP_KERNEL);
++	if (!cmd->urb_tx) {
++		ar5523_err(ar, "could not allocate urb\n");
++		return -ENOMEM;
+ 	}
+-	return 0;
+-
+-out:
+-	while (--i >= 0) {
+-		struct ar5523_tx_cmd *cmd = &ar->tx_cmd[i];
+-
+-		usb_free_coherent(ar->dev, AR5523_MAX_TXCMDSZ,
+-				  cmd->buf_tx, cmd->urb_tx->transfer_dma);
+-		usb_free_coherent(ar->dev, AR5523_MAX_RXCMDSZ,
+-				  cmd->buf_rx, cmd->urb_rx->transfer_dma);
++	cmd->buf_tx = usb_alloc_coherent(ar->dev, AR5523_MAX_TXCMDSZ,
++					 GFP_KERNEL,
++					 &cmd->urb_tx->transfer_dma);
++	if (!cmd->buf_tx) {
+ 		usb_free_urb(cmd->urb_tx);
+-		usb_free_urb(cmd->urb_rx);
+-		list_del(&cmd->list);
++		return -ENOMEM;
+ 	}
+ 
+-	return error;
++	return 0;
+ }
+ 
+ static int ar5523_host_available(struct ar5523 *ar)
+@@ -1718,14 +1692,10 @@ static int ar5523_probe(struct usb_inter
+ 	ar->dev = dev;
+ 	mutex_init(&ar->mutex);
+ 	init_completion(&ar->ready);
+-	init_waitqueue_head(&ar->tx_cmd_wait);
+ 	atomic_set(&ar->tx_data_queued, 0);
+ 	atomic_set(&ar->rx_data_free_cnt, 0);
+ 	INIT_WORK(&ar->stat_work, ar5523_stat_work);
+ 	INIT_WORK(&ar->rx_refill_work, ar5523_rx_refill_work);
+-	INIT_LIST_HEAD(&ar->tx_cmd_free);
+-	INIT_LIST_HEAD(&ar->tx_cmd_used);
+-	spin_lock_init(&ar->tx_cmd_list_lock);
+ 
+ 	INIT_LIST_HEAD(&ar->rx_data_free);
+ 	INIT_LIST_HEAD(&ar->rx_data_used);
+@@ -1737,37 +1707,49 @@ static int ar5523_probe(struct usb_inter
+ 		goto out_free_ar;
+ 	}
+ 
+-	error = ar5523_alloc_tx_cmds(ar);
++	error = ar5523_alloc_rx_cmd(ar);
+ 	if (error) {
+-		ar5523_err(ar, "Could not allocate tx command buffers\n");
++		ar5523_err(ar, "Could not allocate rx command buffers\n");
+ 		goto out_free_rx_bufs;
+ 	}
+ 
++	error = ar5523_alloc_tx_cmd(ar);
++	if (error) {
++		ar5523_err(ar, "Could not allocate tx command buffers\n");
++		goto out_free_rx_cmd;
++	}
++
++	error = ar5523_submit_rx_cmd(ar);
++	if (error) {
++		ar5523_err(ar, "Failed to submit rx cmd\n");
++		goto out_free_tx_cmd;
++	}
++
+ 	/*
+ 	 * We're now ready to send/receive firmware commands.
+ 	 */
+ 	error = ar5523_host_available(ar);
+ 	if (error) {
+ 		ar5523_err(ar, "could not initialize adapter\n");
+-		goto out_free_rx_bufs;
++		goto out_cancel_rx_cmd;
+ 	}
+ 
+ 	error = ar5523_get_max_rxsz(ar);
+ 	if (error) {
+ 		ar5523_err(ar, "could not get caps from adapter\n");
+-		goto out_free_rx_bufs;
++		goto out_cancel_rx_cmd;
+ 	}
+ 
+ 	error = ar5523_get_devcap(ar);
+ 	if (error) {
+ 		ar5523_err(ar, "could not get caps from adapter\n");
+-		goto out_free_rx_bufs;
++		goto out_cancel_rx_cmd;
+ 	}
+ 
+ 	error = ar5523_get_devstatus(ar);
+ 	if (error != 0) {
+ 		ar5523_err(ar, "could not get device status\n");
+-		goto out_free_rx_bufs;
++		goto out_cancel_rx_cmd;
+ 	}
+ 
+ 	ar5523_info(ar, "MAC/BBP AR5523, RF AR%c112\n",
+@@ -1785,20 +1767,24 @@ static int ar5523_probe(struct usb_inter
+ 
+ 	error = ar5523_init_modes(ar);
+ 	if (error)
+-		goto out_free_tx_cmds;
++		goto out_cancel_rx_cmd;
+ 
+ 	usb_set_intfdata(intf, hw);
+ 
+ 	error = ieee80211_register_hw(hw);
+ 	if (error) {
+ 		ar5523_err(ar, "could not register device\n");
+-		goto out_free_tx_cmds;
++		goto out_cancel_rx_cmd;
+ 	}
+ 
+ 	return 0;
+ 
+-out_free_tx_cmds:
+-	ar5523_free_tx_cmds(ar);
++out_cancel_rx_cmd:
++	ar5523_cancel_rx_cmd(ar);
++out_free_tx_cmd:
++	ar5523_free_tx_cmd(ar);
++out_free_rx_cmd:
++	ar5523_free_rx_cmd(ar);
+ out_free_rx_bufs:
+ 	ar5523_free_rx_bufs(ar);
+ out_free_ar:
+@@ -1818,7 +1804,9 @@ static void ar5523_disconnect(struct usb
+ 
+ 	del_timer_sync(&ar->stat_timer);
+ 
+-	ar5523_free_tx_cmds(ar);
++	ar5523_cancel_rx_cmd(ar);
++	ar5523_free_tx_cmd(ar);
++	ar5523_free_rx_cmd(ar);
+ 	ar5523_free_rx_bufs(ar);
+ 
+ 	ieee80211_free_hw(hw);
