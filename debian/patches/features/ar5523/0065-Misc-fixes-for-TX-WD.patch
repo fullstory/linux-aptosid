@@ -1,0 +1,69 @@
+From 4f1ee4b3037c188792e3df7205fbecd17b0cef19 Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Wed, 3 Oct 2012 20:26:16 +0200
+Subject: [PATCH 65/68] Misc fixes for TX WD
+
+Use define for timeouts. Touch timer on TX notification too.
+---
+ ar5523.c |   19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -93,6 +93,9 @@
+ #define AR5523_CMD_ID	1
+ #define AR5523_DATA_ID	2
+ 
++#define AR5523_TX_WD_TIMEOUT	HZ*2
++#define AR5523_FLUSH_TIMEOUT	HZ*3
++
+ enum AR5523_flags {
+ 	AR5523_HW_UP,
+ 	AR5523_USB_DISCONNECTED,
+@@ -283,8 +286,12 @@ static void ar5523_cmd_rx_cb(struct urb
+ 			atomic_read(&ar->tx_nr_pending));
+ 		if (!test_bit(AR5523_HW_UP, &ar->flags))
+ 			ar5523_dbg(ar, "Unexpected WDCMSG_SEND_COMPLETE\n");
+-		else
++		else {
++			mod_timer(&ar->tx_wd_timer,
++				  jiffies + AR5523_TX_WD_TIMEOUT);
+ 			ar5523_data_tx_pkt_put(ar);
++
++		}
+ 		break;
+ 
+ 	case WDCMSG_TARGET_START:
+@@ -1016,6 +1023,8 @@ static void ar5523_tx_work_locked(struct
+ 		spin_lock_irqsave(&ar->tx_data_list_lock, flags);
+ 		list_add_tail(&data->list, &ar->tx_queue_submitted);
+ 		spin_unlock_irqrestore(&ar->tx_data_list_lock, flags);
++		mod_timer(&ar->tx_wd_timer, jiffies + AR5523_TX_WD_TIMEOUT);
++		atomic_inc(&ar->tx_nr_pending);
+ 
+ 		error = usb_submit_urb(urb, GFP_KERNEL);
+ 		if (error) {
+@@ -1024,12 +1033,10 @@ static void ar5523_tx_work_locked(struct
+ 			spin_lock_irqsave(&ar->tx_data_list_lock, flags);
+ 			list_del(&data->list);
+ 			spin_unlock_irqrestore(&ar->tx_data_list_lock, flags);
+-			atomic_dec(&ar->tx_nr_total);
++			atomic_dec(&ar->tx_nr_pending);
++			ar5523_data_tx_pkt_put(ar);
+ 			usb_free_urb(urb);
+ 			ieee80211_free_txskb(ar->hw, skb);
+-		} else {
+-			mod_timer(&ar->tx_wd_timer, jiffies + HZ*2);
+-			atomic_inc(&ar->tx_nr_pending);
+ 		}
+ 	} while (true);
+ }
+@@ -1078,7 +1085,7 @@ static void ar5523_flush_tx(struct ar552
+ 	if (test_bit(AR5523_USB_DISCONNECTED, &ar->flags))
+ 		return;
+ 	if (!wait_event_timeout(ar->tx_flush_waitq,
+-	    !atomic_read(&ar->tx_nr_pending), HZ * 3))
++	    !atomic_read(&ar->tx_nr_pending), AR5523_FLUSH_TIMEOUT))
+ 		ar5523_err(ar, "flush timeout (tot %d pend %d)\n",
+ 			   atomic_read(&ar->tx_nr_total),
+ 			   atomic_read(&ar->tx_nr_pending));

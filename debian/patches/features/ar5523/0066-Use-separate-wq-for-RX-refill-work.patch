@@ -1,0 +1,140 @@
+From 7b8ecc93380b9e43717c94b432c5e7e34cdea934 Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Thu, 4 Oct 2012 19:08:13 +0200
+Subject: [PATCH 66/68] Use separate wq for RX refill work
+
+Using the ieee80211 wq for RX refill caused trouble on the TX path (!).
+Apparently TX does not work if RX is not flowing and if flush was called
+when no RX requests was submitted flush would block the refill work and
+the flushed timed out.
+---
+ ar5523.c |   32 +++++++++++++++++++-------------
+ 1 file changed, 19 insertions(+), 13 deletions(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -136,6 +136,8 @@ struct ar5523 {
+ 
+ 	unsigned long		flags;
+ 	struct mutex		mutex;
++	struct workqueue_struct *wq;
++
+ 	struct ar5523_tx_cmd	tx_cmd;
+ 
+ 	struct delayed_work	stat_work;
+@@ -477,10 +479,9 @@ static int ar5523_config_multi(struct ar
+ 	/* properly handle the case where len is zero (reset) */
+ 	error = ar5523_cmd_write(ar, WDCMSG_TARGET_SET_CONFIG, &write,
+ 	    (len == 0) ? sizeof(u32) : 2 * sizeof(u32) + len, 0);
+-	if (error != 0) {
++	if (error != 0)
+ 		ar5523_err(ar, "could not write %d bytes to register 0x%02x\n",
+ 			   len, reg);
+-	}
+ 	return error;
+ }
+ 
+@@ -598,7 +599,6 @@ static int ar5523_reset_tx_queues(struct
+ 	__be32 qid = cpu_to_be32(0);
+ 
+ 	ar5523_dbg(ar, "resetting Tx queue\n");
+-
+ 	return ar5523_cmd_write(ar, WDCMSG_RELEASE_TX_QUEUE,
+ 				 &qid, sizeof(qid), 0);
+ }
+@@ -731,13 +731,12 @@ static void ar5523_data_rx_cb(struct urb
+ 	}
+ 
+ 	if (be32_to_cpu(desc->status) != 0) {
+-		ar5523_dbg(ar, "Bad RX status (0x%x). Skip\n",
+-			   be32_to_cpu(desc->status));
++		ar5523_dbg(ar, "Bad RX status (0x%x len = %d). Skip\n",
++			   be32_to_cpu(desc->status), be32_to_cpu(desc->len));
+ 		goto skip;
+ 	}
+ 
+ 	skb_reserve(data->skb, sizeof(*chunk));
+-
+ 	skb_put(data->skb, rxlen - sizeof(struct ar5523_rx_desc));
+ 
+ 	hdrlen = ieee80211_get_hdrlen_from_skb(data->skb);
+@@ -767,8 +766,7 @@ skip:
+ 	if (atomic_inc_return(&ar->rx_data_free_cnt) >=
+ 	    AR5523_RX_DATA_REFILL_COUNT &&
+ 	    test_bit(AR5523_HW_UP, &ar->flags))
+-		ieee80211_queue_work(ar->hw, &ar->rx_refill_work);
+-
++		queue_work(ar->wq, &ar->rx_refill_work);
+ }
+ 
+ static void ar5523_rx_refill_work(struct work_struct *work)
+@@ -849,7 +847,6 @@ static void ar5523_free_rx_bufs(struct a
+ 	struct ar5523_rx_data *data;
+ 
+ 	ar5523_cancel_rx_bufs(ar);
+-
+ 	while (!list_empty(&ar->rx_data_free)) {
+ 		data = (struct ar5523_rx_data *) ar->rx_data_free.next;
+ 		list_del(&data->list);
+@@ -932,7 +929,6 @@ static void ar5523_tx(struct ieee80211_h
+ 	unsigned long flags;
+ 
+ 	ar5523_dbg(ar, "tx called\n");
+-
+ 	if (atomic_inc_return(&ar->tx_nr_total) >= AR5523_TX_DATA_COUNT) {
+ 		ar5523_dbg(ar, "tx queue full\n");
+ 		ar5523_dbg(ar, "stop queues (tot %d pend %d)\n",
+@@ -1166,7 +1162,7 @@ static int ar5523_start(struct ieee80211
+ 	ar5523_cmd_write(ar, WDCMSG_RESET_KEY_CACHE, NULL, 0, 0);
+ 
+ 	set_bit(AR5523_HW_UP, &ar->flags);
+-	ieee80211_queue_work(ar->hw, &ar->rx_refill_work);
++	queue_work(ar->wq, &ar->rx_refill_work);
+ 
+ 	/* enable Rx */
+ 	ar5523_set_rxfilter(ar, 0, UATH_FILTER_OP_INIT);
+@@ -1546,7 +1542,7 @@ static int ar5523_get_devstatus(struct a
+ 
+ 	/* retrieve MAC address */
+ 	error = ar5523_get_status(ar, ST_MAC_ADDR, macaddr, ETH_ALEN);
+-	if (error != 0) {
++	if (error) {
+ 		ar5523_err(ar, "could not read MAC address\n");
+ 		return error;
+ 	}
+@@ -1785,10 +1781,16 @@ static int ar5523_probe(struct usb_inter
+ 	INIT_LIST_HEAD(&ar->rx_data_used);
+ 	spin_lock_init(&ar->rx_data_list_lock);
+ 
++	ar->wq = create_singlethread_workqueue("ar5523");
++	if (!ar->wq) {
++		ar5523_err(ar, "Could not create wq\n");
++		goto out_free_ar;
++	}
++
+ 	error = ar5523_alloc_rx_bufs(ar);
+ 	if (error) {
+ 		ar5523_err(ar, "Could not allocate rx buffers\n");
+-		goto out_free_ar;
++		goto out_free_wq;
+ 	}
+ 
+ 	error = ar5523_alloc_rx_cmd(ar);
+@@ -1871,6 +1873,8 @@ out_free_rx_cmd:
+ 	ar5523_free_rx_cmd(ar);
+ out_free_rx_bufs:
+ 	ar5523_free_rx_bufs(ar);
++out_free_wq:
++	destroy_workqueue(ar->wq);
+ out_free_ar:
+ 	ieee80211_free_hw(hw);
+ out:
+@@ -1892,6 +1896,8 @@ static void ar5523_disconnect(struct usb
+ 	ar5523_free_rx_cmd(ar);
+ 	ar5523_free_rx_bufs(ar);
+ 
++	destroy_workqueue(ar->wq);
++
+ 	ieee80211_free_hw(hw);
+ 	usb_set_intfdata(intf, NULL);
+ }
