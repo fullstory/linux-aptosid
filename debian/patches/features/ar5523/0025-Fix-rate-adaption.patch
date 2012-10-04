@@ -1,0 +1,113 @@
+From 505719252595e33c2b1416754b15b124aad28f4c Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Sat, 8 Sep 2012 19:11:25 +0200
+Subject: [PATCH 25/61] Fix rate adaption
+
+Not all rates where used when verifying with a sniffer. Now it
+uses all rates.
+---
+ ar5523.c |   35 +++++++++++++++++------------------
+ 1 file changed, 17 insertions(+), 18 deletions(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -1216,7 +1216,6 @@ static int ar5523_get_wlan_mode(struct a
+ }
+ 
+ static void ar5523_create_rateset(struct ar5523 *ar,
+-				  struct ieee80211_vif *vif,
+ 				  struct ieee80211_bss_conf *bss_conf,
+ 				  struct ar5523_cmd_rateset *rs,
+ 				  bool basic)
+@@ -1224,18 +1223,15 @@ static void ar5523_create_rateset(struct
+ 	struct ieee80211_supported_band *band;
+ 	struct ieee80211_sta *sta;
+ 	int bit, i = 0;
+-	u32 sta_rate_set;
++	u32 sta_rate_set, basic_rate_set;
+ 
+-	if (basic)
++	sta = ieee80211_find_sta(ar->vif, bss_conf->bssid);
++	basic_rate_set = bss_conf->basic_rates;
++	if (!sta) {
++		ar5523_info(ar, "STA not found. Cannot set rates\n");
+ 		sta_rate_set = bss_conf->basic_rates;
+-	else {
+-		sta = ieee80211_find_sta(vif, bss_conf->bssid);
+-		if (!sta) {
+-			ar5523_info(ar, "STA not found. Cannot set rates\n");
+-			sta_rate_set = bss_conf->basic_rates;
+-		}
+-		sta_rate_set = sta->supp_rates[ar->hw->conf.channel->band];
+ 	}
++	sta_rate_set = sta->supp_rates[ar->hw->conf.channel->band];
+ 
+ 	ar5523_dbg(ar, "sta rate_set = %08x\n", sta_rate_set);
+ 
+@@ -1244,16 +1240,20 @@ static void ar5523_create_rateset(struct
+ 		BUG_ON(i >= AR5523_MAX_NRATES);
+ 		ar5523_dbg(ar, "Considering rate %d : %d\n",
+ 			   band->bitrates[bit].hw_value, sta_rate_set & 1);
+-		if (sta_rate_set & 1)
+-			rs->set[i++] = band->bitrates[bit].hw_value;
++		if (sta_rate_set & 1) {
++			rs->set[i] = band->bitrates[bit].hw_value;
++			if (basic_rate_set & 1 && basic)
++				rs->set[i] |= 0x80;
++			i++;
++		}
+ 		sta_rate_set >>= 1;
++		basic_rate_set >>= 1;
+ 	}
+ 
+ 	rs->length = i;
+ }
+ 
+ static int ar5523_set_basic_rates(struct ar5523 *ar,
+-			    struct ieee80211_vif *vif,
+ 			    struct ieee80211_bss_conf *bss)
+ {
+ 	struct ar5523_cmd_rates rates;
+@@ -1261,7 +1261,7 @@ static int ar5523_set_basic_rates(struct
+ 	memset(&rates, 0, sizeof(rates));
+ 	rates.connid = cpu_to_be32(2);		/* XXX */
+ 	rates.size   = cpu_to_be32(sizeof(struct ar5523_cmd_rateset));
+-	ar5523_create_rateset(ar, vif, bss, &rates.rateset, true);
++	ar5523_create_rateset(ar, bss, &rates.rateset, true);
+ 
+ 	return ar5523_cmd_write(ar, WDCMSG_SET_BASIC_RATE,
+ 				&rates, sizeof(rates), 0);
+@@ -1280,14 +1280,13 @@ static int ar5523_create_connection(stru
+ 	/* XXX packed or not?  */
+ 	create.size = cpu_to_be32(sizeof(struct ar5523_cmd_rateset));
+ 
+-	ar5523_create_rateset(ar, vif, bss, &create.connattr.rateset, false);
++	ar5523_create_rateset(ar, bss, &create.connattr.rateset, false);
+ 
+ 	wlan_mode = ar5523_get_wlan_mode(ar, bss);
+ 	create.connattr.wlanmode = cpu_to_be32(wlan_mode);
+ 
+ 	return ar5523_cmd_write(ar, WDCMSG_CREATE_CONNECTION, &create,
+ 				sizeof(create), 0);
+-
+ }
+ 
+ static int ar5523_write_associd(struct ar5523 *ar,
+@@ -1296,7 +1295,7 @@ static int ar5523_write_associd(struct a
+ 	struct ar5523_cmd_set_associd associd;
+ 
+ 	memset(&associd, 0, sizeof(associd));
+-	associd.defaultrateix = cpu_to_be32(1);	/* XXX */
++	associd.defaultrateix = cpu_to_be32(0);	/* XXX */
+ 	associd.associd = cpu_to_be32(bss->aid);
+ 	associd.timoffset = cpu_to_be32(0x3b);	/* XXX */
+ 	memcpy(associd.bssid, bss->bssid, ETH_ALEN);
+@@ -1326,7 +1325,7 @@ static void ar5523_bss_info_changed(stru
+ 			return;
+ 		}
+ 
+-		error = ar5523_set_basic_rates(ar, vif, bss);
++		error = ar5523_set_basic_rates(ar, bss);
+ 		if (error) {
+ 			ar5523_err(ar, "could not set negotiated rate set\n");
+ 			return;
