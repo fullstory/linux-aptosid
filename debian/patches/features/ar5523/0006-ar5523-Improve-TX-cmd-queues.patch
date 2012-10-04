@@ -1,0 +1,204 @@
+From 1e14cb1c676aa1d0e9a7cc109c6196a039849f1b Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Thu, 23 Aug 2012 21:52:27 +0200
+Subject: [PATCH 06/58] ar5523: Improve TX cmd queues
+
+New implementation used free/busy list with proper locking.
+---
+ ar5523.c |   71 +++++++++++++++++++++++++++++++++++++-------------------------
+ 1 file changed, 43 insertions(+), 28 deletions(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -31,6 +31,7 @@
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/list.h>
+ #include <linux/etherdevice.h>
+ #include <linux/netdevice.h>
+ #include <linux/completion.h>
+@@ -83,6 +84,8 @@ enum {
+ };
+ 
+ struct ar5523_tx_cmd {
++	struct	list_head	list;
++	int			id;
+         struct ar5523		*ar;
+ 	struct urb		*urb;
+ 	void			*buf;
+@@ -113,9 +116,10 @@ struct ar5523 {
+ 
+ 	struct ar5523_tx_cmd	tx_cmd[AR5523_TX_CMD_COUNT];
+ 	struct ar5523_rx_cmd	rx_cmd[AR5523_RX_CMD_COUNT];
+-	int			cmd_idx;
+-	atomic_t		tx_cmd_queued;
+ 	wait_queue_head_t	tx_cmd_wait;
++	spinlock_t		tx_cmd_list_lock;
++	struct	list_head	tx_cmd_free;
++	struct	list_head	tx_cmd_used;
+ 
+ 	struct ar5523_rx_data	rx_data[AR5523_RX_DATA_COUNT];
+ 	atomic_t		tx_data_queued;
+@@ -165,9 +169,14 @@ static void ar5523_cmd_tx_cb(struct urb
+ 	struct ar5523_tx_cmd *cmd = urb->context;
+ 	struct ar5523_cmd_hdr *hdr = cmd->buf;
+ 	struct ar5523 *ar = cmd->ar;
++	unsigned long flags;
+ 
+ 	ar5523_dbg(ar, "tx urb %d completed\n", hdr->priv);
+ 
++	spin_lock_irqsave(&ar->tx_cmd_list_lock, flags);
++	list_move(&cmd->list, &ar->tx_cmd_free);
++	spin_unlock_irqrestore(&ar->tx_cmd_list_lock, flags);
++
+ 	/*
+ 	 * No ones is waiting for async write commands and read commands
+ 	 * get completed by ar5523_cmd_rx_cb.
+@@ -177,24 +186,26 @@ static void ar5523_cmd_tx_cb(struct urb
+ 	wake_up(&ar->tx_cmd_wait);
+ }
+ 
+-/*
+- * Yes, this is potentially racy and buggy, will fix later..
+- */
+ static int ar5523_cmd(struct ar5523 *ar, u32 code, const void *idata,
+ 		int ilen, void *odata, int flags)
+ {
+ 	struct ar5523_cmd_hdr *hdr;
+-	struct ar5523_tx_cmd *cmd;
++	struct ar5523_tx_cmd *cmd = NULL;
+ 	int xferlen, error;
++	unsigned long irqflags;
+ 
+-	if (atomic_read(&ar->tx_cmd_queued) >= AR5523_TX_CMD_COUNT) {
+-		wait_event(ar->tx_cmd_wait,
+-			   (atomic_read(&ar->tx_cmd_queued) <
+-			    AR5523_TX_CMD_COUNT));
+-	}
+-
+-	/* grab a xfer */
+-	cmd = &ar->tx_cmd[ar->cmd_idx];
++	do {
++		spin_lock_irqsave(&ar->tx_cmd_list_lock, irqflags);
++		if (!list_empty(&ar->tx_cmd_free)) {
++			cmd = (struct ar5523_tx_cmd *) ar->tx_cmd_free.next;
++			list_move(&cmd->list, &ar->tx_cmd_used);
++		}
++		spin_unlock_irqrestore(&ar->tx_cmd_list_lock, irqflags);
++		if (!cmd) {
++			ar5523_info(ar, "No free tx cmd available. Sleep\n");
++			wait_event(ar->tx_cmd_wait, 1);
++		}
++	} while(!cmd);
+ 
+ 	/* always bulk-out a multiple of 4 bytes */
+ 	xferlen = (sizeof(struct ar5523_cmd_hdr) + ilen + 3) & ~3;
+@@ -203,7 +214,7 @@ static int ar5523_cmd(struct ar5523 *ar,
+ 	memset(hdr, 0, sizeof(struct ar5523_cmd_hdr));
+ 	hdr->len   = cpu_to_be32(xferlen);
+ 	hdr->code  = cpu_to_be32(code);
+-	hdr->priv  = ar->cmd_idx;	/* don't care about endianness */
++	hdr->priv  = cmd->id;	/* don't care about endianness */
+ 	if (flags & AR5523_CMD_FLAG_MAGIC)
+ 		hdr->magic = cpu_to_be32(1 << 24);
+ 	memcpy(hdr + 1, idata, ilen);
+@@ -215,11 +226,6 @@ static int ar5523_cmd(struct ar5523 *ar,
+ 			  cmd->buf, xferlen, ar5523_cmd_tx_cb, cmd);
+ 	cmd->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+ 
+-	while (cmd->urb->hcpriv) {
+-		ar5523_info(ar, "urgg, hcpriv set, cmd_idx = %d\n", ar->cmd_idx);
+-		msleep_interruptible(200);
+-	}
+-
+ 	error = usb_submit_urb(cmd->urb, GFP_KERNEL);
+ 	if (error) {
+ 		ar5523_err(ar, "could not send command 0x%x, error=%d\n",
+@@ -227,14 +233,13 @@ static int ar5523_cmd(struct ar5523 *ar,
+ 		return error;
+ 	}
+ 
+-	ar->cmd_idx = (ar->cmd_idx + 1) % AR5523_TX_CMD_COUNT;
+-
+ 	/* wait at most two seconds for command reply */
+ 	if ((flags & AR5523_CMD_FLAG_READ) ||
+ 	    !(flags & AR5523_CMD_FLAG_ASYNC)) {
+ 		if (!wait_for_completion_timeout(&cmd->done, 2 * HZ)) {
+ 			cmd->odata = NULL;
+-			ar5523_err(ar, "timeout waiting for command reply\n");
++			ar5523_err(ar, "timeout waiting for command "
++					"%02x reply\n", code);
+ 			return -EIO;
+ 		}
+ 		cmd->odata = NULL;
+@@ -691,9 +696,6 @@ static int ar5523_start(struct ieee80211
+ 
+ 	ar5523_dbg(ar, "start called\n");
+ 
+-	/* reset data and command rings */
+-	ar->cmd_idx = 0;
+-
+ 	val = 0;
+ 	ar5523_cmd_write(ar, AR5523_CMD_02, &val, sizeof(val), 0);
+ 
+@@ -1066,7 +1068,14 @@ static const struct ieee80211_ops ar5523
+  */
+ static void ar5523_read_reply(struct ar5523 *ar, struct ar5523_cmd_hdr *hdr)
+ {
+-	struct ar5523_tx_cmd *txcmd = &ar->tx_cmd[hdr->priv];
++	struct ar5523_tx_cmd *txcmd;
++
++	if (hdr->priv > AR5523_TX_CMD_COUNT) {
++		WARN_ON(1);
++		return;
++	}
++	
++	txcmd = &ar->tx_cmd[hdr->priv];
+ 
+ 	if (txcmd->odata) {
+ 		memcpy(txcmd->odata, hdr + 1,
+@@ -1136,6 +1145,7 @@ static void ar5523_free_tx_cmds(struct a
+ 	for (i = 0; i < AR5523_TX_CMD_COUNT; i++) {
+ 		struct ar5523_tx_cmd *cmd = &ar->tx_cmd[i];
+ 
++		list_del(&cmd->list);
+ 		usb_kill_urb(cmd->urb);
+ 		usb_free_coherent(ar->dev, AR5523_MAX_TXCMDSZ,
+ 				  cmd->buf, cmd->urb->transfer_dma);
+@@ -1152,6 +1162,7 @@ static int ar5523_alloc_tx_cmds(struct a
+ 		struct ar5523_tx_cmd *cmd = &ar->tx_cmd[i];
+ 
+ 		cmd->ar = ar;
++		cmd->id = i;
+ 		cmd->urb = usb_alloc_urb(0, GFP_KERNEL);
+ 		if (!cmd->urb) {
+ 			ar5523_err(ar, "could not allocate tx urb\n");
+@@ -1166,8 +1177,8 @@ static int ar5523_alloc_tx_cmds(struct a
+ 			goto out;
+ 		}
+ 		init_completion(&cmd->done);
++		list_add(&cmd->list, &ar->tx_cmd_free);
+ 	}
+-
+ 	return 0;
+ 
+  out:
+@@ -1177,6 +1188,7 @@ static int ar5523_alloc_tx_cmds(struct a
+ 		usb_free_coherent(ar->dev, AR5523_MAX_TXCMDSZ,
+ 				  cmd->buf, cmd->urb->transfer_dma);
+ 		usb_free_urb(cmd->urb);
++		list_del(&cmd->list);		
+ 	}
+ 
+ 	return error;
+@@ -1496,6 +1508,9 @@ static int ar5523_probe(struct usb_inter
+ 	init_waitqueue_head(&ar->tx_cmd_wait);
+ 	atomic_set(&ar->tx_data_queued, 0);
+ 	INIT_WORK(&ar->stat_work, ar5523_stat_work);
++	INIT_LIST_HEAD(&ar->tx_cmd_free);
++	INIT_LIST_HEAD(&ar->tx_cmd_used);
++	spin_lock_init(&ar->tx_cmd_list_lock);
+ 
+ 	error = ar5523_alloc_tx_cmds(ar);
+ 	if (error)
