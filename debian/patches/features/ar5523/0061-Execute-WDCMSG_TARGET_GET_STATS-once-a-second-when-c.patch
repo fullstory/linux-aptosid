@@ -1,0 +1,100 @@
+From cb05a40363f585c3144daf3c84a04fdd309ce759 Mon Sep 17 00:00:00 2001
+From: Pontus Fuchs <pontus.fuchs@gmail.com>
+Date: Mon, 1 Oct 2012 20:46:17 +0200
+Subject: [PATCH 61/61] Execute WDCMSG_TARGET_GET_STATS once a second when
+ connected
+
+Device seems to like this. Don't know why.
+---
+ ar5523.c |   36 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/ar5523.c
++++ b/drivers/net/wireless/ar5523.c
+@@ -135,6 +135,8 @@ struct ar5523 {
+ 	struct mutex		mutex;
+ 	struct ar5523_tx_cmd	tx_cmd;
+ 
++	struct delayed_work	stat_work;
++
+ 	struct timer_list	tx_wd_timer;
+ 	struct work_struct	tx_wd_work;
+ 	struct work_struct	tx_work;
+@@ -262,7 +264,8 @@ static void ar5523_cmd_rx_cb(struct urb
+ 	default:
+ 		/* reply to a read command */
+ 		if (hdr->priv != AR5523_CMD_ID) {
+-			ar5523_err(ar, "Unexpected command id\n");
++			ar5523_err(ar, "Unexpected command id: %02x\n",
++				   hdr->code & 0xff);
+ 			goto skip;
+ 		}
+ 		ar5523_read_reply(ar, hdr, cmd);
+@@ -297,6 +300,10 @@ static void ar5523_cmd_rx_cb(struct urb
+ 		cmd->res = 0;
+ 		complete(&cmd->done);
+ 		break;
++
++	case WDCMSG_STATS_UPDATE:
++		ar5523_dbg(ar, "WDCMSG_STATS_UPDATE\n");
++		break;
+ 	}
+ 
+ skip:
+@@ -1069,6 +1076,29 @@ static void ar5523_flush_tx(struct ar552
+ }
+ 
+ /*
++ * This function is called periodically (every second) when associated to
++ * query device statistics.
++ */
++static void ar5523_stat_work(struct work_struct *work)
++{
++	struct ar5523 *ar = container_of(work, struct ar5523, stat_work.work);
++	int error;
++
++	ar5523_dbg(ar, "%s\n", __func__);
++	mutex_lock(&ar->mutex);
++
++	/*
++	 * Send request for statistics asynchronously once a second. This
++	 * seems to be important. Throughput is a lot better if this is done.
++	 */
++	error = ar5523_cmd_write(ar, WDCMSG_TARGET_GET_STATS, NULL, 0, 0);
++	if (error)
++		ar5523_err(ar, "could not query stats, error %d\n", error);
++	mutex_unlock(&ar->mutex);
++	ieee80211_queue_delayed_work(ar->hw, &ar->stat_work, HZ);
++}
++
++/*
+  * Interface routines to the mac80211 stack.
+  */
+ static int ar5523_start(struct ieee80211_hw *hw)
+@@ -1143,6 +1173,7 @@ static void ar5523_stop(struct ieee80211
+ 
+ 	ar5523_dbg(ar, "stop called\n");
+ 
++	cancel_delayed_work_sync(&ar->stat_work);
+ 	mutex_lock(&ar->mutex);
+ 	clear_bit(AR5523_HW_UP, &ar->flags);
+ 
+@@ -1388,8 +1419,10 @@ static void ar5523_bss_info_changed(stru
+ 		/* turn link LED on */
+ 		ar5523_set_ledsteady(ar, UATH_LED_LINK, UATH_LED_ON);
+ 		set_bit(AR5523_CONNECTED, &ar->flags);
++		ieee80211_queue_delayed_work(hw, &ar->stat_work, HZ);
+ 
+ 	} else {
++		cancel_delayed_work(&ar->stat_work);
+ 		clear_bit(AR5523_CONNECTED, &ar->flags);
+ 		ar5523_set_ledsteady(ar, UATH_LED_LINK, UATH_LED_OFF);
+ 	}
+@@ -1718,6 +1751,7 @@ static int ar5523_probe(struct usb_inter
+ 	ar->dev = dev;
+ 	mutex_init(&ar->mutex);
+ 
++	INIT_DELAYED_WORK(&ar->stat_work, ar5523_stat_work);
+ 	init_timer(&ar->tx_wd_timer);
+ 	setup_timer(&ar->tx_wd_timer, ar5523_tx_wd_timer, (unsigned long) ar);
+ 	INIT_WORK(&ar->tx_wd_work, ar5523_tx_wd_work);
