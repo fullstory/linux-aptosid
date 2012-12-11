@@ -71,7 +71,7 @@
  VERSION = 3
  PATCHLEVEL = 6
 -SUBLEVEL = 0
-+SUBLEVEL = 9
++SUBLEVEL = 10
  EXTRAVERSION =
  NAME = Terrified Chipmunk
  
@@ -98,7 +98,15 @@
  }
 --- a/arch/arm/Kconfig
 +++ b/arch/arm/Kconfig
-@@ -1413,6 +1413,16 @@ config PL310_ERRATA_769419
+@@ -585,6 +585,7 @@ config ARCH_KIRKWOOD
+ 	bool "Marvell Kirkwood"
+ 	select CPU_FEROCEON
+ 	select PCI
++	select PCI_QUIRKS
+ 	select ARCH_REQUIRE_GPIOLIB
+ 	select GENERIC_CLOCKEVENTS
+ 	select NEED_MACH_IO_H
+@@ -1413,6 +1414,16 @@ config PL310_ERRATA_769419
  	  on systems with an outer cache, the store buffer is drained
  	  explicitly.
  
@@ -368,6 +376,41 @@
  		at91_soc_initdata.type = AT91_SOC_SAM9G10;
  		at91_boot_soc = at91sam9261_soc;
  	}
+--- a/arch/arm/mach-dove/include/mach/pm.h
++++ b/arch/arm/mach-dove/include/mach/pm.h
+@@ -45,7 +45,7 @@ static inline int pmu_to_irq(int pin)
+ 
+ static inline int irq_to_pmu(int irq)
+ {
+-	if (IRQ_DOVE_PMU_START < irq && irq < NR_IRQS)
++	if (IRQ_DOVE_PMU_START <= irq && irq < NR_IRQS)
+ 		return irq - IRQ_DOVE_PMU_START;
+ 
+ 	return -EINVAL;
+--- a/arch/arm/mach-dove/irq.c
++++ b/arch/arm/mach-dove/irq.c
+@@ -45,8 +45,20 @@ static void pmu_irq_ack(struct irq_data
+ 	int pin = irq_to_pmu(d->irq);
+ 	u32 u;
+ 
++	/*
++	 * The PMU mask register is not RW0C: it is RW.  This means that
++	 * the bits take whatever value is written to them; if you write
++	 * a '1', you will set the interrupt.
++	 *
++	 * Unfortunately this means there is NO race free way to clear
++	 * these interrupts.
++	 *
++	 * So, let's structure the code so that the window is as small as
++	 * possible.
++	 */
+ 	u = ~(1 << (pin & 31));
+-	writel(u, PMU_INTERRUPT_CAUSE);
++	u &= readl_relaxed(PMU_INTERRUPT_CAUSE);
++	writel_relaxed(u, PMU_INTERRUPT_CAUSE);
+ }
+ 
+ static struct irq_chip pmu_irq_chip = {
 --- a/arch/arm/mach-exynos/common.c
 +++ b/arch/arm/mach-exynos/common.c
 @@ -47,6 +47,7 @@
@@ -418,6 +461,31 @@
  #define MX35_H1_IPPUE_UP_BIT	(1 << 7)
  #define MX35_H1_IPPUE_DOWN_BIT	(1 << 6)
  #define MX35_H1_TLL_BIT		(1 << 5)
+--- a/arch/arm/mach-kirkwood/pcie.c
++++ b/arch/arm/mach-kirkwood/pcie.c
+@@ -225,14 +225,19 @@ static int __init kirkwood_pcie_setup(in
+ 	return 1;
+ }
+ 
++/*
++ * The root complex has a hardwired class of PCI_CLASS_MEMORY_OTHER, when it
++ * is operating as a root complex this needs to be switched to
++ * PCI_CLASS_BRIDGE_HOST or Linux will errantly try to process the BAR's on
++ * the device. Decoding setup is handled by the orion code.
++ */
+ static void __devinit rc_pci_fixup(struct pci_dev *dev)
+ {
+-	/*
+-	 * Prevent enumeration of root complex.
+-	 */
+ 	if (dev->bus->parent == NULL && dev->devfn == 0) {
+ 		int i;
+ 
++		dev->class &= 0xff;
++		dev->class |= PCI_CLASS_BRIDGE_HOST << 8;
+ 		for (i = 0; i < DEVICE_COUNT_RESOURCE; i++) {
+ 			dev->resource[i].start = 0;
+ 			dev->resource[i].end   = 0;
 --- a/arch/arm/mach-s3c24xx/s3c2416.c
 +++ b/arch/arm/mach-s3c24xx/s3c2416.c
 @@ -61,6 +61,7 @@
@@ -1744,6 +1812,32 @@
  
  #ifndef CONFIG_EFI
  /*
+--- a/arch/x86/include/asm/fpu-internal.h
++++ b/arch/x86/include/asm/fpu-internal.h
+@@ -334,14 +334,17 @@ static inline void __thread_fpu_begin(st
+ typedef struct { int preload; } fpu_switch_t;
+ 
+ /*
+- * FIXME! We could do a totally lazy restore, but we need to
+- * add a per-cpu "this was the task that last touched the FPU
+- * on this CPU" variable, and the task needs to have a "I last
+- * touched the FPU on this CPU" and check them.
++ * Must be run with preemption disabled: this clears the fpu_owner_task,
++ * on this CPU.
+  *
+- * We don't do that yet, so "fpu_lazy_restore()" always returns
+- * false, but some day..
++ * This will disable any lazy FPU state restore of the current FPU state,
++ * but if the current thread owns the FPU, it will still be saved by.
+  */
++static inline void __cpu_disable_lazy_restore(unsigned int cpu)
++{
++	per_cpu(fpu_owner_task, cpu) = NULL;
++}
++
+ static inline int fpu_lazy_restore(struct task_struct *new, unsigned int cpu)
+ {
+ 	return new == this_cpu_read_stable(fpu_owner_task) &&
 --- a/arch/x86/include/asm/pgtable.h
 +++ b/arch/x86/include/asm/pgtable.h
 @@ -146,8 +146,7 @@ static inline unsigned long pmd_pfn(pmd_
@@ -1799,6 +1893,29 @@
  
  #define GET_IP(regs) ((regs)->ip)
  #define GET_FP(regs) ((regs)->bp)
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -631,6 +631,20 @@ static void __cpuinit init_amd(struct cp
+ 		}
+ 	}
+ 
++	/*
++	 * The way access filter has a performance penalty on some workloads.
++	 * Disable it on the affected CPUs.
++	 */
++	if ((c->x86 == 0x15) &&
++	    (c->x86_model >= 0x02) && (c->x86_model < 0x20)) {
++		u64 val;
++
++		if (!rdmsrl_safe(0xc0011021, &val) && !(val & 0x1E)) {
++			val |= 0x1E;
++			wrmsrl_safe(0xc0011021, val);
++		}
++	}
++
+ 	cpu_detect_cache_sizes(c);
+ 
+ 	/* Multi core CPU? */
 --- a/arch/x86/kernel/cpu/mcheck/mce_amd.c
 +++ b/arch/x86/kernel/cpu/mcheck/mce_amd.c
 @@ -576,12 +576,10 @@ static __cpuinit int threshold_create_ba
@@ -1993,6 +2110,27 @@
  }
  
  #ifdef CONFIG_X86_32
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -68,6 +68,8 @@
+ #include <asm/mwait.h>
+ #include <asm/apic.h>
+ #include <asm/io_apic.h>
++#include <asm/i387.h>
++#include <asm/fpu-internal.h>
+ #include <asm/setup.h>
+ #include <asm/uv/uv.h>
+ #include <linux/mc146818rtc.h>
+@@ -817,6 +819,9 @@ int __cpuinit native_cpu_up(unsigned int
+ 
+ 	per_cpu(cpu_state, cpu) = CPU_UP_PREPARE;
+ 
++	/* the FPU context is blank, nobody can own it */
++	__cpu_disable_lazy_restore(cpu);
++
+ 	err = do_boot_cpu(apicid, cpu, tidle);
+ 	if (err) {
+ 		pr_debug("do_boot_cpu failed %d\n", err);
 --- a/arch/x86/kvm/cpuid.h
 +++ b/arch/x86/kvm/cpuid.h
 @@ -24,6 +24,9 @@ static inline bool guest_cpuid_has_xsave
@@ -2743,6 +2881,16 @@
  int __init acpi_ec_ecdt_probe(void)
  {
  	acpi_status status;
+--- a/drivers/acpi/processor_driver.c
++++ b/drivers/acpi/processor_driver.c
+@@ -409,6 +409,7 @@ static void acpi_processor_notify(struct
+ 		acpi_bus_generate_proc_event(device, event, 0);
+ 		acpi_bus_generate_netlink_event(device->pnp.device_class,
+ 						  dev_name(&device->dev), event, 0);
++		break;
+ 	default:
+ 		ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+ 				  "Unsupported event [0x%x]\n", event));
 --- a/drivers/acpi/video.c
 +++ b/drivers/acpi/video.c
 @@ -1345,12 +1345,15 @@ static int
@@ -3090,6 +3238,66 @@
  	}
  
  	scrubval = scrubrates[i].scrubval;
+--- a/drivers/edac/i7300_edac.c
++++ b/drivers/edac/i7300_edac.c
+@@ -197,8 +197,8 @@ static const char *ferr_fat_fbd_name[] =
+ 	[0]  = "Memory Write error on non-redundant retry or "
+ 	       "FBD configuration Write error on retry",
+ };
+-#define GET_FBD_FAT_IDX(fbderr)	(fbderr & (3 << 28))
+-#define FERR_FAT_FBD_ERR_MASK ((1 << 0) | (1 << 1) | (1 << 2) | (1 << 3))
++#define GET_FBD_FAT_IDX(fbderr)	(((fbderr) >> 28) & 3)
++#define FERR_FAT_FBD_ERR_MASK ((1 << 0) | (1 << 1) | (1 << 2) | (1 << 22))
+ 
+ #define FERR_NF_FBD	0xa0
+ static const char *ferr_nf_fbd_name[] = {
+@@ -225,7 +225,7 @@ static const char *ferr_nf_fbd_name[] =
+ 	[1]  = "Aliased Uncorrectable Non-Mirrored Demand Data ECC",
+ 	[0]  = "Uncorrectable Data ECC on Replay",
+ };
+-#define GET_FBD_NF_IDX(fbderr)	(fbderr & (3 << 28))
++#define GET_FBD_NF_IDX(fbderr)	(((fbderr) >> 28) & 3)
+ #define FERR_NF_FBD_ERR_MASK ((1 << 24) | (1 << 23) | (1 << 22) | (1 << 21) |\
+ 			      (1 << 18) | (1 << 17) | (1 << 16) | (1 << 15) |\
+ 			      (1 << 14) | (1 << 13) | (1 << 11) | (1 << 10) |\
+@@ -464,7 +464,7 @@ static void i7300_process_fbd_error(stru
+ 		errnum = find_first_bit(&errors,
+ 					ARRAY_SIZE(ferr_nf_fbd_name));
+ 		specific = GET_ERR_FROM_TABLE(ferr_nf_fbd_name, errnum);
+-		branch = (GET_FBD_FAT_IDX(error_reg) == 2) ? 1 : 0;
++		branch = (GET_FBD_NF_IDX(error_reg) == 2) ? 1 : 0;
+ 
+ 		pci_read_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+ 			REDMEMA, &syndrome);
+--- a/drivers/edac/i7core_edac.c
++++ b/drivers/edac/i7core_edac.c
+@@ -816,7 +816,7 @@ static ssize_t i7core_inject_store_##par
+ 	struct device_attribute *mattr,				\
+ 	const char *data, size_t count)				\
+ {								\
+-	struct mem_ctl_info *mci = to_mci(dev);			\
++	struct mem_ctl_info *mci = dev_get_drvdata(dev);	\
+ 	struct i7core_pvt *pvt;					\
+ 	long value;						\
+ 	int rc;							\
+@@ -845,7 +845,7 @@ static ssize_t i7core_inject_show_##para
+ 	struct device_attribute *mattr,				\
+ 	char *data)						\
+ {								\
+-	struct mem_ctl_info *mci = to_mci(dev);			\
++	struct mem_ctl_info *mci = dev_get_drvdata(dev);	\
+ 	struct i7core_pvt *pvt;					\
+ 								\
+ 	pvt = mci->pvt_info;					\
+@@ -1052,7 +1052,7 @@ static ssize_t i7core_show_counter_##par
+ 	struct device_attribute *mattr,				\
+ 	char *data)						\
+ {								\
+-	struct mem_ctl_info *mci = to_mci(dev);			\
++	struct mem_ctl_info *mci = dev_get_drvdata(dev);	\
+ 	struct i7core_pvt *pvt = mci->pvt_info;			\
+ 								\
+ 	edac_dbg(1, "\n");					\
 --- a/drivers/extcon/extcon_class.c
 +++ b/drivers/extcon/extcon_class.c
 @@ -575,6 +575,10 @@ static void extcon_cleanup(struct extcon
@@ -3520,6 +3728,23 @@
  	mmiowb();
  
  	val |= hsw_infoframe_enable(frame);
+--- a/drivers/gpu/drm/i915/intel_lvds.c
++++ b/drivers/gpu/drm/i915/intel_lvds.c
+@@ -788,6 +788,14 @@ static const struct dmi_system_id intel_
+ 			DMI_MATCH(DMI_BOARD_NAME, "D525TUD"),
+ 		},
+ 	},
++	{
++		.callback = intel_no_lvds_dmi_callback,
++		.ident = "Supermicro X7SPA-H",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Supermicro"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "X7SPA-H"),
++		},
++	},
+ 
+ 	{ }	/* terminating entry */
+ };
 --- a/drivers/gpu/drm/i915/intel_overlay.c
 +++ b/drivers/gpu/drm/i915/intel_overlay.c
 @@ -431,9 +431,17 @@ static int intel_overlay_off(struct inte
@@ -3930,6 +4155,248 @@
  				atombios_dig_transmitter_setup(encoder, ATOM_TRANSMITTER_ACTION_ENABLE_OUTPUT, 0, 0);
  		}
  		if (ENCODER_MODE_IS_DP(atombios_get_encoder_mode(encoder)) && connector) {
+--- a/drivers/gpu/drm/radeon/evergreen.c
++++ b/drivers/gpu/drm/radeon/evergreen.c
+@@ -37,6 +37,16 @@
+ #define EVERGREEN_PFP_UCODE_SIZE 1120
+ #define EVERGREEN_PM4_UCODE_SIZE 1376
+ 
++static const u32 crtc_offsets[6] =
++{
++	EVERGREEN_CRTC0_REGISTER_OFFSET,
++	EVERGREEN_CRTC1_REGISTER_OFFSET,
++	EVERGREEN_CRTC2_REGISTER_OFFSET,
++	EVERGREEN_CRTC3_REGISTER_OFFSET,
++	EVERGREEN_CRTC4_REGISTER_OFFSET,
++	EVERGREEN_CRTC5_REGISTER_OFFSET
++};
++
+ static void evergreen_gpu_init(struct radeon_device *rdev);
+ void evergreen_fini(struct radeon_device *rdev);
+ void evergreen_pcie_gen2_enable(struct radeon_device *rdev);
+@@ -109,17 +119,19 @@ void evergreen_fix_pci_max_read_req_size
+  */
+ void dce4_wait_for_vblank(struct radeon_device *rdev, int crtc)
+ {
+-	struct radeon_crtc *radeon_crtc = rdev->mode_info.crtcs[crtc];
+ 	int i;
+ 
+-	if (RREG32(EVERGREEN_CRTC_CONTROL + radeon_crtc->crtc_offset) & EVERGREEN_CRTC_MASTER_EN) {
++	if (crtc >= rdev->num_crtc)
++		return;
++
++	if (RREG32(EVERGREEN_CRTC_CONTROL + crtc_offsets[crtc]) & EVERGREEN_CRTC_MASTER_EN) {
+ 		for (i = 0; i < rdev->usec_timeout; i++) {
+-			if (!(RREG32(EVERGREEN_CRTC_STATUS + radeon_crtc->crtc_offset) & EVERGREEN_CRTC_V_BLANK))
++			if (!(RREG32(EVERGREEN_CRTC_STATUS + crtc_offsets[crtc]) & EVERGREEN_CRTC_V_BLANK))
+ 				break;
+ 			udelay(1);
+ 		}
+ 		for (i = 0; i < rdev->usec_timeout; i++) {
+-			if (RREG32(EVERGREEN_CRTC_STATUS + radeon_crtc->crtc_offset) & EVERGREEN_CRTC_V_BLANK)
++			if (RREG32(EVERGREEN_CRTC_STATUS + crtc_offsets[crtc]) & EVERGREEN_CRTC_V_BLANK)
+ 				break;
+ 			udelay(1);
+ 		}
+@@ -1229,116 +1241,105 @@ void evergreen_agp_enable(struct radeon_
+ 
+ void evergreen_mc_stop(struct radeon_device *rdev, struct evergreen_mc_save *save)
+ {
++	u32 crtc_enabled, tmp, frame_count, blackout;
++	int i, j;
++
+ 	save->vga_render_control = RREG32(VGA_RENDER_CONTROL);
+ 	save->vga_hdp_control = RREG32(VGA_HDP_CONTROL);
+ 
+-	/* Stop all video */
++	/* disable VGA render */
+ 	WREG32(VGA_RENDER_CONTROL, 0);
+-	WREG32(EVERGREEN_CRTC_UPDATE_LOCK + EVERGREEN_CRTC0_REGISTER_OFFSET, 1);
+-	WREG32(EVERGREEN_CRTC_UPDATE_LOCK + EVERGREEN_CRTC1_REGISTER_OFFSET, 1);
+-	if (rdev->num_crtc >= 4) {
+-		WREG32(EVERGREEN_CRTC_UPDATE_LOCK + EVERGREEN_CRTC2_REGISTER_OFFSET, 1);
+-		WREG32(EVERGREEN_CRTC_UPDATE_LOCK + EVERGREEN_CRTC3_REGISTER_OFFSET, 1);
+-	}
+-	if (rdev->num_crtc >= 6) {
+-		WREG32(EVERGREEN_CRTC_UPDATE_LOCK + EVERGREEN_CRTC4_REGISTER_OFFSET, 1);
+-		WREG32(EVERGREEN_CRTC_UPDATE_LOCK + EVERGREEN_CRTC5_REGISTER_OFFSET, 1);
+-	}
+-	WREG32(EVERGREEN_CRTC_CONTROL + EVERGREEN_CRTC0_REGISTER_OFFSET, 0);
+-	WREG32(EVERGREEN_CRTC_CONTROL + EVERGREEN_CRTC1_REGISTER_OFFSET, 0);
+-	if (rdev->num_crtc >= 4) {
+-		WREG32(EVERGREEN_CRTC_CONTROL + EVERGREEN_CRTC2_REGISTER_OFFSET, 0);
+-		WREG32(EVERGREEN_CRTC_CONTROL + EVERGREEN_CRTC3_REGISTER_OFFSET, 0);
+-	}
+-	if (rdev->num_crtc >= 6) {
+-		WREG32(EVERGREEN_CRTC_CONTROL + EVERGREEN_CRTC4_REGISTER_OFFSET, 0);
+-		WREG32(EVERGREEN_CRTC_CONTROL + EVERGREEN_CRTC5_REGISTER_OFFSET, 0);
+-	}
+-	WREG32(EVERGREEN_CRTC_UPDATE_LOCK + EVERGREEN_CRTC0_REGISTER_OFFSET, 0);
+-	WREG32(EVERGREEN_CRTC_UPDATE_LOCK + EVERGREEN_CRTC1_REGISTER_OFFSET, 0);
+-	if (rdev->num_crtc >= 4) {
+-		WREG32(EVERGREEN_CRTC_UPDATE_LOCK + EVERGREEN_CRTC2_REGISTER_OFFSET, 0);
+-		WREG32(EVERGREEN_CRTC_UPDATE_LOCK + EVERGREEN_CRTC3_REGISTER_OFFSET, 0);
+-	}
+-	if (rdev->num_crtc >= 6) {
+-		WREG32(EVERGREEN_CRTC_UPDATE_LOCK + EVERGREEN_CRTC4_REGISTER_OFFSET, 0);
+-		WREG32(EVERGREEN_CRTC_UPDATE_LOCK + EVERGREEN_CRTC5_REGISTER_OFFSET, 0);
+-	}
+-
+-	WREG32(D1VGA_CONTROL, 0);
+-	WREG32(D2VGA_CONTROL, 0);
+-	if (rdev->num_crtc >= 4) {
+-		WREG32(EVERGREEN_D3VGA_CONTROL, 0);
+-		WREG32(EVERGREEN_D4VGA_CONTROL, 0);
+-	}
+-	if (rdev->num_crtc >= 6) {
+-		WREG32(EVERGREEN_D5VGA_CONTROL, 0);
+-		WREG32(EVERGREEN_D6VGA_CONTROL, 0);
++	/* blank the display controllers */
++	for (i = 0; i < rdev->num_crtc; i++) {
++		crtc_enabled = RREG32(EVERGREEN_CRTC_CONTROL + crtc_offsets[i]) & EVERGREEN_CRTC_MASTER_EN;
++		if (crtc_enabled) {
++			save->crtc_enabled[i] = true;
++			if (ASIC_IS_DCE6(rdev)) {
++				tmp = RREG32(EVERGREEN_CRTC_BLANK_CONTROL + crtc_offsets[i]);
++				if (!(tmp & EVERGREEN_CRTC_BLANK_DATA_EN)) {
++					radeon_wait_for_vblank(rdev, i);
++					tmp |= EVERGREEN_CRTC_BLANK_DATA_EN;
++					WREG32(EVERGREEN_CRTC_BLANK_CONTROL + crtc_offsets[i], tmp);
++				}
++			} else {
++				tmp = RREG32(EVERGREEN_CRTC_CONTROL + crtc_offsets[i]);
++				if (!(tmp & EVERGREEN_CRTC_DISP_READ_REQUEST_DISABLE)) {
++					radeon_wait_for_vblank(rdev, i);
++					tmp |= EVERGREEN_CRTC_DISP_READ_REQUEST_DISABLE;
++					WREG32(EVERGREEN_CRTC_CONTROL + crtc_offsets[i], tmp);
++				}
++			}
++			/* wait for the next frame */
++			frame_count = radeon_get_vblank_counter(rdev, i);
++			for (j = 0; j < rdev->usec_timeout; j++) {
++				if (radeon_get_vblank_counter(rdev, i) != frame_count)
++					break;
++				udelay(1);
++			}
++		} else {
++			save->crtc_enabled[i] = false;
++		}
++	}
++
++	radeon_mc_wait_for_idle(rdev);
++
++	blackout = RREG32(MC_SHARED_BLACKOUT_CNTL);
++	if ((blackout & BLACKOUT_MODE_MASK) != 1) {
++		/* Block CPU access */
++		WREG32(BIF_FB_EN, 0);
++		/* blackout the MC */
++		blackout &= ~BLACKOUT_MODE_MASK;
++		WREG32(MC_SHARED_BLACKOUT_CNTL, blackout | 1);
+ 	}
+ }
+ 
+ void evergreen_mc_resume(struct radeon_device *rdev, struct evergreen_mc_save *save)
+ {
+-	WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH + EVERGREEN_CRTC0_REGISTER_OFFSET,
+-	       upper_32_bits(rdev->mc.vram_start));
+-	WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH + EVERGREEN_CRTC0_REGISTER_OFFSET,
+-	       upper_32_bits(rdev->mc.vram_start));
+-	WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS + EVERGREEN_CRTC0_REGISTER_OFFSET,
+-	       (u32)rdev->mc.vram_start);
+-	WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS + EVERGREEN_CRTC0_REGISTER_OFFSET,
+-	       (u32)rdev->mc.vram_start);
+-
+-	WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH + EVERGREEN_CRTC1_REGISTER_OFFSET,
+-	       upper_32_bits(rdev->mc.vram_start));
+-	WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH + EVERGREEN_CRTC1_REGISTER_OFFSET,
+-	       upper_32_bits(rdev->mc.vram_start));
+-	WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS + EVERGREEN_CRTC1_REGISTER_OFFSET,
+-	       (u32)rdev->mc.vram_start);
+-	WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS + EVERGREEN_CRTC1_REGISTER_OFFSET,
+-	       (u32)rdev->mc.vram_start);
+-
+-	if (rdev->num_crtc >= 4) {
+-		WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH + EVERGREEN_CRTC2_REGISTER_OFFSET,
+-		       upper_32_bits(rdev->mc.vram_start));
+-		WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH + EVERGREEN_CRTC2_REGISTER_OFFSET,
+-		       upper_32_bits(rdev->mc.vram_start));
+-		WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS + EVERGREEN_CRTC2_REGISTER_OFFSET,
+-		       (u32)rdev->mc.vram_start);
+-		WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS + EVERGREEN_CRTC2_REGISTER_OFFSET,
+-		       (u32)rdev->mc.vram_start);
++	u32 tmp, frame_count;
++	int i, j;
+ 
+-		WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH + EVERGREEN_CRTC3_REGISTER_OFFSET,
+-		       upper_32_bits(rdev->mc.vram_start));
+-		WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH + EVERGREEN_CRTC3_REGISTER_OFFSET,
+-		       upper_32_bits(rdev->mc.vram_start));
+-		WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS + EVERGREEN_CRTC3_REGISTER_OFFSET,
+-		       (u32)rdev->mc.vram_start);
+-		WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS + EVERGREEN_CRTC3_REGISTER_OFFSET,
+-		       (u32)rdev->mc.vram_start);
+-	}
+-	if (rdev->num_crtc >= 6) {
+-		WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH + EVERGREEN_CRTC4_REGISTER_OFFSET,
+-		       upper_32_bits(rdev->mc.vram_start));
+-		WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH + EVERGREEN_CRTC4_REGISTER_OFFSET,
+-		       upper_32_bits(rdev->mc.vram_start));
+-		WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS + EVERGREEN_CRTC4_REGISTER_OFFSET,
+-		       (u32)rdev->mc.vram_start);
+-		WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS + EVERGREEN_CRTC4_REGISTER_OFFSET,
+-		       (u32)rdev->mc.vram_start);
+-
+-		WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH + EVERGREEN_CRTC5_REGISTER_OFFSET,
++	/* update crtc base addresses */
++	for (i = 0; i < rdev->num_crtc; i++) {
++		WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH + crtc_offsets[i],
+ 		       upper_32_bits(rdev->mc.vram_start));
+-		WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH + EVERGREEN_CRTC5_REGISTER_OFFSET,
++		WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH + crtc_offsets[i],
+ 		       upper_32_bits(rdev->mc.vram_start));
+-		WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS + EVERGREEN_CRTC5_REGISTER_OFFSET,
++		WREG32(EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS + crtc_offsets[i],
+ 		       (u32)rdev->mc.vram_start);
+-		WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS + EVERGREEN_CRTC5_REGISTER_OFFSET,
++		WREG32(EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS + crtc_offsets[i],
+ 		       (u32)rdev->mc.vram_start);
+ 	}
+-
+ 	WREG32(EVERGREEN_VGA_MEMORY_BASE_ADDRESS_HIGH, upper_32_bits(rdev->mc.vram_start));
+ 	WREG32(EVERGREEN_VGA_MEMORY_BASE_ADDRESS, (u32)rdev->mc.vram_start);
+-	/* Unlock host access */
++
++	/* unblackout the MC */
++	tmp = RREG32(MC_SHARED_BLACKOUT_CNTL);
++	tmp &= ~BLACKOUT_MODE_MASK;
++	WREG32(MC_SHARED_BLACKOUT_CNTL, tmp);
++	/* allow CPU access */
++	WREG32(BIF_FB_EN, FB_READ_EN | FB_WRITE_EN);
++
++	for (i = 0; i < rdev->num_crtc; i++) {
++		if (save->crtc_enabled) {
++			if (ASIC_IS_DCE6(rdev)) {
++				tmp = RREG32(EVERGREEN_CRTC_BLANK_CONTROL + crtc_offsets[i]);
++				tmp |= EVERGREEN_CRTC_BLANK_DATA_EN;
++				WREG32(EVERGREEN_CRTC_BLANK_CONTROL + crtc_offsets[i], tmp);
++			} else {
++				tmp = RREG32(EVERGREEN_CRTC_CONTROL + crtc_offsets[i]);
++				tmp &= ~EVERGREEN_CRTC_DISP_READ_REQUEST_DISABLE;
++				WREG32(EVERGREEN_CRTC_CONTROL + crtc_offsets[i], tmp);
++			}
++			/* wait for the next frame */
++			frame_count = radeon_get_vblank_counter(rdev, i);
++			for (j = 0; j < rdev->usec_timeout; j++) {
++				if (radeon_get_vblank_counter(rdev, i) != frame_count)
++					break;
++				udelay(1);
++			}
++		}
++	}
++	/* Unlock vga access */
+ 	WREG32(VGA_HDP_CONTROL, save->vga_hdp_control);
+ 	mdelay(1);
+ 	WREG32(VGA_RENDER_CONTROL, save->vga_render_control);
 --- a/drivers/gpu/drm/radeon/evergreen_cs.c
 +++ b/drivers/gpu/drm/radeon/evergreen_cs.c
 @@ -846,6 +846,16 @@ static int evergreen_cs_track_validate_t
@@ -4039,12 +4506,27 @@
  		return false;
  	}
  }
+--- a/drivers/gpu/drm/radeon/evergreen_reg.h
++++ b/drivers/gpu/drm/radeon/evergreen_reg.h
+@@ -218,6 +218,8 @@
+ #define EVERGREEN_CRTC_CONTROL                          0x6e70
+ #       define EVERGREEN_CRTC_MASTER_EN                 (1 << 0)
+ #       define EVERGREEN_CRTC_DISP_READ_REQUEST_DISABLE (1 << 24)
++#define EVERGREEN_CRTC_BLANK_CONTROL                    0x6e74
++#       define EVERGREEN_CRTC_BLANK_DATA_EN             (1 << 8)
+ #define EVERGREEN_CRTC_STATUS                           0x6e8c
+ #       define EVERGREEN_CRTC_V_BLANK                   (1 << 0)
+ #define EVERGREEN_CRTC_STATUS_POSITION                  0x6e90
 --- a/drivers/gpu/drm/radeon/evergreend.h
 +++ b/drivers/gpu/drm/radeon/evergreend.h
-@@ -87,6 +87,10 @@
+@@ -87,6 +87,14 @@
  
  #define	CONFIG_MEMSIZE					0x5428
  
++#define	BIF_FB_EN						0x5490
++#define		FB_READ_EN					(1 << 0)
++#define		FB_WRITE_EN					(1 << 1)
++
 +#define	CP_STRMOUT_CNTL					0x84FC
 +
 +#define	CP_COHER_CNTL					0x85F0
@@ -4052,6 +4534,16 @@
  #define	CP_COHER_BASE					0x85F8
  #define	CP_STALLED_STAT1			0x8674
  #define	CP_STALLED_STAT2			0x8678
+@@ -430,6 +438,9 @@
+ #define		NOOFCHAN_MASK					0x00003000
+ #define MC_SHARED_CHREMAP					0x2008
+ 
++#define MC_SHARED_BLACKOUT_CNTL           		0x20ac
++#define		BLACKOUT_MODE_MASK			0x00000007
++
+ #define	MC_ARB_RAMCFG					0x2760
+ #define		NOOFBANK_SHIFT					0
+ #define		NOOFBANK_MASK					0x00000003
 --- a/drivers/gpu/drm/radeon/r600_cs.c
 +++ b/drivers/gpu/drm/radeon/r600_cs.c
 @@ -2180,7 +2180,8 @@ static int r600_packet3_check(struct rad
@@ -4080,6 +4572,16 @@
  	/* Intel 82852/82855 host bridge / Mobility 9600 M10 RV350 Needs AGPMode 1 (deb #467460) */
  	{ PCI_VENDOR_ID_INTEL, 0x3580, PCI_VENDOR_ID_ATI, 0x4e50,
  		0x1025, 0x0061, 1},
+--- a/drivers/gpu/drm/radeon/radeon_asic.h
++++ b/drivers/gpu/drm/radeon/radeon_asic.h
+@@ -389,6 +389,7 @@ void r700_cp_fini(struct radeon_device *
+ struct evergreen_mc_save {
+ 	u32 vga_render_control;
+ 	u32 vga_hdp_control;
++	bool crtc_enabled[RADEON_MAX_CRTCS];
+ };
+ 
+ void evergreen_pcie_gart_tlb_flush(struct radeon_device *rdev);
 --- a/drivers/gpu/drm/radeon/radeon_drv.c
 +++ b/drivers/gpu/drm/radeon/radeon_drv.c
 @@ -64,9 +64,11 @@
@@ -4980,6 +5482,15 @@
  	/* Binary search between lo and hi for 'target'
 --- a/drivers/md/raid1.c
 +++ b/drivers/md/raid1.c
+@@ -958,7 +958,7 @@ static void raid1_unplug(struct blk_plug
+ 	struct r1conf *conf = mddev->private;
+ 	struct bio *bio;
+ 
+-	if (from_schedule) {
++	if (from_schedule || current->bio_list) {
+ 		spin_lock_irq(&conf->device_lock);
+ 		bio_list_merge(&conf->pending_bio_list, &plug->pending);
+ 		conf->pending_count += plug->pending_cnt;
 @@ -2699,7 +2699,7 @@ static struct r1conf *setup_conf(struct
  		    || disk_idx < 0)
  			continue;
@@ -5904,6 +6415,26 @@
  	---help---
  	  This driver supports Broadcom Tigon3 based gigabit Ethernet cards.
  
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+@@ -9545,10 +9545,13 @@ static int __devinit bnx2x_prev_unload_c
+  */
+ static void __devinit bnx2x_prev_interrupted_dmae(struct bnx2x *bp)
+ {
+-	u32 val = REG_RD(bp, PGLUE_B_REG_PGLUE_B_INT_STS);
+-	if (val & PGLUE_B_PGLUE_B_INT_STS_REG_WAS_ERROR_ATTN) {
+-		BNX2X_ERR("was error bit was found to be set in pglueb upon startup. Clearing");
+-		REG_WR(bp, PGLUE_B_REG_WAS_ERROR_PF_7_0_CLR, 1 << BP_FUNC(bp));
++	if (!CHIP_IS_E1x(bp)) {
++		u32 val = REG_RD(bp, PGLUE_B_REG_PGLUE_B_INT_STS);
++		if (val & PGLUE_B_PGLUE_B_INT_STS_REG_WAS_ERROR_ATTN) {
++			BNX2X_ERR("was error bit was found to be set in pglueb upon startup. Clearing");
++			REG_WR(bp, PGLUE_B_REG_WAS_ERROR_PF_7_0_CLR,
++			       1 << BP_FUNC(bp));
++		}
+ 	}
+ }
+ 
 --- a/drivers/net/ethernet/broadcom/tg3.c
 +++ b/drivers/net/ethernet/broadcom/tg3.c
 @@ -44,10 +44,8 @@
@@ -6346,6 +6877,44 @@
  	mdiobus_free(pldat->mii_bus);
  	clk_disable(pldat->clk);
  	clk_put(pldat->clk);
+--- a/drivers/net/ethernet/realtek/8139cp.c
++++ b/drivers/net/ethernet/realtek/8139cp.c
+@@ -979,17 +979,6 @@ static void cp_init_hw (struct cp_privat
+ 	cpw32_f (MAC0 + 0, le32_to_cpu (*(__le32 *) (dev->dev_addr + 0)));
+ 	cpw32_f (MAC0 + 4, le32_to_cpu (*(__le32 *) (dev->dev_addr + 4)));
+ 
+-	cpw32_f(HiTxRingAddr, 0);
+-	cpw32_f(HiTxRingAddr + 4, 0);
+-
+-	ring_dma = cp->ring_dma;
+-	cpw32_f(RxRingAddr, ring_dma & 0xffffffff);
+-	cpw32_f(RxRingAddr + 4, (ring_dma >> 16) >> 16);
+-
+-	ring_dma += sizeof(struct cp_desc) * CP_RX_RING_SIZE;
+-	cpw32_f(TxRingAddr, ring_dma & 0xffffffff);
+-	cpw32_f(TxRingAddr + 4, (ring_dma >> 16) >> 16);
+-
+ 	cp_start_hw(cp);
+ 	cpw8(TxThresh, 0x06); /* XXX convert magic num to a constant */
+ 
+@@ -1003,6 +992,17 @@ static void cp_init_hw (struct cp_privat
+ 
+ 	cpw8(Config5, cpr8(Config5) & PMEStatus);
+ 
++	cpw32_f(HiTxRingAddr, 0);
++	cpw32_f(HiTxRingAddr + 4, 0);
++
++	ring_dma = cp->ring_dma;
++	cpw32_f(RxRingAddr, ring_dma & 0xffffffff);
++	cpw32_f(RxRingAddr + 4, (ring_dma >> 16) >> 16);
++
++	ring_dma += sizeof(struct cp_desc) * CP_RX_RING_SIZE;
++	cpw32_f(TxRingAddr, ring_dma & 0xffffffff);
++	cpw32_f(TxRingAddr + 4, (ring_dma >> 16) >> 16);
++
+ 	cpw16(MultiIntr, 0);
+ 
+ 	cpw8_f(Cfg9346, Cfg9346_Lock);
 --- a/drivers/net/ethernet/realtek/r8169.c
 +++ b/drivers/net/ethernet/realtek/r8169.c
 @@ -77,7 +77,7 @@
@@ -6775,6 +7344,65 @@
  
  	/* 2. Combined interface devices matching on class+protocol */
  	{	/* Huawei E367 and possibly others in "Windows mode" */
+@@ -384,16 +398,58 @@ static const struct usb_device_id produc
+ 	},
+ 
+ 	/* 3. Combined interface devices matching on interface number */
++	{QMI_FIXED_INTF(0x12d1, 0x140c, 1)},	/* Huawei E173 */
++	{QMI_FIXED_INTF(0x19d2, 0x0002, 1)},
++	{QMI_FIXED_INTF(0x19d2, 0x0012, 1)},
++	{QMI_FIXED_INTF(0x19d2, 0x0017, 3)},
++	{QMI_FIXED_INTF(0x19d2, 0x0021, 4)},
++	{QMI_FIXED_INTF(0x19d2, 0x0025, 1)},
++	{QMI_FIXED_INTF(0x19d2, 0x0031, 4)},
++	{QMI_FIXED_INTF(0x19d2, 0x0042, 4)},
++	{QMI_FIXED_INTF(0x19d2, 0x0049, 5)},
++	{QMI_FIXED_INTF(0x19d2, 0x0052, 4)},
+ 	{QMI_FIXED_INTF(0x19d2, 0x0055, 1)},	/* ZTE (Vodafone) K3520-Z */
++	{QMI_FIXED_INTF(0x19d2, 0x0058, 4)},
+ 	{QMI_FIXED_INTF(0x19d2, 0x0063, 4)},	/* ZTE (Vodafone) K3565-Z */
+ 	{QMI_FIXED_INTF(0x19d2, 0x0104, 4)},	/* ZTE (Vodafone) K4505-Z */
++	{QMI_FIXED_INTF(0x19d2, 0x0113, 5)},
++	{QMI_FIXED_INTF(0x19d2, 0x0118, 5)},
++	{QMI_FIXED_INTF(0x19d2, 0x0121, 5)},
++	{QMI_FIXED_INTF(0x19d2, 0x0123, 4)},
++	{QMI_FIXED_INTF(0x19d2, 0x0124, 5)},
++	{QMI_FIXED_INTF(0x19d2, 0x0125, 6)},
++	{QMI_FIXED_INTF(0x19d2, 0x0126, 5)},
++	{QMI_FIXED_INTF(0x19d2, 0x0130, 1)},
++	{QMI_FIXED_INTF(0x19d2, 0x0133, 3)},
++	{QMI_FIXED_INTF(0x19d2, 0x0141, 5)},
+ 	{QMI_FIXED_INTF(0x19d2, 0x0157, 5)},	/* ZTE MF683 */
++	{QMI_FIXED_INTF(0x19d2, 0x0158, 3)},
+ 	{QMI_FIXED_INTF(0x19d2, 0x0167, 4)},	/* ZTE MF820D */
++	{QMI_FIXED_INTF(0x19d2, 0x0168, 4)},
++	{QMI_FIXED_INTF(0x19d2, 0x0176, 3)},
++	{QMI_FIXED_INTF(0x19d2, 0x0178, 3)},
++	{QMI_FIXED_INTF(0x19d2, 0x0191, 4)},	/* ZTE EuFi890 */
++	{QMI_FIXED_INTF(0x19d2, 0x0199, 1)},	/* ZTE MF820S */
++	{QMI_FIXED_INTF(0x19d2, 0x0200, 1)},
++	{QMI_FIXED_INTF(0x19d2, 0x0257, 3)},	/* ZTE MF821 */
+ 	{QMI_FIXED_INTF(0x19d2, 0x0326, 4)},	/* ZTE MF821D */
+ 	{QMI_FIXED_INTF(0x19d2, 0x1008, 4)},	/* ZTE (Vodafone) K3570-Z */
+ 	{QMI_FIXED_INTF(0x19d2, 0x1010, 4)},	/* ZTE (Vodafone) K3571-Z */
++	{QMI_FIXED_INTF(0x19d2, 0x1012, 4)},
+ 	{QMI_FIXED_INTF(0x19d2, 0x1018, 3)},	/* ZTE (Vodafone) K5006-Z */
++	{QMI_FIXED_INTF(0x19d2, 0x1021, 2)},
++	{QMI_FIXED_INTF(0x19d2, 0x1245, 4)},
++	{QMI_FIXED_INTF(0x19d2, 0x1247, 4)},
++	{QMI_FIXED_INTF(0x19d2, 0x1252, 4)},
++	{QMI_FIXED_INTF(0x19d2, 0x1254, 4)},
++	{QMI_FIXED_INTF(0x19d2, 0x1255, 3)},
++	{QMI_FIXED_INTF(0x19d2, 0x1255, 4)},
++	{QMI_FIXED_INTF(0x19d2, 0x1256, 4)},
++	{QMI_FIXED_INTF(0x19d2, 0x1401, 2)},
+ 	{QMI_FIXED_INTF(0x19d2, 0x1402, 2)},	/* ZTE MF60 */
++	{QMI_FIXED_INTF(0x19d2, 0x1424, 2)},
++	{QMI_FIXED_INTF(0x19d2, 0x1425, 2)},
++	{QMI_FIXED_INTF(0x19d2, 0x1426, 2)},	/* ZTE MF91 */
+ 	{QMI_FIXED_INTF(0x19d2, 0x2002, 4)},	/* ZTE (Vodafone) K3765-Z */
+ 	{QMI_FIXED_INTF(0x0f3d, 0x68a2, 8)},    /* Sierra Wireless MC7700 */
+ 	{QMI_FIXED_INTF(0x114f, 0x68a2, 8)},    /* Sierra Wireless MC7750 */
 --- a/drivers/net/usb/usbnet.c
 +++ b/drivers/net/usb/usbnet.c
 @@ -1158,6 +1158,7 @@ netdev_tx_t usbnet_start_xmit (struct sk
@@ -7333,6 +7961,27 @@
  	err = iwl_setup_interface(priv, ctx);
  	if (!err || reset)
  		goto out;
+--- a/drivers/net/wireless/iwlwifi/dvm/rxon.c
++++ b/drivers/net/wireless/iwlwifi/dvm/rxon.c
+@@ -1012,12 +1012,12 @@ static void iwl_calc_basic_rates(struct
+ 	 * As a consequence, it's not as complicated as it sounds, just add
+ 	 * any lower rates to the ACK rate bitmap.
+ 	 */
+-	if (IWL_RATE_11M_INDEX < lowest_present_ofdm)
+-		ofdm |= IWL_RATE_11M_MASK >> IWL_FIRST_CCK_RATE;
+-	if (IWL_RATE_5M_INDEX < lowest_present_ofdm)
+-		ofdm |= IWL_RATE_5M_MASK >> IWL_FIRST_CCK_RATE;
+-	if (IWL_RATE_2M_INDEX < lowest_present_ofdm)
+-		ofdm |= IWL_RATE_2M_MASK >> IWL_FIRST_CCK_RATE;
++	if (IWL_RATE_11M_INDEX < lowest_present_cck)
++		cck |= IWL_RATE_11M_MASK >> IWL_FIRST_CCK_RATE;
++	if (IWL_RATE_5M_INDEX < lowest_present_cck)
++		cck |= IWL_RATE_5M_MASK >> IWL_FIRST_CCK_RATE;
++	if (IWL_RATE_2M_INDEX < lowest_present_cck)
++		cck |= IWL_RATE_2M_MASK >> IWL_FIRST_CCK_RATE;
+ 	/* 1M already there or needed so always add */
+ 	cck |= IWL_RATE_1M_MASK >> IWL_FIRST_CCK_RATE;
+ 
 --- a/drivers/net/wireless/iwlwifi/pcie/rx.c
 +++ b/drivers/net/wireless/iwlwifi/pcie/rx.c
 @@ -314,6 +314,14 @@ static void iwlagn_rx_allocate(struct iw
@@ -9646,6 +10295,27 @@
  }
  
  /**
+@@ -1757,8 +1756,10 @@ void target_execute_cmd(struct se_cmd *c
+ 	/*
+ 	 * If the received CDB has aleady been aborted stop processing it here.
+ 	 */
+-	if (transport_check_aborted_status(cmd, 1))
++	if (transport_check_aborted_status(cmd, 1)) {
++		complete(&cmd->t_transport_stop_comp);
+ 		return;
++	}
+ 
+ 	/*
+ 	 * Determine if IOCTL context caller in requesting the stopping of this
+@@ -3030,7 +3031,7 @@ void transport_send_task_abort(struct se
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&cmd->t_state_lock, flags);
+-	if (cmd->se_cmd_flags & SCF_SENT_CHECK_CONDITION) {
++	if (cmd->se_cmd_flags & (SCF_SENT_CHECK_CONDITION | SCF_SENT_DELAYED_TAS)) {
+ 		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ 		return;
+ 	}
 --- a/drivers/tty/n_gsm.c
 +++ b/drivers/tty/n_gsm.c
 @@ -875,7 +875,7 @@ static int gsm_dlci_data_output_framed(s
@@ -19937,6 +20607,38 @@
  }
  
  /*
+--- a/kernel/sched/auto_group.c
++++ b/kernel/sched/auto_group.c
+@@ -143,15 +143,11 @@ autogroup_move_group(struct task_struct
+ 
+ 	p->signal->autogroup = autogroup_kref_get(ag);
+ 
+-	if (!ACCESS_ONCE(sysctl_sched_autogroup_enabled))
+-		goto out;
+-
+ 	t = p;
+ 	do {
+ 		sched_move_task(t);
+ 	} while_each_thread(p, t);
+ 
+-out:
+ 	unlock_task_sighand(p, &flags);
+ 	autogroup_kref_put(prev);
+ }
+--- a/kernel/sched/auto_group.h
++++ b/kernel/sched/auto_group.h
+@@ -4,11 +4,6 @@
+ #include <linux/rwsem.h>
+ 
+ struct autogroup {
+-	/*
+-	 * reference doesn't mean how many thread attach to this
+-	 * autogroup now. It just stands for the number of task
+-	 * could use this autogroup.
+-	 */
+ 	struct kref		kref;
+ 	struct task_group	*tg;
+ 	struct rw_semaphore	lock;
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -5604,7 +5604,9 @@ migration_call(struct notifier_block *nf
@@ -20113,7 +20815,19 @@
  	lock_map_acquire_read(&cwq->wq->lockdep_map);
  	lock_map_acquire(&lockdep_map);
  	trace_workqueue_execute_start(work);
-@@ -2844,6 +2853,18 @@ static int try_to_grab_pending(struct wo
+@@ -2257,8 +2266,10 @@ static int rescuer_thread(void *__wq)
+ repeat:
+ 	set_current_state(TASK_INTERRUPTIBLE);
+ 
+-	if (kthread_should_stop())
++	if (kthread_should_stop()) {
++		__set_current_state(TASK_RUNNING);
+ 		return 0;
++	}
+ 
+ 	/*
+ 	 * See whether any cpu is asking for help.  Unbounded
+@@ -2844,6 +2855,18 @@ static int try_to_grab_pending(struct wo
  		smp_rmb();
  		if (gcwq == get_work_gcwq(work)) {
  			debug_work_deactivate(work);
@@ -20362,6 +21076,26 @@
  		mz->usage_in_excess = 0;
  		mz->on_tree = false;
  		mz->memcg = memcg;
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -1474,9 +1474,17 @@ int soft_offline_page(struct page *page,
+ {
+ 	int ret;
+ 	unsigned long pfn = page_to_pfn(page);
++	struct page *hpage = compound_trans_head(page);
+ 
+ 	if (PageHuge(page))
+ 		return soft_offline_huge_page(page, flags);
++	if (PageTransHuge(hpage)) {
++		if (PageAnon(hpage) && unlikely(split_huge_page(hpage))) {
++			pr_info("soft offline: %#lx: failed to split THP\n",
++				pfn);
++			return -EBUSY;
++		}
++	}
+ 
+ 	ret = get_any_page(page, pfn, flags);
+ 	if (ret < 0)
 --- a/mm/mempolicy.c
 +++ b/mm/mempolicy.c
 @@ -607,6 +607,42 @@ check_range(struct mm_struct *mm, unsign
@@ -20767,6 +21501,45 @@
  	/* Done! */
  	slab_state = FULL;
  
+--- a/mm/sparse.c
++++ b/mm/sparse.c
+@@ -617,7 +617,7 @@ static void __kfree_section_memmap(struc
+ {
+ 	return; /* XXX: Not implemented yet */
+ }
+-static void free_map_bootmem(struct page *page, unsigned long nr_pages)
++static void free_map_bootmem(struct page *memmap, unsigned long nr_pages)
+ {
+ }
+ #else
+@@ -658,10 +658,11 @@ static void __kfree_section_memmap(struc
+ 			   get_order(sizeof(struct page) * nr_pages));
+ }
+ 
+-static void free_map_bootmem(struct page *page, unsigned long nr_pages)
++static void free_map_bootmem(struct page *memmap, unsigned long nr_pages)
+ {
+ 	unsigned long maps_section_nr, removing_section_nr, i;
+ 	unsigned long magic;
++	struct page *page = virt_to_page(memmap);
+ 
+ 	for (i = 0; i < nr_pages; i++, page++) {
+ 		magic = (unsigned long) page->lru.next;
+@@ -710,13 +711,10 @@ static void free_section_usemap(struct p
+ 	 */
+ 
+ 	if (memmap) {
+-		struct page *memmap_page;
+-		memmap_page = virt_to_page(memmap);
+-
+ 		nr_pages = PAGE_ALIGN(PAGES_PER_SECTION * sizeof(struct page))
+ 			>> PAGE_SHIFT;
+ 
+-		free_map_bootmem(memmap_page, nr_pages);
++		free_map_bootmem(memmap, nr_pages);
+ 	}
+ }
+ 
 --- a/mm/truncate.c
 +++ b/mm/truncate.c
 @@ -394,11 +394,12 @@ invalidate_complete_page2(struct address
@@ -20863,7 +21636,69 @@
  		return 1;
  
  	trace_mm_vmscan_direct_reclaim_begin(order,
-@@ -2953,6 +2970,8 @@ static int kswapd(void *p)
+@@ -2366,6 +2383,19 @@ static void age_active_anon(struct zone
+ 	} while (memcg);
+ }
+ 
++static bool zone_balanced(struct zone *zone, int order,
++			  unsigned long balance_gap, int classzone_idx)
++{
++	if (!zone_watermark_ok_safe(zone, order, high_wmark_pages(zone) +
++				    balance_gap, classzone_idx, 0))
++		return false;
++
++	if (COMPACTION_BUILD && order && !compaction_suitable(zone, order))
++		return false;
++
++	return true;
++}
++
+ /*
+  * pgdat_balanced is used when checking if a node is balanced for high-order
+  * allocations. Only zones that meet watermarks and are in a zone allowed
+@@ -2444,8 +2474,7 @@ static bool prepare_kswapd_sleep(pg_data
+ 			continue;
+ 		}
+ 
+-		if (!zone_watermark_ok_safe(zone, order, high_wmark_pages(zone),
+-							i, 0))
++		if (!zone_balanced(zone, order, 0, i))
+ 			all_zones_ok = false;
+ 		else
+ 			balanced += zone->present_pages;
+@@ -2554,8 +2583,7 @@ loop_again:
+ 				break;
+ 			}
+ 
+-			if (!zone_watermark_ok_safe(zone, order,
+-					high_wmark_pages(zone), 0, 0)) {
++			if (!zone_balanced(zone, order, 0, 0)) {
+ 				end_zone = i;
+ 				break;
+ 			} else {
+@@ -2631,9 +2659,8 @@ loop_again:
+ 				testorder = 0;
+ 
+ 			if ((buffer_heads_over_limit && is_highmem_idx(i)) ||
+-				    !zone_watermark_ok_safe(zone, testorder,
+-					high_wmark_pages(zone) + balance_gap,
+-					end_zone, 0)) {
++			    !zone_balanced(zone, testorder,
++					   balance_gap, end_zone)) {
+ 				shrink_zone(zone, &sc);
+ 
+ 				reclaim_state->reclaimed_slab = 0;
+@@ -2660,8 +2687,7 @@ loop_again:
+ 				continue;
+ 			}
+ 
+-			if (!zone_watermark_ok_safe(zone, testorder,
+-					high_wmark_pages(zone), end_zone, 0)) {
++			if (!zone_balanced(zone, testorder, 0, end_zone)) {
+ 				all_zones_ok = 0;
+ 				/*
+ 				 * We are still under min water mark.  This
+@@ -2953,6 +2979,8 @@ static int kswapd(void *p)
  						&balanced_classzone_idx);
  		}
  	}
@@ -22449,6 +23284,17 @@
  					       frame_buf);
  	mutex_unlock(&ifmgd->mtx);
  
+--- a/net/mac80211/offchannel.c
++++ b/net/mac80211/offchannel.c
+@@ -453,8 +453,6 @@ void ieee80211_roc_purge(struct ieee8021
+ 		list_move_tail(&roc->list, &tmp_list);
+ 		roc->abort = true;
+ 	}
+-
+-	ieee80211_start_next_roc(local);
+ 	mutex_unlock(&local->mtx);
+ 
+ 	list_for_each_entry_safe(roc, tmp, &tmp_list, list) {
 --- a/net/mac80211/rx.c
 +++ b/net/mac80211/rx.c
 @@ -491,6 +491,11 @@ ieee80211_rx_mesh_check(struct ieee80211
