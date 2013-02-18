@@ -60,7 +60,7 @@
  VERSION = 3
  PATCHLEVEL = 7
 -SUBLEVEL = 0
-+SUBLEVEL = 8
++SUBLEVEL = 9
  EXTRAVERSION =
  NAME = Terrified Chipmunk
  
@@ -1054,6 +1054,16 @@
  }
  
  /*
+@@ -120,6 +120,9 @@ static int s390_next_ktime(ktime_t expir
+ 	nsecs = ktime_to_ns(ktime_add(timespec_to_ktime(ts), expires));
+ 	do_div(nsecs, 125);
+ 	S390_lowcore.clock_comparator = sched_clock_base_cc + (nsecs << 9);
++	/* Program the maximum value if we have an overflow (== year 2042) */
++	if (unlikely(S390_lowcore.clock_comparator < sched_clock_base_cc))
++		S390_lowcore.clock_comparator = -1ULL;
+ 	set_clock_comparator(S390_lowcore.clock_comparator);
+ 	return 0;
+ }
 --- a/arch/s390/kvm/interrupt.c
 +++ b/arch/s390/kvm/interrupt.c
 @@ -408,7 +408,7 @@ int kvm_s390_handle_wait(struct kvm_vcpu
@@ -1403,6 +1413,60 @@
  extern void efi_set_executable(efi_memory_desc_t *md, bool executable);
  extern int efi_memblock_x86_reserve_range(void);
  extern void efi_call_phys_prelog(void);
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -142,6 +142,11 @@ static inline unsigned long pmd_pfn(pmd_
+ 	return (pmd_val(pmd) & PTE_PFN_MASK) >> PAGE_SHIFT;
+ }
+ 
++static inline unsigned long pud_pfn(pud_t pud)
++{
++	return (pud_val(pud) & PTE_PFN_MASK) >> PAGE_SHIFT;
++}
++
+ #define pte_page(pte)	pfn_to_page(pte_pfn(pte))
+ 
+ static inline int pmd_large(pmd_t pte)
+--- a/arch/x86/kernel/apic/x2apic_phys.c
++++ b/arch/x86/kernel/apic/x2apic_phys.c
+@@ -20,18 +20,19 @@ static int set_x2apic_phys_mode(char *ar
+ }
+ early_param("x2apic_phys", set_x2apic_phys_mode);
+ 
+-static int x2apic_acpi_madt_oem_check(char *oem_id, char *oem_table_id)
++static bool x2apic_fadt_phys(void)
+ {
+-	if (x2apic_phys)
+-		return x2apic_enabled();
+-	else if ((acpi_gbl_FADT.header.revision >= FADT2_REVISION_ID) &&
+-		(acpi_gbl_FADT.flags & ACPI_FADT_APIC_PHYSICAL) &&
+-		x2apic_enabled()) {
++	if ((acpi_gbl_FADT.header.revision >= FADT2_REVISION_ID) &&
++		(acpi_gbl_FADT.flags & ACPI_FADT_APIC_PHYSICAL)) {
+ 		printk(KERN_DEBUG "System requires x2apic physical mode\n");
+-		return 1;
++		return true;
+ 	}
+-	else
+-		return 0;
++	return false;
++}
++
++static int x2apic_acpi_madt_oem_check(char *oem_id, char *oem_table_id)
++{
++	return x2apic_enabled() && (x2apic_phys || x2apic_fadt_phys());
+ }
+ 
+ static void
+@@ -82,7 +83,7 @@ static void init_x2apic_ldr(void)
+ 
+ static int x2apic_phys_probe(void)
+ {
+-	if (x2apic_mode && x2apic_phys)
++	if (x2apic_mode && (x2apic_phys || x2apic_fadt_phys()))
+ 		return 1;
+ 
+ 	return apic == &apic_x2apic_phys;
 --- a/arch/x86/kernel/cpu/perf_event.c
 +++ b/arch/x86/kernel/cpu/perf_event.c
 @@ -340,9 +340,6 @@ int x86_setup_perfctr(struct perf_event
@@ -1668,6 +1732,39 @@
  	 */
  	local_irq_disable();
  	debugctl = get_debugctlmsr();
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -748,13 +748,15 @@ __bad_area_nosemaphore(struct pt_regs *r
+ 				return;
+ 		}
+ #endif
++		/* Kernel addresses are always protection faults: */
++		if (address >= TASK_SIZE)
++			error_code |= PF_PROT;
+ 
+-		if (unlikely(show_unhandled_signals))
++		if (likely(show_unhandled_signals))
+ 			show_signal_msg(regs, error_code, address, tsk);
+ 
+-		/* Kernel addresses are always protection faults: */
+ 		tsk->thread.cr2		= address;
+-		tsk->thread.error_code	= error_code | (address >= TASK_SIZE);
++		tsk->thread.error_code	= error_code;
+ 		tsk->thread.trap_nr	= X86_TRAP_PF;
+ 
+ 		force_sig_info_fault(SIGSEGV, si_code, address, tsk, 0);
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -829,6 +829,9 @@ int kern_addr_valid(unsigned long addr)
+ 	if (pud_none(*pud))
+ 		return 0;
+ 
++	if (pud_large(*pud))
++		return pfn_valid(pud_pfn(*pud));
++
+ 	pmd = pmd_offset(pud, addr);
+ 	if (pmd_none(*pmd))
+ 		return 0;
 --- a/arch/x86/pci/common.c
 +++ b/arch/x86/pci/common.c
 @@ -433,7 +433,8 @@ static const struct dmi_system_id __devi
@@ -1721,7 +1818,7 @@
  static int __init setup_noefi(char *arg)
  {
 -	efi_enabled = 0;
-+	clear_bit(EFI_BOOT, &x86_efi_facility);
++	clear_bit(EFI_RUNTIME_SERVICES, &x86_efi_facility);
  	return 0;
  }
  early_param("noefi", setup_noefi);
@@ -1887,6 +1984,47 @@
  	__flush_tlb_all();
  	local_irq_restore(efi_flags);
  	early_code_mapping_set_exec(0);
+--- a/arch/x86/xen/xen-asm_32.S
++++ b/arch/x86/xen/xen-asm_32.S
+@@ -89,11 +89,11 @@ ENTRY(xen_iret)
+ 	 */
+ #ifdef CONFIG_SMP
+ 	GET_THREAD_INFO(%eax)
+-	movl TI_cpu(%eax), %eax
+-	movl __per_cpu_offset(,%eax,4), %eax
+-	mov xen_vcpu(%eax), %eax
++	movl %ss:TI_cpu(%eax), %eax
++	movl %ss:__per_cpu_offset(,%eax,4), %eax
++	mov %ss:xen_vcpu(%eax), %eax
+ #else
+-	movl xen_vcpu, %eax
++	movl %ss:xen_vcpu, %eax
+ #endif
+ 
+ 	/* check IF state we're restoring */
+@@ -106,11 +106,11 @@ ENTRY(xen_iret)
+ 	 * resuming the code, so we don't have to be worried about
+ 	 * being preempted to another CPU.
+ 	 */
+-	setz XEN_vcpu_info_mask(%eax)
++	setz %ss:XEN_vcpu_info_mask(%eax)
+ xen_iret_start_crit:
+ 
+ 	/* check for unmasked and pending */
+-	cmpw $0x0001, XEN_vcpu_info_pending(%eax)
++	cmpw $0x0001, %ss:XEN_vcpu_info_pending(%eax)
+ 
+ 	/*
+ 	 * If there's something pending, mask events again so we can
+@@ -118,7 +118,7 @@ xen_iret_start_crit:
+ 	 * touch XEN_vcpu_info_mask.
+ 	 */
+ 	jne 1f
+-	movb $1, XEN_vcpu_info_mask(%eax)
++	movb $1, %ss:XEN_vcpu_info_mask(%eax)
+ 
+ 1:	popl %eax
+ 
 --- a/drivers/acpi/battery.c
 +++ b/drivers/acpi/battery.c
 @@ -34,6 +34,7 @@
@@ -10661,6 +10799,17 @@
  DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_RICOH, PCI_DEVICE_ID_RICOH_R5CE823, ricoh_mmc_fixup_r5c832);
  DECLARE_PCI_FIXUP_RESUME_EARLY(PCI_VENDOR_ID_RICOH, PCI_DEVICE_ID_RICOH_R5CE823, ricoh_mmc_fixup_r5c832);
  #endif /*CONFIG_MMC_RICOH_MMC*/
+--- a/drivers/pci/remove.c
++++ b/drivers/pci/remove.c
+@@ -19,6 +19,8 @@ static void pci_free_resources(struct pc
+ 
+ static void pci_stop_dev(struct pci_dev *dev)
+ {
++	pci_pme_active(dev, false);
++
+ 	if (dev->is_added) {
+ 		pci_proc_detach_device(dev);
+ 		pci_remove_sysfs_dev_files(dev);
 --- a/drivers/platform/x86/ibm_rtl.c
 +++ b/drivers/platform/x86/ibm_rtl.c
 @@ -244,7 +244,7 @@ static int __init ibm_rtl_init(void) {
@@ -11131,7 +11280,7 @@
  
  	ret = amba_request_regions(adev, NULL);
  	if (ret)
-@@ -345,10 +346,11 @@ static int pl031_probe(struct amba_devic
+@@ -345,10 +346,13 @@ static int pl031_probe(struct amba_devic
  	dev_dbg(&adev->dev, "designer ID = 0x%02x\n", amba_manf(adev));
  	dev_dbg(&adev->dev, "revision = 0x%01x\n", amba_rev(adev));
  
@@ -11141,7 +11290,9 @@
 -		writel(readl(ldata->base + RTC_CR) | RTC_CR_CWEN,
 -		       ldata->base + RTC_CR);
 +		data |= RTC_CR_CWEN;
-+	writel(data | RTC_CR_EN, ldata->base + RTC_CR);
++	else
++		data |= RTC_CR_EN;
++	writel(data, ldata->base + RTC_CR);
  
  	/*
  	 * On ST PL031 variants, the RTC reset value does not provide correct
@@ -17348,40 +17499,6 @@
  out_destroy_ioend:
  	xfs_destroy_ioend(ioend);
  	return ret;
---- a/fs/xfs/xfs_buf.c
-+++ b/fs/xfs/xfs_buf.c
-@@ -487,6 +487,7 @@ _xfs_buf_find(
- 	struct rb_node		*parent;
- 	xfs_buf_t		*bp;
- 	xfs_daddr_t		blkno = map[0].bm_bn;
-+	xfs_daddr_t		eofs;
- 	int			numblks = 0;
- 	int			i;
- 
-@@ -498,6 +499,23 @@ _xfs_buf_find(
- 	ASSERT(!(numbytes < (1 << btp->bt_sshift)));
- 	ASSERT(!(BBTOB(blkno) & (xfs_off_t)btp->bt_smask));
- 
-+	/*
-+	 * Corrupted block numbers can get through to here, unfortunately, so we
-+	 * have to check that the buffer falls within the filesystem bounds.
-+	 */
-+	eofs = XFS_FSB_TO_BB(btp->bt_mount, btp->bt_mount->m_sb.sb_dblocks);
-+	if (blkno >= eofs) {
-+		/*
-+		 * XXX (dgc): we should really be returning EFSCORRUPTED here,
-+		 * but none of the higher level infrastructure supports
-+		 * returning a specific error on buffer lookup failures.
-+		 */
-+		xfs_alert(btp->bt_mount,
-+			  "%s: Block out of range: block 0x%llx, EOFS 0x%llx ",
-+			  __func__, blkno, eofs);
-+		return NULL;
-+	}
-+
- 	/* get tree root */
- 	pag = xfs_perag_get(btp->bt_mount,
- 				xfs_daddr_to_agno(btp->bt_mount, blkno));
 --- a/fs/xfs/xfs_log.c
 +++ b/fs/xfs/xfs_log.c
 @@ -458,7 +458,8 @@ xfs_log_reserve(
@@ -19926,6 +20043,23 @@
  #endif
  	flush_cache_page(vma, addr, pte_pfn(pte));
  	set_pte_at(mm, addr, ptep, pte);
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@ -517,11 +517,11 @@ SYSCALL_DEFINE2(munlock, unsigned long,
+ static int do_mlockall(int flags)
+ {
+ 	struct vm_area_struct * vma, * prev = NULL;
+-	unsigned int def_flags = 0;
+ 
+ 	if (flags & MCL_FUTURE)
+-		def_flags = VM_LOCKED;
+-	current->mm->def_flags = def_flags;
++		current->mm->def_flags |= VM_LOCKED;
++	else
++		current->mm->def_flags &= ~VM_LOCKED;
+ 	if (flags == MCL_FUTURE)
+ 		goto out;
+ 
 --- a/mm/page-writeback.c
 +++ b/mm/page-writeback.c
 @@ -201,6 +201,18 @@ static unsigned long highmem_dirtyable_m
