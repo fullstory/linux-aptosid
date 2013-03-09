@@ -2608,7 +2608,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/branch.h
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,236 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -2672,6 +2672,13 @@
 +/* ext2 has 3 types of operations at least, ext3 has 4 */
 +#define AuBrDynOp (AuDyLast * 4)
 +
++#ifdef CONFIG_AUFS_HFSNOTIFY
++/* support for asynchronous destruction */
++struct au_br_hfsnotify {
++	struct fsnotify_group	*hfsn_group;
++};
++#endif
++
 +/* protected by superblock rwsem */
 +struct au_branch {
 +	struct au_xino_file	br_xino;
@@ -2691,8 +2698,7 @@
 +	atomic_t		br_xino_running;
 +
 +#ifdef CONFIG_AUFS_HFSNOTIFY
-+	struct fsnotify_group	*br_hfsn_group;
-+	struct fsnotify_ops	br_hfsn_ops;
++	struct au_br_hfsnotify	*br_hfsn;
 +#endif
 +
 +#ifdef CONFIG_SYSFS
@@ -8607,7 +8613,7 @@
 +#endif /* __AUFS_DYNOP_H__ */
 --- /dev/null
 +++ b/fs/aufs/export.c
-@@ -0,0 +1,812 @@
+@@ -0,0 +1,827 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -8697,6 +8703,21 @@
 +{
 +	/* note: read d_flags without d_lock */
 +	return !!(dentry->d_flags & DCACHE_DISCONNECTED);
++}
++
++int au_test_nfsd(void)
++{
++	int ret;
++	struct task_struct *tsk = current;
++	char comm[sizeof(tsk->comm)];
++
++	ret = 0;
++	if (tsk->flags & PF_KTHREAD) {
++		get_task_comm(comm, tsk);
++		ret = !strcmp(comm, "nfsd");
++	}
++
++	return ret;
 +}
 +
 +/* ---------------------------------------------------------------------- */
@@ -9346,7 +9367,7 @@
 +	err = fh[Fh_h_type];
 +	*max_len += Fh_tail;
 +	/* todo: macros? */
-+	if (err != 255)
++	if (err != FILEID_INVALID)
 +		err = 99;
 +	else
 +		AuWarn1("%s encode_fh failed\n", au_sbtype(h_sb));
@@ -9360,7 +9381,7 @@
 +	si_read_unlock(sb);
 +out:
 +	if (unlikely(err < 0))
-+		err = 255;
++		err = FILEID_INVALID;
 +	return err;
 +}
 +
@@ -10409,7 +10430,7 @@
 +#endif /* __AUFS_FILE_H__ */
 --- /dev/null
 +++ b/fs/aufs/finfo.c
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,157 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -10539,7 +10560,7 @@
 +
 +int au_finfo_init(struct file *file, struct au_fidir *fidir)
 +{
-+	int err, lc_idx;
++	int err;
 +	struct au_finfo *finfo;
 +	struct dentry *dentry;
 +
@@ -10551,10 +10572,11 @@
 +
 +	err = 0;
 +	au_nfiles_inc(dentry->d_sb);
-+	lc_idx = AuLcNonDir_FIINFO;
-+	if (fidir)
-+		lc_idx = AuLcDir_FIINFO;
-+	au_rw_class(&finfo->fi_rwsem, au_lc_key + lc_idx);
++	/* verbose coding for lock class name */
++	if (!fidir)
++		au_rw_class(&finfo->fi_rwsem, au_lc_key + AuLcNonDir_FIINFO);
++	else
++		au_rw_class(&finfo->fi_rwsem, au_lc_key + AuLcDir_FIINFO);
 +	au_rw_write_lock(&finfo->fi_rwsem);
 +	finfo->fi_btop = -1;
 +	finfo->fi_hdir = fidir;
@@ -12076,7 +12098,7 @@
 +#endif /* __AUFS_FSTYPE_H__ */
 --- /dev/null
 +++ b/fs/aufs/hfsnotify.c
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,293 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -12114,12 +12136,13 @@
 +	AuDbg("here\n");
 +	au_cache_free_hnotify(hn);
 +	smp_mb__before_atomic_dec();
-+	atomic64_dec(&au_hfsn_ifree);
-+	wake_up(&au_hfsn_wq);
++	if (atomic64_dec_and_test(&au_hfsn_ifree))
++		wake_up(&au_hfsn_wq);
 +}
 +
 +static int au_hfsn_alloc(struct au_hinode *hinode)
 +{
++	int err;
 +	struct au_hnotify *hn;
 +	struct super_block *sb;
 +	struct au_branch *br;
@@ -12130,6 +12153,8 @@
 +	sb = hn->hn_aufs_inode->i_sb;
 +	bindex = au_br_index(sb, hinode->hi_id);
 +	br = au_sbr(sb, bindex);
++	AuDebugOn(!br->br_hfsn);
++
 +	mark = &hn->hn_mark;
 +	fsnotify_init_mark(mark, au_hfsn_free_mark);
 +	mark->mask = AuHfsnMask;
@@ -12137,21 +12162,30 @@
 +	 * by udba rename or rmdir, aufs assign a new inode to the known
 +	 * h_inode, so specify 1 to allow dups.
 +	 */
-+	return fsnotify_add_mark(mark, br->br_hfsn_group, hinode->hi_inode,
++	err = fsnotify_add_mark(mark, br->br_hfsn->hfsn_group, hinode->hi_inode,
 +				 /*mnt*/NULL, /*allow_dups*/1);
++	/* even if err */
++	fsnotify_put_mark(mark);
++
++	return err;
 +}
 +
 +static int au_hfsn_free(struct au_hinode *hinode, struct au_hnotify *hn)
 +{
 +	struct fsnotify_mark *mark;
 +	unsigned long long ull;
++	struct fsnotify_group *group;
 +
 +	ull = atomic64_inc_return(&au_hfsn_ifree);
 +	BUG_ON(!ull);
 +
 +	mark = &hn->hn_mark;
-+	fsnotify_destroy_mark(mark);
-+	fsnotify_put_mark(mark);
++	spin_lock(&mark->lock);
++	group = mark->group;
++	fsnotify_get_group(group);
++	spin_unlock(&mark->lock);
++	fsnotify_destroy_mark(mark, group);
++	fsnotify_put_group(group);
 +
 +	/* free hn by myself */
 +	return 0;
@@ -12213,6 +12247,14 @@
 +
 +/* ---------------------------------------------------------------------- */
 +
++static void au_hfsn_free_group(struct fsnotify_group *group)
++{
++	struct au_br_hfsnotify *hfsn = group->private;
++
++	AuDbg("here\n");
++	kfree(hfsn);
++}
++
 +static int au_hfsn_handle_event(struct fsnotify_group *group,
 +				struct fsnotify_mark *inode_mark,
 +				struct fsnotify_mark *vfsmount_mark,
@@ -12270,22 +12312,54 @@
 +
 +static struct fsnotify_ops au_hfsn_ops = {
 +	.should_send_event	= au_hfsn_should_send_event,
-+	.handle_event		= au_hfsn_handle_event
++	.handle_event		= au_hfsn_handle_event,
++	.free_group_priv	= au_hfsn_free_group
 +};
 +
 +/* ---------------------------------------------------------------------- */
 +
 +static void au_hfsn_fin_br(struct au_branch *br)
 +{
-+	if (br->br_hfsn_group)
-+		fsnotify_put_group(br->br_hfsn_group);
++	struct au_br_hfsnotify *hfsn;
++
++	hfsn = br->br_hfsn;
++	if (hfsn)
++		fsnotify_put_group(hfsn->hfsn_group);
 +}
 +
 +static int au_hfsn_init_br(struct au_branch *br, int perm)
 +{
-+	br->br_hfsn_group = NULL;
-+	br->br_hfsn_ops = au_hfsn_ops;
-+	return 0;
++	int err;
++	struct fsnotify_group *group;
++	struct au_br_hfsnotify *hfsn;
++
++	err = 0;
++	br->br_hfsn = NULL;
++	if (!au_br_hnotifyable(perm))
++		goto out;
++
++	err = -ENOMEM;
++	hfsn = kmalloc(sizeof(*hfsn), GFP_NOFS);
++	if (unlikely(!hfsn))
++		goto out;
++
++	err = 0;
++	group = fsnotify_alloc_group(&au_hfsn_ops);
++	if (IS_ERR(group)) {
++		err = PTR_ERR(group);
++		pr_err("fsnotify_alloc_group() failed, %d\n", err);
++		goto out_hfsn;
++	}
++
++	group->private = hfsn;
++	hfsn->hfsn_group = group;
++	br->br_hfsn = hfsn;
++	goto out; /* success */
++
++out_hfsn:
++	kfree(hfsn);
++out:
++	return err;
 +}
 +
 +static int au_hfsn_reset_br(unsigned int udba, struct au_branch *br, int perm)
@@ -12293,25 +12367,9 @@
 +	int err;
 +
 +	err = 0;
-+	if (udba != AuOpt_UDBA_HNOTIFY
-+	    || !au_br_hnotifyable(perm)) {
-+		au_hfsn_fin_br(br);
-+		br->br_hfsn_group = NULL;
-+		goto out;
-+	}
++	if (!br->br_hfsn)
++		err = au_hfsn_init_br(br, perm);
 +
-+	if (br->br_hfsn_group)
-+		goto out;
-+
-+	br->br_hfsn_group = fsnotify_alloc_group(&br->br_hfsn_ops);
-+	if (IS_ERR(br->br_hfsn_group)) {
-+		err = PTR_ERR(br->br_hfsn_group);
-+		pr_err("fsnotify_alloc_group() failed, %d\n", err);
-+		br->br_hfsn_group = NULL;
-+	}
-+
-+out:
-+	AuTraceErr(err);
 +	return err;
 +}
 +
@@ -13391,7 +13449,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/inode.c
-@@ -0,0 +1,488 @@
+@@ -0,0 +1,492 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -13730,7 +13788,7 @@
 +	struct super_block *sb;
 +	struct mutex *mtx;
 +	ino_t h_ino, ino;
-+	int err, lc_idx;
++	int err;
 +	aufs_bindex_t bstart;
 +
 +	sb = dentry->d_sb;
@@ -13771,12 +13829,16 @@
 +
 +	AuDbg("%lx, new %d\n", inode->i_state, !!(inode->i_state & I_NEW));
 +	if (inode->i_state & I_NEW) {
-+		lc_idx = AuLcNonDir_IIINFO;
-+		if (S_ISLNK(h_inode->i_mode))
-+			lc_idx = AuLcSymlink_IIINFO;
-+		else if (S_ISDIR(h_inode->i_mode))
-+			lc_idx = AuLcDir_IIINFO;
-+		au_rw_class(&au_ii(inode)->ii_rwsem, au_lc_key + lc_idx);
++		/* verbose coding for lock class name */
++		if (unlikely(S_ISLNK(h_inode->i_mode)))
++			au_rw_class(&au_ii(inode)->ii_rwsem,
++				    au_lc_key + AuLcSymlink_IIINFO);
++		else if (unlikely(S_ISDIR(h_inode->i_mode)))
++			au_rw_class(&au_ii(inode)->ii_rwsem,
++				    au_lc_key + AuLcDir_IIINFO);
++		else /* likely */
++			au_rw_class(&au_ii(inode)->ii_rwsem,
++				    au_lc_key + AuLcNonDir_IIINFO);
 +
 +		ii_write_lock_new_child(inode);
 +		err = set_inode(inode, dentry);
@@ -15388,7 +15450,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/i_op.c
-@@ -0,0 +1,1026 @@
+@@ -0,0 +1,1030 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -15550,7 +15612,7 @@
 +	struct dentry *ret, *parent;
 +	struct inode *inode;
 +	struct super_block *sb;
-+	int err, npositive, lc_idx;
++	int err, npositive;
 +
 +	IMustLock(dir);
 +
@@ -15617,12 +15679,16 @@
 +out_unlock:
 +	di_write_unlock(dentry);
 +	if (inode) {
-+		lc_idx = AuLcNonDir_DIINFO;
-+		if (S_ISLNK(inode->i_mode))
-+			lc_idx = AuLcSymlink_DIINFO;
-+		else if (S_ISDIR(inode->i_mode))
-+			lc_idx = AuLcDir_DIINFO;
-+		au_rw_class(&au_di(dentry)->di_rwsem, au_lc_key + lc_idx);
++		/* verbose coding for lock class name */
++		if (unlikely(S_ISLNK(inode->i_mode)))
++			au_rw_class(&au_di(dentry)->di_rwsem,
++				    au_lc_key + AuLcSymlink_DIINFO);
++		else if (unlikely(S_ISDIR(inode->i_mode)))
++			au_rw_class(&au_di(dentry)->di_rwsem,
++				    au_lc_key + AuLcDir_DIINFO);
++		else /* likely */
++			au_rw_class(&au_di(dentry)->di_rwsem,
++				    au_lc_key + AuLcNonDir_DIINFO);
 +	}
 +out_si:
 +	si_read_unlock(sb);
@@ -18132,7 +18198,7 @@
 +endif
 --- /dev/null
 +++ b/fs/aufs/loop.c
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,135 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -18186,12 +18252,14 @@
 +{
 +	int ret;
 +	struct task_struct *tsk = current;
++	char c, comm[sizeof(tsk->comm)];
 +
 +	ret = 0;
 +	if (tsk->flags & PF_KTHREAD) {
-+		const char c = tsk->comm[4];
++		get_task_comm(comm, tsk);
++		c = comm[4];
 +		ret = ('0' <= c && c <= '9'
-+		       && !strncmp(tsk->comm, "loop", 4));
++		       && !strncmp(comm, "loop", 4));
 +	}
 +
 +	return ret;
@@ -23359,7 +23427,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/super.h
-@@ -0,0 +1,546 @@
+@@ -0,0 +1,538 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -23628,16 +23696,8 @@
 +/* ---------------------------------------------------------------------- */
 +
 +#ifdef CONFIG_AUFS_EXPORT
++int au_test_nfsd(void);
 +void au_export_init(struct super_block *sb);
-+
-+static inline int au_test_nfsd(void)
-+{
-+	struct task_struct *tsk = current;
-+
-+	return (tsk->flags & PF_KTHREAD)
-+		&& !strcmp(tsk->comm, "nfsd");
-+}
-+
 +void au_xigen_inc(struct inode *inode);
 +int au_xigen_new(struct inode *inode);
 +int au_xigen_set(struct super_block *sb, struct file *base);
@@ -23650,8 +23710,8 @@
 +	return -ESTALE;
 +}
 +#else
-+AuStubVoid(au_export_init, struct super_block *sb)
 +AuStubInt0(au_test_nfsd, void)
++AuStubVoid(au_export_init, struct super_block *sb)
 +AuStubVoid(au_xigen_inc, struct inode *inode)
 +AuStubInt0(au_xigen_new, struct inode *inode)
 +AuStubInt0(au_xigen_set, struct super_block *sb, struct file *base)
@@ -29930,7 +29990,7 @@
 +#include <uapi/linux/aufs_type.h>
 --- /dev/null
 +++ b/include/uapi/linux/aufs_type.h
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,234 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -29963,8 +30023,9 @@
 +#define pr_fmt(fmt)	AUFS_NAME " %s:%d: " fmt, __func__, __LINE__
 +#include <linux/sched.h>
 +#undef pr_fmt
-+#define pr_fmt(fmt)	AUFS_NAME " %s:%d:%s[%d]: " fmt, \
-+		__func__, __LINE__, current->comm, current->pid
++#define pr_fmt(fmt) \
++		AUFS_NAME " %s:%d:%.*s[%d]: " fmt, __func__, __LINE__, \
++		(int)sizeof(current->comm), current->comm, current->pid
 +#else
 +#include <stdint.h>
 +#include <sys/types.h>
@@ -29972,7 +30033,7 @@
 +
 +#include <linux/limits.h>
 +
-+#define AUFS_VERSION	"3.7-20130114"
++#define AUFS_VERSION	"3.8-20130311"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
@@ -30166,7 +30227,7 @@
 +#endif /* __AUFS_TYPE_H__ */
 --- a/include/uapi/linux/Kbuild
 +++ b/include/uapi/linux/Kbuild
-@@ -416,3 +416,4 @@ header-y += x25.h
+@@ -417,3 +417,4 @@ header-y += x25.h
  header-y += xattr.h
  header-y += xfrm.h
  header-y += hw_breakpoint.h
