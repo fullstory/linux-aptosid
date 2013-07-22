@@ -2973,7 +2973,7 @@
 +-include ${srctree}/${src}/conf_priv.mk
 --- /dev/null
 +++ b/fs/aufs/cpup.c
-@@ -0,0 +1,1228 @@
+@@ -0,0 +1,1247 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -3923,6 +3923,25 @@
 +	return err;
 +}
 +
++/* generalized cpup_simple() with h_open_pre/post() calls */
++int au_sio_cpup_simple_h_open(struct dentry *dentry, aufs_bindex_t bdst,
++			      loff_t len, unsigned int flags,
++			      struct au_pin *pin, aufs_bindex_t bsrc)
++{
++	int err;
++	struct file *h_file;
++
++	h_file = au_h_open_pre(dentry, bsrc);
++	if (IS_ERR(h_file))
++		err = PTR_ERR(h_file);
++	else {
++		err = au_sio_cpup_simple(dentry, bdst, len, flags, pin);
++		au_h_open_post(dentry, bsrc, h_file);
++	}
++
++	return err;
++}
++
 +/* ---------------------------------------------------------------------- */
 +
 +/*
@@ -4204,7 +4223,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/cpup.h
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,87 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -4264,6 +4283,9 @@
 +		       struct dentry *dst_parent, struct au_pin *pin);
 +int au_sio_cpup_simple(struct dentry *dentry, aufs_bindex_t bdst, loff_t len,
 +		       unsigned int flags, struct au_pin *pin);
++int au_sio_cpup_simple_h_open(struct dentry *dentry, aufs_bindex_t bdst,
++			      loff_t len, unsigned int flags,
++			      struct au_pin *pin, aufs_bindex_t bsrc);
 +int au_sio_cpup_wh(struct dentry *dentry, aufs_bindex_t bdst, loff_t len,
 +		   struct file *file, struct au_pin *pin);
 +
@@ -9777,7 +9799,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/file.c
-@@ -0,0 +1,688 @@
+@@ -0,0 +1,689 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -10192,10 +10214,11 @@
 +		/* always superio. */
 +		err = au_pin(&pin, dentry, bstart, AuOpt_UDBA_NONE,
 +			     AuPin_DI_LOCKED | AuPin_MNT_WRITE);
-+		if (!err)
++		if (!err) {
 +			err = au_sio_cpup_simple(dentry, bstart, -1,
 +						 AuCpup_DTIME, &pin);
-+		au_unpin(&pin);
++			au_unpin(&pin);
++		}
 +	} else if (hi_wh) {
 +		/* already copied-up after unlink */
 +		err = au_reopen_wh(file, bstart, hi_wh);
@@ -15174,7 +15197,7 @@
 +#endif
 --- /dev/null
 +++ b/fs/aufs/i_op_add.c
-@@ -0,0 +1,722 @@
+@@ -0,0 +1,716 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -15536,7 +15559,6 @@
 +{
 +	int err;
 +	struct dentry *h_src_dentry;
-+	struct file *h_file;
 +
 +	di_read_lock_parent(a->src_parent, AuLock_IR);
 +	err = au_test_and_cpup_dirs(src_dentry, a->bdst);
@@ -15549,15 +15571,10 @@
 +		     AuPin_DI_LOCKED | AuPin_MNT_WRITE);
 +	if (unlikely(err))
 +		goto out;
-+	h_file = au_h_open_pre(src_dentry, a->bsrc);
-+	if (IS_ERR(h_file))
-+		err = PTR_ERR(h_file);
-+	else {
-+		err = au_sio_cpup_simple(src_dentry, a->bdst, -1,
-+					 AuCpup_DTIME /* | AuCpup_KEEPLINO */,
-+					 &a->pin);
-+		au_h_open_post(src_dentry, a->bsrc, h_file);
-+	}
++
++	err = au_sio_cpup_simple_h_open(src_dentry, a->bdst, -1,
++					AuCpup_DTIME /* | AuCpup_KEEPLINO */,
++					&a->pin, a->bsrc);
 +	au_unpin(&a->pin);
 +
 +out:
@@ -15899,7 +15916,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/i_op.c
-@@ -0,0 +1,1108 @@
+@@ -0,0 +1,1100 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -16532,7 +16549,6 @@
 +	aufs_bindex_t bstart, ibstart;
 +	struct dentry *hi_wh, *parent;
 +	struct inode *inode;
-+	struct file *h_file;
 +	struct au_wr_dir_args wr_dir_args = {
 +		.force_btgt	= -1,
 +		.flags		= 0
@@ -16574,7 +16590,6 @@
 +		sz = ia->ia_size;
 +	mutex_unlock(&a->h_inode->i_mutex);
 +
-+	h_file = NULL;
 +	hi_wh = NULL;
 +	if (au_ftest_icpup(a->flags, DID_CPUP) && d_unlinked(dentry)) {
 +		hi_wh = au_hi_wh(inode, a->btgt);
@@ -16598,14 +16613,8 @@
 +		goto out; /* success */
 +
 +	if (!d_unhashed(dentry)) {
-+		h_file = au_h_open_pre(dentry, bstart);
-+		if (IS_ERR(h_file))
-+			err = PTR_ERR(h_file);
-+		else {
-+			err = au_sio_cpup_simple(dentry, a->btgt, sz,
-+						 AuCpup_DTIME, &a->pin);
-+			au_h_open_post(dentry, bstart, h_file);
-+		}
++		err = au_sio_cpup_simple_h_open(dentry, a->btgt, sz,
++						AuCpup_DTIME, &a->pin, bstart);
 +		if (!err)
 +			a->h_path.dentry = au_h_dptr(dentry, a->btgt);
 +	} else if (!hi_wh)
@@ -17490,7 +17499,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/i_op_ren.c
-@@ -0,0 +1,1053 @@
+@@ -0,0 +1,1045 @@
 +/*
 + * Copyright (C) 2005-2013 Junjiro R. Okajima
 + *
@@ -18454,26 +18463,18 @@
 +
 +	/* cpup src */
 +	if (a->src_bstart != a->btgt) {
-+		struct file *h_file;
 +		struct au_pin pin;
 +
 +		err = au_pin(&pin, a->src_dentry, a->btgt,
 +			     au_opt_udba(a->src_dentry->d_sb),
 +			     AuPin_DI_LOCKED | AuPin_MNT_WRITE);
-+		if (unlikely(err))
-+			goto out_children;
-+
-+		AuDebugOn(au_dbstart(a->src_dentry) != a->src_bstart);
-+		h_file = au_h_open_pre(a->src_dentry, a->src_bstart);
-+		if (IS_ERR(h_file)) {
-+			err = PTR_ERR(h_file);
-+			h_file = NULL;
-+		} else {
-+			err = au_sio_cpup_simple(a->src_dentry, a->btgt, -1,
-+						 AuCpup_DTIME, &pin);
-+			au_h_open_post(a->src_dentry, a->src_bstart, h_file);
++		if (!err) {
++			AuDebugOn(au_dbstart(a->src_dentry) != a->src_bstart);
++			err = au_sio_cpup_simple_h_open(a->src_dentry, a->btgt,
++							-1, AuCpup_DTIME, &pin,
++							a->src_bstart);
++			au_unpin(&pin);
 +		}
-+		au_unpin(&pin);
 +		if (unlikely(err))
 +			goto out_children;
 +		a->src_bstart = a->btgt;
@@ -30661,7 +30662,7 @@
 +
 +#include <linux/limits.h>
 +
-+#define AUFS_VERSION	"3.x-rcN-20130701"
++#define AUFS_VERSION	"3.10-20130708"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
