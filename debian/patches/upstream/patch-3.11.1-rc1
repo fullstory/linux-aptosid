@@ -1,0 +1,365 @@
+--- a/Documentation/hwmon/k10temp
++++ b/Documentation/hwmon/k10temp
+@@ -12,6 +12,7 @@ Supported chips:
+ * AMD Family 12h processors: "Llano" (E2/A4/A6/A8-Series)
+ * AMD Family 14h processors: "Brazos" (C/E/G/Z-Series)
+ * AMD Family 15h processors: "Bulldozer" (FX-Series), "Trinity"
++* AMD Family 16h processors: "Kabini"
+ 
+   Prefix: 'k10temp'
+   Addresses scanned: PCI space
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 3
+ PATCHLEVEL = 11
+-SUBLEVEL = 0
+-EXTRAVERSION =
++SUBLEVEL = 1
++EXTRAVERSION = -rc1
+ NAME = Linux for Workgroups
+ 
+ # *DOCUMENTATION*
+--- a/arch/x86/include/asm/xor_avx.h
++++ b/arch/x86/include/asm/xor_avx.h
+@@ -167,12 +167,12 @@ static struct xor_block_template xor_blo
+ 
+ #define AVX_XOR_SPEED \
+ do { \
+-	if (cpu_has_avx) \
++	if (cpu_has_avx && cpu_has_osxsave) \
+ 		xor_speed(&xor_block_avx); \
+ } while (0)
+ 
+ #define AVX_SELECT(FASTEST) \
+-	(cpu_has_avx ? &xor_block_avx : FASTEST)
++	(cpu_has_avx && cpu_has_osxsave ? &xor_block_avx : FASTEST)
+ 
+ #else
+ 
+--- a/drivers/acpi/ec.c
++++ b/drivers/acpi/ec.c
+@@ -987,6 +987,10 @@ static struct dmi_system_id __initdata e
+ 	ec_skip_dsdt_scan, "HP Folio 13", {
+ 	DMI_MATCH(DMI_SYS_VENDOR, "Hewlett-Packard"),
+ 	DMI_MATCH(DMI_PRODUCT_NAME, "HP Folio 13"),}, NULL},
++	{
++	ec_validate_ecdt, "ASUS hardware", {
++	DMI_MATCH(DMI_SYS_VENDOR, "ASUSTek Computer Inc."),
++	DMI_MATCH(DMI_PRODUCT_NAME, "L4R"),}, NULL},
+ 	{},
+ };
+ 
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -262,6 +262,13 @@ static void vmbus_process_offer(struct w
+ 	}
+ 
+ 	/*
++	 * This state is used to indicate a successful open
++	 * so that when we do close the channel normally, we
++	 * can cleanup properly
++	 */
++	newchannel->state = CHANNEL_OPEN_STATE;
++
++	/*
+ 	 * Start the process of binding this offer to the driver
+ 	 * We need to set the DeviceObject field before calling
+ 	 * vmbus_child_dev_add()
+@@ -287,13 +294,6 @@ static void vmbus_process_offer(struct w
+ 		kfree(newchannel->device_obj);
+ 
+ 		free_channel(newchannel);
+-	} else {
+-		/*
+-		 * This state is used to indicate a successful open
+-		 * so that when we do close the channel normally, we
+-		 * can cleanup properly
+-		 */
+-		newchannel->state = CHANNEL_OPEN_STATE;
+ 	}
+ }
+ 
+--- a/drivers/hwmon/Kconfig
++++ b/drivers/hwmon/Kconfig
+@@ -296,8 +296,8 @@ config SENSORS_K10TEMP
+ 	  If you say yes here you get support for the temperature
+ 	  sensor(s) inside your CPU. Supported are later revisions of
+ 	  the AMD Family 10h and all revisions of the AMD Family 11h,
+-	  12h (Llano), 14h (Brazos) and 15h (Bulldozer/Trinity)
+-	  microarchitectures.
++	  12h (Llano), 14h (Brazos), 15h (Bulldozer/Trinity) and
++	  16h (Kabini) microarchitectures.
+ 
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called k10temp.
+--- a/drivers/hwmon/k10temp.c
++++ b/drivers/hwmon/k10temp.c
+@@ -1,5 +1,5 @@
+ /*
+- * k10temp.c - AMD Family 10h/11h/12h/14h/15h processor hardware monitoring
++ * k10temp.c - AMD Family 10h/11h/12h/14h/15h/16h processor hardware monitoring
+  *
+  * Copyright (c) 2009 Clemens Ladisch <clemens@ladisch.de>
+  *
+@@ -211,6 +211,7 @@ static DEFINE_PCI_DEVICE_TABLE(k10temp_i
+ 	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_CNB17H_F3) },
+ 	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_15H_NB_F3) },
+ 	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_15H_M10H_F3) },
++	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_16H_NB_F3) },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(pci, k10temp_id_table);
+--- a/drivers/misc/hpilo.c
++++ b/drivers/misc/hpilo.c
+@@ -759,7 +759,7 @@ static int ilo_probe(struct pci_dev *pde
+ 
+ 	/* Ignore subsystem_device = 0x1979 (set by BIOS)  */
+ 	if (pdev->subsystem_device == 0x1979)
+-		goto out;
++		return 0;
+ 
+ 	if (max_ccb > MAX_CCB)
+ 		max_ccb = MAX_CCB;
+@@ -899,7 +899,7 @@ static void __exit ilo_exit(void)
+ 	class_destroy(ilo_class);
+ }
+ 
+-MODULE_VERSION("1.4");
++MODULE_VERSION("1.4.1");
+ MODULE_ALIAS(ILO_NAME);
+ MODULE_DESCRIPTION(ILO_NAME);
+ MODULE_AUTHOR("David Altobelli <david.altobelli@hp.com>");
+--- a/drivers/misc/mei/hw-me.c
++++ b/drivers/misc/mei/hw-me.c
+@@ -176,21 +176,18 @@ static int mei_me_hw_reset(struct mei_de
+ 	struct mei_me_hw *hw = to_me_hw(dev);
+ 	u32 hcsr = mei_hcsr_read(hw);
+ 
+-	dev_dbg(&dev->pdev->dev, "before reset HCSR = 0x%08x.\n", hcsr);
+-
+-	hcsr |= (H_RST | H_IG);
++	hcsr |= H_RST | H_IG | H_IS;
+ 
+ 	if (intr_enable)
+ 		hcsr |= H_IE;
+ 	else
+-		hcsr |= ~H_IE;
++		hcsr &= ~H_IE;
+ 
+-	mei_hcsr_set(hw, hcsr);
++	mei_me_reg_write(hw, H_CSR, hcsr);
+ 
+ 	if (dev->dev_state == MEI_DEV_POWER_DOWN)
+ 		mei_me_hw_reset_release(dev);
+ 
+-	dev_dbg(&dev->pdev->dev, "current HCSR = 0x%08x.\n", mei_hcsr_read(hw));
+ 	return 0;
+ }
+ 
+--- a/drivers/net/wireless/mwifiex/main.c
++++ b/drivers/net/wireless/mwifiex/main.c
+@@ -458,20 +458,6 @@ static void mwifiex_fw_dpc(const struct
+ 		dev_err(adapter->dev, "cannot create default STA interface\n");
+ 		goto err_add_intf;
+ 	}
+-
+-	/* Create AP interface by default */
+-	if (!mwifiex_add_virtual_intf(adapter->wiphy, "uap%d",
+-				      NL80211_IFTYPE_AP, NULL, NULL)) {
+-		dev_err(adapter->dev, "cannot create default AP interface\n");
+-		goto err_add_intf;
+-	}
+-
+-	/* Create P2P interface by default */
+-	if (!mwifiex_add_virtual_intf(adapter->wiphy, "p2p%d",
+-				      NL80211_IFTYPE_P2P_CLIENT, NULL, NULL)) {
+-		dev_err(adapter->dev, "cannot create default P2P interface\n");
+-		goto err_add_intf;
+-	}
+ 	rtnl_unlock();
+ 
+ 	mwifiex_drv_get_driver_version(adapter, fmt, sizeof(fmt) - 1);
+--- a/drivers/rtc/rtc-max77686.c
++++ b/drivers/rtc/rtc-max77686.c
+@@ -240,9 +240,9 @@ static int max77686_rtc_read_alarm(struc
+ 	}
+ 
+ 	alrm->pending = 0;
+-	ret = regmap_read(info->max77686->regmap, MAX77686_REG_STATUS1, &val);
++	ret = regmap_read(info->max77686->regmap, MAX77686_REG_STATUS2, &val);
+ 	if (ret < 0) {
+-		dev_err(info->dev, "%s:%d fail to read status1 reg(%d)\n",
++		dev_err(info->dev, "%s:%d fail to read status2 reg(%d)\n",
+ 				__func__, __LINE__, ret);
+ 		goto out;
+ 	}
+--- a/drivers/staging/imx-drm/imx-drm-core.c
++++ b/drivers/staging/imx-drm/imx-drm-core.c
+@@ -678,6 +678,7 @@ found:
+ 
+ 	return i;
+ }
++EXPORT_SYMBOL_GPL(imx_drm_encoder_get_mux_id);
+ 
+ /*
+  * imx_drm_remove_encoder - remove an encoder
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@ -1086,7 +1086,6 @@ int iscsit_process_scsi_cmd(struct iscsi
+ 		if (cmd->reject_reason)
+ 			return 0;
+ 
+-		target_put_sess_cmd(conn->sess->se_sess, &cmd->se_cmd);
+ 		return 1;
+ 	}
+ 	/*
+@@ -1124,14 +1123,10 @@ after_immediate_data:
+ 		 */
+ 		cmdsn_ret = iscsit_sequence_cmd(cmd->conn, cmd,
+ 					(unsigned char *)hdr, hdr->cmdsn);
+-		if (cmdsn_ret == CMDSN_ERROR_CANNOT_RECOVER) {
++		if (cmdsn_ret == CMDSN_ERROR_CANNOT_RECOVER)
+ 			return -1;
+-		} else if (cmdsn_ret == CMDSN_LOWER_THAN_EXP) {
+-			target_put_sess_cmd(conn->sess->se_sess, &cmd->se_cmd);
+-			return 0;
+-		}
+ 
+-		if (cmd->sense_reason) {
++		if (cmd->sense_reason || cmdsn_ret == CMDSN_LOWER_THAN_EXP) {
+ 			int rc;
+ 
+ 			rc = iscsit_dump_data_payload(cmd->conn,
+@@ -1527,6 +1522,10 @@ int iscsit_setup_nop_out(struct iscsi_co
+ 	if (hdr->itt == RESERVED_ITT && !(hdr->opcode & ISCSI_OP_IMMEDIATE)) {
+ 		pr_err("NOPOUT ITT is reserved, but Immediate Bit is"
+ 			" not set, protocol error.\n");
++		if (!cmd)
++			return iscsit_add_reject(conn, ISCSI_REASON_PROTOCOL_ERROR,
++						 (unsigned char *)hdr);
++
+ 		return iscsit_reject_cmd(cmd, ISCSI_REASON_PROTOCOL_ERROR,
+ 					 (unsigned char *)hdr);
+ 	}
+@@ -1536,6 +1535,10 @@ int iscsit_setup_nop_out(struct iscsi_co
+ 			" greater than MaxXmitDataSegmentLength: %u, protocol"
+ 			" error.\n", payload_length,
+ 			conn->conn_ops->MaxXmitDataSegmentLength);
++		if (!cmd)
++			return iscsit_add_reject(conn, ISCSI_REASON_PROTOCOL_ERROR,
++						 (unsigned char *)hdr);
++
+ 		return iscsit_reject_cmd(cmd, ISCSI_REASON_PROTOCOL_ERROR,
+ 					 (unsigned char *)hdr);
+ 	}
+--- a/drivers/target/iscsi/iscsi_target_login.c
++++ b/drivers/target/iscsi/iscsi_target_login.c
+@@ -1163,12 +1163,11 @@ static int __iscsi_target_login_thread(s
+ 		if (np->np_thread_state == ISCSI_NP_THREAD_RESET) {
+ 			spin_unlock_bh(&np->np_thread_lock);
+ 			complete(&np->np_restart_comp);
+-			if (ret == -ENODEV) {
+-				iscsit_put_transport(conn->conn_transport);
+-				kfree(conn);
+-				conn = NULL;
++			iscsit_put_transport(conn->conn_transport);
++			kfree(conn);
++			conn = NULL;
++			if (ret == -ENODEV)
+ 				goto out;
+-			}
+ 			/* Get another socket */
+ 			return 1;
+ 		}
+--- a/drivers/target/target_core_spc.c
++++ b/drivers/target/target_core_spc.c
+@@ -97,9 +97,12 @@ spc_emulate_inquiry_std(struct se_cmd *c
+ 
+ 	buf[7] = 0x2; /* CmdQue=1 */
+ 
+-	snprintf(&buf[8], 8, "LIO-ORG");
+-	snprintf(&buf[16], 16, "%s", dev->t10_wwn.model);
+-	snprintf(&buf[32], 4, "%s", dev->t10_wwn.revision);
++	memcpy(&buf[8], "LIO-ORG ", 8);
++	memset(&buf[16], 0x20, 16);
++	memcpy(&buf[16], dev->t10_wwn.model,
++	       min_t(size_t, strlen(dev->t10_wwn.model), 16));
++	memcpy(&buf[32], dev->t10_wwn.revision,
++	       min_t(size_t, strlen(dev->t10_wwn.revision), 4));
+ 	buf[4] = 31; /* Set additional length to 31 */
+ 
+ 	return 0;
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -2134,6 +2134,7 @@ static void transport_write_pending_qf(s
+ 
+ int transport_generic_free_cmd(struct se_cmd *cmd, int wait_for_tasks)
+ {
++	unsigned long flags;
+ 	int ret = 0;
+ 
+ 	if (!(cmd->se_cmd_flags & SCF_SE_LUN_CMD)) {
+@@ -2144,6 +2145,16 @@ int transport_generic_free_cmd(struct se
+ 	} else {
+ 		if (wait_for_tasks)
+ 			transport_wait_for_tasks(cmd);
++		/*
++		 * Handle WRITE failure case where transport_generic_new_cmd()
++		 * has already added se_cmd to state_list, but fabric has
++		 * failed command before I/O submission.
++		 */
++		if (cmd->state_active) {
++			spin_lock_irqsave(&cmd->t_state_lock, flags);
++			target_remove_from_state_list(cmd);
++			spin_unlock_irqrestore(&cmd->t_state_lock, flags);
++		}
+ 
+ 		if (cmd->se_lun)
+ 			transport_lun_remove_cmd(cmd);
+--- a/drivers/usb/gadget/f_acm.c
++++ b/drivers/usb/gadget/f_acm.c
+@@ -285,6 +285,7 @@ static struct usb_string acm_string_defs
+ 	[ACM_CTRL_IDX].s = "CDC Abstract Control Model (ACM)",
+ 	[ACM_DATA_IDX].s = "CDC ACM Data",
+ 	[ACM_IAD_IDX ].s = "CDC Serial",
++	{  } /* end of list */
+ };
+ 
+ static struct usb_gadget_strings acm_string_table = {
+--- a/sound/soc/fsl/Kconfig
++++ b/sound/soc/fsl/Kconfig
+@@ -109,11 +109,11 @@ config SND_SOC_IMX_SSI
+ 	tristate
+ 
+ config SND_SOC_IMX_PCM_FIQ
+-	bool
++	tristate
+ 	select FIQ
+ 
+ config SND_SOC_IMX_PCM_DMA
+-	bool
++	tristate
+ 	select SND_SOC_GENERIC_DMAENGINE_PCM
+ 
+ config SND_SOC_IMX_AUDMUX
+--- a/sound/soc/fsl/imx-pcm.h
++++ b/sound/soc/fsl/imx-pcm.h
+@@ -32,7 +32,7 @@ imx_pcm_dma_params_init_data(struct imx_
+ 		dma_data->peripheral_type = IMX_DMATYPE_SSI;
+ }
+ 
+-#ifdef CONFIG_SND_SOC_IMX_PCM_DMA
++#if IS_ENABLED(CONFIG_SND_SOC_IMX_PCM_DMA)
+ int imx_pcm_dma_init(struct platform_device *pdev);
+ void imx_pcm_dma_exit(struct platform_device *pdev);
+ #else
+@@ -46,7 +46,7 @@ static inline void imx_pcm_dma_exit(stru
+ }
+ #endif
+ 
+-#ifdef CONFIG_SND_SOC_IMX_PCM_FIQ
++#if IS_ENABLED(CONFIG_SND_SOC_IMX_PCM_FIQ)
+ int imx_pcm_fiq_init(struct platform_device *pdev);
+ void imx_pcm_fiq_exit(struct platform_device *pdev);
+ #else
