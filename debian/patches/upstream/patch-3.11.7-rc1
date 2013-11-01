@@ -1,0 +1,2201 @@
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -478,6 +478,15 @@ tcp_syn_retries - INTEGER
+ tcp_timestamps - BOOLEAN
+ 	Enable timestamps as defined in RFC1323.
+ 
++tcp_min_tso_segs - INTEGER
++	Minimal number of segments per TSO frame.
++	Since linux-3.12, TCP does an automatic sizing of TSO frames,
++	depending on flow rate, instead of filling 64Kbytes packets.
++	For specific usages, it's possible to force TCP to build big
++	TSO frames. Note that TCP stack might split too big TSO packets
++	if available window is too small.
++	Default: 2
++
+ tcp_tso_win_divisor - INTEGER
+ 	This allows control over what percentage of the congestion window
+ 	can be consumed by a single TSO frame.
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 3
+ PATCHLEVEL = 11
+-SUBLEVEL = 6
+-EXTRAVERSION =
++SUBLEVEL = 7
++EXTRAVERSION = -rc1
+ NAME = Linux for Workgroups
+ 
+ # *DOCUMENTATION*
+--- a/arch/arm/boot/dts/integratorcp.dts
++++ b/arch/arm/boot/dts/integratorcp.dts
+@@ -9,11 +9,6 @@
+ 	model = "ARM Integrator/CP";
+ 	compatible = "arm,integrator-cp";
+ 
+-	aliases {
+-		arm,timer-primary = &timer2;
+-		arm,timer-secondary = &timer1;
+-	};
+-
+ 	chosen {
+ 		bootargs = "root=/dev/ram0 console=ttyAMA0,38400n8 earlyprintk";
+ 	};
+@@ -24,14 +19,18 @@
+ 	};
+ 
+ 	timer0: timer@13000000 {
++		/* TIMER0 runs @ 25MHz */
+ 		compatible = "arm,integrator-cp-timer";
++		status = "disabled";
+ 	};
+ 
+ 	timer1: timer@13000100 {
++		/* TIMER1 runs @ 1MHz */
+ 		compatible = "arm,integrator-cp-timer";
+ 	};
+ 
+ 	timer2: timer@13000200 {
++		/* TIMER2 runs @ 1MHz */
+ 		compatible = "arm,integrator-cp-timer";
+ 	};
+ 
+--- a/arch/arm/include/asm/syscall.h
++++ b/arch/arm/include/asm/syscall.h
+@@ -57,6 +57,9 @@ static inline void syscall_get_arguments
+ 					 unsigned int i, unsigned int n,
+ 					 unsigned long *args)
+ {
++	if (n == 0)
++		return;
++
+ 	if (i + n > SYSCALL_MAX_ARGS) {
+ 		unsigned long *args_bad = args + SYSCALL_MAX_ARGS - i;
+ 		unsigned int n_bad = n + i - SYSCALL_MAX_ARGS;
+@@ -81,6 +84,9 @@ static inline void syscall_set_arguments
+ 					 unsigned int i, unsigned int n,
+ 					 const unsigned long *args)
+ {
++	if (n == 0)
++		return;
++
+ 	if (i + n > SYSCALL_MAX_ARGS) {
+ 		pr_warning("%s called with max args %d, handling only %d\n",
+ 			   __func__, i + n, SYSCALL_MAX_ARGS);
+--- a/drivers/connector/cn_proc.c
++++ b/drivers/connector/cn_proc.c
+@@ -65,6 +65,7 @@ void proc_fork_connector(struct task_str
+ 
+ 	msg = (struct cn_msg *)buffer;
+ 	ev = (struct proc_event *)msg->data;
++	memset(&ev->event_data, 0, sizeof(ev->event_data));
+ 	get_seq(&msg->seq, &ev->cpu);
+ 	ktime_get_ts(&ts); /* get high res monotonic timestamp */
+ 	put_unaligned(timespec_to_ns(&ts), (__u64 *)&ev->timestamp_ns);
+@@ -80,6 +81,7 @@ void proc_fork_connector(struct task_str
+ 	memcpy(&msg->id, &cn_proc_event_id, sizeof(msg->id));
+ 	msg->ack = 0; /* not used */
+ 	msg->len = sizeof(*ev);
++	msg->flags = 0; /* not used */
+ 	/*  If cn_netlink_send() failed, the data is not sent */
+ 	cn_netlink_send(msg, CN_IDX_PROC, GFP_KERNEL);
+ }
+@@ -96,6 +98,7 @@ void proc_exec_connector(struct task_str
+ 
+ 	msg = (struct cn_msg *)buffer;
+ 	ev = (struct proc_event *)msg->data;
++	memset(&ev->event_data, 0, sizeof(ev->event_data));
+ 	get_seq(&msg->seq, &ev->cpu);
+ 	ktime_get_ts(&ts); /* get high res monotonic timestamp */
+ 	put_unaligned(timespec_to_ns(&ts), (__u64 *)&ev->timestamp_ns);
+@@ -106,6 +109,7 @@ void proc_exec_connector(struct task_str
+ 	memcpy(&msg->id, &cn_proc_event_id, sizeof(msg->id));
+ 	msg->ack = 0; /* not used */
+ 	msg->len = sizeof(*ev);
++	msg->flags = 0; /* not used */
+ 	cn_netlink_send(msg, CN_IDX_PROC, GFP_KERNEL);
+ }
+ 
+@@ -122,6 +126,7 @@ void proc_id_connector(struct task_struc
+ 
+ 	msg = (struct cn_msg *)buffer;
+ 	ev = (struct proc_event *)msg->data;
++	memset(&ev->event_data, 0, sizeof(ev->event_data));
+ 	ev->what = which_id;
+ 	ev->event_data.id.process_pid = task->pid;
+ 	ev->event_data.id.process_tgid = task->tgid;
+@@ -145,6 +150,7 @@ void proc_id_connector(struct task_struc
+ 	memcpy(&msg->id, &cn_proc_event_id, sizeof(msg->id));
+ 	msg->ack = 0; /* not used */
+ 	msg->len = sizeof(*ev);
++	msg->flags = 0; /* not used */
+ 	cn_netlink_send(msg, CN_IDX_PROC, GFP_KERNEL);
+ }
+ 
+@@ -160,6 +166,7 @@ void proc_sid_connector(struct task_stru
+ 
+ 	msg = (struct cn_msg *)buffer;
+ 	ev = (struct proc_event *)msg->data;
++	memset(&ev->event_data, 0, sizeof(ev->event_data));
+ 	get_seq(&msg->seq, &ev->cpu);
+ 	ktime_get_ts(&ts); /* get high res monotonic timestamp */
+ 	put_unaligned(timespec_to_ns(&ts), (__u64 *)&ev->timestamp_ns);
+@@ -170,6 +177,7 @@ void proc_sid_connector(struct task_stru
+ 	memcpy(&msg->id, &cn_proc_event_id, sizeof(msg->id));
+ 	msg->ack = 0; /* not used */
+ 	msg->len = sizeof(*ev);
++	msg->flags = 0; /* not used */
+ 	cn_netlink_send(msg, CN_IDX_PROC, GFP_KERNEL);
+ }
+ 
+@@ -185,6 +193,7 @@ void proc_ptrace_connector(struct task_s
+ 
+ 	msg = (struct cn_msg *)buffer;
+ 	ev = (struct proc_event *)msg->data;
++	memset(&ev->event_data, 0, sizeof(ev->event_data));
+ 	get_seq(&msg->seq, &ev->cpu);
+ 	ktime_get_ts(&ts); /* get high res monotonic timestamp */
+ 	put_unaligned(timespec_to_ns(&ts), (__u64 *)&ev->timestamp_ns);
+@@ -203,6 +212,7 @@ void proc_ptrace_connector(struct task_s
+ 	memcpy(&msg->id, &cn_proc_event_id, sizeof(msg->id));
+ 	msg->ack = 0; /* not used */
+ 	msg->len = sizeof(*ev);
++	msg->flags = 0; /* not used */
+ 	cn_netlink_send(msg, CN_IDX_PROC, GFP_KERNEL);
+ }
+ 
+@@ -218,6 +228,7 @@ void proc_comm_connector(struct task_str
+ 
+ 	msg = (struct cn_msg *)buffer;
+ 	ev = (struct proc_event *)msg->data;
++	memset(&ev->event_data, 0, sizeof(ev->event_data));
+ 	get_seq(&msg->seq, &ev->cpu);
+ 	ktime_get_ts(&ts); /* get high res monotonic timestamp */
+ 	put_unaligned(timespec_to_ns(&ts), (__u64 *)&ev->timestamp_ns);
+@@ -229,6 +240,7 @@ void proc_comm_connector(struct task_str
+ 	memcpy(&msg->id, &cn_proc_event_id, sizeof(msg->id));
+ 	msg->ack = 0; /* not used */
+ 	msg->len = sizeof(*ev);
++	msg->flags = 0; /* not used */
+ 	cn_netlink_send(msg, CN_IDX_PROC, GFP_KERNEL);
+ }
+ 
+@@ -244,6 +256,7 @@ void proc_coredump_connector(struct task
+ 
+ 	msg = (struct cn_msg *)buffer;
+ 	ev = (struct proc_event *)msg->data;
++	memset(&ev->event_data, 0, sizeof(ev->event_data));
+ 	get_seq(&msg->seq, &ev->cpu);
+ 	ktime_get_ts(&ts); /* get high res monotonic timestamp */
+ 	put_unaligned(timespec_to_ns(&ts), (__u64 *)&ev->timestamp_ns);
+@@ -254,6 +267,7 @@ void proc_coredump_connector(struct task
+ 	memcpy(&msg->id, &cn_proc_event_id, sizeof(msg->id));
+ 	msg->ack = 0; /* not used */
+ 	msg->len = sizeof(*ev);
++	msg->flags = 0; /* not used */
+ 	cn_netlink_send(msg, CN_IDX_PROC, GFP_KERNEL);
+ }
+ 
+@@ -269,6 +283,7 @@ void proc_exit_connector(struct task_str
+ 
+ 	msg = (struct cn_msg *)buffer;
+ 	ev = (struct proc_event *)msg->data;
++	memset(&ev->event_data, 0, sizeof(ev->event_data));
+ 	get_seq(&msg->seq, &ev->cpu);
+ 	ktime_get_ts(&ts); /* get high res monotonic timestamp */
+ 	put_unaligned(timespec_to_ns(&ts), (__u64 *)&ev->timestamp_ns);
+@@ -281,6 +296,7 @@ void proc_exit_connector(struct task_str
+ 	memcpy(&msg->id, &cn_proc_event_id, sizeof(msg->id));
+ 	msg->ack = 0; /* not used */
+ 	msg->len = sizeof(*ev);
++	msg->flags = 0; /* not used */
+ 	cn_netlink_send(msg, CN_IDX_PROC, GFP_KERNEL);
+ }
+ 
+@@ -304,6 +320,7 @@ static void cn_proc_ack(int err, int rcv
+ 
+ 	msg = (struct cn_msg *)buffer;
+ 	ev = (struct proc_event *)msg->data;
++	memset(&ev->event_data, 0, sizeof(ev->event_data));
+ 	msg->seq = rcvd_seq;
+ 	ktime_get_ts(&ts); /* get high res monotonic timestamp */
+ 	put_unaligned(timespec_to_ns(&ts), (__u64 *)&ev->timestamp_ns);
+@@ -313,6 +330,7 @@ static void cn_proc_ack(int err, int rcv
+ 	memcpy(&msg->id, &cn_proc_event_id, sizeof(msg->id));
+ 	msg->ack = rcvd_ack + 1;
+ 	msg->len = sizeof(*ev);
++	msg->flags = 0; /* not used */
+ 	cn_netlink_send(msg, CN_IDX_PROC, GFP_KERNEL);
+ }
+ 
+--- a/drivers/connector/connector.c
++++ b/drivers/connector/connector.c
+@@ -157,17 +157,18 @@ static int cn_call_callback(struct sk_bu
+ static void cn_rx_skb(struct sk_buff *__skb)
+ {
+ 	struct nlmsghdr *nlh;
+-	int err;
+ 	struct sk_buff *skb;
++	int len, err;
+ 
+ 	skb = skb_get(__skb);
+ 
+ 	if (skb->len >= NLMSG_HDRLEN) {
+ 		nlh = nlmsg_hdr(skb);
++		len = nlmsg_len(nlh);
+ 
+-		if (nlh->nlmsg_len < sizeof(struct cn_msg) ||
++		if (len < (int)sizeof(struct cn_msg) ||
+ 		    skb->len < nlh->nlmsg_len ||
+-		    nlh->nlmsg_len > CONNECTOR_MAX_MSG_SIZE) {
++		    len > CONNECTOR_MAX_MSG_SIZE) {
+ 			kfree_skb(skb);
+ 			return;
+ 		}
+--- a/drivers/gpio/gpio-lynxpoint.c
++++ b/drivers/gpio/gpio-lynxpoint.c
+@@ -248,14 +248,15 @@ static void lp_gpio_irq_handler(unsigned
+ 	struct lp_gpio *lg = irq_data_get_irq_handler_data(data);
+ 	struct irq_chip *chip = irq_data_get_irq_chip(data);
+ 	u32 base, pin, mask;
+-	unsigned long reg, pending;
++	unsigned long reg, ena, pending;
+ 	unsigned virq;
+ 
+ 	/* check from GPIO controller which pin triggered the interrupt */
+ 	for (base = 0; base < lg->chip.ngpio; base += 32) {
+ 		reg = lp_gpio_reg(&lg->chip, base, LP_INT_STAT);
++		ena = lp_gpio_reg(&lg->chip, base, LP_INT_ENABLE);
+ 
+-		while ((pending = inl(reg))) {
++		while ((pending = (inl(reg) & inl(ena)))) {
+ 			pin = __ffs(pending);
+ 			mask = BIT(pin);
+ 			/* Clear before handling so we don't lose an edge */
+--- a/drivers/i2c/busses/i2c-ismt.c
++++ b/drivers/i2c/busses/i2c-ismt.c
+@@ -393,6 +393,9 @@ static int ismt_access(struct i2c_adapte
+ 
+ 	desc = &priv->hw[priv->head];
+ 
++	/* Initialize the DMA buffer */
++	memset(priv->dma_buffer, 0, sizeof(priv->dma_buffer));
++
+ 	/* Initialize the descriptor */
+ 	memset(desc, 0, sizeof(struct ismt_desc));
+ 	desc->tgtaddr_rw = ISMT_DESC_ADDR_RW(addr, read_write);
+--- a/drivers/md/dm-snap-persistent.c
++++ b/drivers/md/dm-snap-persistent.c
+@@ -269,6 +269,14 @@ static chunk_t area_location(struct psto
+ 	return NUM_SNAPSHOT_HDR_CHUNKS + ((ps->exceptions_per_area + 1) * area);
+ }
+ 
++static void skip_metadata(struct pstore *ps)
++{
++	uint32_t stride = ps->exceptions_per_area + 1;
++	chunk_t next_free = ps->next_free;
++	if (sector_div(next_free, stride) == NUM_SNAPSHOT_HDR_CHUNKS)
++		ps->next_free++;
++}
++
+ /*
+  * Read or write a metadata area.  Remembering to skip the first
+  * chunk which holds the header.
+@@ -502,6 +510,8 @@ static int read_exceptions(struct pstore
+ 
+ 	ps->current_area--;
+ 
++	skip_metadata(ps);
++
+ 	return 0;
+ }
+ 
+@@ -616,8 +626,6 @@ static int persistent_prepare_exception(
+ 					struct dm_exception *e)
+ {
+ 	struct pstore *ps = get_info(store);
+-	uint32_t stride;
+-	chunk_t next_free;
+ 	sector_t size = get_dev_size(dm_snap_cow(store->snap)->bdev);
+ 
+ 	/* Is there enough room ? */
+@@ -630,10 +638,8 @@ static int persistent_prepare_exception(
+ 	 * Move onto the next free pending, making sure to take
+ 	 * into account the location of the metadata chunks.
+ 	 */
+-	stride = (ps->exceptions_per_area + 1);
+-	next_free = ++ps->next_free;
+-	if (sector_div(next_free, stride) == 1)
+-		ps->next_free++;
++	ps->next_free++;
++	skip_metadata(ps);
+ 
+ 	atomic_inc(&ps->pending_count);
+ 	return 0;
+--- a/drivers/net/can/dev.c
++++ b/drivers/net/can/dev.c
+@@ -705,14 +705,14 @@ static size_t can_get_size(const struct
+ 	size_t size;
+ 
+ 	size = nla_total_size(sizeof(u32));   /* IFLA_CAN_STATE */
+-	size += sizeof(struct can_ctrlmode);  /* IFLA_CAN_CTRLMODE */
++	size += nla_total_size(sizeof(struct can_ctrlmode));  /* IFLA_CAN_CTRLMODE */
+ 	size += nla_total_size(sizeof(u32));  /* IFLA_CAN_RESTART_MS */
+-	size += sizeof(struct can_bittiming); /* IFLA_CAN_BITTIMING */
+-	size += sizeof(struct can_clock);     /* IFLA_CAN_CLOCK */
++	size += nla_total_size(sizeof(struct can_bittiming)); /* IFLA_CAN_BITTIMING */
++	size += nla_total_size(sizeof(struct can_clock));     /* IFLA_CAN_CLOCK */
+ 	if (priv->do_get_berr_counter)        /* IFLA_CAN_BERR_COUNTER */
+-		size += sizeof(struct can_berr_counter);
++		size += nla_total_size(sizeof(struct can_berr_counter));
+ 	if (priv->bittiming_const)	      /* IFLA_CAN_BITTIMING_CONST */
+-		size += sizeof(struct can_bittiming_const);
++		size += nla_total_size(sizeof(struct can_bittiming_const));
+ 
+ 	return size;
+ }
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+@@ -676,6 +676,7 @@ static void bnx2x_gro_receive(struct bnx
+ 		}
+ 	}
+ #endif
++	skb_record_rx_queue(skb, fp->rx_queue);
+ 	napi_gro_receive(&fp->napi, skb);
+ }
+ 
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.c
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.c
+@@ -1150,7 +1150,6 @@ int be_cmd_txq_create(struct be_adapter
+ 
+ 	if (lancer_chip(adapter)) {
+ 		req->hdr.version = 1;
+-		req->if_id = cpu_to_le16(adapter->if_handle);
+ 	} else if (BEx_chip(adapter)) {
+ 		if (adapter->function_caps & BE_FUNCTION_CAPS_SUPER_NIC)
+ 			req->hdr.version = 2;
+@@ -1158,6 +1157,8 @@ int be_cmd_txq_create(struct be_adapter
+ 		req->hdr.version = 2;
+ 	}
+ 
++	if (req->hdr.version > 0)
++		req->if_id = cpu_to_le16(adapter->if_handle);
+ 	req->num_pages = PAGES_4K_SPANNED(q_mem->va, q_mem->size);
+ 	req->ulp_num = BE_ULP1_NUM;
+ 	req->type = BE_ETH_TX_RING_TYPE_STANDARD;
+--- a/drivers/net/ethernet/marvell/mv643xx_eth.c
++++ b/drivers/net/ethernet/marvell/mv643xx_eth.c
+@@ -1131,15 +1131,13 @@ static void mib_counters_update(struct m
+ 	p->rx_discard += rdlp(mp, RX_DISCARD_FRAME_CNT);
+ 	p->rx_overrun += rdlp(mp, RX_OVERRUN_FRAME_CNT);
+ 	spin_unlock_bh(&mp->mib_counters_lock);
+-
+-	mod_timer(&mp->mib_counters_timer, jiffies + 30 * HZ);
+ }
+ 
+ static void mib_counters_timer_wrapper(unsigned long _mp)
+ {
+ 	struct mv643xx_eth_private *mp = (void *)_mp;
+-
+ 	mib_counters_update(mp);
++	mod_timer(&mp->mib_counters_timer, jiffies + 30 * HZ);
+ }
+ 
+ 
+@@ -2237,6 +2235,7 @@ static int mv643xx_eth_open(struct net_d
+ 		mp->int_mask |= INT_TX_END_0 << i;
+ 	}
+ 
++	add_timer(&mp->mib_counters_timer);
+ 	port_start(mp);
+ 
+ 	wrlp(mp, INT_MASK_EXT, INT_EXT_LINK_PHY | INT_EXT_TX);
+@@ -2916,7 +2915,6 @@ static int mv643xx_eth_probe(struct plat
+ 	mp->mib_counters_timer.data = (unsigned long)mp;
+ 	mp->mib_counters_timer.function = mib_counters_timer_wrapper;
+ 	mp->mib_counters_timer.expires = jiffies + 30 * HZ;
+-	add_timer(&mp->mib_counters_timer);
+ 
+ 	spin_lock_init(&mp->mib_counters_lock);
+ 
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@ -70,14 +70,15 @@ static int mlx4_alloc_pages(struct mlx4_
+ 		put_page(page);
+ 		return -ENOMEM;
+ 	}
+-	page_alloc->size = PAGE_SIZE << order;
++	page_alloc->page_size = PAGE_SIZE << order;
+ 	page_alloc->page = page;
+ 	page_alloc->dma = dma;
+-	page_alloc->offset = frag_info->frag_align;
++	page_alloc->page_offset = frag_info->frag_align;
+ 	/* Not doing get_page() for each frag is a big win
+ 	 * on asymetric workloads.
+ 	 */
+-	atomic_set(&page->_count, page_alloc->size / frag_info->frag_stride);
++	atomic_set(&page->_count,
++		   page_alloc->page_size / frag_info->frag_stride);
+ 	return 0;
+ }
+ 
+@@ -96,16 +97,19 @@ static int mlx4_en_alloc_frags(struct ml
+ 	for (i = 0; i < priv->num_frags; i++) {
+ 		frag_info = &priv->frag_info[i];
+ 		page_alloc[i] = ring_alloc[i];
+-		page_alloc[i].offset += frag_info->frag_stride;
+-		if (page_alloc[i].offset + frag_info->frag_stride <= ring_alloc[i].size)
++		page_alloc[i].page_offset += frag_info->frag_stride;
++
++		if (page_alloc[i].page_offset + frag_info->frag_stride <=
++		    ring_alloc[i].page_size)
+ 			continue;
++
+ 		if (mlx4_alloc_pages(priv, &page_alloc[i], frag_info, gfp))
+ 			goto out;
+ 	}
+ 
+ 	for (i = 0; i < priv->num_frags; i++) {
+ 		frags[i] = ring_alloc[i];
+-		dma = ring_alloc[i].dma + ring_alloc[i].offset;
++		dma = ring_alloc[i].dma + ring_alloc[i].page_offset;
+ 		ring_alloc[i] = page_alloc[i];
+ 		rx_desc->data[i].addr = cpu_to_be64(dma);
+ 	}
+@@ -117,7 +121,7 @@ out:
+ 		frag_info = &priv->frag_info[i];
+ 		if (page_alloc[i].page != ring_alloc[i].page) {
+ 			dma_unmap_page(priv->ddev, page_alloc[i].dma,
+-				page_alloc[i].size, PCI_DMA_FROMDEVICE);
++				page_alloc[i].page_size, PCI_DMA_FROMDEVICE);
+ 			page = page_alloc[i].page;
+ 			atomic_set(&page->_count, 1);
+ 			put_page(page);
+@@ -131,10 +135,12 @@ static void mlx4_en_free_frag(struct mlx
+ 			      int i)
+ {
+ 	const struct mlx4_en_frag_info *frag_info = &priv->frag_info[i];
++	u32 next_frag_end = frags[i].page_offset + 2 * frag_info->frag_stride;
++
+ 
+-	if (frags[i].offset + frag_info->frag_stride > frags[i].size)
+-		dma_unmap_page(priv->ddev, frags[i].dma, frags[i].size,
+-					 PCI_DMA_FROMDEVICE);
++	if (next_frag_end > frags[i].page_size)
++		dma_unmap_page(priv->ddev, frags[i].dma, frags[i].page_size,
++			       PCI_DMA_FROMDEVICE);
+ 
+ 	if (frags[i].page)
+ 		put_page(frags[i].page);
+@@ -161,7 +167,7 @@ out:
+ 
+ 		page_alloc = &ring->page_alloc[i];
+ 		dma_unmap_page(priv->ddev, page_alloc->dma,
+-			       page_alloc->size, PCI_DMA_FROMDEVICE);
++			       page_alloc->page_size, PCI_DMA_FROMDEVICE);
+ 		page = page_alloc->page;
+ 		atomic_set(&page->_count, 1);
+ 		put_page(page);
+@@ -184,10 +190,11 @@ static void mlx4_en_destroy_allocator(st
+ 		       i, page_count(page_alloc->page));
+ 
+ 		dma_unmap_page(priv->ddev, page_alloc->dma,
+-				page_alloc->size, PCI_DMA_FROMDEVICE);
+-		while (page_alloc->offset + frag_info->frag_stride < page_alloc->size) {
++				page_alloc->page_size, PCI_DMA_FROMDEVICE);
++		while (page_alloc->page_offset + frag_info->frag_stride <
++		       page_alloc->page_size) {
+ 			put_page(page_alloc->page);
+-			page_alloc->offset += frag_info->frag_stride;
++			page_alloc->page_offset += frag_info->frag_stride;
+ 		}
+ 		page_alloc->page = NULL;
+ 	}
+@@ -478,7 +485,7 @@ static int mlx4_en_complete_rx_desc(stru
+ 		/* Save page reference in skb */
+ 		__skb_frag_set_page(&skb_frags_rx[nr], frags[nr].page);
+ 		skb_frag_size_set(&skb_frags_rx[nr], frag_info->frag_size);
+-		skb_frags_rx[nr].page_offset = frags[nr].offset;
++		skb_frags_rx[nr].page_offset = frags[nr].page_offset;
+ 		skb->truesize += frag_info->frag_stride;
+ 		frags[nr].page = NULL;
+ 	}
+@@ -517,7 +524,7 @@ static struct sk_buff *mlx4_en_rx_skb(st
+ 
+ 	/* Get pointer to first fragment so we could copy the headers into the
+ 	 * (linear part of the) skb */
+-	va = page_address(frags[0].page) + frags[0].offset;
++	va = page_address(frags[0].page) + frags[0].page_offset;
+ 
+ 	if (length <= SMALL_PACKET_SIZE) {
+ 		/* We are copying all relevant data to the skb - temporarily
+@@ -645,7 +652,7 @@ int mlx4_en_process_rx_cq(struct net_dev
+ 			dma_sync_single_for_cpu(priv->ddev, dma, sizeof(*ethh),
+ 						DMA_FROM_DEVICE);
+ 			ethh = (struct ethhdr *)(page_address(frags[0].page) +
+-						 frags[0].offset);
++						 frags[0].page_offset);
+ 
+ 			if (is_multicast_ether_addr(ethh->h_dest)) {
+ 				struct mlx4_mac_entry *entry;
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -237,8 +237,8 @@ struct mlx4_en_tx_desc {
+ struct mlx4_en_rx_alloc {
+ 	struct page	*page;
+ 	dma_addr_t	dma;
+-	u32		offset;
+-	u32		size;
++	u32		page_offset;
++	u32		page_size;
+ };
+ 
+ struct mlx4_en_tx_ring {
+--- a/drivers/net/ethernet/ti/davinci_emac.c
++++ b/drivers/net/ethernet/ti/davinci_emac.c
+@@ -876,8 +876,7 @@ static void emac_dev_mcast_set(struct ne
+ 		    netdev_mc_count(ndev) > EMAC_DEF_MAX_MULTICAST_ADDRESSES) {
+ 			mbp_enable = (mbp_enable | EMAC_MBP_RXMCAST);
+ 			emac_add_mcast(priv, EMAC_ALL_MULTI_SET, NULL);
+-		}
+-		if (!netdev_mc_empty(ndev)) {
++		} else if (!netdev_mc_empty(ndev)) {
+ 			struct netdev_hw_addr *ha;
+ 
+ 			mbp_enable = (mbp_enable | EMAC_MBP_RXMCAST);
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -916,7 +916,9 @@ static int virtnet_set_queues(struct vir
+ 		return -EINVAL;
+ 	} else {
+ 		vi->curr_queue_pairs = queue_pairs;
+-		schedule_delayed_work(&vi->refill, 0);
++		/* virtnet_open() will refill when device is going to up. */
++		if (dev->flags & IFF_UP)
++			schedule_delayed_work(&vi->refill, 0);
+ 	}
+ 
+ 	return 0;
+@@ -1094,6 +1096,11 @@ static int virtnet_cpu_callback(struct n
+ {
+ 	struct virtnet_info *vi = container_of(nfb, struct virtnet_info, nb);
+ 
++	mutex_lock(&vi->config_lock);
++
++	if (!vi->config_enable)
++		goto done;
++
+ 	switch(action & ~CPU_TASKS_FROZEN) {
+ 	case CPU_ONLINE:
+ 	case CPU_DOWN_FAILED:
+@@ -1106,6 +1113,9 @@ static int virtnet_cpu_callback(struct n
+ 	default:
+ 		break;
+ 	}
++
++done:
++	mutex_unlock(&vi->config_lock);
+ 	return NOTIFY_OK;
+ }
+ 
+@@ -1706,7 +1716,9 @@ static int virtnet_restore(struct virtio
+ 	vi->config_enable = true;
+ 	mutex_unlock(&vi->config_lock);
+ 
++	rtnl_lock();
+ 	virtnet_set_queues(vi, vi->curr_queue_pairs);
++	rtnl_unlock();
+ 
+ 	return 0;
+ }
+--- a/drivers/net/wan/farsync.c
++++ b/drivers/net/wan/farsync.c
+@@ -1972,6 +1972,7 @@ fst_get_iface(struct fst_card_info *card
+ 	}
+ 
+ 	i = port->index;
++	memset(&sync, 0, sizeof(sync));
+ 	sync.clock_rate = FST_RDL(card, portConfig[i].lineSpeed);
+ 	/* Lucky card and linux use same encoding here */
+ 	sync.clock_type = FST_RDB(card, portConfig[i].internalClock) ==
+--- a/drivers/net/wan/wanxl.c
++++ b/drivers/net/wan/wanxl.c
+@@ -355,6 +355,7 @@ static int wanxl_ioctl(struct net_device
+ 			ifr->ifr_settings.size = size; /* data size wanted */
+ 			return -ENOBUFS;
+ 		}
++		memset(&line, 0, sizeof(line));
+ 		line.clock_type = get_status(port)->clocking;
+ 		line.clock_rate = 0;
+ 		line.loopback = 0;
+--- a/drivers/net/wireless/cw1200/cw1200_spi.c
++++ b/drivers/net/wireless/cw1200/cw1200_spi.c
+@@ -237,7 +237,9 @@ static irqreturn_t cw1200_spi_irq_handle
+ 	struct hwbus_priv *self = dev_id;
+ 
+ 	if (self->core) {
++		cw1200_spi_lock(self);
+ 		cw1200_irq_handler(self->core);
++		cw1200_spi_unlock(self);
+ 		return IRQ_HANDLED;
+ 	} else {
+ 		return IRQ_NONE;
+--- a/drivers/net/xen-netback/common.h
++++ b/drivers/net/xen-netback/common.h
+@@ -120,6 +120,7 @@ int xenvif_connect(struct xenvif *vif, u
+ 		   unsigned long rx_ring_ref, unsigned int tx_evtchn,
+ 		   unsigned int rx_evtchn);
+ void xenvif_disconnect(struct xenvif *vif);
++void xenvif_free(struct xenvif *vif);
+ 
+ void xenvif_get(struct xenvif *vif);
+ void xenvif_put(struct xenvif *vif);
+--- a/drivers/net/xen-netback/interface.c
++++ b/drivers/net/xen-netback/interface.c
+@@ -326,6 +326,9 @@ struct xenvif *xenvif_alloc(struct devic
+ 	}
+ 
+ 	netdev_dbg(dev, "Successfully created xenvif\n");
++
++	__module_get(THIS_MODULE);
++
+ 	return vif;
+ }
+ 
+@@ -413,12 +416,6 @@ void xenvif_carrier_off(struct xenvif *v
+ 
+ void xenvif_disconnect(struct xenvif *vif)
+ {
+-	/* Disconnect funtion might get called by generic framework
+-	 * even before vif connects, so we need to check if we really
+-	 * need to do a module_put.
+-	 */
+-	int need_module_put = 0;
+-
+ 	if (netif_carrier_ok(vif->dev))
+ 		xenvif_carrier_off(vif);
+ 
+@@ -432,18 +429,16 @@ void xenvif_disconnect(struct xenvif *vi
+ 			unbind_from_irqhandler(vif->tx_irq, vif);
+ 			unbind_from_irqhandler(vif->rx_irq, vif);
+ 		}
+-		/* vif->irq is valid, we had a module_get in
+-		 * xenvif_connect.
+-		 */
+-		need_module_put = 1;
+ 	}
+ 
+-	unregister_netdev(vif->dev);
+-
+ 	xen_netbk_unmap_frontend_rings(vif);
++}
++
++void xenvif_free(struct xenvif *vif)
++{
++	unregister_netdev(vif->dev);
+ 
+ 	free_netdev(vif->dev);
+ 
+-	if (need_module_put)
+-		module_put(THIS_MODULE);
++	module_put(THIS_MODULE);
+ }
+--- a/drivers/net/xen-netback/xenbus.c
++++ b/drivers/net/xen-netback/xenbus.c
+@@ -42,7 +42,7 @@ static int netback_remove(struct xenbus_
+ 	if (be->vif) {
+ 		kobject_uevent(&dev->dev.kobj, KOBJ_OFFLINE);
+ 		xenbus_rm(XBT_NIL, dev->nodename, "hotplug-status");
+-		xenvif_disconnect(be->vif);
++		xenvif_free(be->vif);
+ 		be->vif = NULL;
+ 	}
+ 	kfree(be);
+@@ -213,9 +213,18 @@ static void disconnect_backend(struct xe
+ {
+ 	struct backend_info *be = dev_get_drvdata(&dev->dev);
+ 
++	if (be->vif)
++		xenvif_disconnect(be->vif);
++}
++
++static void destroy_backend(struct xenbus_device *dev)
++{
++	struct backend_info *be = dev_get_drvdata(&dev->dev);
++
+ 	if (be->vif) {
++		kobject_uevent(&dev->dev.kobj, KOBJ_OFFLINE);
+ 		xenbus_rm(XBT_NIL, dev->nodename, "hotplug-status");
+-		xenvif_disconnect(be->vif);
++		xenvif_free(be->vif);
+ 		be->vif = NULL;
+ 	}
+ }
+@@ -246,14 +255,11 @@ static void frontend_changed(struct xenb
+ 	case XenbusStateConnected:
+ 		if (dev->state == XenbusStateConnected)
+ 			break;
+-		backend_create_xenvif(be);
+ 		if (be->vif)
+ 			connect(be);
+ 		break;
+ 
+ 	case XenbusStateClosing:
+-		if (be->vif)
+-			kobject_uevent(&dev->dev.kobj, KOBJ_OFFLINE);
+ 		disconnect_backend(dev);
+ 		xenbus_switch_state(dev, XenbusStateClosing);
+ 		break;
+@@ -262,6 +268,7 @@ static void frontend_changed(struct xenb
+ 		xenbus_switch_state(dev, XenbusStateClosed);
+ 		if (xenbus_dev_is_online(dev))
+ 			break;
++		destroy_backend(dev);
+ 		/* fall through if not online */
+ 	case XenbusStateUnknown:
+ 		device_unregister(&dev->dev);
+--- a/drivers/tty/serial/vt8500_serial.c
++++ b/drivers/tty/serial/vt8500_serial.c
+@@ -559,12 +559,13 @@ static int vt8500_serial_probe(struct pl
+ 	if (!mmres || !irqres)
+ 		return -ENODEV;
+ 
+-	if (np)
++	if (np) {
+ 		port = of_alias_get_id(np, "serial");
+ 		if (port >= VT8500_MAX_PORTS)
+ 			port = -1;
+-	else
++	} else {
+ 		port = -1;
++	}
+ 
+ 	if (port < 0) {
+ 		/* calculate the port id */
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -451,6 +451,10 @@ static void option_instat_callback(struc
+ #define CHANGHONG_VENDOR_ID			0x2077
+ #define CHANGHONG_PRODUCT_CH690			0x7001
+ 
++/* Inovia */
++#define INOVIA_VENDOR_ID			0x20a6
++#define INOVIA_SEW858				0x1105
++
+ /* some devices interfaces need special handling due to a number of reasons */
+ enum option_blacklist_reason {
+ 		OPTION_BLACKLIST_NONE = 0,
+@@ -1257,7 +1261,9 @@ static const struct usb_device_id option
+ 
+ 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD100) },
+ 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD145) },
+-	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD200) },
++	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD200),
++		.driver_info = (kernel_ulong_t)&net_intf6_blacklist
++	},
+ 	{ USB_DEVICE(CELOT_VENDOR_ID, CELOT_PRODUCT_CT680M) }, /* CT-650 CDMA 450 1xEVDO modem */
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(SAMSUNG_VENDOR_ID, SAMSUNG_PRODUCT_GT_B3730, USB_CLASS_CDC_DATA, 0x00, 0x00) }, /* Samsung GT-B3730 LTE USB modem.*/
+ 	{ USB_DEVICE(YUGA_VENDOR_ID, YUGA_PRODUCT_CEM600) },
+@@ -1345,6 +1351,7 @@ static const struct usb_device_id option
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(0x2001, 0x7d03, 0xff, 0x00, 0x00) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x3e01, 0xff, 0xff, 0xff) }, /* D-Link DWM-152/C1 */
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x3e02, 0xff, 0xff, 0xff) }, /* D-Link DWM-156/C1 */
++	{ USB_DEVICE(INOVIA_VENDOR_ID, INOVIA_SEW858) },
+ 	{ } /* Terminating entry */
+ };
+ MODULE_DEVICE_TABLE(usb, option_ids);
+--- a/drivers/usb/serial/ti_usb_3410_5052.c
++++ b/drivers/usb/serial/ti_usb_3410_5052.c
+@@ -203,6 +203,7 @@ static struct usb_device_id ti_id_table_
+ 	{ USB_DEVICE(IBM_VENDOR_ID, IBM_454B_PRODUCT_ID) },
+ 	{ USB_DEVICE(IBM_VENDOR_ID, IBM_454C_PRODUCT_ID) },
+ 	{ USB_DEVICE(ABBOTT_VENDOR_ID, ABBOTT_PRODUCT_ID) },
++	{ USB_DEVICE(ABBOTT_VENDOR_ID, ABBOTT_STRIP_PORT_ID) },
+ 	{ USB_DEVICE(TI_VENDOR_ID, FRI2_PRODUCT_ID) },
+ 	{ }
+ };
+--- a/drivers/w1/w1.c
++++ b/drivers/w1/w1.c
+@@ -680,7 +680,10 @@ static int w1_attach_slave_device(struct
+ 	atomic_set(&sl->refcnt, 0);
+ 	init_completion(&sl->released);
+ 
++	/* slave modules need to be loaded in a context with unlocked mutex */
++	mutex_unlock(&dev->mutex);
+ 	request_module("w1-family-0x%0x", rn->family);
++	mutex_lock(&dev->mutex);
+ 
+ 	spin_lock(&w1_flock);
+ 	f = w1_family_registered(rn->family);
+--- a/fs/ext3/namei.c
++++ b/fs/ext3/namei.c
+@@ -1783,7 +1783,7 @@ retry:
+ 		d_tmpfile(dentry, inode);
+ 		err = ext3_orphan_add(handle, inode);
+ 		if (err)
+-			goto err_drop_inode;
++			goto err_unlock_inode;
+ 		mark_inode_dirty(inode);
+ 		unlock_new_inode(inode);
+ 	}
+@@ -1791,10 +1791,9 @@ retry:
+ 	if (err == -ENOSPC && ext3_should_retry_alloc(dir->i_sb, &retries))
+ 		goto retry;
+ 	return err;
+-err_drop_inode:
++err_unlock_inode:
+ 	ext3_journal_stop(handle);
+ 	unlock_new_inode(inode);
+-	iput(inode);
+ 	return err;
+ }
+ 
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -2319,7 +2319,7 @@ retry:
+ 		d_tmpfile(dentry, inode);
+ 		err = ext4_orphan_add(handle, inode);
+ 		if (err)
+-			goto err_drop_inode;
++			goto err_unlock_inode;
+ 		mark_inode_dirty(inode);
+ 		unlock_new_inode(inode);
+ 	}
+@@ -2328,10 +2328,9 @@ retry:
+ 	if (err == -ENOSPC && ext4_should_retry_alloc(dir->i_sb, &retries))
+ 		goto retry;
+ 	return err;
+-err_drop_inode:
++err_unlock_inode:
+ 	ext4_journal_stop(handle);
+ 	unlock_new_inode(inode);
+-	iput(inode);
+ 	return err;
+ }
+ 
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1316,6 +1316,11 @@ static inline int skb_pagelen(const stru
+ 	return len + skb_headlen(skb);
+ }
+ 
++static inline bool skb_has_frags(const struct sk_buff *skb)
++{
++	return skb_shinfo(skb)->nr_frags;
++}
++
+ /**
+  * __skb_fill_page_desc - initialise a paged fragment in an skb
+  * @skb: buffer containing fragment to be initialised
+--- a/include/net/cipso_ipv4.h
++++ b/include/net/cipso_ipv4.h
+@@ -290,6 +290,7 @@ static inline int cipso_v4_validate(cons
+ 	unsigned char err_offset = 0;
+ 	u8 opt_len = opt[1];
+ 	u8 opt_iter;
++	u8 tag_len;
+ 
+ 	if (opt_len < 8) {
+ 		err_offset = 1;
+@@ -302,11 +303,12 @@ static inline int cipso_v4_validate(cons
+ 	}
+ 
+ 	for (opt_iter = 6; opt_iter < opt_len;) {
+-		if (opt[opt_iter + 1] > (opt_len - opt_iter)) {
++		tag_len = opt[opt_iter + 1];
++		if ((tag_len == 0) || (opt[opt_iter + 1] > (opt_len - opt_iter))) {
+ 			err_offset = opt_iter + 1;
+ 			goto out;
+ 		}
+-		opt_iter += opt[opt_iter + 1];
++		opt_iter += tag_len;
+ 	}
+ 
+ out:
+--- a/include/net/dst.h
++++ b/include/net/dst.h
+@@ -477,10 +477,22 @@ static inline struct dst_entry *xfrm_loo
+ {
+ 	return dst_orig;
+ } 
++
++static inline struct xfrm_state *dst_xfrm(const struct dst_entry *dst)
++{
++	return NULL;
++}
++
+ #else
+ extern struct dst_entry *xfrm_lookup(struct net *net, struct dst_entry *dst_orig,
+ 				     const struct flowi *fl, struct sock *sk,
+ 				     int flags);
++
++/* skb attached with this dst needs transformation if dst->xfrm is valid */
++static inline struct xfrm_state *dst_xfrm(const struct dst_entry *dst)
++{
++	return dst->xfrm;
++}
+ #endif
+ 
+ #endif /* _NET_DST_H */
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@ -196,11 +196,9 @@ static inline int ip6_skb_dst_mtu(struct
+ 	       skb_dst(skb)->dev->mtu : dst_mtu(skb_dst(skb));
+ }
+ 
+-static inline struct in6_addr *rt6_nexthop(struct rt6_info *rt, struct in6_addr *dest)
++static inline struct in6_addr *rt6_nexthop(struct rt6_info *rt)
+ {
+-	if (rt->rt6i_flags & RTF_GATEWAY)
+-		return &rt->rt6i_gateway;
+-	return dest;
++	return &rt->rt6i_gateway;
+ }
+ 
+ #endif
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -232,6 +232,7 @@ struct cg_proto;
+   *	@sk_napi_id: id of the last napi context to receive data for sk
+   *	@sk_ll_usec: usecs to busypoll when there is no data
+   *	@sk_allocation: allocation mode
++  *	@sk_pacing_rate: Pacing rate (if supported by transport/packet scheduler)
+   *	@sk_sndbuf: size of send buffer in bytes
+   *	@sk_flags: %SO_LINGER (l_onoff), %SO_BROADCAST, %SO_KEEPALIVE,
+   *		   %SO_OOBINLINE settings, %SO_TIMESTAMPING settings
+@@ -361,6 +362,7 @@ struct sock {
+ 	kmemcheck_bitfield_end(flags);
+ 	int			sk_wmem_queued;
+ 	gfp_t			sk_allocation;
++	u32			sk_pacing_rate; /* bytes per second */
+ 	netdev_features_t	sk_route_caps;
+ 	netdev_features_t	sk_route_nocaps;
+ 	int			sk_gso_type;
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -284,6 +284,7 @@ extern int sysctl_tcp_thin_dupack;
+ extern int sysctl_tcp_early_retrans;
+ extern int sysctl_tcp_limit_output_bytes;
+ extern int sysctl_tcp_challenge_ack_limit;
++extern int sysctl_tcp_min_tso_segs;
+ 
+ extern atomic_long_t tcp_memory_allocated;
+ extern struct percpu_counter tcp_sockets_allocated;
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2709,6 +2709,7 @@ void __split_huge_page_pmd(struct vm_are
+ 
+ 	mmun_start = haddr;
+ 	mmun_end   = haddr + HPAGE_PMD_SIZE;
++again:
+ 	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
+ 	spin_lock(&mm->page_table_lock);
+ 	if (unlikely(!pmd_trans_huge(*pmd))) {
+@@ -2731,7 +2732,14 @@ void __split_huge_page_pmd(struct vm_are
+ 	split_huge_page(page);
+ 
+ 	put_page(page);
+-	BUG_ON(pmd_trans_huge(*pmd));
++
++	/*
++	 * We don't always have down_write of mmap_sem here: a racing
++	 * do_huge_pmd_wp_page() might have copied-on-write to another
++	 * huge page before our split_huge_page() got the anon_vma lock.
++	 */
++	if (unlikely(pmd_trans_huge(*pmd)))
++		goto again;
+ }
+ 
+ void split_huge_page_pmd_mm(struct mm_struct *mm, unsigned long address,
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -861,6 +861,8 @@ copy_one_pte(struct mm_struct *dst_mm, s
+ 					 */
+ 					make_migration_entry_read(&entry);
+ 					pte = swp_entry_to_pte(entry);
++					if (pte_swp_soft_dirty(*src_pte))
++						pte = pte_swp_mksoft_dirty(pte);
+ 					set_pte_at(src_mm, addr, src_pte, pte);
+ 				}
+ 			}
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -157,6 +157,8 @@ static int remove_migration_pte(struct p
+ 
+ 	get_page(new);
+ 	pte = pte_mkold(mk_pte(new, vma->vm_page_prot));
++	if (pte_swp_soft_dirty(*ptep))
++		pte = pte_mksoft_dirty(pte);
+ 	if (is_write_migration_entry(entry))
+ 		pte = pte_mkwrite(pte);
+ #ifdef CONFIG_HUGETLB_PAGE
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -94,13 +94,16 @@ static unsigned long change_pte_range(st
+ 			swp_entry_t entry = pte_to_swp_entry(oldpte);
+ 
+ 			if (is_write_migration_entry(entry)) {
++				pte_t newpte;
+ 				/*
+ 				 * A protection check is difficult so
+ 				 * just be safe and disable write
+ 				 */
+ 				make_migration_entry_read(&entry);
+-				set_pte_at(mm, addr, pte,
+-					swp_entry_to_pte(entry));
++				newpte = swp_entry_to_pte(entry);
++				if (pte_swp_soft_dirty(oldpte))
++					newpte = pte_swp_mksoft_dirty(newpte);
++				set_pte_at(mm, addr, pte, newpte);
+ 			}
+ 			pages++;
+ 		}
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -1104,11 +1104,11 @@ static unsigned long dirty_poll_interval
+ 	return 1;
+ }
+ 
+-static long bdi_max_pause(struct backing_dev_info *bdi,
+-			  unsigned long bdi_dirty)
++static unsigned long bdi_max_pause(struct backing_dev_info *bdi,
++				   unsigned long bdi_dirty)
+ {
+-	long bw = bdi->avg_write_bandwidth;
+-	long t;
++	unsigned long bw = bdi->avg_write_bandwidth;
++	unsigned long t;
+ 
+ 	/*
+ 	 * Limit pause time for small memory systems. If sleeping for too long
+@@ -1120,7 +1120,7 @@ static long bdi_max_pause(struct backing
+ 	t = bdi_dirty / (1 + bw / roundup_pow_of_two(1 + HZ / 8));
+ 	t++;
+ 
+-	return min_t(long, t, MAX_PAUSE);
++	return min_t(unsigned long, t, MAX_PAUSE);
+ }
+ 
+ static long bdi_min_pause(struct backing_dev_info *bdi,
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -816,6 +816,10 @@ static void zswap_frontswap_invalidate_a
+ 	}
+ 	tree->rbroot = RB_ROOT;
+ 	spin_unlock(&tree->lock);
++
++	zbud_destroy_pool(tree->pool);
++	kfree(tree);
++	zswap_trees[type] = NULL;
+ }
+ 
+ static struct zbud_ops zswap_zbud_ops = {
+--- a/net/8021q/vlan_netlink.c
++++ b/net/8021q/vlan_netlink.c
+@@ -171,7 +171,7 @@ static size_t vlan_get_size(const struct
+ 
+ 	return nla_total_size(2) +	/* IFLA_VLAN_PROTOCOL */
+ 	       nla_total_size(2) +	/* IFLA_VLAN_ID */
+-	       sizeof(struct ifla_vlan_flags) + /* IFLA_VLAN_FLAGS */
++	       nla_total_size(sizeof(struct ifla_vlan_flags)) + /* IFLA_VLAN_FLAGS */
+ 	       vlan_qos_map_size(vlan->nr_ingress_mappings) +
+ 	       vlan_qos_map_size(vlan->nr_egress_mappings);
+ }
+--- a/net/batman-adv/main.c
++++ b/net/batman-adv/main.c
+@@ -61,6 +61,7 @@ static int __init batadv_init(void)
+ 	batadv_recv_handler_init();
+ 
+ 	batadv_iv_init();
++	batadv_nc_init();
+ 
+ 	batadv_event_workqueue = create_singlethread_workqueue("bat_events");
+ 
+@@ -138,7 +139,7 @@ int batadv_mesh_init(struct net_device *
+ 	if (ret < 0)
+ 		goto err;
+ 
+-	ret = batadv_nc_init(bat_priv);
++	ret = batadv_nc_mesh_init(bat_priv);
+ 	if (ret < 0)
+ 		goto err;
+ 
+@@ -163,7 +164,7 @@ void batadv_mesh_free(struct net_device
+ 	batadv_vis_quit(bat_priv);
+ 
+ 	batadv_gw_node_purge(bat_priv);
+-	batadv_nc_free(bat_priv);
++	batadv_nc_mesh_free(bat_priv);
+ 	batadv_dat_free(bat_priv);
+ 	batadv_bla_free(bat_priv);
+ 
+--- a/net/batman-adv/network-coding.c
++++ b/net/batman-adv/network-coding.c
+@@ -35,6 +35,20 @@ static int batadv_nc_recv_coded_packet(s
+ 				       struct batadv_hard_iface *recv_if);
+ 
+ /**
++ * batadv_nc_init - one-time initialization for network coding
++ */
++int __init batadv_nc_init(void)
++{
++	int ret;
++
++	/* Register our packet type */
++	ret = batadv_recv_handler_register(BATADV_CODED,
++					   batadv_nc_recv_coded_packet);
++
++	return ret;
++}
++
++/**
+  * batadv_nc_start_timer - initialise the nc periodic worker
+  * @bat_priv: the bat priv with all the soft interface information
+  */
+@@ -45,10 +59,10 @@ static void batadv_nc_start_timer(struct
+ }
+ 
+ /**
+- * batadv_nc_init - initialise coding hash table and start house keeping
++ * batadv_nc_mesh_init - initialise coding hash table and start house keeping
+  * @bat_priv: the bat priv with all the soft interface information
+  */
+-int batadv_nc_init(struct batadv_priv *bat_priv)
++int batadv_nc_mesh_init(struct batadv_priv *bat_priv)
+ {
+ 	bat_priv->nc.timestamp_fwd_flush = jiffies;
+ 	bat_priv->nc.timestamp_sniffed_purge = jiffies;
+@@ -70,11 +84,6 @@ int batadv_nc_init(struct batadv_priv *b
+ 	batadv_hash_set_lock_class(bat_priv->nc.coding_hash,
+ 				   &batadv_nc_decoding_hash_lock_class_key);
+ 
+-	/* Register our packet type */
+-	if (batadv_recv_handler_register(BATADV_CODED,
+-					 batadv_nc_recv_coded_packet) < 0)
+-		goto err;
+-
+ 	INIT_DELAYED_WORK(&bat_priv->nc.work, batadv_nc_worker);
+ 	batadv_nc_start_timer(bat_priv);
+ 
+@@ -1721,12 +1730,11 @@ free_nc_packet:
+ }
+ 
+ /**
+- * batadv_nc_free - clean up network coding memory
++ * batadv_nc_mesh_free - clean up network coding memory
+  * @bat_priv: the bat priv with all the soft interface information
+  */
+-void batadv_nc_free(struct batadv_priv *bat_priv)
++void batadv_nc_mesh_free(struct batadv_priv *bat_priv)
+ {
+-	batadv_recv_handler_unregister(BATADV_CODED);
+ 	cancel_delayed_work_sync(&bat_priv->nc.work);
+ 
+ 	batadv_nc_purge_paths(bat_priv, bat_priv->nc.coding_hash, NULL);
+--- a/net/batman-adv/network-coding.h
++++ b/net/batman-adv/network-coding.h
+@@ -22,8 +22,9 @@
+ 
+ #ifdef CONFIG_BATMAN_ADV_NC
+ 
+-int batadv_nc_init(struct batadv_priv *bat_priv);
+-void batadv_nc_free(struct batadv_priv *bat_priv);
++int batadv_nc_init(void);
++int batadv_nc_mesh_init(struct batadv_priv *bat_priv);
++void batadv_nc_mesh_free(struct batadv_priv *bat_priv);
+ void batadv_nc_update_nc_node(struct batadv_priv *bat_priv,
+ 			      struct batadv_orig_node *orig_node,
+ 			      struct batadv_orig_node *orig_neigh_node,
+@@ -46,12 +47,17 @@ int batadv_nc_init_debugfs(struct batadv
+ 
+ #else /* ifdef CONFIG_BATMAN_ADV_NC */
+ 
+-static inline int batadv_nc_init(struct batadv_priv *bat_priv)
++static inline int batadv_nc_init(void)
+ {
+ 	return 0;
+ }
+ 
+-static inline void batadv_nc_free(struct batadv_priv *bat_priv)
++static inline int batadv_nc_mesh_init(struct batadv_priv *bat_priv)
++{
++	return 0;
++}
++
++static inline void batadv_nc_mesh_free(struct batadv_priv *bat_priv)
+ {
+ 	return;
+ }
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@ -451,7 +451,7 @@ static int __br_mdb_del(struct net_bridg
+ 		call_rcu_bh(&p->rcu, br_multicast_free_pg);
+ 		err = 0;
+ 
+-		if (!mp->ports && !mp->mglist && mp->timer_armed &&
++		if (!mp->ports && !mp->mglist &&
+ 		    netif_running(br->dev))
+ 			mod_timer(&mp->timer, jiffies);
+ 		break;
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@ -271,7 +271,7 @@ static void br_multicast_del_pg(struct n
+ 		del_timer(&p->timer);
+ 		call_rcu_bh(&p->rcu, br_multicast_free_pg);
+ 
+-		if (!mp->ports && !mp->mglist && mp->timer_armed &&
++		if (!mp->ports && !mp->mglist &&
+ 		    netif_running(br->dev))
+ 			mod_timer(&mp->timer, jiffies);
+ 
+@@ -619,7 +619,6 @@ rehash:
+ 
+ 	mp->br = br;
+ 	mp->addr = *group;
+-
+ 	setup_timer(&mp->timer, br_multicast_group_expired,
+ 		    (unsigned long)mp);
+ 
+@@ -659,6 +658,7 @@ static int br_multicast_add_group(struct
+ 	struct net_bridge_mdb_entry *mp;
+ 	struct net_bridge_port_group *p;
+ 	struct net_bridge_port_group __rcu **pp;
++	unsigned long now = jiffies;
+ 	int err;
+ 
+ 	spin_lock(&br->multicast_lock);
+@@ -673,6 +673,7 @@ static int br_multicast_add_group(struct
+ 
+ 	if (!port) {
+ 		mp->mglist = true;
++		mod_timer(&mp->timer, now + br->multicast_membership_interval);
+ 		goto out;
+ 	}
+ 
+@@ -680,7 +681,7 @@ static int br_multicast_add_group(struct
+ 	     (p = mlock_dereference(*pp, br)) != NULL;
+ 	     pp = &p->next) {
+ 		if (p->port == port)
+-			goto out;
++			goto found;
+ 		if ((unsigned long)p->port < (unsigned long)port)
+ 			break;
+ 	}
+@@ -691,6 +692,8 @@ static int br_multicast_add_group(struct
+ 	rcu_assign_pointer(*pp, p);
+ 	br_mdb_notify(br->dev, port, group, RTM_NEWMDB);
+ 
++found:
++	mod_timer(&p->timer, now + br->multicast_membership_interval);
+ out:
+ 	err = 0;
+ 
+@@ -1190,9 +1193,6 @@ static int br_ip4_multicast_query(struct
+ 	if (!mp)
+ 		goto out;
+ 
+-	mod_timer(&mp->timer, now + br->multicast_membership_interval);
+-	mp->timer_armed = true;
+-
+ 	max_delay *= br->multicast_last_member_count;
+ 
+ 	if (mp->mglist &&
+@@ -1269,9 +1269,6 @@ static int br_ip6_multicast_query(struct
+ 	if (!mp)
+ 		goto out;
+ 
+-	mod_timer(&mp->timer, now + br->multicast_membership_interval);
+-	mp->timer_armed = true;
+-
+ 	max_delay *= br->multicast_last_member_count;
+ 	if (mp->mglist &&
+ 	    (timer_pending(&mp->timer) ?
+@@ -1357,7 +1354,7 @@ static void br_multicast_leave_group(str
+ 			call_rcu_bh(&p->rcu, br_multicast_free_pg);
+ 			br_mdb_notify(br->dev, port, group, RTM_DELMDB);
+ 
+-			if (!mp->ports && !mp->mglist && mp->timer_armed &&
++			if (!mp->ports && !mp->mglist &&
+ 			    netif_running(br->dev))
+ 				mod_timer(&mp->timer, jiffies);
+ 		}
+@@ -1369,12 +1366,30 @@ static void br_multicast_leave_group(str
+ 		     br->multicast_last_member_interval;
+ 
+ 	if (!port) {
+-		if (mp->mglist && mp->timer_armed &&
++		if (mp->mglist &&
+ 		    (timer_pending(&mp->timer) ?
+ 		     time_after(mp->timer.expires, time) :
+ 		     try_to_del_timer_sync(&mp->timer) >= 0)) {
+ 			mod_timer(&mp->timer, time);
+ 		}
++
++		goto out;
++	}
++
++	for (p = mlock_dereference(mp->ports, br);
++	     p != NULL;
++	     p = mlock_dereference(p->next, br)) {
++		if (p->port != port)
++			continue;
++
++		if (!hlist_unhashed(&p->mglist) &&
++		    (timer_pending(&p->timer) ?
++		     time_after(p->timer.expires, time) :
++		     try_to_del_timer_sync(&p->timer) >= 0)) {
++			mod_timer(&p->timer, time);
++		}
++
++		break;
+ 	}
+ out:
+ 	spin_unlock(&br->multicast_lock);
+@@ -1791,7 +1806,6 @@ void br_multicast_stop(struct net_bridge
+ 		hlist_for_each_entry_safe(mp, n, &mdb->mhash[i],
+ 					  hlist[ver]) {
+ 			del_timer(&mp->timer);
+-			mp->timer_armed = false;
+ 			call_rcu_bh(&mp->rcu, br_multicast_free_group);
+ 		}
+ 	}
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -126,7 +126,6 @@ struct net_bridge_mdb_entry
+ 	struct timer_list		timer;
+ 	struct br_ip			addr;
+ 	bool				mglist;
+-	bool				timer_armed;
+ };
+ 
+ struct net_bridge_mdb_htable
+--- a/net/bridge/br_stp_if.c
++++ b/net/bridge/br_stp_if.c
+@@ -134,7 +134,7 @@ static void br_stp_start(struct net_brid
+ 
+ 	if (br->bridge_forward_delay < BR_MIN_FORWARD_DELAY)
+ 		__br_set_forward_delay(br, BR_MIN_FORWARD_DELAY);
+-	else if (br->bridge_forward_delay < BR_MAX_FORWARD_DELAY)
++	else if (br->bridge_forward_delay > BR_MAX_FORWARD_DELAY)
+ 		__br_set_forward_delay(br, BR_MAX_FORWARD_DELAY);
+ 
+ 	if (r == 0) {
+--- a/net/compat.c
++++ b/net/compat.c
+@@ -71,6 +71,8 @@ int get_compat_msghdr(struct msghdr *kms
+ 	    __get_user(kmsg->msg_controllen, &umsg->msg_controllen) ||
+ 	    __get_user(kmsg->msg_flags, &umsg->msg_flags))
+ 		return -EFAULT;
++	if (kmsg->msg_namelen > sizeof(struct sockaddr_storage))
++		return -EINVAL;
+ 	kmsg->msg_name = compat_ptr(tmp1);
+ 	kmsg->msg_iov = compat_ptr(tmp2);
+ 	kmsg->msg_control = compat_ptr(tmp3);
+--- a/net/core/secure_seq.c
++++ b/net/core/secure_seq.c
+@@ -10,6 +10,7 @@
+ 
+ #include <net/secure_seq.h>
+ 
++#if IS_ENABLED(CONFIG_IPV6) || IS_ENABLED(CONFIG_INET)
+ #define NET_SECRET_SIZE (MD5_MESSAGE_BYTES / 4)
+ 
+ static u32 net_secret[NET_SECRET_SIZE] ____cacheline_aligned;
+@@ -29,6 +30,7 @@ static void net_secret_init(void)
+ 		cmpxchg(&net_secret[--i], 0, tmp);
+ 	}
+ }
++#endif
+ 
+ #ifdef CONFIG_INET
+ static u32 seq_scale(u32 seq)
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -2297,6 +2297,7 @@ void sock_init_data(struct socket *sock,
+ 	sk->sk_ll_usec		=	sysctl_net_busy_read;
+ #endif
+ 
++	sk->sk_pacing_rate = ~0U;
+ 	/*
+ 	 * Before updating sk_refcnt, we must commit prior changes to memory
+ 	 * (Documentation/RCU/rculist_nulls.txt for details)
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@ -287,7 +287,7 @@ begintw:
+ 			if (unlikely(!INET_TW_MATCH(sk, net, acookie,
+ 						    saddr, daddr, ports,
+ 						    dif))) {
+-				sock_put(sk);
++				inet_twsk_put(inet_twsk(sk));
+ 				goto begintw;
+ 			}
+ 			goto out;
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -836,7 +836,7 @@ static int __ip_append_data(struct sock
+ 		csummode = CHECKSUM_PARTIAL;
+ 
+ 	cork->length += length;
+-	if (((length > mtu) || (skb && skb_is_gso(skb))) &&
++	if (((length > mtu) || (skb && skb_has_frags(skb))) &&
+ 	    (sk->sk_protocol == IPPROTO_UDP) &&
+ 	    (rt->dst.dev->features & NETIF_F_UFO) && !rt->dst.header_len) {
+ 		err = ip_ufo_append_data(sk, queue, getfrag, from, length,
+--- a/net/ipv4/ip_vti.c
++++ b/net/ipv4/ip_vti.c
+@@ -285,8 +285,17 @@ static int vti_rcv(struct sk_buff *skb)
+ 	tunnel = vti_tunnel_lookup(dev_net(skb->dev), iph->saddr, iph->daddr);
+ 	if (tunnel != NULL) {
+ 		struct pcpu_tstats *tstats;
++		u32 oldmark = skb->mark;
++		int ret;
+ 
+-		if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb))
++
++		/* temporarily mark the skb with the tunnel o_key, to
++		 * only match policies with this mark.
++		 */
++		skb->mark = be32_to_cpu(tunnel->parms.o_key);
++		ret = xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb);
++		skb->mark = oldmark;
++		if (!ret)
+ 			return -1;
+ 
+ 		tstats = this_cpu_ptr(tunnel->dev->tstats);
+@@ -295,7 +304,6 @@ static int vti_rcv(struct sk_buff *skb)
+ 		tstats->rx_bytes += skb->len;
+ 		u64_stats_update_end(&tstats->syncp);
+ 
+-		skb->mark = 0;
+ 		secpath_reset(skb);
+ 		skb->dev = tunnel->dev;
+ 		return 1;
+@@ -327,7 +335,7 @@ static netdev_tx_t vti_tunnel_xmit(struc
+ 
+ 	memset(&fl4, 0, sizeof(fl4));
+ 	flowi4_init_output(&fl4, tunnel->parms.link,
+-			   be32_to_cpu(tunnel->parms.i_key), RT_TOS(tos),
++			   be32_to_cpu(tunnel->parms.o_key), RT_TOS(tos),
+ 			   RT_SCOPE_UNIVERSE,
+ 			   IPPROTO_IPIP, 0,
+ 			   dst, tiph->saddr, 0, 0);
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -2074,7 +2074,7 @@ struct rtable *__ip_route_output_key(str
+ 							      RT_SCOPE_LINK);
+ 			goto make_route;
+ 		}
+-		if (fl4->saddr) {
++		if (!fl4->saddr) {
+ 			if (ipv4_is_multicast(fl4->daddr))
+ 				fl4->saddr = inet_select_addr(dev_out, 0,
+ 							      fl4->flowi4_scope);
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -29,6 +29,7 @@
+ static int zero;
+ static int one = 1;
+ static int four = 4;
++static int gso_max_segs = GSO_MAX_SEGS;
+ static int tcp_retr1_max = 255;
+ static int ip_local_port_range_min[] = { 1, 1 };
+ static int ip_local_port_range_max[] = { 65535, 65535 };
+@@ -754,6 +755,15 @@ static struct ctl_table ipv4_table[] = {
+ 		.extra2		= &four,
+ 	},
+ 	{
++		.procname	= "tcp_min_tso_segs",
++		.data		= &sysctl_tcp_min_tso_segs,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &zero,
++		.extra2		= &gso_max_segs,
++	},
++	{
+ 		.procname	= "udp_mem",
+ 		.data		= &sysctl_udp_mem,
+ 		.maxlen		= sizeof(sysctl_udp_mem),
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -283,6 +283,8 @@
+ 
+ int sysctl_tcp_fin_timeout __read_mostly = TCP_FIN_TIMEOUT;
+ 
++int sysctl_tcp_min_tso_segs __read_mostly = 2;
++
+ struct percpu_counter tcp_orphan_count;
+ EXPORT_SYMBOL_GPL(tcp_orphan_count);
+ 
+@@ -789,12 +791,28 @@ static unsigned int tcp_xmit_size_goal(s
+ 	xmit_size_goal = mss_now;
+ 
+ 	if (large_allowed && sk_can_gso(sk)) {
+-		xmit_size_goal = ((sk->sk_gso_max_size - 1) -
+-				  inet_csk(sk)->icsk_af_ops->net_header_len -
+-				  inet_csk(sk)->icsk_ext_hdr_len -
+-				  tp->tcp_header_len);
++		u32 gso_size, hlen;
+ 
+-		/* TSQ : try to have two TSO segments in flight */
++		/* Maybe we should/could use sk->sk_prot->max_header here ? */
++		hlen = inet_csk(sk)->icsk_af_ops->net_header_len +
++		       inet_csk(sk)->icsk_ext_hdr_len +
++		       tp->tcp_header_len;
++
++		/* Goal is to send at least one packet per ms,
++		 * not one big TSO packet every 100 ms.
++		 * This preserves ACK clocking and is consistent
++		 * with tcp_tso_should_defer() heuristic.
++		 */
++		gso_size = sk->sk_pacing_rate / (2 * MSEC_PER_SEC);
++		gso_size = max_t(u32, gso_size,
++				 sysctl_tcp_min_tso_segs * mss_now);
++
++		xmit_size_goal = min_t(u32, gso_size,
++				       sk->sk_gso_max_size - 1 - hlen);
++
++		/* TSQ : try to have at least two segments in flight
++		 * (one in NIC TX ring, another in Qdisc)
++		 */
+ 		xmit_size_goal = min_t(u32, xmit_size_goal,
+ 				       sysctl_tcp_limit_output_bytes >> 1);
+ 
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -688,6 +688,34 @@ static void tcp_rtt_estimator(struct soc
+ 	}
+ }
+ 
++/* Set the sk_pacing_rate to allow proper sizing of TSO packets.
++ * Note: TCP stack does not yet implement pacing.
++ * FQ packet scheduler can be used to implement cheap but effective
++ * TCP pacing, to smooth the burst on large writes when packets
++ * in flight is significantly lower than cwnd (or rwin)
++ */
++static void tcp_update_pacing_rate(struct sock *sk)
++{
++	const struct tcp_sock *tp = tcp_sk(sk);
++	u64 rate;
++
++	/* set sk_pacing_rate to 200 % of current rate (mss * cwnd / srtt) */
++	rate = (u64)tp->mss_cache * 2 * (HZ << 3);
++
++	rate *= max(tp->snd_cwnd, tp->packets_out);
++
++	/* Correction for small srtt : minimum srtt being 8 (1 jiffy << 3),
++	 * be conservative and assume srtt = 1 (125 us instead of 1.25 ms)
++	 * We probably need usec resolution in the future.
++	 * Note: This also takes care of possible srtt=0 case,
++	 * when tcp_rtt_estimator() was not yet called.
++	 */
++	if (tp->srtt > 8 + 2)
++		do_div(rate, tp->srtt);
++
++	sk->sk_pacing_rate = min_t(u64, rate, ~0U);
++}
++
+ /* Calculate rto without backoff.  This is the second half of Van Jacobson's
+  * routine referred to above.
+  */
+@@ -1251,7 +1279,10 @@ static bool tcp_shifted_skb(struct sock
+ 		tp->lost_cnt_hint -= tcp_skb_pcount(prev);
+ 	}
+ 
+-	TCP_SKB_CB(skb)->tcp_flags |= TCP_SKB_CB(prev)->tcp_flags;
++	TCP_SKB_CB(prev)->tcp_flags |= TCP_SKB_CB(skb)->tcp_flags;
++	if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
++		TCP_SKB_CB(prev)->end_seq++;
++
+ 	if (skb == tcp_highest_sack(sk))
+ 		tcp_advance_highest_sack(sk, skb);
+ 
+@@ -3253,7 +3284,7 @@ static void tcp_process_tlp_ack(struct s
+ 			tcp_init_cwnd_reduction(sk, true);
+ 			tcp_set_ca_state(sk, TCP_CA_CWR);
+ 			tcp_end_cwnd_reduction(sk);
+-			tcp_set_ca_state(sk, TCP_CA_Open);
++			tcp_try_keep_open(sk);
+ 			NET_INC_STATS_BH(sock_net(sk),
+ 					 LINUX_MIB_TCPLOSSPROBERECOVERY);
+ 		}
+@@ -3269,7 +3300,7 @@ static int tcp_ack(struct sock *sk, cons
+ 	u32 ack_seq = TCP_SKB_CB(skb)->seq;
+ 	u32 ack = TCP_SKB_CB(skb)->ack_seq;
+ 	bool is_dupack = false;
+-	u32 prior_in_flight;
++	u32 prior_in_flight, prior_cwnd = tp->snd_cwnd, prior_rtt = tp->srtt;
+ 	u32 prior_fackets;
+ 	int prior_packets = tp->packets_out;
+ 	const int prior_unsacked = tp->packets_out - tp->sacked_out;
+@@ -3375,6 +3406,8 @@ static int tcp_ack(struct sock *sk, cons
+ 
+ 	if (icsk->icsk_pending == ICSK_TIME_RETRANS)
+ 		tcp_schedule_loss_probe(sk);
++	if (tp->srtt != prior_rtt || tp->snd_cwnd != prior_cwnd)
++		tcp_update_pacing_rate(sk);
+ 	return 1;
+ 
+ no_queue:
+@@ -5671,6 +5704,8 @@ int tcp_rcv_state_process(struct sock *s
+ 		} else
+ 			tcp_init_metrics(sk);
+ 
++		tcp_update_pacing_rate(sk);
++
+ 		/* Prevent spurious tcp_cwnd_restart() on first data packet */
+ 		tp->lsndtime = tcp_time_stamp;
+ 
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -892,8 +892,7 @@ static int tcp_transmit_skb(struct sock
+ 
+ 	skb_orphan(skb);
+ 	skb->sk = sk;
+-	skb->destructor = (sysctl_tcp_limit_output_bytes > 0) ?
+-			  tcp_wfree : sock_wfree;
++	skb->destructor = tcp_wfree;
+ 	atomic_add(skb->truesize, &sk->sk_wmem_alloc);
+ 
+ 	/* Build TCP header and checksum it. */
+@@ -982,6 +981,9 @@ static void tcp_queue_skb(struct sock *s
+ static void tcp_set_skb_tso_segs(const struct sock *sk, struct sk_buff *skb,
+ 				 unsigned int mss_now)
+ {
++	/* Make sure we own this skb before messing gso_size/gso_segs */
++	WARN_ON_ONCE(skb_cloned(skb));
++
+ 	if (skb->len <= mss_now || !sk_can_gso(sk) ||
+ 	    skb->ip_summed == CHECKSUM_NONE) {
+ 		/* Avoid the costly divide in the normal
+@@ -1063,9 +1065,7 @@ int tcp_fragment(struct sock *sk, struct
+ 	if (nsize < 0)
+ 		nsize = 0;
+ 
+-	if (skb_cloned(skb) &&
+-	    skb_is_nonlinear(skb) &&
+-	    pskb_expand_head(skb, 0, 0, GFP_ATOMIC))
++	if (skb_unclone(skb, GFP_ATOMIC))
+ 		return -ENOMEM;
+ 
+ 	/* Get a new skb... force flag on. */
+@@ -1628,7 +1628,7 @@ static bool tcp_tso_should_defer(struct
+ 
+ 	/* If a full-sized TSO skb can be sent, do it. */
+ 	if (limit >= min_t(unsigned int, sk->sk_gso_max_size,
+-			   sk->sk_gso_max_segs * tp->mss_cache))
++			   tp->xmit_size_goal_segs * tp->mss_cache))
+ 		goto send_now;
+ 
+ 	/* Middle in queue won't get any more data, full sendable already? */
+@@ -1837,7 +1837,6 @@ static bool tcp_write_xmit(struct sock *
+ 	while ((skb = tcp_send_head(sk))) {
+ 		unsigned int limit;
+ 
+-
+ 		tso_segs = tcp_init_tso_segs(sk, skb, mss_now);
+ 		BUG_ON(!tso_segs);
+ 
+@@ -1866,13 +1865,20 @@ static bool tcp_write_xmit(struct sock *
+ 				break;
+ 		}
+ 
+-		/* TSQ : sk_wmem_alloc accounts skb truesize,
+-		 * including skb overhead. But thats OK.
++		/* TCP Small Queues :
++		 * Control number of packets in qdisc/devices to two packets / or ~1 ms.
++		 * This allows for :
++		 *  - better RTT estimation and ACK scheduling
++		 *  - faster recovery
++		 *  - high rates
+ 		 */
+-		if (atomic_read(&sk->sk_wmem_alloc) >= sysctl_tcp_limit_output_bytes) {
++		limit = max(skb->truesize, sk->sk_pacing_rate >> 10);
++
++		if (atomic_read(&sk->sk_wmem_alloc) > limit) {
+ 			set_bit(TSQ_THROTTLED, &tp->tsq_flags);
+ 			break;
+ 		}
++
+ 		limit = mss_now;
+ 		if (tso_segs > 1 && !tcp_urg_mode(tp))
+ 			limit = tcp_mss_split_point(sk, skb, mss_now,
+@@ -2334,6 +2340,8 @@ int __tcp_retransmit_skb(struct sock *sk
+ 		int oldpcount = tcp_skb_pcount(skb);
+ 
+ 		if (unlikely(oldpcount > 1)) {
++			if (skb_unclone(skb, GFP_ATOMIC))
++				return -ENOMEM;
+ 			tcp_init_tso_segs(sk, skb, cur_mss);
+ 			tcp_adjust_pcount(sk, skb, oldpcount - tcp_skb_pcount(skb));
+ 		}
+--- a/net/ipv6/inet6_hashtables.c
++++ b/net/ipv6/inet6_hashtables.c
+@@ -116,7 +116,7 @@ begintw:
+ 			}
+ 			if (unlikely(!INET6_TW_MATCH(sk, net, saddr, daddr,
+ 						     ports, dif))) {
+-				sock_put(sk);
++				inet_twsk_put(inet_twsk(sk));
+ 				goto begintw;
+ 			}
+ 			goto out;
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -130,7 +130,7 @@ static int ip6_finish_output2(struct sk_
+ 	}
+ 
+ 	rcu_read_lock_bh();
+-	nexthop = rt6_nexthop((struct rt6_info *)dst, &ipv6_hdr(skb)->daddr);
++	nexthop = rt6_nexthop((struct rt6_info *)dst);
+ 	neigh = __ipv6_neigh_lookup_noref(dst->dev, nexthop);
+ 	if (unlikely(!neigh))
+ 		neigh = __neigh_create(&nd_tbl, nexthop, dst->dev, false);
+@@ -899,7 +899,7 @@ static int ip6_dst_lookup_tail(struct so
+ 	 */
+ 	rt = (struct rt6_info *) *dst;
+ 	rcu_read_lock_bh();
+-	n = __ipv6_neigh_lookup_noref(rt->dst.dev, rt6_nexthop(rt, &fl6->daddr));
++	n = __ipv6_neigh_lookup_noref(rt->dst.dev, rt6_nexthop(rt));
+ 	err = n && !(n->nud_state & NUD_VALID) ? -EINVAL : 0;
+ 	rcu_read_unlock_bh();
+ 
+@@ -1252,7 +1252,7 @@ int ip6_append_data(struct sock *sk, int
+ 	skb = skb_peek_tail(&sk->sk_write_queue);
+ 	cork->length += length;
+ 	if (((length > mtu) ||
+-	     (skb && skb_is_gso(skb))) &&
++	     (skb && skb_has_frags(skb))) &&
+ 	    (sk->sk_protocol == IPPROTO_UDP) &&
+ 	    (rt->dst.dev->features & NETIF_F_UFO)) {
+ 		err = ip6_ufo_append_data(sk, getfrag, from, length,
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -477,6 +477,24 @@ out:
+ }
+ 
+ #ifdef CONFIG_IPV6_ROUTER_PREF
++struct __rt6_probe_work {
++	struct work_struct work;
++	struct in6_addr target;
++	struct net_device *dev;
++};
++
++static void rt6_probe_deferred(struct work_struct *w)
++{
++	struct in6_addr mcaddr;
++	struct __rt6_probe_work *work =
++		container_of(w, struct __rt6_probe_work, work);
++
++	addrconf_addr_solict_mult(&work->target, &mcaddr);
++	ndisc_send_ns(work->dev, NULL, &work->target, &mcaddr, NULL);
++	dev_put(work->dev);
++	kfree(w);
++}
++
+ static void rt6_probe(struct rt6_info *rt)
+ {
+ 	struct neighbour *neigh;
+@@ -500,17 +518,23 @@ static void rt6_probe(struct rt6_info *r
+ 
+ 	if (!neigh ||
+ 	    time_after(jiffies, neigh->updated + rt->rt6i_idev->cnf.rtr_probe_interval)) {
+-		struct in6_addr mcaddr;
+-		struct in6_addr *target;
++		struct __rt6_probe_work *work;
+ 
+-		if (neigh) {
++		work = kmalloc(sizeof(*work), GFP_ATOMIC);
++
++		if (neigh && work)
+ 			neigh->updated = jiffies;
++
++		if (neigh)
+ 			write_unlock(&neigh->lock);
+-		}
+ 
+-		target = (struct in6_addr *)&rt->rt6i_gateway;
+-		addrconf_addr_solict_mult(target, &mcaddr);
+-		ndisc_send_ns(rt->dst.dev, NULL, target, &mcaddr, NULL);
++		if (work) {
++			INIT_WORK(&work->work, rt6_probe_deferred);
++			work->target = rt->rt6i_gateway;
++			dev_hold(rt->dst.dev);
++			work->dev = rt->dst.dev;
++			schedule_work(&work->work);
++		}
+ 	} else {
+ out:
+ 		write_unlock(&neigh->lock);
+@@ -852,7 +876,6 @@ static struct rt6_info *rt6_alloc_cow(st
+ 			if (ort->rt6i_dst.plen != 128 &&
+ 			    ipv6_addr_equal(&ort->rt6i_dst.addr, daddr))
+ 				rt->rt6i_flags |= RTF_ANYCAST;
+-			rt->rt6i_gateway = *daddr;
+ 		}
+ 
+ 		rt->rt6i_flags |= RTF_CACHE;
+@@ -1270,6 +1293,7 @@ struct dst_entry *icmp6_dst_alloc(struct
+ 	rt->dst.flags |= DST_HOST;
+ 	rt->dst.output  = ip6_output;
+ 	atomic_set(&rt->dst.__refcnt, 1);
++	rt->rt6i_gateway  = fl6->daddr;
+ 	rt->rt6i_dst.addr = fl6->daddr;
+ 	rt->rt6i_dst.plen = 128;
+ 	rt->rt6i_idev     = idev;
+@@ -1824,7 +1848,10 @@ static struct rt6_info *ip6_rt_copy(stru
+ 			in6_dev_hold(rt->rt6i_idev);
+ 		rt->dst.lastuse = jiffies;
+ 
+-		rt->rt6i_gateway = ort->rt6i_gateway;
++		if (ort->rt6i_flags & RTF_GATEWAY)
++			rt->rt6i_gateway = ort->rt6i_gateway;
++		else
++			rt->rt6i_gateway = *dest;
+ 		rt->rt6i_flags = ort->rt6i_flags;
+ 		if ((ort->rt6i_flags & (RTF_DEFAULT | RTF_ADDRCONF)) ==
+ 		    (RTF_DEFAULT | RTF_ADDRCONF))
+@@ -2111,6 +2138,7 @@ struct rt6_info *addrconf_dst_alloc(stru
+ 	else
+ 		rt->rt6i_flags |= RTF_LOCAL;
+ 
++	rt->rt6i_gateway  = *addr;
+ 	rt->rt6i_dst.addr = *addr;
+ 	rt->rt6i_dst.plen = 128;
+ 	rt->rt6i_table = fib6_get_table(net, RT6_TABLE_LOCAL);
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@ -1708,7 +1708,6 @@ static void __net_exit sit_exit_net(stru
+ 
+ 	rtnl_lock();
+ 	sit_destroy_tunnels(sitn, &list);
+-	unregister_netdevice_queue(sitn->fb_tunnel_dev, &list);
+ 	unregister_netdevice_many(&list);
+ 	rtnl_unlock();
+ }
+--- a/net/l2tp/l2tp_core.c
++++ b/net/l2tp/l2tp_core.c
+@@ -115,6 +115,11 @@ struct l2tp_net {
+ static void l2tp_session_set_header_len(struct l2tp_session *session, int version);
+ static void l2tp_tunnel_free(struct l2tp_tunnel *tunnel);
+ 
++static inline struct l2tp_tunnel *l2tp_tunnel(struct sock *sk)
++{
++	return sk->sk_user_data;
++}
++
+ static inline struct l2tp_net *l2tp_pernet(struct net *net)
+ {
+ 	BUG_ON(!net);
+@@ -504,7 +509,7 @@ static inline int l2tp_verify_udp_checks
+ 		return 0;
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+-	if (sk->sk_family == PF_INET6) {
++	if (sk->sk_family == PF_INET6 && !l2tp_tunnel(sk)->v4mapped) {
+ 		if (!uh->check) {
+ 			LIMIT_NETDEBUG(KERN_INFO "L2TP: IPv6: checksum is 0\n");
+ 			return 1;
+@@ -1128,7 +1133,7 @@ static int l2tp_xmit_core(struct l2tp_se
+ 	/* Queue the packet to IP for output */
+ 	skb->local_df = 1;
+ #if IS_ENABLED(CONFIG_IPV6)
+-	if (skb->sk->sk_family == PF_INET6)
++	if (skb->sk->sk_family == PF_INET6 && !tunnel->v4mapped)
+ 		error = inet6_csk_xmit(skb, NULL);
+ 	else
+ #endif
+@@ -1255,7 +1260,7 @@ int l2tp_xmit_skb(struct l2tp_session *s
+ 
+ 		/* Calculate UDP checksum if configured to do so */
+ #if IS_ENABLED(CONFIG_IPV6)
+-		if (sk->sk_family == PF_INET6)
++		if (sk->sk_family == PF_INET6 && !tunnel->v4mapped)
+ 			l2tp_xmit_ipv6_csum(sk, skb, udp_len);
+ 		else
+ #endif
+@@ -1304,10 +1309,9 @@ EXPORT_SYMBOL_GPL(l2tp_xmit_skb);
+  */
+ static void l2tp_tunnel_destruct(struct sock *sk)
+ {
+-	struct l2tp_tunnel *tunnel;
++	struct l2tp_tunnel *tunnel = l2tp_tunnel(sk);
+ 	struct l2tp_net *pn;
+ 
+-	tunnel = sk->sk_user_data;
+ 	if (tunnel == NULL)
+ 		goto end;
+ 
+@@ -1675,7 +1679,7 @@ int l2tp_tunnel_create(struct net *net,
+ 	}
+ 
+ 	/* Check if this socket has already been prepped */
+-	tunnel = (struct l2tp_tunnel *)sk->sk_user_data;
++	tunnel = l2tp_tunnel(sk);
+ 	if (tunnel != NULL) {
+ 		/* This socket has already been prepped */
+ 		err = -EBUSY;
+@@ -1704,6 +1708,24 @@ int l2tp_tunnel_create(struct net *net,
+ 	if (cfg != NULL)
+ 		tunnel->debug = cfg->debug;
+ 
++#if IS_ENABLED(CONFIG_IPV6)
++	if (sk->sk_family == PF_INET6) {
++		struct ipv6_pinfo *np = inet6_sk(sk);
++
++		if (ipv6_addr_v4mapped(&np->saddr) &&
++		    ipv6_addr_v4mapped(&np->daddr)) {
++			struct inet_sock *inet = inet_sk(sk);
++
++			tunnel->v4mapped = true;
++			inet->inet_saddr = np->saddr.s6_addr32[3];
++			inet->inet_rcv_saddr = np->rcv_saddr.s6_addr32[3];
++			inet->inet_daddr = np->daddr.s6_addr32[3];
++		} else {
++			tunnel->v4mapped = false;
++		}
++	}
++#endif
++
+ 	/* Mark socket as an encapsulation socket. See net/ipv4/udp.c */
+ 	tunnel->encap = encap;
+ 	if (encap == L2TP_ENCAPTYPE_UDP) {
+@@ -1712,7 +1734,7 @@ int l2tp_tunnel_create(struct net *net,
+ 		udp_sk(sk)->encap_rcv = l2tp_udp_encap_recv;
+ 		udp_sk(sk)->encap_destroy = l2tp_udp_encap_destroy;
+ #if IS_ENABLED(CONFIG_IPV6)
+-		if (sk->sk_family == PF_INET6)
++		if (sk->sk_family == PF_INET6 && !tunnel->v4mapped)
+ 			udpv6_encap_enable();
+ 		else
+ #endif
+--- a/net/l2tp/l2tp_core.h
++++ b/net/l2tp/l2tp_core.h
+@@ -194,6 +194,9 @@ struct l2tp_tunnel {
+ 	struct sock		*sock;		/* Parent socket */
+ 	int			fd;		/* Parent fd, if tunnel socket
+ 						 * was created by userspace */
++#if IS_ENABLED(CONFIG_IPV6)
++	bool			v4mapped;
++#endif
+ 
+ 	struct work_struct	del_work;
+ 
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -353,7 +353,9 @@ static int pppol2tp_sendmsg(struct kiocb
+ 		goto error_put_sess_tun;
+ 	}
+ 
++	local_bh_disable();
+ 	l2tp_xmit_skb(session, skb, session->hdr_len);
++	local_bh_enable();
+ 
+ 	sock_put(ps->tunnel_sock);
+ 	sock_put(sk);
+@@ -422,7 +424,9 @@ static int pppol2tp_xmit(struct ppp_chan
+ 	skb->data[0] = ppph[0];
+ 	skb->data[1] = ppph[1];
+ 
++	local_bh_disable();
+ 	l2tp_xmit_skb(session, skb, session->hdr_len);
++	local_bh_enable();
+ 
+ 	sock_put(sk_tun);
+ 	sock_put(sk);
+--- a/net/netfilter/nf_conntrack_h323_main.c
++++ b/net/netfilter/nf_conntrack_h323_main.c
+@@ -778,8 +778,8 @@ static int callforward_do_filter(const u
+ 				   flowi6_to_flowi(&fl1), false)) {
+ 			if (!afinfo->route(&init_net, (struct dst_entry **)&rt2,
+ 					   flowi6_to_flowi(&fl2), false)) {
+-				if (!memcmp(&rt1->rt6i_gateway, &rt2->rt6i_gateway,
+-					    sizeof(rt1->rt6i_gateway)) &&
++				if (ipv6_addr_equal(rt6_nexthop(rt1),
++						    rt6_nexthop(rt2)) &&
+ 				    rt1->dst.dev == rt2->dst.dev)
+ 					ret = 1;
+ 				dst_release(&rt2->dst);
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@ -358,6 +358,21 @@ static psched_time_t packet_len_2_sched_
+ 	return PSCHED_NS2TICKS(ticks);
+ }
+ 
++static void tfifo_reset(struct Qdisc *sch)
++{
++	struct netem_sched_data *q = qdisc_priv(sch);
++	struct rb_node *p;
++
++	while ((p = rb_first(&q->t_root))) {
++		struct sk_buff *skb = netem_rb_to_skb(p);
++
++		rb_erase(p, &q->t_root);
++		skb->next = NULL;
++		skb->prev = NULL;
++		kfree_skb(skb);
++	}
++}
++
+ static void tfifo_enqueue(struct sk_buff *nskb, struct Qdisc *sch)
+ {
+ 	struct netem_sched_data *q = qdisc_priv(sch);
+@@ -523,6 +538,7 @@ static unsigned int netem_drop(struct Qd
+ 			skb->next = NULL;
+ 			skb->prev = NULL;
+ 			len = qdisc_pkt_len(skb);
++			sch->qstats.backlog -= len;
+ 			kfree_skb(skb);
+ 		}
+ 	}
+@@ -612,6 +628,7 @@ static void netem_reset(struct Qdisc *sc
+ 	struct netem_sched_data *q = qdisc_priv(sch);
+ 
+ 	qdisc_reset_queue(sch);
++	tfifo_reset(sch);
+ 	if (q->qdisc)
+ 		qdisc_reset(q->qdisc);
+ 	qdisc_watchdog_cancel(&q->watchdog);
+--- a/net/sctp/output.c
++++ b/net/sctp/output.c
+@@ -542,7 +542,8 @@ int sctp_packet_transmit(struct sctp_pac
+ 	 * by CRC32-C as described in <draft-ietf-tsvwg-sctpcsum-02.txt>.
+ 	 */
+ 	if (!sctp_checksum_disable) {
+-		if (!(dst->dev->features & NETIF_F_SCTP_CSUM)) {
++		if (!(dst->dev->features & NETIF_F_SCTP_CSUM) ||
++		    (dst_xfrm(dst) != NULL) || packet->ipfragok) {
+ 			__u32 crc32 = sctp_start_cksum((__u8 *)sh, cksum_buf_len);
+ 
+ 			/* 3) Put the resultant value into the checksum field in the
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -1973,6 +1973,16 @@ struct used_address {
+ 	unsigned int name_len;
+ };
+ 
++static int copy_msghdr_from_user(struct msghdr *kmsg,
++				 struct msghdr __user *umsg)
++{
++	if (copy_from_user(kmsg, umsg, sizeof(struct msghdr)))
++		return -EFAULT;
++	if (kmsg->msg_namelen > sizeof(struct sockaddr_storage))
++		return -EINVAL;
++	return 0;
++}
++
+ static int ___sys_sendmsg(struct socket *sock, struct msghdr __user *msg,
+ 			 struct msghdr *msg_sys, unsigned int flags,
+ 			 struct used_address *used_address)
+@@ -1991,8 +2001,11 @@ static int ___sys_sendmsg(struct socket
+ 	if (MSG_CMSG_COMPAT & flags) {
+ 		if (get_compat_msghdr(msg_sys, msg_compat))
+ 			return -EFAULT;
+-	} else if (copy_from_user(msg_sys, msg, sizeof(struct msghdr)))
+-		return -EFAULT;
++	} else {
++		err = copy_msghdr_from_user(msg_sys, msg);
++		if (err)
++			return err;
++	}
+ 
+ 	if (msg_sys->msg_iovlen > UIO_FASTIOV) {
+ 		err = -EMSGSIZE;
+@@ -2200,8 +2213,11 @@ static int ___sys_recvmsg(struct socket
+ 	if (MSG_CMSG_COMPAT & flags) {
+ 		if (get_compat_msghdr(msg_sys, msg_compat))
+ 			return -EFAULT;
+-	} else if (copy_from_user(msg_sys, msg, sizeof(struct msghdr)))
+-		return -EFAULT;
++	} else {
++		err = copy_msghdr_from_user(msg_sys, msg);
++		if (err)
++			return err;
++	}
+ 
+ 	if (msg_sys->msg_iovlen > UIO_FASTIOV) {
+ 		err = -EMSGSIZE;
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -1246,6 +1246,15 @@ static int unix_socketpair(struct socket
+ 	return 0;
+ }
+ 
++static void unix_sock_inherit_flags(const struct socket *old,
++				    struct socket *new)
++{
++	if (test_bit(SOCK_PASSCRED, &old->flags))
++		set_bit(SOCK_PASSCRED, &new->flags);
++	if (test_bit(SOCK_PASSSEC, &old->flags))
++		set_bit(SOCK_PASSSEC, &new->flags);
++}
++
+ static int unix_accept(struct socket *sock, struct socket *newsock, int flags)
+ {
+ 	struct sock *sk = sock->sk;
+@@ -1280,6 +1289,7 @@ static int unix_accept(struct socket *so
+ 	/* attach accepted sock to socket */
+ 	unix_state_lock(tsk);
+ 	newsock->state = SS_CONNECTED;
++	unix_sock_inherit_flags(sock, newsock);
+ 	sock_graft(tsk, newsock);
+ 	unix_state_unlock(tsk);
+ 	return 0;
+--- a/net/unix/diag.c
++++ b/net/unix/diag.c
+@@ -124,6 +124,7 @@ static int sk_diag_fill(struct sock *sk,
+ 	rep->udiag_family = AF_UNIX;
+ 	rep->udiag_type = sk->sk_type;
+ 	rep->udiag_state = sk->sk_state;
++	rep->pad = 0;
+ 	rep->udiag_ino = sk_ino;
+ 	sock_diag_save_cookie(sk, rep->udiag_cookie);
+ 
+--- a/net/wireless/radiotap.c
++++ b/net/wireless/radiotap.c
+@@ -97,6 +97,10 @@ int ieee80211_radiotap_iterator_init(
+ 	struct ieee80211_radiotap_header *radiotap_header,
+ 	int max_length, const struct ieee80211_radiotap_vendor_namespaces *vns)
+ {
++	/* check the radiotap header can actually be present */
++	if (max_length < sizeof(struct ieee80211_radiotap_header))
++		return -EINVAL;
++
+ 	/* Linux only supports version 0 radiotap format */
+ 	if (radiotap_header->it_version)
+ 		return -EINVAL;
+@@ -131,7 +135,8 @@ int ieee80211_radiotap_iterator_init(
+ 			 */
+ 
+ 			if ((unsigned long)iterator->_arg -
+-			    (unsigned long)iterator->_rtheader >
++			    (unsigned long)iterator->_rtheader +
++			    sizeof(uint32_t) >
+ 			    (unsigned long)iterator->_max_length)
+ 				return -EINVAL;
+ 		}
+--- a/sound/pci/hda/hda_generic.c
++++ b/sound/pci/hda/hda_generic.c
+@@ -3505,7 +3505,7 @@ static int create_capture_mixers(struct
+ 		if (!multi)
+ 			err = create_single_cap_vol_ctl(codec, n, vol, sw,
+ 							inv_dmic);
+-		else if (!multi_cap_vol)
++		else if (!multi_cap_vol && !inv_dmic)
+ 			err = create_bind_cap_vol_ctl(codec, n, vol, sw);
+ 		else
+ 			err = create_multi_cap_vol_ctl(codec);
+--- a/sound/usb/usx2y/us122l.c
++++ b/sound/usb/usx2y/us122l.c
+@@ -262,7 +262,9 @@ static int usb_stream_hwdep_mmap(struct
+ 	}
+ 
+ 	area->vm_ops = &usb_stream_hwdep_vm_ops;
+-	area->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
++	area->vm_flags |= VM_DONTDUMP;
++	if (!read)
++		area->vm_flags |= VM_DONTEXPAND;
+ 	area->vm_private_data = us122l;
+ 	atomic_inc(&us122l->mmap_count);
+ out:
