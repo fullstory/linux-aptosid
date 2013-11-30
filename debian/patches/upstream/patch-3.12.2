@@ -1,15 +1,13 @@
 --- a/Makefile
 +++ b/Makefile
-@@ -1,7 +1,7 @@
+@@ -1,6 +1,6 @@
  VERSION = 3
  PATCHLEVEL = 12
--SUBLEVEL = 1
--EXTRAVERSION =
+-SUBLEVEL = 0
 +SUBLEVEL = 2
-+EXTRAVERSION = -rc1
+ EXTRAVERSION =
  NAME = One Giant Leap for Frogkind
  
- # *DOCUMENTATION*
 --- a/arch/arm/kvm/mmu.c
 +++ b/arch/arm/kvm/mmu.c
 @@ -307,6 +307,17 @@ out:
@@ -937,6 +935,21 @@
  		return 0;
  
  	case MSB_RP_RECIVE_STATUS_REG:
+--- a/drivers/misc/atmel_pwm.c
++++ b/drivers/misc/atmel_pwm.c
+@@ -90,8 +90,10 @@ int pwm_channel_alloc(int index, struct
+ 	unsigned long	flags;
+ 	int		status = 0;
+ 
+-	/* insist on PWM init, with this signal pinned out */
+-	if (!pwm || !(pwm->mask & 1 << index))
++	if (!pwm)
++		return -EPROBE_DEFER;
++
++	if (!(pwm->mask & 1 << index))
+ 		return -ENODEV;
+ 
+ 	if (index < 0 || index >= PWM_NCHAN || !ch)
 --- a/drivers/misc/lkdtm.c
 +++ b/drivers/misc/lkdtm.c
 @@ -297,6 +297,14 @@ static void do_nothing(void)
@@ -1079,6 +1092,72 @@
  
  	if (!netif_running(alx->dev))
  		return 0;
+--- a/drivers/net/ethernet/chelsio/cxgb3/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb3/sge.c
+@@ -1599,7 +1599,8 @@ static void write_ofld_wr(struct adapter
+ 	flits = skb_transport_offset(skb) / 8;
+ 	sgp = ndesc == 1 ? (struct sg_ent *)&d->flit[flits] : sgl;
+ 	sgl_flits = make_sgl(skb, sgp, skb_transport_header(skb),
+-			     skb->tail - skb->transport_header,
++			     skb_tail_pointer(skb) -
++			     skb_transport_header(skb),
+ 			     adap->pdev);
+ 	if (need_skb_unmap()) {
+ 		setup_deferred_unmapping(skb, adap->pdev, sgp, sgl_flits);
+--- a/drivers/net/ethernet/mellanox/mlx4/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+@@ -1691,7 +1691,7 @@ static void mlx4_master_deactivate_admin
+ 			vp_oper->vlan_idx = NO_INDX;
+ 		}
+ 		if (NO_INDX != vp_oper->mac_idx) {
+-			__mlx4_unregister_mac(&priv->dev, port, vp_oper->mac_idx);
++			__mlx4_unregister_mac(&priv->dev, port, vp_oper->state.mac);
+ 			vp_oper->mac_idx = NO_INDX;
+ 		}
+ 	}
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -1118,11 +1118,6 @@ static int virtnet_cpu_callback(struct n
+ {
+ 	struct virtnet_info *vi = container_of(nfb, struct virtnet_info, nb);
+ 
+-	mutex_lock(&vi->config_lock);
+-
+-	if (!vi->config_enable)
+-		goto done;
+-
+ 	switch(action & ~CPU_TASKS_FROZEN) {
+ 	case CPU_ONLINE:
+ 	case CPU_DOWN_FAILED:
+@@ -1136,8 +1131,6 @@ static int virtnet_cpu_callback(struct n
+ 		break;
+ 	}
+ 
+-done:
+-	mutex_unlock(&vi->config_lock);
+ 	return NOTIFY_OK;
+ }
+ 
+@@ -1699,6 +1692,8 @@ static int virtnet_freeze(struct virtio_
+ 	struct virtnet_info *vi = vdev->priv;
+ 	int i;
+ 
++	unregister_hotcpu_notifier(&vi->nb);
++
+ 	/* Prevent config work handler from accessing the device */
+ 	mutex_lock(&vi->config_lock);
+ 	vi->config_enable = false;
+@@ -1747,6 +1742,10 @@ static int virtnet_restore(struct virtio
+ 	virtnet_set_queues(vi, vi->curr_queue_pairs);
+ 	rtnl_unlock();
+ 
++	err = register_hotcpu_notifier(&vi->nb);
++	if (err)
++		return err;
++
+ 	return 0;
+ }
+ #endif
 --- a/drivers/net/wireless/libertas/debugfs.c
 +++ b/drivers/net/wireless/libertas/debugfs.c
 @@ -913,7 +913,10 @@ static ssize_t lbs_debugfs_write(struct
@@ -1236,6 +1315,61 @@
  
  	/*
  	 * All information is retrieved from the skb->cb array,
+--- a/drivers/net/xen-netback/common.h
++++ b/drivers/net/xen-netback/common.h
+@@ -163,6 +163,7 @@ struct xenvif {
+ 	unsigned long   credit_usec;
+ 	unsigned long   remaining_credit;
+ 	struct timer_list credit_timeout;
++	u64 credit_window_start;
+ 
+ 	/* Statistics */
+ 	unsigned long rx_gso_checksum_fixup;
+--- a/drivers/net/xen-netback/interface.c
++++ b/drivers/net/xen-netback/interface.c
+@@ -312,8 +312,7 @@ struct xenvif *xenvif_alloc(struct devic
+ 	vif->credit_bytes = vif->remaining_credit = ~0UL;
+ 	vif->credit_usec  = 0UL;
+ 	init_timer(&vif->credit_timeout);
+-	/* Initialize 'expires' now: it's used to track the credit window. */
+-	vif->credit_timeout.expires = jiffies;
++	vif->credit_window_start = get_jiffies_64();
+ 
+ 	dev->netdev_ops	= &xenvif_netdev_ops;
+ 	dev->hw_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_TSO;
+--- a/drivers/net/xen-netback/netback.c
++++ b/drivers/net/xen-netback/netback.c
+@@ -1185,9 +1185,8 @@ out:
+ 
+ static bool tx_credit_exceeded(struct xenvif *vif, unsigned size)
+ {
+-	unsigned long now = jiffies;
+-	unsigned long next_credit =
+-		vif->credit_timeout.expires +
++	u64 now = get_jiffies_64();
++	u64 next_credit = vif->credit_window_start +
+ 		msecs_to_jiffies(vif->credit_usec / 1000);
+ 
+ 	/* Timer could already be pending in rare cases. */
+@@ -1195,8 +1194,8 @@ static bool tx_credit_exceeded(struct xe
+ 		return true;
+ 
+ 	/* Passed the point where we can replenish credit? */
+-	if (time_after_eq(now, next_credit)) {
+-		vif->credit_timeout.expires = now;
++	if (time_after_eq64(now, next_credit)) {
++		vif->credit_window_start = now;
+ 		tx_add_credit(vif);
+ 	}
+ 
+@@ -1208,6 +1207,7 @@ static bool tx_credit_exceeded(struct xe
+ 			tx_credit_callback;
+ 		mod_timer(&vif->credit_timeout,
+ 			  next_credit);
++		vif->credit_window_start = next_credit;
+ 
+ 		return true;
+ 	}
 --- a/drivers/platform/x86/thinkpad_acpi.c
 +++ b/drivers/platform/x86/thinkpad_acpi.c
 @@ -6420,7 +6420,12 @@ static struct ibm_struct brightness_driv
@@ -1351,9 +1485,40 @@
  	if (hcd->driver->set_usb2_hw_lpm) {
  		ret = hcd->driver->set_usb2_hw_lpm(hcd, udev, enable);
  		if (!ret)
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1033,6 +1033,7 @@ static int register_root_hub(struct usb_
+ 					dev_name(&usb_dev->dev), retval);
+ 			return retval;
+ 		}
++		usb_dev->lpm_capable = usb_device_supports_lpm(usb_dev);
+ 	}
+ 
+ 	retval = usb_new_device (usb_dev);
 --- a/drivers/usb/core/hub.c
 +++ b/drivers/usb/core/hub.c
-@@ -1135,6 +1135,11 @@ static void hub_activate(struct usb_hub
+@@ -135,7 +135,7 @@ struct usb_hub *usb_hub_to_struct_hub(st
+ 	return usb_get_intfdata(hdev->actconfig->interface[0]);
+ }
+ 
+-static int usb_device_supports_lpm(struct usb_device *udev)
++int usb_device_supports_lpm(struct usb_device *udev)
+ {
+ 	/* USB 2.1 (and greater) devices indicate LPM support through
+ 	 * their USB 2.0 Extended Capabilities BOS descriptor.
+@@ -156,6 +156,11 @@ static int usb_device_supports_lpm(struc
+ 				"Power management will be impacted.\n");
+ 		return 0;
+ 	}
++
++	/* udev is root hub */
++	if (!udev->parent)
++		return 1;
++
+ 	if (udev->parent->lpm_capable)
+ 		return 1;
+ 
+@@ -1130,6 +1135,11 @@ static void hub_activate(struct usb_hub
  			usb_clear_port_feature(hub->hdev, port1,
  					USB_PORT_FEAT_C_ENABLE);
  		}
@@ -1365,7 +1530,7 @@
  		if ((portchange & USB_PORT_STAT_C_BH_RESET) &&
  				hub_is_superspeed(hub->hdev)) {
  			need_debounce_delay = true;
-@@ -3954,6 +3959,32 @@ static int hub_set_address(struct usb_de
+@@ -3949,6 +3959,32 @@ static int hub_set_address(struct usb_de
  	return retval;
  }
  
@@ -1398,7 +1563,7 @@
  /* Reset device, (re)assign address, get device descriptor.
   * Device connection must be stable, no more debouncing needed.
   * Returns device in USB_STATE_ADDRESS, except on error.
-@@ -4247,6 +4278,7 @@ hub_port_init (struct usb_hub *hub, stru
+@@ -4242,6 +4278,7 @@ hub_port_init (struct usb_hub *hub, stru
  	/* notify HCD that we have a device connected and addressed */
  	if (hcd->driver->update_device)
  		hcd->driver->update_device(hcd, udev);
@@ -1406,7 +1571,7 @@
  fail:
  	if (retval) {
  		hub_port_disable(hub, port1, 0);
-@@ -5091,6 +5123,12 @@ static int usb_reset_and_verify_device(s
+@@ -5086,6 +5123,12 @@ static int usb_reset_and_verify_device(s
  	}
  	parent_hub = usb_hub_to_struct_hub(parent_hdev);
  
@@ -1419,7 +1584,7 @@
  	bos = udev->bos;
  	udev->bos = NULL;
  
-@@ -5198,6 +5236,7 @@ static int usb_reset_and_verify_device(s
+@@ -5193,6 +5236,7 @@ static int usb_reset_and_verify_device(s
  
  done:
  	/* Now that the alt settings are re-installed, enable LTM and LPM. */
@@ -1450,6 +1615,16 @@
  
  	usb_unlock_device(udev);
  
+--- a/drivers/usb/core/usb.h
++++ b/drivers/usb/core/usb.h
+@@ -35,6 +35,7 @@ extern int usb_get_device_descriptor(str
+ 		unsigned int size);
+ extern int usb_get_bos_descriptor(struct usb_device *dev);
+ extern void usb_release_bos_descriptor(struct usb_device *dev);
++extern int usb_device_supports_lpm(struct usb_device *udev);
+ extern char *usb_cache_string(struct usb_device *udev, int index);
+ extern int usb_set_configuration(struct usb_device *dev, int configuration);
+ extern int usb_choose_configuration(struct usb_device *udev);
 --- a/drivers/usb/host/xhci-mem.c
 +++ b/drivers/usb/host/xhci-mem.c
 @@ -1693,9 +1693,7 @@ void xhci_free_command(struct xhci_hcd *
@@ -1843,6 +2018,32 @@
  	result = ((mcr & MCR_DTR) ? TIOCM_DTR : 0)
  	    | ((mcr & MCR_RTS) ? TIOCM_RTS : 0)
  	    | ((mcr & MCR_LOOPBACK) ? TIOCM_LOOP : 0)
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -1376,6 +1376,23 @@ static const struct usb_device_id option
+ 		.driver_info = (kernel_ulong_t)&net_intf2_blacklist },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1426, 0xff, 0xff, 0xff),  /* ZTE MF91 */
+ 		.driver_info = (kernel_ulong_t)&net_intf2_blacklist },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1533, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1534, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1535, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1545, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1546, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1547, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1565, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1566, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1567, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1589, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1590, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1591, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1592, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1594, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1596, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1598, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1600, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x2002, 0xff,
+ 	  0xff, 0xff), .driver_info = (kernel_ulong_t)&zte_k3765_z_blacklist },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x2003, 0xff, 0xff, 0xff) },
 --- a/drivers/usb/wusbcore/wa-rpipe.c
 +++ b/drivers/usb/wusbcore/wa-rpipe.c
 @@ -333,7 +333,10 @@ static int rpipe_aim(struct wa_rpipe *rp
@@ -1857,6 +2058,109 @@
  
  	rpipe->descr.hwa_bMaxBurst = max(min_t(unsigned int,
  				epcd->bMaxBurst, 16U), 1U);
+--- a/drivers/video/backlight/atmel-pwm-bl.c
++++ b/drivers/video/backlight/atmel-pwm-bl.c
+@@ -118,7 +118,7 @@ static const struct backlight_ops atmel_
+ 	.update_status  = atmel_pwm_bl_set_intensity,
+ };
+ 
+-static int __init atmel_pwm_bl_probe(struct platform_device *pdev)
++static int atmel_pwm_bl_probe(struct platform_device *pdev)
+ {
+ 	struct backlight_properties props;
+ 	const struct atmel_pwm_bl_platform_data *pdata;
+@@ -202,7 +202,7 @@ err_free_mem:
+ 	return retval;
+ }
+ 
+-static int __exit atmel_pwm_bl_remove(struct platform_device *pdev)
++static int atmel_pwm_bl_remove(struct platform_device *pdev)
+ {
+ 	struct atmel_pwm_bl *pwmbl = platform_get_drvdata(pdev);
+ 
+@@ -220,10 +220,11 @@ static struct platform_driver atmel_pwm_
+ 		.name = "atmel-pwm-bl",
+ 	},
+ 	/* REVISIT add suspend() and resume() */
+-	.remove = __exit_p(atmel_pwm_bl_remove),
++	.probe = atmel_pwm_bl_probe,
++	.remove = atmel_pwm_bl_remove,
+ };
+ 
+-module_platform_driver_probe(atmel_pwm_bl_driver, atmel_pwm_bl_probe);
++module_platform_driver(atmel_pwm_bl_driver);
+ 
+ MODULE_AUTHOR("Hans-Christian egtvedt <hans-christian.egtvedt@atmel.com>");
+ MODULE_DESCRIPTION("Atmel PWM backlight driver");
+--- a/drivers/video/hyperv_fb.c
++++ b/drivers/video/hyperv_fb.c
+@@ -795,12 +795,21 @@ static int hvfb_remove(struct hv_device
+ }
+ 
+ 
++static DEFINE_PCI_DEVICE_TABLE(pci_stub_id_table) = {
++	{
++		.vendor      = PCI_VENDOR_ID_MICROSOFT,
++		.device      = PCI_DEVICE_ID_HYPERV_VIDEO,
++	},
++	{ /* end of list */ }
++};
++
+ static const struct hv_vmbus_device_id id_table[] = {
+ 	/* Synthetic Video Device GUID */
+ 	{HV_SYNTHVID_GUID},
+ 	{}
+ };
+ 
++MODULE_DEVICE_TABLE(pci, pci_stub_id_table);
+ MODULE_DEVICE_TABLE(vmbus, id_table);
+ 
+ static struct hv_driver hvfb_drv = {
+@@ -810,14 +819,43 @@ static struct hv_driver hvfb_drv = {
+ 	.remove = hvfb_remove,
+ };
+ 
++static int hvfb_pci_stub_probe(struct pci_dev *pdev,
++			       const struct pci_device_id *ent)
++{
++	return 0;
++}
++
++static void hvfb_pci_stub_remove(struct pci_dev *pdev)
++{
++}
++
++static struct pci_driver hvfb_pci_stub_driver = {
++	.name =		KBUILD_MODNAME,
++	.id_table =	pci_stub_id_table,
++	.probe =	hvfb_pci_stub_probe,
++	.remove =	hvfb_pci_stub_remove,
++};
+ 
+ static int __init hvfb_drv_init(void)
+ {
+-	return vmbus_driver_register(&hvfb_drv);
++	int ret;
++
++	ret = vmbus_driver_register(&hvfb_drv);
++	if (ret != 0)
++		return ret;
++
++	ret = pci_register_driver(&hvfb_pci_stub_driver);
++	if (ret != 0) {
++		vmbus_driver_unregister(&hvfb_drv);
++		return ret;
++	}
++
++	return 0;
+ }
+ 
+ static void __exit hvfb_drv_exit(void)
+ {
++	pci_unregister_driver(&hvfb_pci_stub_driver);
+ 	vmbus_driver_unregister(&hvfb_drv);
+ }
+ 
 --- a/fs/btrfs/relocation.c
 +++ b/fs/btrfs/relocation.c
 @@ -4481,6 +4481,7 @@ int btrfs_reloc_clone_csums(struct inode
@@ -2645,6 +2949,16 @@
  	unsigned usb3_lpm_enabled:1;
  	int string_langid;
  
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@ -165,6 +165,7 @@ static inline struct inet6_dev *ip6_dst_
+ static inline void rt6_clean_expires(struct rt6_info *rt)
+ {
+ 	rt->rt6i_flags &= ~RTF_EXPIRES;
++	rt->dst.expires = 0;
+ }
+ 
+ static inline void rt6_set_expires(struct rt6_info *rt, unsigned long expires)
 --- a/include/sound/compress_driver.h
 +++ b/include/sound/compress_driver.h
 @@ -171,4 +171,13 @@ static inline void snd_compr_fragment_el
@@ -2782,6 +3096,22 @@
  		rcu_read_unlock();
  		return -EPERM;
  	}
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -843,9 +843,12 @@ int trace_get_user(struct trace_parser *
+ 	if (isspace(ch)) {
+ 		parser->buffer[parser->idx] = 0;
+ 		parser->cont = false;
+-	} else {
++	} else if (parser->idx < parser->size - 1) {
+ 		parser->cont = true;
+ 		parser->buffer[parser->idx++] = ch;
++	} else {
++		ret = -EINVAL;
++		goto out;
+ 	}
+ 
+ 	*ppos += read;
 --- a/kernel/trace/trace_event_perf.c
 +++ b/kernel/trace/trace_event_perf.c
 @@ -26,7 +26,7 @@ static int perf_trace_event_perm(struct
@@ -2806,6 +3136,186 @@
  		flags |= slub_debug;
  
  	return flags;
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@ -40,7 +40,7 @@ again:
+ 		struct iphdr _iph;
+ ip:
+ 		iph = skb_header_pointer(skb, nhoff, sizeof(_iph), &_iph);
+-		if (!iph)
++		if (!iph || iph->ihl < 5)
+ 			return false;
+ 
+ 		if (ip_is_fragment(iph))
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -2856,7 +2856,8 @@ static inline bool tcp_ack_update_rtt(st
+ 	 * left edge of the send window.
+ 	 * See draft-ietf-tcplw-high-performance-00, section 3.3.
+ 	 */
+-	if (seq_rtt < 0 && tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr)
++	if (seq_rtt < 0 && tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr &&
++	    flag & FLAG_ACKED)
+ 		seq_rtt = tcp_time_stamp - tp->rx_opt.rcv_tsecr;
+ 
+ 	if (seq_rtt < 0)
+@@ -2871,14 +2872,19 @@ static inline bool tcp_ack_update_rtt(st
+ }
+ 
+ /* Compute time elapsed between (last) SYNACK and the ACK completing 3WHS. */
+-static void tcp_synack_rtt_meas(struct sock *sk, struct request_sock *req)
++static void tcp_synack_rtt_meas(struct sock *sk, const u32 synack_stamp)
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	s32 seq_rtt = -1;
+ 
+-	if (tp->lsndtime && !tp->total_retrans)
+-		seq_rtt = tcp_time_stamp - tp->lsndtime;
+-	tcp_ack_update_rtt(sk, FLAG_SYN_ACKED, seq_rtt, -1);
++	if (synack_stamp && !tp->total_retrans)
++		seq_rtt = tcp_time_stamp - synack_stamp;
++
++	/* If the ACK acks both the SYNACK and the (Fast Open'd) data packets
++	 * sent in SYN_RECV, SYNACK RTT is the smooth RTT computed in tcp_ack()
++	 */
++	if (!tp->srtt)
++		tcp_ack_update_rtt(sk, FLAG_SYN_ACKED, seq_rtt, -1);
+ }
+ 
+ static void tcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+@@ -2981,6 +2987,7 @@ static int tcp_clean_rtx_queue(struct so
+ 	s32 seq_rtt = -1;
+ 	s32 ca_seq_rtt = -1;
+ 	ktime_t last_ackt = net_invalid_timestamp();
++	bool rtt_update;
+ 
+ 	while ((skb = tcp_write_queue_head(sk)) && skb != tcp_send_head(sk)) {
+ 		struct tcp_skb_cb *scb = TCP_SKB_CB(skb);
+@@ -3057,14 +3064,13 @@ static int tcp_clean_rtx_queue(struct so
+ 	if (skb && (TCP_SKB_CB(skb)->sacked & TCPCB_SACKED_ACKED))
+ 		flag |= FLAG_SACK_RENEGING;
+ 
+-	if (tcp_ack_update_rtt(sk, flag, seq_rtt, sack_rtt) ||
+-	    (flag & FLAG_ACKED))
+-		tcp_rearm_rto(sk);
++	rtt_update = tcp_ack_update_rtt(sk, flag, seq_rtt, sack_rtt);
+ 
+ 	if (flag & FLAG_ACKED) {
+ 		const struct tcp_congestion_ops *ca_ops
+ 			= inet_csk(sk)->icsk_ca_ops;
+ 
++		tcp_rearm_rto(sk);
+ 		if (unlikely(icsk->icsk_mtup.probe_size &&
+ 			     !after(tp->mtu_probe.probe_seq_end, tp->snd_una))) {
+ 			tcp_mtup_probe_success(sk);
+@@ -3103,6 +3109,13 @@ static int tcp_clean_rtx_queue(struct so
+ 
+ 			ca_ops->pkts_acked(sk, pkts_acked, rtt_us);
+ 		}
++	} else if (skb && rtt_update && sack_rtt >= 0 &&
++		   sack_rtt > (s32)(now - TCP_SKB_CB(skb)->when)) {
++		/* Do not re-arm RTO if the sack RTT is measured from data sent
++		 * after when the head was last (re)transmitted. Otherwise the
++		 * timeout may continue to extend in loss recovery.
++		 */
++		tcp_rearm_rto(sk);
+ 	}
+ 
+ #if FASTRETRANS_DEBUG > 0
+@@ -5587,6 +5600,7 @@ int tcp_rcv_state_process(struct sock *s
+ 	struct request_sock *req;
+ 	int queued = 0;
+ 	bool acceptable;
++	u32 synack_stamp;
+ 
+ 	tp->rx_opt.saw_tstamp = 0;
+ 
+@@ -5669,9 +5683,11 @@ int tcp_rcv_state_process(struct sock *s
+ 		 * so release it.
+ 		 */
+ 		if (req) {
++			synack_stamp = tcp_rsk(req)->snt_synack;
+ 			tp->total_retrans = req->num_retrans;
+ 			reqsk_fastopen_remove(sk, req, false);
+ 		} else {
++			synack_stamp = tp->lsndtime;
+ 			/* Make sure socket is routed, for correct metrics. */
+ 			icsk->icsk_af_ops->rebuild_header(sk);
+ 			tcp_init_congestion_control(sk);
+@@ -5694,7 +5710,7 @@ int tcp_rcv_state_process(struct sock *s
+ 		tp->snd_una = TCP_SKB_CB(skb)->ack_seq;
+ 		tp->snd_wnd = ntohs(th->window) << tp->rx_opt.snd_wscale;
+ 		tcp_init_wl(tp, TCP_SKB_CB(skb)->seq);
+-		tcp_synack_rtt_meas(sk, req);
++		tcp_synack_rtt_meas(sk, synack_stamp);
+ 
+ 		if (tp->rx_opt.tstamp_ok)
+ 			tp->advmss -= TCPOLEN_TSTAMP_ALIGNED;
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@ -18,6 +18,7 @@ struct sk_buff *tcp_tso_segment(struct s
+ 				netdev_features_t features)
+ {
+ 	struct sk_buff *segs = ERR_PTR(-EINVAL);
++	unsigned int sum_truesize = 0;
+ 	struct tcphdr *th;
+ 	unsigned int thlen;
+ 	unsigned int seq;
+@@ -102,13 +103,7 @@ struct sk_buff *tcp_tso_segment(struct s
+ 		if (copy_destructor) {
+ 			skb->destructor = gso_skb->destructor;
+ 			skb->sk = gso_skb->sk;
+-			/* {tcp|sock}_wfree() use exact truesize accounting :
+-			 * sum(skb->truesize) MUST be exactly be gso_skb->truesize
+-			 * So we account mss bytes of 'true size' for each segment.
+-			 * The last segment will contain the remaining.
+-			 */
+-			skb->truesize = mss;
+-			gso_skb->truesize -= mss;
++			sum_truesize += skb->truesize;
+ 		}
+ 		skb = skb->next;
+ 		th = tcp_hdr(skb);
+@@ -125,7 +120,9 @@ struct sk_buff *tcp_tso_segment(struct s
+ 	if (copy_destructor) {
+ 		swap(gso_skb->sk, skb->sk);
+ 		swap(gso_skb->destructor, skb->destructor);
+-		swap(gso_skb->truesize, skb->truesize);
++		sum_truesize += skb->truesize;
++		atomic_add(sum_truesize - gso_skb->truesize,
++			   &skb->sk->sk_wmem_alloc);
+ 	}
+ 
+ 	delta = htonl(oldlen + (skb_tail_pointer(skb) -
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -1087,10 +1087,13 @@ static struct dst_entry *ip6_dst_check(s
+ 	if (rt->rt6i_genid != rt_genid_ipv6(dev_net(rt->dst.dev)))
+ 		return NULL;
+ 
+-	if (rt->rt6i_node && (rt->rt6i_node->fn_sernum == cookie))
+-		return dst;
++	if (!rt->rt6i_node || (rt->rt6i_node->fn_sernum != cookie))
++		return NULL;
++
++	if (rt6_check_expired(rt))
++		return NULL;
+ 
+-	return NULL;
++	return dst;
+ }
+ 
+ static struct dst_entry *ip6_negative_advice(struct dst_entry *dst)
+--- a/net/sctp/sm_sideeffect.c
++++ b/net/sctp/sm_sideeffect.c
+@@ -860,7 +860,6 @@ static void sctp_cmd_delete_tcb(sctp_cmd
+ 	    (!asoc->temp) && (sk->sk_shutdown != SHUTDOWN_MASK))
+ 		return;
+ 
+-	BUG_ON(asoc->peer.primary_path == NULL);
+ 	sctp_unhash_established(asoc);
+ 	sctp_association_free(asoc);
+ }
 --- a/net/sunrpc/auth_gss/auth_gss.c
 +++ b/net/sunrpc/auth_gss/auth_gss.c
 @@ -482,6 +482,7 @@ gss_alloc_msg(struct gss_auth *gss_auth,
@@ -3323,6 +3833,21 @@
  
  MODULE_LICENSE("GPL");
  MODULE_DESCRIPTION("Conexant HD-audio codec");
+--- a/sound/pci/hda/patch_hdmi.c
++++ b/sound/pci/hda/patch_hdmi.c
+@@ -740,9 +740,10 @@ static int hdmi_manual_setup_channel_map
+ static void hdmi_setup_fake_chmap(unsigned char *map, int ca)
+ {
+ 	int i;
++	int ordered_ca = get_channel_allocation_order(ca);
+ 	for (i = 0; i < 8; i++) {
+-		if (i < channel_allocations[ca].channels)
+-			map[i] = from_cea_slot((hdmi_channel_mapping[ca][i] >> 4) & 0x0f);
++		if (i < channel_allocations[ordered_ca].channels)
++			map[i] = from_cea_slot(hdmi_channel_mapping[ca][i] & 0x0f);
+ 		else
+ 			map[i] = 0;
+ 	}
 --- a/sound/pci/hda/patch_realtek.c
 +++ b/sound/pci/hda/patch_realtek.c
 @@ -1043,6 +1043,7 @@ enum {
