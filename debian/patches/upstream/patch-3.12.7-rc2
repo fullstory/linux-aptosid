@@ -17,7 +17,7 @@
 -SUBLEVEL = 6
 -EXTRAVERSION =
 +SUBLEVEL = 7
-+EXTRAVERSION = -rc1
++EXTRAVERSION = -rc2
  NAME = One Giant Leap for Frogkind
  
  # *DOCUMENTATION*
@@ -352,6 +352,20 @@
  long kvmppc_hv_find_lock_hpte(struct kvm *kvm, gva_t eaddr, unsigned long slb_v,
  			      unsigned long valid)
  {
+--- a/arch/sh/kernel/sh_ksyms_32.c
++++ b/arch/sh/kernel/sh_ksyms_32.c
+@@ -20,6 +20,11 @@ EXPORT_SYMBOL(csum_partial_copy_generic)
+ EXPORT_SYMBOL(copy_page);
+ EXPORT_SYMBOL(__clear_user);
+ EXPORT_SYMBOL(empty_zero_page);
++#ifdef CONFIG_FLATMEM
++/* need in pfn_valid macro */
++EXPORT_SYMBOL(min_low_pfn);
++EXPORT_SYMBOL(max_low_pfn);
++#endif
+ 
+ #define DECLARE_EXPORT(name)		\
+ 	extern void name(void);EXPORT_SYMBOL(name)
 --- a/arch/sh/lib/Makefile
 +++ b/arch/sh/lib/Makefile
 @@ -6,7 +6,7 @@ lib-y  = delay.o memmove.o memchr.o \
@@ -452,6 +466,35 @@
  
  	kvm_set_cr3(vcpu, vmcs12->host_cr3);
  	kvm_mmu_reset_context(vcpu);
+--- a/arch/x86/mm/gup.c
++++ b/arch/x86/mm/gup.c
+@@ -83,6 +83,12 @@ static noinline int gup_pte_range(pmd_t
+ 		pte_t pte = gup_get_pte(ptep);
+ 		struct page *page;
+ 
++		/* Similar to the PMD case, NUMA hinting must take slow path */
++		if (pte_numa(pte)) {
++			pte_unmap(ptep);
++			return 0;
++		}
++
+ 		if ((pte_flags(pte) & (mask | _PAGE_SPECIAL)) != mask) {
+ 			pte_unmap(ptep);
+ 			return 0;
+@@ -167,6 +173,13 @@ static int gup_pmd_range(pud_t pud, unsi
+ 		if (pmd_none(pmd) || pmd_trans_splitting(pmd))
+ 			return 0;
+ 		if (unlikely(pmd_large(pmd))) {
++			/*
++			 * NUMA hinting faults need to be handled in the GUP
++			 * slowpath for accounting purposes and so that they
++			 * can be serialised against THP migration.
++			 */
++			if (pmd_numa(pmd))
++				return 0;
+ 			if (!gup_huge_pmd(pmd, addr, next, write, pages, nr))
+ 				return 0;
+ 		} else {
 --- a/drivers/acpi/acpi_lpss.c
 +++ b/drivers/acpi/acpi_lpss.c
 @@ -156,6 +156,7 @@ static const struct acpi_device_id acpi_
@@ -2969,7 +3012,7 @@
  	map->m_flags &= ~EXT4_MAP_FROM_CLUSTER;
  	newex.ee_block = cpu_to_le32(map->m_lblk);
 -	cluster_offset = map->m_lblk & (sbi->s_cluster_ratio-1);
-+	cluster_offset = EXT4_LBLK_CMASK(sbi, map->m_lblk);
++	cluster_offset = EXT4_LBLK_COFF(sbi, map->m_lblk);
  
  	/*
  	 * If we are doing bigalloc, check to see if the extent returned
@@ -3479,6 +3522,26 @@
  #else
  
  static inline void putback_lru_pages(struct list_head *l) {}
+@@ -90,10 +91,18 @@ static inline int migrate_huge_page_move
+ #endif /* CONFIG_MIGRATION */
+ 
+ #ifdef CONFIG_NUMA_BALANCING
+-extern int migrate_misplaced_page(struct page *page, int node);
++extern bool pmd_trans_migrating(pmd_t pmd);
++extern void wait_migrate_huge_page(struct anon_vma *anon_vma, pmd_t *pmd);
+ extern int migrate_misplaced_page(struct page *page, int node);
+ extern bool migrate_ratelimited(int node);
+ #else
++static inline bool pmd_trans_migrating(pmd_t pmd)
++{
++	return false;
++}
++static inline void wait_migrate_huge_page(struct anon_vma *anon_vma, pmd_t *pmd)
++{
++}
+ static inline int migrate_misplaced_page(struct page *page, int node)
+ {
+ 	return -EAGAIN; /* can't migrate now */
 --- a/include/linux/mm_types.h
 +++ b/include/linux/mm_types.h
 @@ -435,6 +435,14 @@ struct mm_struct {
@@ -3784,7 +3847,78 @@
  	else
 --- a/mm/huge_memory.c
 +++ b/mm/huge_memory.c
-@@ -1334,6 +1334,20 @@ int do_huge_pmd_numa_page(struct mm_stru
+@@ -884,6 +884,10 @@ int copy_huge_pmd(struct mm_struct *dst_
+ 		ret = 0;
+ 		goto out_unlock;
+ 	}
++
++	/* mmap_sem prevents this happening but warn if that changes */
++	WARN_ON(pmd_trans_migrating(pmd));
++
+ 	if (unlikely(pmd_trans_splitting(pmd))) {
+ 		/* split huge page running from under us */
+ 		spin_unlock(&src_mm->page_table_lock);
+@@ -1240,6 +1244,10 @@ struct page *follow_trans_huge_pmd(struc
+ 	if ((flags & FOLL_DUMP) && is_huge_zero_pmd(*pmd))
+ 		return ERR_PTR(-EFAULT);
+ 
++	/* Full NUMA hinting faults to serialise migration in fault paths */
++	if ((flags & FOLL_NUMA) && pmd_numa(*pmd))
++		goto out;
++
+ 	page = pmd_page(*pmd);
+ 	VM_BUG_ON(!PageHead(page));
+ 	if (flags & FOLL_TOUCH) {
+@@ -1290,6 +1298,17 @@ int do_huge_pmd_numa_page(struct mm_stru
+ 	if (unlikely(!pmd_same(pmd, *pmdp)))
+ 		goto out_unlock;
+ 
++	/*
++	 * If there are potential migrations, wait for completion and retry
++	 * without disrupting NUMA hinting information. Do not relock and
++	 * check_same as the page may no longer be mapped.
++	 */
++	if (unlikely(pmd_trans_migrating(*pmdp))) {
++		spin_unlock(&mm->page_table_lock);
++		wait_migrate_huge_page(vma->anon_vma, pmdp);
++		goto out;
++	}
++
+ 	page = pmd_page(pmd);
+ 	page_nid = page_to_nid(page);
+ 	count_vm_numa_event(NUMA_HINT_FAULTS);
+@@ -1306,23 +1325,22 @@ int do_huge_pmd_numa_page(struct mm_stru
+ 		/* If the page was locked, there are no parallel migrations */
+ 		if (page_locked)
+ 			goto clear_pmdnuma;
++	}
+ 
+-		/*
+-		 * Otherwise wait for potential migrations and retry. We do
+-		 * relock and check_same as the page may no longer be mapped.
+-		 * As the fault is being retried, do not account for it.
+-		 */
++	/* Migration could have started since the pmd_trans_migrating check */
++	if (!page_locked) {
+ 		spin_unlock(&mm->page_table_lock);
+ 		wait_on_page_locked(page);
+ 		page_nid = -1;
+ 		goto out;
+ 	}
+ 
+-	/* Page is misplaced, serialise migrations and parallel THP splits */
++	/*
++	 * Page is misplaced. Page lock serialises migrations. Acquire anon_vma
++	 * to serialises splits
++	 */
+ 	get_page(page);
+ 	spin_unlock(&mm->page_table_lock);
+-	if (!page_locked)
+-		lock_page(page);
+ 	anon_vma = page_lock_anon_vma_read(page);
+ 
+ 	/* Confirm the PTE did not while locked */
+@@ -1334,6 +1352,13 @@ int do_huge_pmd_numa_page(struct mm_stru
  		goto out_unlock;
  	}
  
@@ -3795,16 +3929,36 @@
 +		goto clear_pmdnuma;
 +	}
 +
-+	/*
-+	 * The page_table_lock above provides a memory barrier
-+	 * with change_protection_range.
-+	 */
-+	if (mm_tlb_flush_pending(mm))
-+		flush_tlb_range(vma, haddr, haddr + HPAGE_PMD_SIZE);
-+
  	/*
  	 * Migrate the THP to the requested node, returns with page unlocked
  	 * and pmd_numa cleared.
+@@ -1466,20 +1491,24 @@ int change_huge_pmd(struct vm_area_struc
+ 
+ 	if (__pmd_trans_huge_lock(pmd, vma) == 1) {
+ 		pmd_t entry;
+-		entry = pmdp_get_and_clear(mm, addr, pmd);
+ 		if (!prot_numa) {
++			entry = pmdp_get_and_clear(mm, addr, pmd);
++			if (pmd_numa(entry))
++				entry = pmd_mknonnuma(entry);
+ 			entry = pmd_modify(entry, newprot);
+ 			BUG_ON(pmd_write(entry));
++			set_pmd_at(mm, addr, pmd, entry);
+ 		} else {
+ 			struct page *page = pmd_page(*pmd);
++			entry = *pmd;
+ 
+ 			/* only check non-shared pages */
+ 			if (page_mapcount(page) == 1 &&
+ 			    !pmd_numa(*pmd)) {
+ 				entry = pmd_mknuma(entry);
++				set_pmd_at(mm, addr, pmd, entry);
+ 			}
+ 		}
+-		set_pmd_at(mm, addr, pmd, entry);
+ 		spin_unlock(&vma->vm_mm->page_table_lock);
+ 		ret = 1;
+ 	}
 --- a/mm/memcontrol.c
 +++ b/mm/memcontrol.c
 @@ -337,7 +337,7 @@ struct mem_cgroup {
@@ -3869,7 +4023,15 @@
   mpol_out:
 --- a/mm/migrate.c
 +++ b/mm/migrate.c
-@@ -315,14 +315,15 @@ static inline bool buffer_migrate_lock_b
+@@ -36,6 +36,7 @@
+ #include <linux/hugetlb_cgroup.h>
+ #include <linux/gfp.h>
+ #include <linux/balloon_compaction.h>
++#include <linux/mmu_notifier.h>
+ 
+ #include <asm/tlbflush.h>
+ 
+@@ -315,14 +316,15 @@ static inline bool buffer_migrate_lock_b
   */
  int migrate_page_move_mapping(struct address_space *mapping,
  		struct page *newpage, struct page *page,
@@ -3888,7 +4050,7 @@
  			return -EAGAIN;
  		return MIGRATEPAGE_SUCCESS;
  	}
-@@ -332,7 +333,7 @@ int migrate_page_move_mapping(struct add
+@@ -332,7 +334,7 @@ int migrate_page_move_mapping(struct add
  	pslot = radix_tree_lookup_slot(&mapping->page_tree,
   					page_index(page));
  
@@ -3897,7 +4059,7 @@
  	if (page_count(page) != expected_count ||
  		radix_tree_deref_slot_protected(pslot, &mapping->tree_lock) != page) {
  		spin_unlock_irq(&mapping->tree_lock);
-@@ -525,7 +526,7 @@ int migrate_page(struct address_space *m
+@@ -525,7 +527,7 @@ int migrate_page(struct address_space *m
  
  	BUG_ON(PageWriteback(page));	/* Writeback must be complete */
  
@@ -3906,7 +4068,7 @@
  
  	if (rc != MIGRATEPAGE_SUCCESS)
  		return rc;
-@@ -552,7 +553,7 @@ int buffer_migrate_page(struct address_s
+@@ -552,7 +554,7 @@ int buffer_migrate_page(struct address_s
  
  	head = page_buffers(page);
  
@@ -3915,7 +4077,66 @@
  
  	if (rc != MIGRATEPAGE_SUCCESS)
  		return rc;
-@@ -1720,7 +1721,8 @@ int migrate_misplaced_transhuge_page(str
+@@ -1596,6 +1598,18 @@ int numamigrate_isolate_page(pg_data_t *
+ 	return 1;
+ }
+ 
++bool pmd_trans_migrating(pmd_t pmd)
++{
++	struct page *page = pmd_page(pmd);
++	return PageLocked(page);
++}
++
++void wait_migrate_huge_page(struct anon_vma *anon_vma, pmd_t *pmd)
++{
++	struct page *page = pmd_page(*pmd);
++	wait_on_page_locked(page);
++}
++
+ /*
+  * Attempt to migrate a misplaced page to the specified destination
+  * node. Caller is expected to have an elevated reference count on
+@@ -1655,12 +1669,14 @@ int migrate_misplaced_transhuge_page(str
+ 				unsigned long address,
+ 				struct page *page, int node)
+ {
+-	unsigned long haddr = address & HPAGE_PMD_MASK;
+ 	pg_data_t *pgdat = NODE_DATA(node);
+ 	int isolated = 0;
+ 	struct page *new_page = NULL;
+ 	struct mem_cgroup *memcg = NULL;
+ 	int page_lru = page_is_file_cache(page);
++	unsigned long mmun_start = address & HPAGE_PMD_MASK;
++	unsigned long mmun_end = mmun_start + HPAGE_PMD_SIZE;
++	pmd_t orig_entry;
+ 
+ 	/*
+ 	 * Don't migrate pages that are mapped in multiple processes.
+@@ -1690,6 +1706,9 @@ int migrate_misplaced_transhuge_page(str
+ 		goto out_fail;
+ 	}
+ 
++	if (mm_tlb_flush_pending(mm))
++		flush_tlb_range(vma, mmun_start, mmun_end);
++
+ 	/* Prepare a page as a migration target */
+ 	__set_page_locked(new_page);
+ 	SetPageSwapBacked(new_page);
+@@ -1701,9 +1720,12 @@ int migrate_misplaced_transhuge_page(str
+ 	WARN_ON(PageLRU(new_page));
+ 
+ 	/* Recheck the target PMD */
++	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
+ 	spin_lock(&mm->page_table_lock);
+-	if (unlikely(!pmd_same(*pmd, entry))) {
++	if (unlikely(!pmd_same(*pmd, entry) || page_count(page) != 2)) {
++fail_putback:
+ 		spin_unlock(&mm->page_table_lock);
++		mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+ 
+ 		/* Reverse changes made by migrate_page_copy() */
+ 		if (TestClearPageActive(new_page))
+@@ -1720,7 +1742,8 @@ int migrate_misplaced_transhuge_page(str
  		putback_lru_page(page);
  		mod_zone_page_state(page_zone(page),
  			 NR_ISOLATED_ANON + page_lru, -HPAGE_PMD_NR);
@@ -3925,9 +4146,69 @@
  	}
  
  	/*
-@@ -1770,6 +1772,7 @@ out_dropref:
- 	set_pmd_at(mm, haddr, pmd, entry);
+@@ -1732,16 +1755,35 @@ int migrate_misplaced_transhuge_page(str
+ 	 */
+ 	mem_cgroup_prepare_migration(page, new_page, &memcg);
+ 
++	orig_entry = *pmd;
+ 	entry = mk_pmd(new_page, vma->vm_page_prot);
+-	entry = pmd_mknonnuma(entry);
+-	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+ 	entry = pmd_mkhuge(entry);
++	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+ 
+-	pmdp_clear_flush(vma, haddr, pmd);
+-	set_pmd_at(mm, haddr, pmd, entry);
+-	page_add_new_anon_rmap(new_page, vma, haddr);
++	/*
++	 * Clear the old entry under pagetable lock and establish the new PTE.
++	 * Any parallel GUP will either observe the old page blocking on the
++	 * page lock, block on the page table lock or observe the new page.
++	 * The SetPageUptodate on the new page and page_add_new_anon_rmap
++	 * guarantee the copy is visible before the pagetable update.
++	 */
++	flush_cache_range(vma, mmun_start, mmun_end);
++	page_add_new_anon_rmap(new_page, vma, mmun_start);
++	pmdp_clear_flush(vma, mmun_start, pmd);
++	set_pmd_at(mm, mmun_start, pmd, entry);
++	flush_tlb_range(vma, mmun_start, mmun_end);
  	update_mmu_cache_pmd(vma, address, &entry);
++
++	if (page_count(page) != 2) {
++		set_pmd_at(mm, mmun_start, pmd, orig_entry);
++		flush_tlb_range(vma, mmun_start, mmun_end);
++		update_mmu_cache_pmd(vma, address, &entry);
++		page_remove_rmap(new_page);
++		goto fail_putback;
++	}
++
+ 	page_remove_rmap(page);
++
+ 	/*
+ 	 * Finish the charge transaction under the page table lock to
+ 	 * prevent split_huge_page() from dividing up the charge
+@@ -1749,6 +1791,7 @@ int migrate_misplaced_transhuge_page(str
+ 	 */
+ 	mem_cgroup_end_migration(memcg, page, new_page, true);
+ 	spin_unlock(&mm->page_table_lock);
++	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+ 
+ 	unlock_page(new_page);
+ 	unlock_page(page);
+@@ -1766,10 +1809,15 @@ int migrate_misplaced_transhuge_page(str
+ out_fail:
+ 	count_vm_events(PGMIGRATE_FAIL, HPAGE_PMD_NR);
+ out_dropref:
+-	entry = pmd_mknonnuma(entry);
+-	set_pmd_at(mm, haddr, pmd, entry);
+-	update_mmu_cache_pmd(vma, address, &entry);
++	spin_lock(&mm->page_table_lock);
++	if (pmd_same(*pmd, entry)) {
++		entry = pmd_mknonnuma(entry);
++		set_pmd_at(mm, mmun_start, pmd, entry);
++		update_mmu_cache_pmd(vma, address, &entry);
++	}
++	spin_unlock(&mm->page_table_lock);
  
 +out_unlock:
  	unlock_page(page);
@@ -4045,7 +4326,45 @@
  		cond_resched();
 --- a/mm/mprotect.c
 +++ b/mm/mprotect.c
-@@ -209,6 +209,7 @@ static unsigned long change_protection_r
+@@ -54,13 +54,16 @@ static unsigned long change_pte_range(st
+ 			pte_t ptent;
+ 			bool updated = false;
+ 
+-			ptent = ptep_modify_prot_start(mm, addr, pte);
+ 			if (!prot_numa) {
++				ptent = ptep_modify_prot_start(mm, addr, pte);
++				if (pte_numa(ptent))
++					ptent = pte_mknonnuma(ptent);
+ 				ptent = pte_modify(ptent, newprot);
+ 				updated = true;
+ 			} else {
+ 				struct page *page;
+ 
++				ptent = *pte;
+ 				page = vm_normal_page(vma, addr, oldpte);
+ 				if (page) {
+ 					int this_nid = page_to_nid(page);
+@@ -73,6 +76,7 @@ static unsigned long change_pte_range(st
+ 					if (!pte_numa(oldpte) &&
+ 					    page_mapcount(page) == 1) {
+ 						ptent = pte_mknuma(ptent);
++						set_pte_at(mm, addr, pte, ptent);
+ 						updated = true;
+ 					}
+ 				}
+@@ -89,7 +93,10 @@ static unsigned long change_pte_range(st
+ 
+ 			if (updated)
+ 				pages++;
+-			ptep_modify_prot_commit(mm, addr, pte, ptent);
++
++			/* Only !prot_numa always clears the pte */
++			if (!prot_numa)
++				ptep_modify_prot_commit(mm, addr, pte, ptent);
+ 		} else if (IS_ENABLED(CONFIG_MIGRATION) && !pte_file(oldpte)) {
+ 			swp_entry_t entry = pte_to_swp_entry(oldpte);
+ 
+@@ -209,6 +216,7 @@ static unsigned long change_protection_r
  	BUG_ON(addr >= end);
  	pgd = pgd_offset(mm, addr);
  	flush_cache_range(vma, addr, end);
@@ -4053,7 +4372,7 @@
  	do {
  		next = pgd_addr_end(addr, end);
  		if (pgd_none_or_clear_bad(pgd))
-@@ -220,6 +221,7 @@ static unsigned long change_protection_r
+@@ -220,6 +228,7 @@ static unsigned long change_protection_r
  	/* Only flush the TLB if we actually modified any entries: */
  	if (pages)
  		flush_tlb_range(vma, start, end);
