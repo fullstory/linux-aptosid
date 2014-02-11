@@ -37,16 +37,14 @@
      Datasheet: Publicly available at the SMSC website http://www.smsc.com
 --- a/Makefile
 +++ b/Makefile
-@@ -1,7 +1,7 @@
+@@ -1,6 +1,6 @@
  VERSION = 3
  PATCHLEVEL = 13
--SUBLEVEL = 1
--EXTRAVERSION =
+-SUBLEVEL = 0
 +SUBLEVEL = 2
-+EXTRAVERSION = -rc1
+ EXTRAVERSION =
  NAME = One Giant Leap for Frogkind
  
- # *DOCUMENTATION*
 --- a/arch/alpha/lib/csum_partial_copy.c
 +++ b/arch/alpha/lib/csum_partial_copy.c
 @@ -378,6 +378,11 @@ csum_partial_copy_from_user(const void _
@@ -726,16 +724,6 @@
  	return rc;
  }
  
---- a/arch/x86/include/asm/irq.h
-+++ b/arch/x86/include/asm/irq.h
-@@ -25,6 +25,7 @@ extern void irq_ctx_init(int cpu);
- 
- #ifdef CONFIG_HOTPLUG_CPU
- #include <linux/cpumask.h>
-+extern int check_irq_vectors_for_cpu_disable(void);
- extern void fixup_irqs(void);
- extern void irq_force_complete_move(int);
- #endif
 --- a/arch/x86/include/asm/kvm_para.h
 +++ b/arch/x86/include/asm/kvm_para.h
 @@ -85,28 +85,9 @@ static inline long kvm_hypercall4(unsign
@@ -786,85 +774,35 @@
  static inline u32 kvm_read_and_reset_pf_reason(void)
  {
  	return 0;
---- a/arch/x86/kernel/irq.c
-+++ b/arch/x86/kernel/irq.c
-@@ -262,6 +262,76 @@ __visible void smp_trace_x86_platform_ip
- EXPORT_SYMBOL_GPL(vector_used_by_percpu_irq);
+--- a/arch/x86/include/uapi/asm/msr-index.h
++++ b/arch/x86/include/uapi/asm/msr-index.h
+@@ -184,6 +184,7 @@
+ #define MSR_AMD64_PATCH_LOADER		0xc0010020
+ #define MSR_AMD64_OSVW_ID_LENGTH	0xc0010140
+ #define MSR_AMD64_OSVW_STATUS		0xc0010141
++#define MSR_AMD64_LS_CFG		0xc0011020
+ #define MSR_AMD64_DC_CFG		0xc0011022
+ #define MSR_AMD64_BU_CFG2		0xc001102a
+ #define MSR_AMD64_IBSFETCHCTL		0xc0011030
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -508,6 +508,16 @@ static void early_init_amd(struct cpuinf
+ 			set_cpu_cap(c, X86_FEATURE_EXTD_APICID);
+ 	}
+ #endif
++
++	/* F16h erratum 793, CVE-2013-6885 */
++	if (c->x86 == 0x16 && c->x86_model <= 0xf) {
++		u64 val;
++
++		rdmsrl(MSR_AMD64_LS_CFG, val);
++		if (!(val & BIT(15)))
++			wrmsrl(MSR_AMD64_LS_CFG, val | BIT(15));
++	}
++
+ }
  
- #ifdef CONFIG_HOTPLUG_CPU
-+/*
-+ * This cpu is going to be removed and its vectors migrated to the remaining
-+ * online cpus.  Check to see if there are enough vectors in the remaining cpus.
-+ * This function is protected by stop_machine().
-+ */
-+int check_irq_vectors_for_cpu_disable(void)
-+{
-+	int irq, cpu;
-+	unsigned int this_cpu, vector, this_count, count;
-+	struct irq_desc *desc;
-+	struct irq_data *data;
-+	struct cpumask affinity_new, online_new;
-+
-+	this_cpu = smp_processor_id();
-+	cpumask_copy(&online_new, cpu_online_mask);
-+	cpu_clear(this_cpu, online_new);
-+
-+	this_count = 0;
-+	for (vector = FIRST_EXTERNAL_VECTOR; vector < NR_VECTORS; vector++) {
-+		irq = __this_cpu_read(vector_irq[vector]);
-+		if (irq >= 0) {
-+			desc = irq_to_desc(irq);
-+			data = irq_desc_get_irq_data(desc);
-+			cpumask_copy(&affinity_new, data->affinity);
-+			cpu_clear(this_cpu, affinity_new);
-+
-+			/* Do not count inactive or per-cpu irqs. */
-+			if (!irq_has_action(irq) || irqd_is_per_cpu(data))
-+				continue;
-+
-+			/*
-+			 * A single irq may be mapped to multiple
-+			 * cpu's vector_irq[] (for example IOAPIC cluster
-+			 * mode).  In this case we have two
-+			 * possibilities:
-+			 *
-+			 * 1) the resulting affinity mask is empty; that is
-+			 * this the down'd cpu is the last cpu in the irq's
-+			 * affinity mask, or
-+			 *
-+			 * 2) the resulting affinity mask is no longer
-+			 * a subset of the online cpus but the affinity
-+			 * mask is not zero; that is the down'd cpu is the
-+			 * last online cpu in a user set affinity mask.
-+			 */
-+			if (cpumask_empty(&affinity_new) ||
-+			    !cpumask_subset(&affinity_new, &online_new))
-+				this_count++;
-+		}
-+	}
-+
-+	count = 0;
-+	for_each_online_cpu(cpu) {
-+		if (cpu == this_cpu)
-+			continue;
-+		for (vector = FIRST_EXTERNAL_VECTOR; vector < NR_VECTORS;
-+		     vector++) {
-+			if (per_cpu(vector_irq, cpu)[vector] < 0)
-+				count++;
-+		}
-+	}
-+
-+	if (count < this_count) {
-+		pr_warn("CPU %d disable failed: CPU has %u vectors assigned and there are only %u available.\n",
-+			this_cpu, this_count, count);
-+		return -ERANGE;
-+	}
-+	return 0;
-+}
-+
- /* A cpu has been removed from cpu_online_mask.  Reset irq affinities. */
- void fixup_irqs(void)
- {
+ static const int amd_erratum_383[];
 --- a/arch/x86/kernel/kvm.c
 +++ b/arch/x86/kernel/kvm.c
 @@ -500,6 +500,38 @@ void __init kvm_guest_init(void)
@@ -906,21 +844,6 @@
  static uint32_t __init kvm_detect(void)
  {
  	return kvm_cpuid_base();
---- a/arch/x86/kernel/smpboot.c
-+++ b/arch/x86/kernel/smpboot.c
-@@ -1312,6 +1312,12 @@ void cpu_disable_common(void)
- 
- int native_cpu_disable(void)
- {
-+	int ret;
-+
-+	ret = check_irq_vectors_for_cpu_disable();
-+	if (ret)
-+		return ret;
-+
- 	clear_local_APIC();
- 
- 	cpu_disable_common();
 --- a/arch/x86/kvm/i8254.c
 +++ b/arch/x86/kvm/i8254.c
 @@ -37,6 +37,7 @@
@@ -1236,6 +1159,33 @@
  
  	if (pvt->bridge_ck == NULL) {
  		e752x_printk(KERN_ERR, "error reporting device not found:"
+--- a/drivers/extcon/extcon-gpio.c
++++ b/drivers/extcon/extcon-gpio.c
+@@ -105,6 +105,12 @@ static int gpio_extcon_probe(struct plat
+ 	extcon_data->state_off = pdata->state_off;
+ 	if (pdata->state_on && pdata->state_off)
+ 		extcon_data->edev.print_state = extcon_gpio_print_state;
++
++	ret = devm_gpio_request_one(&pdev->dev, extcon_data->gpio, GPIOF_DIR_IN,
++				    pdev->name);
++	if (ret < 0)
++		return ret;
++
+ 	if (pdata->debounce) {
+ 		ret = gpio_set_debounce(extcon_data->gpio,
+ 					pdata->debounce * 1000);
+@@ -117,11 +123,6 @@ static int gpio_extcon_probe(struct plat
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = devm_gpio_request_one(&pdev->dev, extcon_data->gpio, GPIOF_DIR_IN,
+-				    pdev->name);
+-	if (ret < 0)
+-		goto err;
+-
+ 	INIT_DELAYED_WORK(&extcon_data->work, gpio_extcon_work);
+ 
+ 	extcon_data->irq = gpio_to_irq(extcon_data->gpio);
 --- a/drivers/hwmon/k10temp.c
 +++ b/drivers/hwmon/k10temp.c
 @@ -210,6 +210,7 @@ static DEFINE_PCI_DEVICE_TABLE(k10temp_i
@@ -1398,6 +1348,43 @@
  		if (bad(b, k))
  			continue;
  
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -675,8 +675,10 @@ get_active_stripe(struct r5conf *conf, s
+ 					 || !conf->inactive_blocked),
+ 					*(conf->hash_locks + hash));
+ 				conf->inactive_blocked = 0;
+-			} else
++			} else {
+ 				init_stripe(sh, sector, previous);
++				atomic_inc(&sh->count);
++			}
+ 		} else {
+ 			spin_lock(&conf->device_lock);
+ 			if (atomic_read(&sh->count)) {
+@@ -695,13 +697,11 @@ get_active_stripe(struct r5conf *conf, s
+ 					sh->group = NULL;
+ 				}
+ 			}
++			atomic_inc(&sh->count);
+ 			spin_unlock(&conf->device_lock);
+ 		}
+ 	} while (sh == NULL);
+ 
+-	if (sh)
+-		atomic_inc(&sh->count);
+-
+ 	spin_unlock_irq(conf->hash_locks + hash);
+ 	return sh;
+ }
+@@ -2111,6 +2111,7 @@ static void raid5_end_write_request(stru
+ 			set_bit(R5_MadeGoodRepl, &sh->dev[i].flags);
+ 	} else {
+ 		if (!uptodate) {
++			set_bit(STRIPE_DEGRADED, &sh->state);
+ 			set_bit(WriteErrorSeen, &rdev->flags);
+ 			set_bit(R5_WriteError, &sh->dev[i].flags);
+ 			if (!test_and_set_bit(WantReplacement, &rdev->flags))
 --- a/drivers/mfd/max77686.c
 +++ b/drivers/mfd/max77686.c
 @@ -104,7 +104,7 @@ static int max77686_i2c_probe(struct i2c
@@ -3249,92 +3236,6 @@
  	{"", 0},
  };
  MODULE_DEVICE_TABLE(acpi, lis3lv02d_device_ids);
---- a/drivers/rtc/rtc-cmos.c
-+++ b/drivers/rtc/rtc-cmos.c
-@@ -34,11 +34,11 @@
- #include <linux/interrupt.h>
- #include <linux/spinlock.h>
- #include <linux/platform_device.h>
--#include <linux/mod_devicetable.h>
- #include <linux/log2.h>
- #include <linux/pm.h>
- #include <linux/of.h>
- #include <linux/of_platform.h>
-+#include <linux/dmi.h>
- 
- /* this is for "generic access to PC-style RTC" using CMOS_READ/CMOS_WRITE */
- #include <asm-generic/rtc.h>
-@@ -377,6 +377,51 @@ static int cmos_set_alarm(struct device
- 	return 0;
- }
- 
-+/*
-+ * Do not disable RTC alarm on shutdown - workaround for b0rked BIOSes.
-+ */
-+static bool alarm_disable_quirk;
-+
-+static int __init set_alarm_disable_quirk(const struct dmi_system_id *id)
-+{
-+	alarm_disable_quirk = true;
-+	pr_info("rtc-cmos: BIOS has alarm-disable quirk. ");
-+	pr_info("RTC alarms disabled\n");
-+	return 0;
-+}
-+
-+static const struct dmi_system_id rtc_quirks[] __initconst = {
-+	/* https://bugzilla.novell.com/show_bug.cgi?id=805740 */
-+	{
-+		.callback = set_alarm_disable_quirk,
-+		.ident    = "IBM Truman",
-+		.matches  = {
-+			DMI_MATCH(DMI_SYS_VENDOR, "TOSHIBA"),
-+			DMI_MATCH(DMI_PRODUCT_NAME, "4852570"),
-+		},
-+	},
-+	/* https://bugzilla.novell.com/show_bug.cgi?id=812592 */
-+	{
-+		.callback = set_alarm_disable_quirk,
-+		.ident    = "Gigabyte GA-990XA-UD3",
-+		.matches  = {
-+			DMI_MATCH(DMI_SYS_VENDOR,
-+					"Gigabyte Technology Co., Ltd."),
-+			DMI_MATCH(DMI_PRODUCT_NAME, "GA-990XA-UD3"),
-+		},
-+	},
-+	/* http://permalink.gmane.org/gmane.linux.kernel/1604474 */
-+	{
-+		.callback = set_alarm_disable_quirk,
-+		.ident    = "Toshiba Satellite L300",
-+		.matches  = {
-+			DMI_MATCH(DMI_SYS_VENDOR, "TOSHIBA"),
-+			DMI_MATCH(DMI_PRODUCT_NAME, "Satellite L300"),
-+		},
-+	},
-+	{}
-+};
-+
- static int cmos_alarm_irq_enable(struct device *dev, unsigned int enabled)
- {
- 	struct cmos_rtc	*cmos = dev_get_drvdata(dev);
-@@ -385,6 +430,9 @@ static int cmos_alarm_irq_enable(struct
- 	if (!is_valid_irq(cmos->irq))
- 		return -EINVAL;
- 
-+	if (alarm_disable_quirk)
-+		return 0;
-+
- 	spin_lock_irqsave(&rtc_lock, flags);
- 
- 	if (enabled)
-@@ -1157,6 +1205,8 @@ static int __init cmos_init(void)
- 			platform_driver_registered = true;
- 	}
- 
-+	dmi_check_system(rtc_quirks);
-+
- 	if (retval == 0)
- 		return 0;
- 
 --- a/drivers/rtc/rtc-max8907.c
 +++ b/drivers/rtc/rtc-max8907.c
 @@ -51,7 +51,7 @@ static irqreturn_t max8907_irq_handler(i
@@ -3471,6 +3372,48 @@
  }
  #endif
  
+--- a/drivers/staging/comedi/comedi_fops.c
++++ b/drivers/staging/comedi/comedi_fops.c
+@@ -1425,6 +1425,7 @@ static int do_cmd_ioctl(struct comedi_de
+ 					  async->cmd.chanlist_len * sizeof(int));
+ 	if (IS_ERR(async->cmd.chanlist)) {
+ 		ret = PTR_ERR(async->cmd.chanlist);
++		async->cmd.chanlist = NULL;
+ 		DPRINTK("memdup_user failed with code %d\n", ret);
+ 		goto cleanup;
+ 	}
+@@ -1547,6 +1548,7 @@ static int do_cmdtest_ioctl(struct comed
+ 				       cmd.chanlist_len * sizeof(int));
+ 		if (IS_ERR(chanlist)) {
+ 			ret = PTR_ERR(chanlist);
++			chanlist = NULL;
+ 			DPRINTK("memdup_user exited with code %d", ret);
+ 			goto cleanup;
+ 		}
+--- a/drivers/staging/comedi/drivers/addi_apci_1032.c
++++ b/drivers/staging/comedi/drivers/addi_apci_1032.c
+@@ -325,8 +325,8 @@ static int apci1032_auto_attach(struct c
+ 	s = &dev->subdevices[1];
+ 	if (dev->irq) {
+ 		dev->read_subdev = s;
+-		s->type		= COMEDI_SUBD_DI | SDF_CMD_READ;
+-		s->subdev_flags	= SDF_READABLE;
++		s->type		= COMEDI_SUBD_DI;
++		s->subdev_flags	= SDF_READABLE | SDF_CMD_READ;
+ 		s->n_chan	= 1;
+ 		s->maxdata	= 1;
+ 		s->range_table	= &range_digital;
+--- a/drivers/staging/comedi/drivers/adl_pci9111.c
++++ b/drivers/staging/comedi/drivers/adl_pci9111.c
+@@ -859,7 +859,7 @@ static int pci9111_auto_attach(struct co
+ 	pci9111_reset(dev);
+ 
+ 	if (pcidev->irq > 0) {
+-		ret = request_irq(dev->irq, pci9111_interrupt,
++		ret = request_irq(pcidev->irq, pci9111_interrupt,
+ 				  IRQF_SHARED, dev->board_name, dev);
+ 		if (ret)
+ 			return ret;
 --- a/drivers/staging/lustre/lustre/ptlrpc/niobuf.c
 +++ b/drivers/staging/lustre/lustre/ptlrpc/niobuf.c
 @@ -179,7 +179,7 @@ int ptlrpc_register_bulk(struct ptlrpc_r
@@ -3761,6 +3704,40 @@
  	{	PCI_VENDOR_ID_TITAN, PCI_DEVICE_ID_TITAN_400V3,
  		PCI_ANY_ID, PCI_ANY_ID, 0, 0,
  		pbn_b0_4_921600 },
+--- a/drivers/tty/serial/amba-pl011.c
++++ b/drivers/tty/serial/amba-pl011.c
+@@ -1537,6 +1537,8 @@ static int pl011_startup(struct uart_por
+ 	/*
+ 	 * Provoke TX FIFO interrupt into asserting.
+ 	 */
++	spin_lock_irq(&uap->port.lock);
++
+ 	cr = UART01x_CR_UARTEN | UART011_CR_TXE | UART011_CR_LBE;
+ 	writew(cr, uap->port.membase + UART011_CR);
+ 	writew(0, uap->port.membase + UART011_FBRD);
+@@ -1561,6 +1563,8 @@ static int pl011_startup(struct uart_por
+ 	cr |= UART01x_CR_UARTEN | UART011_CR_RXE | UART011_CR_TXE;
+ 	writew(cr, uap->port.membase + UART011_CR);
+ 
++	spin_unlock_irq(&uap->port.lock);
++
+ 	/*
+ 	 * initialise the old status of the modem signals
+ 	 */
+@@ -1629,11 +1633,13 @@ static void pl011_shutdown(struct uart_p
+ 	 * it during startup().
+ 	 */
+ 	uap->autorts = false;
++	spin_lock_irq(&uap->port.lock);
+ 	cr = readw(uap->port.membase + UART011_CR);
+ 	uap->old_cr = cr;
+ 	cr &= UART011_CR_RTS | UART011_CR_DTR;
+ 	cr |= UART01x_CR_UARTEN | UART011_CR_TXE;
+ 	writew(cr, uap->port.membase + UART011_CR);
++	spin_unlock_irq(&uap->port.lock);
+ 
+ 	/*
+ 	 * disable break condition and fifos
 --- a/drivers/tty/serial/atmel_serial.c
 +++ b/drivers/tty/serial/atmel_serial.c
 @@ -825,9 +825,6 @@ static void atmel_release_rx_dma(struct
@@ -4718,6 +4695,41 @@
  
  		EXT4_I(inode)->i_inline_size = i_size <
  					EXT4_MIN_INLINE_DATA_SIZE ?
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@ -1607,10 +1607,22 @@ static int setattr_chown(struct inode *i
+ 	if (!(attr->ia_valid & ATTR_GID) || gid_eq(ogid, ngid))
+ 		ogid = ngid = NO_GID_QUOTA_CHANGE;
+ 
+-	error = gfs2_quota_lock(ip, nuid, ngid);
++	error = get_write_access(inode);
+ 	if (error)
+ 		return error;
+ 
++	error = gfs2_rs_alloc(ip);
++	if (error)
++		goto out;
++
++	error = gfs2_rindex_update(sdp);
++	if (error)
++		goto out;
++
++	error = gfs2_quota_lock(ip, nuid, ngid);
++	if (error)
++		goto out;
++
+ 	if (!uid_eq(ouid, NO_UID_QUOTA_CHANGE) ||
+ 	    !gid_eq(ogid, NO_GID_QUOTA_CHANGE)) {
+ 		error = gfs2_quota_check(ip, nuid, ngid);
+@@ -1637,6 +1649,8 @@ out_end_trans:
+ 	gfs2_trans_end(sdp);
+ out_gunlock_q:
+ 	gfs2_quota_unlock(ip);
++out:
++	put_write_access(inode);
+ 	return error;
+ }
+ 
 --- a/fs/hpfs/alloc.c
 +++ b/fs/hpfs/alloc.c
 @@ -8,6 +8,58 @@
@@ -4941,6 +4953,28 @@
  
  	 /* DMA mask for user DMA control: User visible values; DO NOT
  	    renumber */
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -846,11 +846,14 @@ static __always_inline void *lowmem_page
+ #endif
+ 
+ #if defined(WANT_PAGE_VIRTUAL)
+-#define page_address(page) ((page)->virtual)
+-#define set_page_address(page, address)			\
+-	do {						\
+-		(page)->virtual = (address);		\
+-	} while(0)
++static inline void *page_address(const struct page *page)
++{
++	return page->virtual;
++}
++static inline void set_page_address(struct page *page, void *address)
++{
++	page->virtual = address;
++}
+ #define page_address_init()  do { } while(0)
+ #endif
+ 
 --- a/include/linux/mmc/sdhci.h
 +++ b/include/linux/mmc/sdhci.h
 @@ -98,6 +98,8 @@ struct sdhci_host {
@@ -5358,7 +5392,31 @@
  }
  
  static int hdmi_get_channel_count(struct hda_codec *codec, hda_nid_t cvt_nid)
-@@ -1747,6 +1760,7 @@ static int generic_hdmi_playback_pcm_pre
+@@ -1496,11 +1509,14 @@ static bool hdmi_present_sense(struct hd
+ 	 * specification worked this way. Hence, we just ignore the data in
+ 	 * the unsolicited response to avoid custom WARs.
+ 	 */
+-	int present = snd_hda_pin_sense(codec, pin_nid);
++	int present;
+ 	bool update_eld = false;
+ 	bool eld_changed = false;
+ 	bool ret;
+ 
++	snd_hda_power_up(codec);
++	present = snd_hda_pin_sense(codec, pin_nid);
++
+ 	mutex_lock(&per_pin->lock);
+ 	pin_eld->monitor_present = !!(present & AC_PINSENSE_PRESENCE);
+ 	if (pin_eld->monitor_present)
+@@ -1573,6 +1589,7 @@ static bool hdmi_present_sense(struct hd
+ 		jack->block_report = !ret;
+ 
+ 	mutex_unlock(&per_pin->lock);
++	snd_hda_power_down(codec);
+ 	return ret;
+ }
+ 
+@@ -1743,6 +1760,7 @@ static int generic_hdmi_playback_pcm_pre
  	struct hdmi_spec_per_pin *per_pin = get_pin(spec, pin_idx);
  	hda_nid_t pin_nid = per_pin->pin_nid;
  	bool non_pcm;
@@ -5366,7 +5424,7 @@
  
  	non_pcm = check_non_pcm_per_cvt(codec, cvt_nid);
  	mutex_lock(&per_pin->lock);
-@@ -1756,6 +1770,14 @@ static int generic_hdmi_playback_pcm_pre
+@@ -1752,6 +1770,14 @@ static int generic_hdmi_playback_pcm_pre
  	hdmi_setup_audio_infoframe(codec, per_pin, non_pcm);
  	mutex_unlock(&per_pin->lock);
  
@@ -5381,7 +5439,7 @@
  	return spec->ops.setup_stream(codec, cvt_nid, pin_nid, stream_tag, format);
  }
  
-@@ -1775,6 +1797,7 @@ static int hdmi_pcm_close(struct hda_pcm
+@@ -1771,6 +1797,7 @@ static int hdmi_pcm_close(struct hda_pcm
  	int cvt_idx, pin_idx;
  	struct hdmi_spec_per_cvt *per_cvt;
  	struct hdmi_spec_per_pin *per_pin;
@@ -5389,7 +5447,7 @@
  
  	if (hinfo->nid) {
  		cvt_idx = cvt_nid_to_cvt_index(spec, hinfo->nid);
-@@ -1791,6 +1814,14 @@ static int hdmi_pcm_close(struct hda_pcm
+@@ -1787,6 +1814,14 @@ static int hdmi_pcm_close(struct hda_pcm
  			return -EINVAL;
  		per_pin = get_pin(spec, pin_idx);
  
@@ -5404,7 +5462,7 @@
  		snd_hda_spdif_ctls_unassign(codec, pin_idx);
  
  		mutex_lock(&per_pin->lock);
-@@ -2848,6 +2879,7 @@ static int patch_nvhdmi(struct hda_codec
+@@ -2844,6 +2879,7 @@ static int patch_nvhdmi(struct hda_codec
  		return err;
  
  	spec = codec->spec;
