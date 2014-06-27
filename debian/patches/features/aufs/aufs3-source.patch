@@ -1308,7 +1308,7 @@
 +  Modifies a system global kernel internal function get_next_ino() in
 +  order to stop assigning 0 for an inode-number. Not directly related to
 +  aufs, but recommended generally.
-+- tmpfs-ibitmap.patch
++- tmpfs-idr.patch
 +  Keeps the tmpfs inode number as the lowest value. Effective to reduce
 +  the size of aufs XINO files for tmpfs branch. Also it prevents the
 +  duplication of inode number, which is important for backup tools and
@@ -1494,7 +1494,7 @@
 +#endif /* __AUFS_H__ */
 --- /dev/null
 +++ b/fs/aufs/branch.c
-@@ -0,0 +1,1219 @@
+@@ -0,0 +1,1220 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -2546,7 +2546,7 @@
 +	unsigned int mnt_flags;
 +	unsigned long long ull, max;
 +	aufs_bindex_t br_id;
-+	unsigned char verbose;
++	unsigned char verbose, writer;
 +	struct file *file, *hf, **array;
 +	struct inode *inode;
 +	struct au_hfile *hfile;
@@ -2615,11 +2615,12 @@
 +		hf = hfile->hf_file;
 +		/* fi_read_unlock(file); */
 +		spin_lock(&hf->f_lock);
-+		hf->f_mode &= ~FMODE_WRITE;
++		writer = !!(hf->f_mode & FMODE_WRITER);
++		hf->f_mode &= ~(FMODE_WRITE | FMODE_WRITER);
 +		spin_unlock(&hf->f_lock);
-+		if (!file_check_writeable(hf)) {
++		if (writer) {
++			put_write_access(file_inode(hf));
 +			__mnt_drop_write(hf->f_path.mnt);
-+			file_release_write(hf);
 +		}
 +	}
 +
@@ -6034,7 +6035,7 @@
 +#endif /* __AUFS_DEBUG_H__ */
 --- /dev/null
 +++ b/fs/aufs/dentry.c
-@@ -0,0 +1,1085 @@
+@@ -0,0 +1,1084 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -6852,7 +6853,6 @@
 +	 * {FS,I}NOTIFY.
 +	 * But {fs,i}notify doesn't fire some necessary events,
 +	 *	IN_ATTRIB for atime/nlink/pageio
-+	 *	IN_DELETE for NFS dentry
 +	 * Let's do REVAL test too.
 +	 */
 +	if (do_udba && inode) {
@@ -10668,8 +10668,8 @@
 +static int aufs_launder_page(struct page *page)
 +{ AuUnsupport(); return 0; }
 +static int aufs_is_partially_uptodate(struct page *page,
-+				      read_descriptor_t *desc,
-+				      unsigned long from)
++				      unsigned long from,
++				      unsigned long count)
 +{ AuUnsupport(); return 0; }
 +static void aufs_is_dirty_writeback(struct page *page, bool *dirty,
 +				    bool *writeback)
@@ -13119,7 +13119,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/hnotify.c
-@@ -0,0 +1,711 @@
+@@ -0,0 +1,713 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -13752,8 +13752,10 @@
 +		p[len] = 0;
 +	}
 +
++	/* NFS fires the event for silly-renamed one from kworker */
 +	f = 0;
-+	if (!dir->i_nlink)
++	if (!dir->i_nlink
++	    || (au_test_nfs(h_dir->i_sb) && (mask & FS_DELETE)))
 +		f = AuWkq_NEST;
 +	err = au_wkq_nowait(au_hn_bh, args, dir->i_sb, f);
 +	if (unlikely(err)) {
@@ -27583,14 +27585,14 @@
 +	d = path->dentry;
 +	path->dentry = d->d_parent;
 +	tmp.dentry = src_dentry->d_parent;
-+	err = security_path_rename(&tmp, src_dentry, path, d);
++	err = security_path_rename(&tmp, src_dentry, path, d, /*flags*/0);
 +	path->dentry = d;
 +	if (unlikely(err))
 +		goto out;
 +
 +	lockdep_off();
 +	err = vfs_rename(src_dir, src_dentry, dir, path->dentry,
-+			 delegated_inode);
++			 delegated_inode, /*flags*/0);
 +	lockdep_on();
 +	if (!err) {
 +		int did;
@@ -30248,7 +30250,7 @@
 +#endif /* __AUFS_WHOUT_H__ */
 --- /dev/null
 +++ b/fs/aufs/wkq.c
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,213 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -30354,7 +30356,8 @@
 +{
 +	if (au_ftest_wkq(wkinfo->flags, NEST)) {
 +		if (au_wkq_test()) {
-+			AuWarn1("wkq from wkq, due to a dead dir by UDBA?\n");
++			AuWarn1("wkq from wkq, unless silly-rename on NFS,"
++				" due to a dead dir by UDBA?\n");
 +			AuDebugOn(au_ftest_wkq(wkinfo->flags, WAIT));
 +		}
 +	} else
@@ -31914,7 +31917,7 @@
 +
 +#include <linux/limits.h>
 +
-+#define AUFS_VERSION	"3.14-20140602"
++#define AUFS_VERSION	"3.x-rcN-20140609"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
