@@ -2717,7 +2717,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/branch.h
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,283 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -2850,12 +2850,26 @@
 +#define AuBrPerm_RR		(1 << 2)	/* natively readonly */
 +#define AuBrPerm_Mask		(AuBrPerm_RW | AuBrPerm_RO | AuBrPerm_RR)
 +
-+#define AuBrRAttr_WH		(1 << 3)	/* whiteout-able */
-+
-+#define AuBrWAttr_NoLinkWH	(1 << 4)	/* un-hardlinkable whiteouts */
++#define AuBrAttr_COO_REG	(1 << 3)	/* copy-up on open */
++#define AuBrAttr_COO_ALL	(1 << 4)
++#define AuBrAttr_COO_Mask	(AuBrAttr_COO_REG | AuBrAttr_COO_ALL)
 +
 +#define AuBrAttr_UNPIN		(1 << 5)	/* rename-able top dir of
 +						   branch */
++
++#define AuBrRAttr_WH		(1 << 6)	/* whiteout-able */
++
++#define AuBrWAttr_NoLinkWH	(1 << 7)	/* un-hardlinkable whiteouts */
++
++/* the longest combination */
++#define AuBrPermStrSz	sizeof(AUFS_BRPERM_RW		\
++			       "+" AUFS_BRATTR_COO_REG	\
++			       "+" AUFS_BRATTR_UNPIN	\
++			       "+" AUFS_BRWATTR_NLWH)
++
++typedef struct {
++	char a[AuBrPermStrSz];
++} au_br_perm_str_t;
 +
 +static inline int au_br_writable(int brperm)
 +{
@@ -2877,6 +2891,11 @@
 +	return ((au_br_sb(br)->s_flags & MS_RDONLY)
 +		|| !au_br_writable(br->br_perm))
 +		? -EROFS : 0;
++}
++
++static inline int au_br_coo(int brperm)
++{
++	return (brperm & AuBrAttr_COO_Mask);
 +}
 +
 +static inline int au_br_hnotifyable(int brperm __maybe_unused)
@@ -5144,7 +5163,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/dcsub.h
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,120 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -5211,6 +5230,7 @@
 +{
 +	int err;
 +	struct inode *inode = d->d_inode;
++
 +	err = 0;
 +	if (unlikely(d_unhashed(d) || !inode || !inode->i_nlink))
 +		err = -ENOENT;
@@ -5221,6 +5241,7 @@
 +{
 +	int err;
 +	struct inode *inode = d->d_inode;
++
 +	err = au_d_hashed_positive(d);
 +	if (err
 +	    && inode
@@ -5233,6 +5254,7 @@
 +{
 +	int err;
 +	struct inode *inode;
++
 +	err = 0;
 +	if (!IS_ROOT(d))
 +		err = au_d_hashed_positive(d);
@@ -5247,6 +5269,7 @@
 +static inline int au_alive_dir(struct dentry *d)
 +{
 +	int err;
++
 +	err = au_d_alive(d);
 +	if (unlikely(err || IS_DEADDIR(d->d_inode)))
 +		err = -ENOENT;
@@ -5263,7 +5286,7 @@
 +#endif /* __AUFS_DCSUB_H__ */
 --- /dev/null
 +++ b/fs/aufs/debug.c
-@@ -0,0 +1,518 @@
+@@ -0,0 +1,519 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -5443,6 +5466,7 @@
 +{
 +	struct dentry *wh = NULL;
 +	int hn;
++	struct au_iinfo *iinfo;
 +
 +	if (!dentry || IS_ERR(dentry)) {
 +		dpri("d%d: err %ld\n", bindex, PTR_ERR(dentry));
@@ -5457,7 +5481,7 @@
 +	     d_unhashed(dentry) ? "un" : "");
 +	hn = -1;
 +	if (bindex >= 0 && dentry->d_inode && au_test_aufs(dentry->d_sb)) {
-+		struct au_iinfo *iinfo = au_ii(dentry->d_inode);
++		iinfo = au_ii(dentry->d_inode);
 +		if (iinfo) {
 +			hn = !!au_hn(iinfo->ii_hinode + bindex);
 +			wh = iinfo->ii_hinode[0 + bindex].hi_whdentry;
@@ -9980,7 +10004,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/file.c
-@@ -0,0 +1,711 @@
+@@ -0,0 +1,786 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -10092,6 +10116,78 @@
 +	return h_file;
 +}
 +
++static int au_cpup_on_open(struct dentry *dentry)
++{
++	int err, coo;
++	struct au_pin pin;
++	struct au_cp_generic cpg = {
++		.dentry	= dentry,
++		.bdst	= -1,
++		.bsrc	= -1,
++		.len	= -1,
++		.pin	= &pin,
++		.flags	= AuCpup_DTIME | AuCpup_HOPEN
++	};
++	struct inode *inode;
++	struct super_block *sb;
++	struct au_branch *br;
++	struct dentry *parent;
++
++	DiMustWriteLock(dentry);
++	inode = dentry->d_inode;
++	IiMustWriteLock(inode);
++
++	err = 0;
++	if (IS_ROOT(dentry))
++		goto out;
++	cpg.bsrc = au_dbstart(dentry);
++	if (!cpg.bsrc)
++		goto out;
++
++	sb = dentry->d_sb;
++	br = au_sbr(sb, cpg.bsrc);
++	coo = au_br_coo(br->br_perm);
++	if (!coo)
++		goto out;
++	if (!S_ISREG(inode->i_mode))
++		coo &= AuBrAttr_COO_ALL;
++	if (!coo)
++		goto out;
++
++	parent = dget_parent(dentry);
++	di_write_lock_parent(parent);
++	err = au_wbr_do_copyup_bu(dentry, cpg.bsrc - 1);
++	cpg.bdst = err;
++	if (unlikely(err < 0)) {
++		err = 0;	/* there is no upper writable branch */
++		goto out_dgrade;
++	}
++	AuDbg("bsrc %d, bdst %d\n", cpg.bsrc, cpg.bdst);
++
++	/* do not respect the coo attrib for the target branch */
++	err = au_cpup_dirs(dentry, cpg.bdst);
++	if (unlikely(err))
++		goto out_dgrade;
++
++	di_downgrade_lock(parent, AuLock_IR);
++	err = au_pin(&pin, dentry, cpg.bdst, au_opt_udba(sb),
++		     AuPin_DI_LOCKED | AuPin_MNT_WRITE);
++	if (!err) {
++		err = au_sio_cpup_simple(&cpg);
++		au_unpin(&pin);
++	}
++	goto out_parent;
++
++out_dgrade:
++	di_downgrade_lock(parent, AuLock_IR);
++out_parent:
++	di_read_unlock(parent, AuLock_IR);
++	dput(parent);
++out:
++	AuTraceErr(err);
++	return err;
++}
++
 +int au_do_open(struct file *file, int (*open)(struct file *file, int flags),
 +	       struct au_fidir *fidir)
 +{
@@ -10103,8 +10199,11 @@
 +		goto out;
 +
 +	dentry = file->f_dentry;
-+	di_read_lock_child(dentry, AuLock_IR);
-+	err = open(file, vfsub_file_flags(file));
++	di_write_lock_child(dentry);
++	err = au_cpup_on_open(dentry);
++	di_downgrade_lock(dentry, AuLock_IR);
++	if (!err)
++		err = open(file, vfsub_file_flags(file));
 +	di_read_unlock(dentry, AuLock_IR);
 +
 +	fi_write_unlock(file);
@@ -12745,7 +12844,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/hnotify.c
-@@ -0,0 +1,713 @@
+@@ -0,0 +1,714 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -13065,6 +13164,7 @@
 +static int hn_job(struct hn_job_args *a)
 +{
 +	const unsigned int isdir = au_ftest_hnjob(a->flags, ISDIR);
++	int e;
 +
 +	/* reset xino */
 +	if (au_ftest_hnjob(a->flags, XINO0) && a->inode)
@@ -13082,11 +13182,11 @@
 +
 +	/* make the generation obsolete */
 +	if (au_ftest_hnjob(a->flags, GEN)) {
-+		int err = -1;
++		e = -1;
 +		if (a->inode)
-+			err = hn_gen_by_inode(a->h_name, a->h_nlen, a->inode,
++			e = hn_gen_by_inode(a->h_name, a->h_nlen, a->inode,
 +					      isdir);
-+		if (err && a->dentry)
++		if (e && a->dentry)
 +			hn_gen_by_name(a->dentry, isdir);
 +		/* ignore this error */
 +	}
@@ -13741,7 +13841,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/inode.c
-@@ -0,0 +1,491 @@
+@@ -0,0 +1,492 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -14198,6 +14298,7 @@
 +	       struct inode *inode)
 +{
 +	int err;
++	struct inode *hi;
 +
 +	err = au_br_rdonly(au_sbr(sb, bindex));
 +
@@ -14210,7 +14311,7 @@
 +		 * permission check is unnecessary since vfsub routine
 +		 * will be called later
 +		 */
-+		struct inode *hi = au_h_iptr(inode, bindex);
++		hi = au_h_iptr(inode, bindex);
 +		if (hi)
 +			err = IS_IMMUTABLE(hi) ? -EROFS : 0;
 +	}
@@ -15043,7 +15144,7 @@
 +#endif
 --- /dev/null
 +++ b/fs/aufs/i_op_add.c
-@@ -0,0 +1,881 @@
+@@ -0,0 +1,880 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -15276,7 +15377,7 @@
 +static int add_simple(struct inode *dir, struct dentry *dentry,
 +		      struct simple_arg *arg)
 +{
-+	int err;
++	int err, rerr;
 +	aufs_bindex_t bstart;
 +	unsigned char created;
 +	struct dentry *wh_dentry, *parent;
@@ -15338,7 +15439,6 @@
 +
 +	/* revert */
 +	if (unlikely(created && err && a->h_path.dentry->d_inode)) {
-+		int rerr;
 +		/* no delegation since it is just created */
 +		rerr = vfsub_unlink(h_dir, &a->h_path, /*delegated*/NULL,
 +				    /*force*/0);
@@ -16821,7 +16921,7 @@
 +			struct dentry *dentry, struct kstat *st)
 +{
 +	int err;
-+	unsigned int mnt_flags;
++	unsigned int mnt_flags, sigen;
 +	aufs_bindex_t bindex;
 +	unsigned char udba_none, positive;
 +	struct super_block *sb, *h_sb;
@@ -16838,7 +16938,7 @@
 +
 +	/* support fstat(2) */
 +	if (!d_unlinked(dentry) && !udba_none) {
-+		unsigned int sigen = au_sigen(sb);
++		sigen = au_sigen(sb);
 +		err = au_digen_test(dentry, sigen);
 +		if (!err) {
 +			di_read_lock_child(dentry, AuLock_IR);
@@ -19087,7 +19187,7 @@
 +aufs-$(CONFIG_AUFS_MAGIC_SYSRQ) += sysrq.o
 --- /dev/null
 +++ b/fs/aufs/module.c
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,210 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -19199,6 +19299,11 @@
 +MODULE_PARM_DESC(brs, "use <sysfs>/fs/aufs/si_*/brN");
 +module_param_named(brs, sysaufs_brs, int, S_IRUGO);
 +
++/* this module parameter has no meaning when USER_NS is disabled */
++static bool au_userns;
++MODULE_PARM_DESC(allow_userns, "allow unprivileged to mount under userns");
++module_param_named(allow_userns, au_userns, bool, S_IRUGO);
++
 +/* ---------------------------------------------------------------------- */
 +
 +static char au_esc_chars[0x20 + 3]; /* 0x01-0x20, backslash, del, and NULL */
@@ -19249,9 +19354,12 @@
 +	err = au_cache_init();
 +	if (unlikely(err))
 +		goto out_sysrq;
++
++	aufs_fs_type.fs_flags |= au_userns ? FS_USERNS_MOUNT : 0;
 +	err = register_filesystem(&aufs_fs_type);
 +	if (unlikely(err))
 +		goto out_cache;
++
 +	/* since we define pr_fmt, call printk directly */
 +	printk(KERN_INFO AUFS_NAME " " AUFS_VERSION "\n");
 +	goto out; /* success */
@@ -20029,7 +20137,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/opts.c
-@@ -0,0 +1,1701 @@
+@@ -0,0 +1,1698 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -20142,7 +20250,6 @@
 +	{Opt_nowarn_perm, "nowarn_perm"},
 +
 +	/* keep them temporary */
-+	{Opt_ignore_silent, "coo=%s"},
 +	{Opt_ignore_silent, "nodlgt"},
 +	{Opt_ignore_silent, "nodirperm1"},
 +	{Opt_ignore_silent, "clean_plink"},
@@ -20197,15 +20304,35 @@
 +
 +/* ---------------------------------------------------------------------- */
 +
-+static const char *au_parser_pattern(int val, struct match_token *token)
++static const char *au_parser_pattern(int val, match_table_t tbl)
 +{
-+	while (token->pattern) {
-+		if (token->token == val)
-+			return token->pattern;
-+		token++;
++	struct match_token *p;
++
++	p = tbl;
++	while (p->pattern) {
++		if (p->token == val)
++			return p->pattern;
++		p++;
 +	}
 +	BUG();
 +	return "??";
++}
++
++static const char *au_optstr(int *val, match_table_t tbl)
++{
++	struct match_token *p;
++	int v;
++
++	v = *val;
++	p = tbl;
++	while (p->token) {
++		if ((v & p->token) == p->token) {
++			*val &= ~p->token;
++			return p->pattern;
++		}
++		p++;
++	}
++	return NULL;
 +}
 +
 +/* ---------------------------------------------------------------------- */
@@ -20218,15 +20345,19 @@
 +};
 +
 +static match_table_t brattr = {
++	/* general */
++	{AuBrAttr_COO_REG, AUFS_BRATTR_COO_REG},
++	{AuBrAttr_COO_ALL, AUFS_BRATTR_COO_ALL},
 +	{AuBrAttr_UNPIN, AUFS_BRATTR_UNPIN},
++
++	/* ro/rr branch */
 +	{AuBrRAttr_WH, AUFS_BRRATTR_WH},
++
++	/* rw branch */
 +	{AuBrWAttr_NoLinkWH, AUFS_BRWATTR_NLWH},
++
 +	{0, NULL}
 +};
-+
-+#define AuBrStr_LONGEST	AUFS_BRPERM_RW \
-+	"+" AUFS_BRATTR_UNPIN \
-+	"+" AUFS_BRWATTR_NLWH
 +
 +static int br_attr_val(char *str, match_table_t table, substring_t args[])
 +{
@@ -20239,9 +20370,11 @@
 +		if (p)
 +			*p = 0;
 +		v = match_token(str, table, args);
-+		if (v)
++		if (v) {
++			if (v & AuBrAttr_COO_Mask)
++				attr &= ~AuBrAttr_COO_Mask;
 +			attr |= v;
-+		else {
++		} else {
 +			if (p)
 +				*p = '+';
 +			pr_warn("ignored branch attribute %s\n", str);
@@ -20257,7 +20390,7 @@
 +static int noinline_for_stack br_perm_val(char *perm)
 +{
 +	int val;
-+	char *p, *q;
++	char *p;
 +	substring_t args[MAX_OPT_ARGS];
 +
 +	p = strchr(perm, '+');
@@ -20274,18 +20407,8 @@
 +	if (!p)
 +		goto out;
 +
-+	p++;
-+	while (1) {
-+		q = strchr(p, '+');
-+		if (q)
-+			*q = 0;
-+		val |= br_attr_val(p, brattr, args);
-+		if (q) {
-+			*q = '+';
-+			p = q + 1;
-+		} else
-+			break;
-+	}
++	val |= br_attr_val(p + 1, brattr, args);
++
 +	switch (val & AuBrPerm_Mask) {
 +	case AuBrPerm_RO:
 +	case AuBrPerm_RR:
@@ -20308,49 +20431,30 @@
 +	return val;
 +}
 +
-+/* Caller should free the return value */
-+char *au_optstr_br_perm(int brperm)
++void au_optstr_br_perm(au_br_perm_str_t *str, int perm)
 +{
-+	char *p, a[sizeof(AuBrStr_LONGEST)];
++	const char *p;
++	char *q;
 +	int sz;
 +
-+#define SetPerm(str) do {			\
-+		sz = sizeof(str);		\
-+		memcpy(a, str, sz);		\
-+		p = a + sz - 1;			\
-+	} while (0)
++	q = str->a;
++	p = au_optstr(&perm, brperm);
++	AuDebugOn(!p || !*p);
++	sz = strlen(p);
++	memcpy(q, p, sz + 1);
++	q += sz;
 +
-+#define AppendAttr(flag, str) do {			\
-+		if (brperm & flag) {		\
-+			sz = sizeof(str);	\
-+			*p++ = '+';		\
-+			memcpy(p, str, sz);	\
-+			p += sz - 1;		\
-+		}				\
-+	} while (0)
++	do {
++		p = au_optstr(&perm, brattr);
++		if (p) {
++			*q++ = '+';
++			sz = strlen(p);
++			memcpy(q, p, sz + 1);
++			q += sz;
++		}
++	} while (p);
 +
-+	switch (brperm & AuBrPerm_Mask) {
-+	case AuBrPerm_RO:
-+		SetPerm(AUFS_BRPERM_RO);
-+		break;
-+	case AuBrPerm_RR:
-+		SetPerm(AUFS_BRPERM_RR);
-+		break;
-+	case AuBrPerm_RW:
-+		SetPerm(AUFS_BRPERM_RW);
-+		break;
-+	default:
-+		AuDebugOn(1);
-+	}
-+
-+	AppendAttr(AuBrAttr_UNPIN, AUFS_BRATTR_UNPIN);
-+	AppendAttr(AuBrRAttr_WH, AUFS_BRRATTR_WH);
-+	AppendAttr(AuBrWAttr_NoLinkWH, AUFS_BRWATTR_NLWH);
-+
-+	AuDebugOn(strlen(a) >= sizeof(a));
-+	return kstrdup(a, GFP_NOFS);
-+#undef SetPerm
-+#undef AppendAttr
++	AuDebugOn(strlen(str->a) >= sizeof(str->a));
 +}
 +
 +/* ---------------------------------------------------------------------- */
@@ -20376,7 +20480,7 @@
 +
 +const char *au_optstr_udba(int udba)
 +{
-+	return au_parser_pattern(udba, (void *)udbalevel);
++	return au_parser_pattern(udba, udbalevel);
 +}
 +
 +/* ---------------------------------------------------------------------- */
@@ -20498,7 +20602,7 @@
 +
 +const char *au_optstr_wbr_create(int wbr_create)
 +{
-+	return au_parser_pattern(wbr_create, (void *)au_wbr_create_policy);
++	return au_parser_pattern(wbr_create, au_wbr_create_policy);
 +}
 +
 +static match_table_t au_wbr_copyup_policy = {
@@ -20520,7 +20624,7 @@
 +
 +const char *au_optstr_wbr_copyup(int wbr_copyup)
 +{
-+	return au_parser_pattern(wbr_copyup, (void *)au_wbr_copyup_policy);
++	return au_parser_pattern(wbr_copyup, au_wbr_copyup_policy);
 +}
 +
 +/* ---------------------------------------------------------------------- */
@@ -21597,6 +21701,7 @@
 +	struct au_opt_xino *opt_xino, xino;
 +	struct au_sbinfo *sbinfo;
 +	struct au_branch *br;
++	struct inode *dir;
 +
 +	SiMustWriteLock(sb);
 +
@@ -21670,7 +21775,7 @@
 +		/* go on even if err */
 +	}
 +	if (au_opt_test(tmp, UDBA_HNOTIFY)) {
-+		struct inode *dir = sb->s_root->d_inode;
++		dir = sb->s_root->d_inode;
 +		au_hn_reset(dir, au_hi_flags(dir, /*isdir*/1) & ~AuHi_XINO);
 +	}
 +
@@ -21733,7 +21838,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/opts.h
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,211 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -21761,6 +21866,7 @@
 +#ifdef __KERNEL__
 +
 +#include <linux/path.h>
++#include "branch.h"
 +
 +struct file;
 +struct super_block;
@@ -21926,7 +22032,7 @@
 +
 +/* ---------------------------------------------------------------------- */
 +
-+char *au_optstr_br_perm(int brperm);
++void au_optstr_br_perm(au_br_perm_str_t *str, int perm);
 +const char *au_optstr_udba(int udba);
 +const char *au_optstr_wbr_copyup(int wbr_copyup);
 +const char *au_optstr_wbr_create(int wbr_create);
@@ -23102,7 +23208,7 @@
 +#endif
 --- /dev/null
 +++ b/fs/aufs/rwsem.h
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,191 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -23241,7 +23347,9 @@
 +/* why is not _nested version defined */
 +static inline int au_rw_read_trylock(struct au_rwsem *rw)
 +{
-+	int ret = down_read_trylock(&rw->rwsem);
++	int ret;
++
++	ret = down_read_trylock(&rw->rwsem);
 +	if (ret)
 +		AuDbgRcntInc(rw);
 +	return ret;
@@ -23249,7 +23357,9 @@
 +
 +static inline int au_rw_write_trylock(struct au_rwsem *rw)
 +{
-+	int ret = down_write_trylock(&rw->rwsem);
++	int ret;
++
++	ret = down_write_trylock(&rw->rwsem);
 +	if (ret)
 +		AuDbgWcntInc(rw);
 +	return ret;
@@ -23760,7 +23870,7 @@
 +#endif /* __AUFS_SPL_H__ */
 --- /dev/null
 +++ b/fs/aufs/super.c
-@@ -0,0 +1,1001 @@
+@@ -0,0 +1,998 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -23859,7 +23969,7 @@
 +	struct path path;
 +	struct au_hdentry *hdp;
 +	struct au_branch *br;
-+	char *perm;
++	au_br_perm_str_t perm;
 +
 +	err = 0;
 +	bend = au_sbend(sb);
@@ -23870,14 +23980,10 @@
 +		path.dentry = hdp[bindex].hd_dentry;
 +		err = au_seq_path(seq, &path);
 +		if (err > 0) {
-+			perm = au_optstr_br_perm(br->br_perm);
-+			if (perm) {
-+				err = seq_printf(seq, "=%s", perm);
-+				kfree(perm);
-+				if (err == -1)
-+					err = -E2BIG;
-+			} else
-+				err = -ENOMEM;
++			au_optstr_br_perm(&perm, br->br_perm);
++			err = seq_printf(seq, "=%s", perm.a);
++			if (err == -1)
++				err = -E2BIG;
 +		}
 +		if (!err && bindex != bend)
 +			err = seq_putc(seq, ':');
@@ -24247,7 +24353,7 @@
 +void *au_array_alloc(unsigned long long *hint, au_arraycb_t cb, void *arg)
 +{
 +	void *array;
-+	unsigned long long n;
++	unsigned long long n, sz;
 +
 +	array = NULL;
 +	n = 0;
@@ -24260,9 +24366,10 @@
 +		goto out;
 +	}
 +
-+	array = kmalloc(sizeof(array) * *hint, GFP_NOFS);
++	sz = sizeof(array) * *hint;
++	array = kmalloc(sz, GFP_NOFS);
 +	if (unlikely(!array))
-+		array = vmalloc(sizeof(array) * *hint);
++		array = vmalloc(sz);
 +	if (unlikely(!array)) {
 +		array = ERR_PTR(-ENOMEM);
 +		goto out;
@@ -24764,7 +24871,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/super.h
-@@ -0,0 +1,571 @@
+@@ -0,0 +1,582 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -25051,6 +25158,7 @@
 +extern struct au_wbr_create_operations au_wbr_create_ops[];
 +int au_cpdown_dirs(struct dentry *dentry, aufs_bindex_t bdst);
 +int au_wbr_nonopq(struct dentry *dentry, aufs_bindex_t bindex);
++int au_wbr_do_copyup_bu(struct dentry *dentry, aufs_bindex_t bstart);
 +
 +/* mvdown.c */
 +int au_mvdown(struct dentry *dentry, struct aufs_mvdown __user *arg);
@@ -25166,7 +25274,9 @@
 +
 +static inline int si_pid_test(struct super_block *sb)
 +{
-+	pid_t bit = si_pid_bit();
++	pid_t bit;
++
++	bit = si_pid_bit();
 +	if (bit < PID_MAX_DEFAULT)
 +		return test_bit(bit, au_sbi(sb)->au_si_pid.bitmap);
 +	else
@@ -25175,7 +25285,9 @@
 +
 +static inline void si_pid_set(struct super_block *sb)
 +{
-+	pid_t bit = si_pid_bit();
++	pid_t bit;
++
++	bit = si_pid_bit();
 +	if (bit < PID_MAX_DEFAULT) {
 +		AuDebugOn(test_bit(bit, au_sbi(sb)->au_si_pid.bitmap));
 +		set_bit(bit, au_sbi(sb)->au_si_pid.bitmap);
@@ -25186,7 +25298,9 @@
 +
 +static inline void si_pid_clr(struct super_block *sb)
 +{
-+	pid_t bit = si_pid_bit();
++	pid_t bit;
++
++	bit = si_pid_bit();
 +	if (bit < PID_MAX_DEFAULT) {
 +		AuDebugOn(!test_bit(bit, au_sbi(sb)->au_si_pid.bitmap));
 +		clear_bit(bit, au_sbi(sb)->au_si_pid.bitmap);
@@ -25216,7 +25330,9 @@
 +
 +static inline int si_noflush_read_trylock(struct super_block *sb)
 +{
-+	int locked = __si_read_trylock(sb);
++	int locked;
++
++	locked = __si_read_trylock(sb);
 +	if (locked)
 +		si_pid_set(sb);
 +	return locked;
@@ -25230,7 +25346,9 @@
 +
 +static inline int si_noflush_write_trylock(struct super_block *sb)
 +{
-+	int locked = __si_write_trylock(sb);
++	int locked;
++
++	locked = __si_write_trylock(sb);
 +	if (locked)
 +		si_pid_set(sb);
 +	return locked;
@@ -25551,7 +25669,7 @@
 +#endif /* __SYSAUFS_H__ */
 --- /dev/null
 +++ b/fs/aufs/sysfs.c
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,292 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -25637,7 +25755,7 @@
 +	struct path path;
 +	struct dentry *root;
 +	struct au_branch *br;
-+	char *perm;
++	au_br_perm_str_t perm;
 +
 +	AuDbg("b%d\n", bindex);
 +
@@ -25652,14 +25770,10 @@
 +		path.dentry = au_h_dptr(root, bindex);
 +		au_seq_path(seq, &path);
 +		di_read_unlock(root, !AuLock_IR);
-+		perm = au_optstr_br_perm(br->br_perm);
-+		if (perm) {
-+			err = seq_printf(seq, "=%s\n", perm);
-+			kfree(perm);
-+			if (err == -1)
-+				err = -E2BIG;
-+		} else
-+			err = -ENOMEM;
++		au_optstr_br_perm(&perm, br->br_perm);
++		err = seq_printf(seq, "=%s\n", perm.a);
++		if (err == -1)
++			err = -E2BIG;
 +		break;
 +	case AuBrSysfs_BRID:
 +		err = seq_printf(seq, "%d\n", br->br_id);
@@ -25850,7 +25964,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/sysrq.c
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,157 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -25928,6 +26042,7 @@
 +#if 1
 +	{
 +		struct inode *i;
++
 +		pr("isolated inode\n");
 +		spin_lock(&inode_sb_list_lock);
 +		list_for_each_entry(i, &sb->s_inodes, i_sb_list) {
@@ -25944,6 +26059,7 @@
 +	spin_lock(&files->spin);
 +	hlist_for_each_entry(finfo, &files->head, fi_hlist) {
 +		umode_t mode;
++
 +		file = finfo->fi_file;
 +		mode = file_inode(file)->i_mode;
 +		if (!special_file(mode))
@@ -26001,13 +26117,14 @@
 +void au_sysrq_fin(void)
 +{
 +	int err;
++
 +	err = unregister_sysrq_key(*aufs_sysrq_key, &au_sysrq_op);
 +	if (unlikely(err))
 +		pr_err("err %d (ignored)\n", err);
 +}
 --- /dev/null
 +++ b/fs/aufs/vdir.c
-@@ -0,0 +1,887 @@
+@@ -0,0 +1,889 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -26086,8 +26203,10 @@
 +{
 +	struct hlist_head *head;
 +	unsigned int u;
++	size_t sz;
 +
-+	head = kmalloc(sizeof(*nhash->nh_head) * num_hash, gfp);
++	sz = sizeof(*nhash->nh_head) * num_hash;
++	head = kmalloc(sz, gfp);
 +	if (head) {
 +		nhash->nh_num = num_hash;
 +		nhash->nh_head = head;
@@ -27682,7 +27801,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/vfsub.h
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,284 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -27790,6 +27909,7 @@
 +static inline int vfsub_mnt_want_write(struct vfsmount *mnt)
 +{
 +	int err;
++
 +	lockdep_off();
 +	err = mnt_want_write(mnt);
 +	lockdep_on();
@@ -27902,6 +28022,7 @@
 +static inline long vfsub_truncate(struct path *path, loff_t length)
 +{
 +	long err;
++
 +	lockdep_off();
 +	err = vfs_truncate(path, length);
 +	lockdep_on();
@@ -27967,7 +28088,7 @@
 +#endif /* __AUFS_VFSUB_H__ */
 --- /dev/null
 +++ b/fs/aufs/wbr_policy.c
-@@ -0,0 +1,756 @@
+@@ -0,0 +1,764 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -28646,18 +28767,26 @@
 +}
 +
 +/* bottom up */
-+static int au_wbr_copyup_bu(struct dentry *dentry)
++int au_wbr_do_copyup_bu(struct dentry *dentry, aufs_bindex_t bstart)
 +{
 +	int err;
-+	aufs_bindex_t bstart;
 +
-+	bstart = au_dbstart(dentry);
 +	err = au_wbr_bu(dentry->d_sb, bstart);
 +	AuDbg("b%d\n", err);
 +	if (err > bstart)
 +		err = au_wbr_nonopq(dentry, err);
 +
 +	AuDbg("b%d\n", err);
++	return err;
++}
++
++static int au_wbr_copyup_bu(struct dentry *dentry)
++{
++	int err;
++	aufs_bindex_t bstart;
++
++	bstart = au_dbstart(dentry);
++	err = au_wbr_do_copyup_bu(dentry, bstart);
 +	return err;
 +}
 +
@@ -31495,7 +31624,7 @@
 +}
 --- /dev/null
 +++ b/include/uapi/linux/aufs_type.h
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,283 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -31537,7 +31666,7 @@
 +
 +#include <linux/limits.h>
 +
-+#define AUFS_VERSION	"3.15-20140623"
++#define AUFS_VERSION	"3.15-20140630"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
@@ -31614,9 +31743,11 @@
 +#define AUFS_BRPERM_RW		"rw"
 +#define AUFS_BRPERM_RO		"ro"
 +#define AUFS_BRPERM_RR		"rr"
++#define AUFS_BRATTR_COO_REG	"coo_reg"
++#define AUFS_BRATTR_COO_ALL	"coo_all"
++#define AUFS_BRATTR_UNPIN	"unpin"
 +#define AUFS_BRRATTR_WH		"wh"
 +#define AUFS_BRWATTR_NLWH	"nolwh"
-+#define AUFS_BRATTR_UNPIN	"unpin"
 +
 +/* ---------------------------------------------------------------------- */
 +
