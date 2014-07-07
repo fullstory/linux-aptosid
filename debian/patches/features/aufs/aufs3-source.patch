@@ -496,7 +496,7 @@
 +For this purpose, use "aumvdown" command in aufs-util.git.
 --- /dev/null
 +++ b/Documentation/filesystems/aufs/design/03lookup.txt
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,133 @@
 +
 +# Copyright (C) 2005-2014 Junjiro R. Okajima
 +# 
@@ -537,6 +537,34 @@
 +them.
 +For d_revalidate, aufs implements three levels of revalidate tests. See
 +"Revalidate Dentry and UDBA" in detail.
++
++
++Test Only the Highest One for the Directory Permission (dirperm1 option)
++----------------------------------------------------------------------
++Let's try case study.
++- aufs has two branches, upper readwrite and lower readonly.
++  /au = /rw + /ro
++- "dirA" exists under /ro, but /rw. and its mode is 0700.
++- user invoked "chmod a+rx /au/dirA"
++- the internal copy-up is activated and "/rw/dirA" is created and its
++  permission bits are set to world readble.
++- then "/au/dirA" becomes world readable?
++
++In this case, /ro/dirA is still 0700 since it exists in readonly branch,
++or it may be a natively readonly filesystem. If aufs respects the lower
++branch, it should not respond readdir request from other users. But user
++allowed it by chmod. Should really aufs rejects showing the entries
++under /ro/dirA?
++
++To be honest, I don't have a best solution for this case. So aufs
++implements 'dirperm1' and 'nodirperm1' and leave it to users.
++When dirperm1 is specified, aufs checks only the highest one for the
++directory permission, and shows the entries. Otherwise, as usual, checks
++every dir existing on all branches and rejects the request.
++
++As a side effect, dirperm1 option improves the performance of aufs
++because the number of permission check is reduced when the number of
++branch is many.
 +
 +
 +Loopback Mount
@@ -963,7 +991,7 @@
 +vm_operations_struct for regular files only.
 --- /dev/null
 +++ b/Documentation/filesystems/aufs/design/99plan.txt
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,58 @@
 +
 +# Copyright (C) 2005-2014 Junjiro R. Okajima
 +# 
@@ -987,48 +1015,11 @@
 +easier to be reviewed.
 +
 +
-+Test Only the Highest One for the Directory Permission (dirperm1 option)
-+----------------------------------------------------------------------
-+Let's try case study.
-+- aufs has two branches, upper readwrite and lower readonly.
-+  /au = /rw + /ro
-+- "dirA" exists under /ro, but /rw. and its mode is 0700.
-+- user invoked "chmod a+rx /au/dirA"
-+- then "dirA" becomes world readable?
-+
-+In this case, /ro/dirA is still 0700 since it exists in readonly branch,
-+or it may be a natively readonly filesystem. If aufs respects the lower
-+branch, it should not respond readdir request from other users. But user
-+allowed it by chmod. Should really aufs rejects showing the entries
-+under /ro/dirA?
-+
-+To be honest, I don't have a best solution for this case. So I
-+implemented 'dirperm1' and 'nodirperm1' option in aufs1, and leave it to
-+users.
-+When dirperm1 is specified, aufs checks only the highest one for the
-+directory permission, and shows the entries. Otherwise, as usual, checks
-+every dir existing on all branches and rejects the request.
-+
-+As a side effect, dirperm1 option improves the performance of aufs
-+because the number of permission check is reduced.
-+
-+
 +Being Another Aufs's Readonly Branch (robr)
 +----------------------------------------------------------------------
 +Aufs1 allows aufs to be another aufs's readonly branch.
 +This feature was developed by a user's request. But it may not be used
 +currecnly.
-+
-+
-+Copy-up on Open (coo=)
-+----------------------------------------------------------------------
-+By default the internal copy-up is executed when it is really necessary.
-+It is not done when a file is opened for writing, but when write(2) is
-+done. Users who have many (over 100) branches want to know and analyse
-+when and what file is copied-up. To insert a new upper branch which
-+contains such files only may improve the performance of aufs.
-+
-+Aufs1 implemented "coo=none | leaf | all" option.
 +
 +
 +Refresh the Opened File (refrof)
@@ -2717,7 +2708,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/branch.h
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,288 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -2858,8 +2849,13 @@
 +						   branch */
 +
 +#define AuBrRAttr_WH		(1 << 6)	/* whiteout-able */
++#define AuBrRAttr_Mask		AuBrRAttr_WH
 +
 +#define AuBrWAttr_NoLinkWH	(1 << 7)	/* un-hardlinkable whiteouts */
++#define AuBrWAttr_MOO		(1 << 8)	/* move-up on open */
++#define AuBrWAttr_Mask		(AuBrWAttr_NoLinkWH | AuBrWAttr_MOO)
++
++#define AuBrAttr_CMOO_Mask	(AuBrAttr_COO_Mask | AuBrWAttr_MOO)
 +
 +/* the longest combination */
 +#define AuBrPermStrSz	sizeof(AUFS_BRPERM_RW		\
@@ -2893,9 +2889,9 @@
 +		? -EROFS : 0;
 +}
 +
-+static inline int au_br_coo(int brperm)
++static inline int au_br_cmoo(int brperm)
 +{
-+	return (brperm & AuBrAttr_COO_Mask);
++	return brperm & AuBrAttr_CMOO_Mask;
 +}
 +
 +static inline int au_br_hnotifyable(int brperm __maybe_unused)
@@ -6058,7 +6054,7 @@
 +#endif /* __AUFS_DEBUG_H__ */
 --- /dev/null
 +++ b/fs/aufs/dentry.c
-@@ -0,0 +1,1084 @@
+@@ -0,0 +1,1094 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -6084,6 +6080,7 @@
 +#include "aufs.h"
 +
 +#define AuLkup_ALLOW_NEG	1
++#define AuLkup_IGNORE_PERM	(1 << 1)
 +#define au_ftest_lkup(flags, name)	((flags) & AuLkup_##name)
 +#define au_fset_lkup(flags, name) \
 +	do { (flags) |= AuLkup_##name; } while (0)
@@ -6110,12 +6107,14 @@
 +	int wh_found, opq;
 +	unsigned char wh_able;
 +	const unsigned char allow_neg = !!au_ftest_lkup(args->flags, ALLOW_NEG);
++	const unsigned char ignore_perm = !!au_ftest_lkup(args->flags,
++							  IGNORE_PERM);
 +
 +	wh_found = 0;
 +	br = au_sbr(dentry->d_sb, bindex);
 +	wh_able = !!au_br_whable(br->br_perm);
 +	if (wh_able)
-+		wh_found = au_wh_test(h_parent, wh_name, br, /*try_sio*/0);
++		wh_found = au_wh_test(h_parent, wh_name, /*try_sio*/0);
 +	h_dentry = ERR_PTR(wh_found);
 +	if (!wh_found)
 +		goto real_lookup;
@@ -6129,7 +6128,10 @@
 +		return NULL; /* success */
 +
 +real_lookup:
-+	h_dentry = vfsub_lkup_one(&dentry->d_name, h_parent);
++	if (!ignore_perm)
++		h_dentry = vfsub_lkup_one(&dentry->d_name, h_parent);
++	else
++		h_dentry = au_sio_lkup_one(&dentry->d_name, h_parent);
 +	if (IS_ERR(h_dentry))
 +		goto out;
 +
@@ -6153,7 +6155,7 @@
 +		goto out; /* success */
 +
 +	mutex_lock_nested(&h_inode->i_mutex, AuLsc_I_CHILD);
-+	opq = au_diropq_test(h_dentry, br);
++	opq = au_diropq_test(h_dentry);
 +	mutex_unlock(&h_inode->i_mutex);
 +	if (opq > 0)
 +		au_set_dbdiropq(dentry, bindex);
@@ -6187,7 +6189,7 @@
 +{
 +	int npositive, err;
 +	aufs_bindex_t bindex, btail, bdiropq;
-+	unsigned char isdir;
++	unsigned char isdir, dirperm1;
 +	struct qstr whname;
 +	struct au_do_lookup_args args = {
 +		.flags		= 0,
@@ -6196,8 +6198,10 @@
 +	const struct qstr *name = &dentry->d_name;
 +	struct dentry *parent;
 +	struct inode *inode;
++	struct super_block *sb;
 +
-+	err = au_test_shwh(dentry->d_sb, name);
++	sb = dentry->d_sb;
++	err = au_test_shwh(sb, name);
 +	if (unlikely(err))
 +		goto out;
 +
@@ -6209,6 +6213,7 @@
 +	isdir = !!(inode && S_ISDIR(inode->i_mode));
 +	if (!type)
 +		au_fset_lkup(args.flags, ALLOW_NEG);
++	dirperm1 = !!au_opt_test(au_mntflags(sb), DIRPERM1);
 +
 +	npositive = 0;
 +	parent = dget_parent(dentry);
@@ -6240,6 +6245,8 @@
 +		if (IS_ERR(h_dentry))
 +			goto out_parent;
 +		au_fclr_lkup(args.flags, ALLOW_NEG);
++		if (dirperm1)
++			au_fset_lkup(args.flags, IGNORE_PERM);
 +
 +		if (au_dbwh(dentry) >= 0)
 +			break;
@@ -6266,7 +6273,7 @@
 +		au_update_dbstart(dentry);
 +	}
 +	err = npositive;
-+	if (unlikely(!au_opt_test(au_mntflags(dentry->d_sb), UDBA_NONE)
++	if (unlikely(!au_opt_test(au_mntflags(sb), UDBA_NONE)
 +		     && au_dbstart(dentry) < 0)) {
 +		err = -EIO;
 +		AuIOErr("both of real entry and whiteout found, %pd, err %d\n",
@@ -6280,8 +6287,7 @@
 +	return err;
 +}
 +
-+struct dentry *au_sio_lkup_one(struct qstr *name, struct dentry *parent,
-+			       struct au_branch *br)
++struct dentry *au_sio_lkup_one(struct qstr *name, struct dentry *parent)
 +{
 +	struct dentry *dentry;
 +	int wkq_err;
@@ -6318,7 +6324,7 @@
 +	if (wh)
 +		h_dentry = au_whtmp_lkup(h_parent, br, &dentry->d_name);
 +	else
-+		h_dentry = au_sio_lkup_one(&dentry->d_name, h_parent, br);
++		h_dentry = au_sio_lkup_one(&dentry->d_name, h_parent);
 +	err = PTR_ERR(h_dentry);
 +	if (IS_ERR(h_dentry))
 +		goto out;
@@ -7145,7 +7151,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/dentry.h
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,233 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -7194,8 +7200,7 @@
 +/* dentry.c */
 +extern const struct dentry_operations aufs_dop;
 +struct au_branch;
-+struct dentry *au_sio_lkup_one(struct qstr *name, struct dentry *parent,
-+			       struct au_branch *br);
++struct dentry *au_sio_lkup_one(struct qstr *name, struct dentry *parent);
 +int au_h_verify(struct dentry *h_dentry, unsigned int udba, struct inode *h_dir,
 +		struct dentry *h_parent, struct au_branch *br);
 +
@@ -7929,7 +7934,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/dir.c
-@@ -0,0 +1,639 @@
+@@ -0,0 +1,643 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -8486,6 +8491,7 @@
 +			.actor = au_diractor(test_empty_cb)
 +		}
 +	};
++	int (*test_empty)(struct dentry *dentry, struct test_empty_arg *arg);
 +
 +	SiMustAnyLock(dentry->d_sb);
 +
@@ -8501,8 +8507,11 @@
 +	bstart = au_dbstart(dentry);
 +	if (au_opt_test(au_mntflags(dentry->d_sb), SHWH))
 +		au_fset_testempty(arg.flags, SHWH);
++	test_empty = do_test_empty;
++	if (au_opt_test(au_mntflags(dentry->d_sb), DIRPERM1))
++		test_empty = sio_test_empty;
 +	arg.bindex = bstart;
-+	err = do_test_empty(dentry, &arg);
++	err = test_empty(dentry, &arg);
 +	if (unlikely(err))
 +		goto out_whlist;
 +
@@ -8514,7 +8523,7 @@
 +		h_dentry = au_h_dptr(dentry, bindex);
 +		if (h_dentry && h_dentry->d_inode) {
 +			arg.bindex = bindex;
-+			err = do_test_empty(dentry, &arg);
++			err = test_empty(dentry, &arg);
 +		}
 +	}
 +
@@ -10004,7 +10013,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/file.c
-@@ -0,0 +1,786 @@
+@@ -0,0 +1,809 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -10116,9 +10125,10 @@
 +	return h_file;
 +}
 +
-+static int au_cpup_on_open(struct dentry *dentry)
++static int au_cmoo(struct dentry *dentry)
 +{
-+	int err, coo;
++	int err, cmoo;
++	struct path h_path;
 +	struct au_pin pin;
 +	struct au_cp_generic cpg = {
 +		.dentry	= dentry,
@@ -10128,10 +10138,11 @@
 +		.pin	= &pin,
 +		.flags	= AuCpup_DTIME | AuCpup_HOPEN
 +	};
-+	struct inode *inode;
++	struct inode *inode, *delegated;
 +	struct super_block *sb;
 +	struct au_branch *br;
 +	struct dentry *parent;
++	struct au_hinode *hdir;
 +
 +	DiMustWriteLock(dentry);
 +	inode = dentry->d_inode;
@@ -10146,12 +10157,12 @@
 +
 +	sb = dentry->d_sb;
 +	br = au_sbr(sb, cpg.bsrc);
-+	coo = au_br_coo(br->br_perm);
-+	if (!coo)
++	cmoo = au_br_cmoo(br->br_perm);
++	if (!cmoo)
 +		goto out;
 +	if (!S_ISREG(inode->i_mode))
-+		coo &= AuBrAttr_COO_ALL;
-+	if (!coo)
++		cmoo &= AuBrAttr_COO_ALL;
++	if (!cmoo)
 +		goto out;
 +
 +	parent = dget_parent(dentry);
@@ -10175,6 +10186,27 @@
 +	if (!err) {
 +		err = au_sio_cpup_simple(&cpg);
 +		au_unpin(&pin);
++	}
++	if (!err && (cmoo & AuBrWAttr_MOO)) {
++		/* todo: keep h_dentry? */
++		h_path.mnt = au_br_mnt(br);
++		h_path.dentry = au_h_dptr(dentry, cpg.bsrc);
++		hdir = au_hi(parent->d_inode, cpg.bsrc);
++		delegated = NULL;
++		au_hn_imtx_lock_nested(hdir, AuLsc_I_PARENT2);
++		err = vfsub_unlink(hdir->hi_inode, &h_path, &delegated,
++				   /*force*/1);
++		au_hn_imtx_unlock(hdir);
++		if (unlikely(err == -EWOULDBLOCK)) {
++			pr_warn("cannot retry for NFSv4 delegation"
++				" for an internal unlink\n");
++			iput(delegated);
++		}
++		if (unlikely(err)) {
++			pr_err("unlink %pd after coo failed (%d), ignored\n",
++			       dentry, err);
++			err = 0;
++		}
 +	}
 +	goto out_parent;
 +
@@ -10200,7 +10232,7 @@
 +
 +	dentry = file->f_dentry;
 +	di_write_lock_child(dentry);
-+	err = au_cpup_on_open(dentry);
++	err = au_cmoo(dentry);
 +	di_downgrade_lock(dentry, AuLock_IR);
 +	if (!err)
 +		err = open(file, vfsub_file_flags(file));
@@ -16027,7 +16059,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/i_op.c
-@@ -0,0 +1,1138 @@
+@@ -0,0 +1,1140 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -16132,7 +16164,9 @@
 +		goto out;
 +#endif
 +
-+	if (!isdir || write_mask) {
++	if (!isdir
++	    || write_mask
++	    || au_opt_test(au_mntflags(sb), DIRPERM1)) {
 +		err = au_busy_or_stale();
 +		h_inode = au_h_iptr(inode, au_ibstart(inode));
 +		if (unlikely(!h_inode
@@ -17168,7 +17202,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/i_op_del.c
-@@ -0,0 +1,506 @@
+@@ -0,0 +1,507 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -17297,11 +17331,12 @@
 +	 * let's try heavy test.
 +	 */
 +	err = -EACCES;
-+	if (unlikely(au_test_h_perm(h_parent->d_inode, MAY_EXEC | MAY_WRITE)))
++	if (unlikely(!au_opt_test(au_mntflags(dentry->d_sb), DIRPERM1)
++		     && au_test_h_perm(h_parent->d_inode,
++				       MAY_EXEC | MAY_WRITE)))
 +		goto out;
 +
-+	h_latest = au_sio_lkup_one(&dentry->d_name, h_parent,
-+				   au_sbr(dentry->d_sb, bindex));
++	h_latest = au_sio_lkup_one(&dentry->d_name, h_parent);
 +	err = -EIO;
 +	if (IS_ERR(h_latest))
 +		goto out;
@@ -20137,7 +20172,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/opts.c
-@@ -0,0 +1,1698 @@
+@@ -0,0 +1,1750 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -20188,6 +20223,7 @@
 +	Opt_refrof, Opt_norefrof,
 +	Opt_verbose, Opt_noverbose,
 +	Opt_sum, Opt_nosum, Opt_wsum,
++	Opt_dirperm1, Opt_nodirperm1,
 +	Opt_tail, Opt_ignore, Opt_ignore_silent, Opt_err
 +};
 +
@@ -20251,13 +20287,15 @@
 +
 +	/* keep them temporary */
 +	{Opt_ignore_silent, "nodlgt"},
-+	{Opt_ignore_silent, "nodirperm1"},
 +	{Opt_ignore_silent, "clean_plink"},
 +
 +#ifdef CONFIG_AUFS_SHWH
 +	{Opt_shwh, "shwh"},
 +#endif
 +	{Opt_noshwh, "noshwh"},
++
++	{Opt_dirperm1, "dirperm1"},
++	{Opt_nodirperm1, "nodirperm1"},
 +
 +	{Opt_rendir, "rendir=%d"},
 +
@@ -20354,6 +20392,7 @@
 +	{AuBrRAttr_WH, AUFS_BRRATTR_WH},
 +
 +	/* rw branch */
++	{AuBrWAttr_MOO, AUFS_BRWATTR_MOO},
 +	{AuBrWAttr_NoLinkWH, AUFS_BRWATTR_NLWH},
 +
 +	{0, NULL}
@@ -20371,8 +20410,8 @@
 +			*p = 0;
 +		v = match_token(str, table, args);
 +		if (v) {
-+			if (v & AuBrAttr_COO_Mask)
-+				attr &= ~AuBrAttr_COO_Mask;
++			if (v & AuBrAttr_CMOO_Mask)
++				attr &= ~AuBrAttr_CMOO_Mask;
 +			attr |= v;
 +		} else {
 +			if (p)
@@ -20387,11 +20426,43 @@
 +	return attr;
 +}
 +
++static int au_do_optstr_br_attr(au_br_perm_str_t *str, int perm)
++{
++	int sz;
++	const char *p;
++	char *q;
++
++	sz = 0;
++	q = str->a;
++	*q = 0;
++	p = au_optstr(&perm, brattr);
++	if (p) {
++		sz = strlen(p);
++		memcpy(q, p, sz + 1);
++		q += sz;
++	} else
++		goto out;
++
++	do {
++		p = au_optstr(&perm, brattr);
++		if (p) {
++			*q++ = '+';
++			sz = strlen(p);
++			memcpy(q, p, sz + 1);
++			q += sz;
++		}
++	} while (p);
++
++out:
++	return sz;
++}
++
 +static int noinline_for_stack br_perm_val(char *perm)
 +{
-+	int val;
++	int val, bad, sz;
 +	char *p;
 +	substring_t args[MAX_OPT_ARGS];
++	au_br_perm_str_t attr;
 +
 +	p = strchr(perm, '+');
 +	if (p)
@@ -20409,22 +20480,22 @@
 +
 +	val |= br_attr_val(p + 1, brattr, args);
 +
++	bad = 0;
 +	switch (val & AuBrPerm_Mask) {
 +	case AuBrPerm_RO:
 +	case AuBrPerm_RR:
-+		if (unlikely(val & AuBrWAttr_NoLinkWH)) {
-+			pr_warn("ignored branch attribute %s\n",
-+				AUFS_BRWATTR_NLWH);
-+			val &= ~AuBrWAttr_NoLinkWH;
-+		}
++		bad = val & AuBrWAttr_Mask;
++		val &= ~AuBrWAttr_Mask;
 +		break;
 +	case AuBrPerm_RW:
-+		if (unlikely(val & AuBrRAttr_WH)) {
-+			pr_warn("ignored branch attribute %s\n",
-+				AUFS_BRRATTR_WH);
-+			val &= ~AuBrRAttr_WH;
-+		}
++		bad = val & AuBrRAttr_Mask;
++		val &= ~AuBrRAttr_Mask;
 +		break;
++	}
++	if (unlikely(bad)) {
++		sz = au_do_optstr_br_attr(&attr, bad);
++		AuDebugOn(!sz);
++		pr_warn("ignored branch attribute %s\n", attr.a);
 +	}
 +
 +out:
@@ -20433,6 +20504,7 @@
 +
 +void au_optstr_br_perm(au_br_perm_str_t *str, int perm)
 +{
++	au_br_perm_str_t attr;
 +	const char *p;
 +	char *q;
 +	int sz;
@@ -20444,15 +20516,11 @@
 +	memcpy(q, p, sz + 1);
 +	q += sz;
 +
-+	do {
-+		p = au_optstr(&perm, brattr);
-+		if (p) {
-+			*q++ = '+';
-+			sz = strlen(p);
-+			memcpy(q, p, sz + 1);
-+			q += sz;
-+		}
-+	} while (p);
++	sz = au_do_optstr_br_attr(&attr, perm);
++	if (sz) {
++		*q++ = '+';
++		memcpy(q, attr.a, sz + 1);
++	}
 +
 +	AuDebugOn(strlen(str->a) >= sizeof(str->a));
 +}
@@ -20726,6 +20794,12 @@
 +			break;
 +		case Opt_noshwh:
 +			AuLabel(noshwh);
++			break;
++		case Opt_dirperm1:
++			AuLabel(dirperm1);
++			break;
++		case Opt_nodirperm1:
++			AuLabel(nodirperm1);
 +			break;
 +		case Opt_plink:
 +			AuLabel(plink);
@@ -21230,6 +21304,8 @@
 +		case Opt_notrunc_xib:
 +		case Opt_shwh:
 +		case Opt_noshwh:
++		case Opt_dirperm1:
++		case Opt_nodirperm1:
 +		case Opt_plink:
 +		case Opt_noplink:
 +		case Opt_list_plink:
@@ -21471,6 +21547,13 @@
 +		au_opt_clr(sbinfo->si_mntflags, SHWH);
 +		break;
 +
++	case Opt_dirperm1:
++		au_opt_set(sbinfo->si_mntflags, DIRPERM1);
++		break;
++	case Opt_nodirperm1:
++		au_opt_clr(sbinfo->si_mntflags, DIRPERM1);
++		break;
++
 +	case Opt_trunc_xino:
 +		au_opt_set(sbinfo->si_mntflags, TRUNC_XINO);
 +		break;
@@ -21627,6 +21710,10 @@
 +	if (au_opt_test((sbinfo->si_mntflags | pending), UDBA_HNOTIFY)
 +	    && !au_opt_test(sbinfo->si_mntflags, XINO))
 +		pr_warn("udba=*notify requires xino\n");
++
++	if (au_opt_test(sbinfo->si_mntflags, DIRPERM1))
++		pr_warn("dirperm1 breaks the protection"
++			" by the permission bits on the lower branch\n");
 +
 +	err = 0;
 +	root = sb->s_root;
@@ -21838,7 +21925,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/opts.h
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,212 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -21882,7 +21969,8 @@
 +#define AuOpt_UDBA_HNOTIFY	(1 << 4)
 +#define AuOpt_SHWH		(1 << 5)	/* show whiteout */
 +#define AuOpt_PLINK		(1 << 6)	/* pseudo-link */
-+#define AuOpt_DIRPERM1		(1 << 7)	/* unimplemented */
++#define AuOpt_DIRPERM1		(1 << 7)	/* ignore the lower dir's perm
++						   bits */
 +#define AuOpt_REFROF		(1 << 8)	/* unimplemented */
 +#define AuOpt_ALWAYS_DIROPQ	(1 << 9)	/* policy to creating diropq */
 +#define AuOpt_SUM		(1 << 10)	/* summation for statfs(2) */
@@ -24129,7 +24217,7 @@
 +	AuBool(SHWH, shwh);
 +	AuBool(PLINK, plink);
 +	AuBool(DIO, dio);
-+	/* AuBool(DIRPERM1, dirperm1); */
++	AuBool(DIRPERM1, dirperm1);
 +	/* AuBool(REFROF, refrof); */
 +
 +	v = sbinfo->si_wbr_create;
@@ -28855,7 +28943,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/whout.c
-@@ -0,0 +1,1052 @@
+@@ -0,0 +1,1051 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -28921,8 +29009,7 @@
 + * test if the @wh_name exists under @h_parent.
 + * @try_sio specifies the necessary of super-io.
 + */
-+int au_wh_test(struct dentry *h_parent, struct qstr *wh_name,
-+	       struct au_branch *br, int try_sio)
++int au_wh_test(struct dentry *h_parent, struct qstr *wh_name, int try_sio)
 +{
 +	int err;
 +	struct dentry *wh_dentry;
@@ -28930,7 +29017,7 @@
 +	if (!try_sio)
 +		wh_dentry = vfsub_lkup_one(wh_name, h_parent);
 +	else
-+		wh_dentry = au_sio_lkup_one(wh_name, h_parent, br);
++		wh_dentry = au_sio_lkup_one(wh_name, h_parent);
 +	err = PTR_ERR(wh_dentry);
 +	if (IS_ERR(wh_dentry))
 +		goto out;
@@ -28956,13 +29043,13 @@
 +/*
 + * test if the @h_dentry sets opaque or not.
 + */
-+int au_diropq_test(struct dentry *h_dentry, struct au_branch *br)
++int au_diropq_test(struct dentry *h_dentry)
 +{
 +	int err;
 +	struct inode *h_dir;
 +
 +	h_dir = h_dentry->d_inode;
-+	err = au_wh_test(h_dentry, &diropq_name, br,
++	err = au_wh_test(h_dentry, &diropq_name,
 +			 au_test_h_perm_sio(h_dir, MAY_EXEC));
 +	return err;
 +}
@@ -29006,7 +29093,7 @@
 +	qs.name = name;
 +	for (i = 0; i < 3; i++) {
 +		sprintf(p, "%.*x", AUFS_WH_TMP_LEN, cnt++);
-+		dentry = au_sio_lkup_one(&qs, h_parent, br);
++		dentry = au_sio_lkup_one(&qs, h_parent);
 +		if (IS_ERR(dentry) || !dentry->d_inode)
 +			goto out_name;
 +		dput(dentry);
@@ -29910,7 +29997,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/whout.h
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,85 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -29942,9 +30029,8 @@
 +/* whout.c */
 +int au_wh_name_alloc(struct qstr *wh, const struct qstr *name);
 +struct au_branch;
-+int au_wh_test(struct dentry *h_parent, struct qstr *wh_name,
-+	       struct au_branch *br, int try_sio);
-+int au_diropq_test(struct dentry *h_dentry, struct au_branch *br);
++int au_wh_test(struct dentry *h_parent, struct qstr *wh_name, int try_sio);
++int au_diropq_test(struct dentry *h_dentry);
 +struct dentry *au_whtmp_lkup(struct dentry *h_parent, struct au_branch *br,
 +			     struct qstr *prefix);
 +int au_whtmp_ren(struct dentry *h_dentry, struct au_branch *br);
@@ -31624,7 +31710,7 @@
 +}
 --- /dev/null
 +++ b/include/uapi/linux/aufs_type.h
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,284 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -31666,7 +31752,7 @@
 +
 +#include <linux/limits.h>
 +
-+#define AUFS_VERSION	"3.15-20140630"
++#define AUFS_VERSION	"3.15-20140707"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
@@ -31748,6 +31834,7 @@
 +#define AUFS_BRATTR_UNPIN	"unpin"
 +#define AUFS_BRRATTR_WH		"wh"
 +#define AUFS_BRWATTR_NLWH	"nolwh"
++#define AUFS_BRWATTR_MOO	"moo"
 +
 +/* ---------------------------------------------------------------------- */
 +
