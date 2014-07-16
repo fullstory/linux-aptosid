@@ -251,7 +251,7 @@
 +about it. But currently I have implemented it in kernel space.
 --- /dev/null
 +++ b/Documentation/filesystems/aufs/design/02struct.txt
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,249 @@
 +
 +# Copyright (C) 2005-2014 Junjiro R. Okajima
 +# 
@@ -486,6 +486,13 @@
 +changes something about the file.
 +"Move-down" is an opposite action of copy-up. Basically this action is
 +ran manually instead of automatically and internally.
++For desgin and implementation, aufs has to consider these issues.
++- whiteout for the file may exist on the lower branch.
++- ancestor directories may not exist on the lower branch.
++- diropq for the ancestor directories may exist on the upper branch.
++- free space on the lower branch will reduce.
++- another access to the file may happen during moving-down, including
++  UDBA.
 +
 +Sometimes users want to move-down a file from the upper writable branch
 +to the lower readonly or writable branch. For instance,
@@ -1083,7 +1090,7 @@
 +    UnionMount, and he pointed out an issue around a directory mutex
 +    lock and aufs addressed it. But it is still unsure whether aufs will
 +    be merged (or any other union solution).
-+<http://lkml.org/lkml/2013/3/12/637>
++<http://marc.info/?l=linux-kernel&m=136312705029295&w=1>
 +
 +
 +1. Features
@@ -1485,7 +1492,7 @@
 +#endif /* __AUFS_H__ */
 --- /dev/null
 +++ b/fs/aufs/branch.c
-@@ -0,0 +1,1220 @@
+@@ -0,0 +1,1238 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -2706,9 +2713,27 @@
 +	AuTraceErr(err);
 +	return err;
 +}
++
++/* ---------------------------------------------------------------------- */
++
++int au_br_stfs(struct au_branch *br, struct aufs_stfs *stfs)
++{
++	int err;
++	struct kstatfs kstfs;
++
++	err = vfs_statfs(&br->br_path, &kstfs);
++	if (!err) {
++		stfs->f_blocks = kstfs.f_blocks;
++		stfs->f_bavail = kstfs.f_bavail;
++		stfs->f_files = kstfs.f_files;
++		stfs->f_ffree = kstfs.f_ffree;
++	}
++
++	return err;
++}
 --- /dev/null
 +++ b/fs/aufs/branch.h
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,290 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -2920,6 +2945,8 @@
 +struct au_opt_mod;
 +int au_br_mod(struct super_block *sb, struct au_opt_mod *mod, int remount,
 +	      int *do_refresh);
++struct aufs_stfs;
++int au_br_stfs(struct au_branch *br, struct aufs_stfs *stfs);
 +
 +/* xino.c */
 +static const loff_t au_loff_max = LLONG_MAX;
@@ -19542,7 +19569,7 @@
 +#endif /* __AUFS_MODULE_H__ */
 --- /dev/null
 +++ b/fs/aufs/mvdown.c
-@@ -0,0 +1,627 @@
+@@ -0,0 +1,653 @@
 +/*
 + * Copyright (C) 2011-2014 Junjiro R. Okajima
 + *
@@ -19584,10 +19611,10 @@
 +};
 +
 +#define mvd_errno		mvdown.au_errno
-+#define mvd_bsrc		mvdown.a[AUFS_MVDOWN_UPPER].bindex
-+#define mvd_src_brid		mvdown.a[AUFS_MVDOWN_UPPER].brid
-+#define mvd_bdst		mvdown.a[AUFS_MVDOWN_LOWER].bindex
-+#define mvd_dst_brid		mvdown.a[AUFS_MVDOWN_LOWER].brid
++#define mvd_bsrc		mvdown.stbr[AUFS_MVDOWN_UPPER].bindex
++#define mvd_src_brid		mvdown.stbr[AUFS_MVDOWN_UPPER].brid
++#define mvd_bdst		mvdown.stbr[AUFS_MVDOWN_LOWER].bindex
++#define mvd_dst_brid		mvdown.stbr[AUFS_MVDOWN_LOWER].brid
 +
 +#define mvd_h_src_sb		info[AUFS_MVDOWN_UPPER].h_sb
 +#define mvd_h_src_parent	info[AUFS_MVDOWN_UPPER].h_parent
@@ -19605,6 +19632,36 @@
 +		if (flag)				\
 +			pr_err(__VA_ARGS__);		\
 +	} while (0)
++
++static int find_lower_writable(struct au_mvd_args *a)
++{
++	struct super_block *sb;
++	aufs_bindex_t bindex, bend;
++	struct au_branch *br;
++
++	sb = a->sb;
++	bindex = a->mvd_bsrc;
++	bend = au_sbend(sb);
++	if (!(a->mvdown.flags & AUFS_MVDOWN_ROLOWER)) {
++		for (bindex++; bindex <= bend; bindex++) {
++			br = au_sbr(sb, bindex);
++			if (!au_br_rdonly(br))
++				return bindex;
++		}
++	} else {
++		for (bindex++; bindex <= bend; bindex++) {
++			br = au_sbr(sb, bindex);
++			if (!(au_br_sb(br)->s_flags & MS_RDONLY)) {
++				if (au_br_rdonly(br))
++					a->mvdown.flags
++						|= AUFS_MVDOWN_ROLOWER_R;
++				return bindex;
++			}
++		}
++	}
++
++	return -1;
++}
 +
 +/* make the parent dir on bdst */
 +static int au_do_mkdir(const unsigned char dmsg, struct au_mvd_args *a)
@@ -19773,6 +19830,26 @@
 +	return err;
 +}
 +
++/* Since mvdown succeeded, we ignore an error of this function */
++static void au_do_stfs(const unsigned char dmsg, struct au_mvd_args *a)
++{
++	int err;
++	struct au_branch *br;
++
++	a->mvdown.flags |= AUFS_MVDOWN_STFS_FAILED;
++	br = au_sbr(a->sb, a->mvd_bsrc);
++	err = au_br_stfs(br, &a->mvdown.stbr[AUFS_MVDOWN_UPPER].stfs);
++	if (!err) {
++		br = au_sbr(a->sb, a->mvd_bdst);
++		a->mvdown.stbr[AUFS_MVDOWN_LOWER].brid = br->br_id;
++		err = au_br_stfs(br, &a->mvdown.stbr[AUFS_MVDOWN_LOWER].stfs);
++	}
++	if (!err)
++		a->mvdown.flags &= ~AUFS_MVDOWN_STFS_FAILED;
++	else
++		AU_MVD_PR(dmsg, "statfs failed (%d), ignored\n", err);
++}
++
 +/*
 + * copy-down the file and unlink the bsrc file.
 + * - unlink the bdst whout if exist
@@ -19802,6 +19879,12 @@
 +	if (unlikely(err))
 +		goto out_unlock;
 +
++	if (find_lower_writable(a) < 0)
++		a->mvdown.flags |= AUFS_MVDOWN_BOTTOM;
++
++	if (a->mvdown.flags & AUFS_MVDOWN_STFS)
++		au_do_stfs(dmsg, a);
++
 +	/* maintain internal array */
 +	if (!(a->mvdown.flags & AUFS_MVDOWN_KUPPER)) {
 +		au_set_h_dptr(a->dentry, a->mvd_bsrc, NULL);
@@ -19822,36 +19905,6 @@
 +}
 +
 +/* ---------------------------------------------------------------------- */
-+
-+static int find_lower_writable(struct au_mvd_args *a)
-+{
-+	struct super_block *sb;
-+	aufs_bindex_t bindex, bend;
-+	struct au_branch *br;
-+
-+	sb = a->sb;
-+	bindex = a->mvd_bsrc;
-+	bend = au_sbend(sb);
-+	if (!(a->mvdown.flags & AUFS_MVDOWN_ROLOWER)) {
-+		for (bindex++; bindex <= bend; bindex++) {
-+			br = au_sbr(sb, bindex);
-+			if (!au_br_rdonly(br))
-+				return bindex;
-+		}
-+	} else {
-+		for (bindex++; bindex <= bend; bindex++) {
-+			br = au_sbr(sb, bindex);
-+			if (!(au_br_sb(br)->s_flags & MS_RDONLY)) {
-+				if (au_br_rdonly(br))
-+					a->mvdown.flags
-+						|= AUFS_MVDOWN_ROLOWER_R;
-+				return bindex;
-+			}
-+		}
-+	}
-+
-+	return -1;
-+}
 +
 +/* make sure the file is idle */
 +static int au_mvd_args_busy(const unsigned char dmsg, struct au_mvd_args *a)
@@ -25757,7 +25810,7 @@
 +#endif /* __SYSAUFS_H__ */
 --- /dev/null
 +++ b/fs/aufs/sysfs.c
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,289 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -25857,19 +25910,16 @@
 +		path.mnt = au_br_mnt(br);
 +		path.dentry = au_h_dptr(root, bindex);
 +		au_seq_path(seq, &path);
-+		di_read_unlock(root, !AuLock_IR);
 +		au_optstr_br_perm(&perm, br->br_perm);
 +		err = seq_printf(seq, "=%s\n", perm.a);
-+		if (err == -1)
-+			err = -E2BIG;
 +		break;
 +	case AuBrSysfs_BRID:
 +		err = seq_printf(seq, "%d\n", br->br_id);
-+		di_read_unlock(root, !AuLock_IR);
-+		if (err == -1)
-+			err = -E2BIG;
 +		break;
 +	}
++	di_read_unlock(root, !AuLock_IR);
++	if (err == -1)
++		err = -E2BIG;
 +
 +	return err;
 +}
@@ -31710,7 +31760,7 @@
 +}
 --- /dev/null
 +++ b/include/uapi/linux/aufs_type.h
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,301 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -31752,7 +31802,7 @@
 +
 +#include <linux/limits.h>
 +
-+#define AUFS_VERSION	"3.15-20140707"
++#define AUFS_VERSION	"3.15-20140714"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
@@ -31965,22 +32015,39 @@
 +#define AUFS_MVDOWN_ROUPPER_R	(1 << 6)	/* did on upper RO */
 +#define AUFS_MVDOWN_BRID_UPPER	(1 << 7)	/* upper brid */
 +#define AUFS_MVDOWN_BRID_LOWER	(1 << 8)	/* lower brid */
-+/* will be added more */
++#define AUFS_MVDOWN_STFS	(1 << 9)	/* req. stfs */
++#define AUFS_MVDOWN_STFS_FAILED	(1 << 10)	/* output: stfs is unusable */
++#define AUFS_MVDOWN_BOTTOM	(1 << 11)	/* output: no more lowers */
 +
++/* index for move-down */
 +enum {
 +	AUFS_MVDOWN_UPPER,
 +	AUFS_MVDOWN_LOWER,
 +	AUFS_MVDOWN_NARRAY
 +};
 +
++/*
++ * additional info of move-down
++ * number of free blocks and inodes.
++ * subset of struct kstatfs, but smaller and always 64bit.
++ */
++struct aufs_stfs {
++	uint64_t	f_blocks;
++	uint64_t	f_bavail;
++	uint64_t	f_files;
++	uint64_t	f_ffree;
++};
++
++struct aufs_stbr {
++	int16_t			brid;	/* optional input */
++	int16_t			bindex;	/* output */
++	struct aufs_stfs	stfs;	/* output when AUFS_MVDOWN_STFS set */
++} __aligned(8);
++
 +struct aufs_mvdown {
-+	uint32_t	flags;
-+	struct {
-+		int16_t		bindex;
-+		int16_t		brid;
-+	} a[AUFS_MVDOWN_NARRAY];
-+	int8_t		au_errno;
-+	/* will be added more */
++	uint32_t		flags;			/* input/output */
++	struct aufs_stbr	stbr[AUFS_MVDOWN_NARRAY]; /* input/output */
++	int8_t			au_errno;		/* output */
 +} __aligned(8);
 +
 +/* ---------------------------------------------------------------------- */
