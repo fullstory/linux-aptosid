@@ -1619,7 +1619,7 @@
 +#endif /* __AUFS_H__ */
 --- /dev/null
 +++ b/fs/aufs/branch.c
-@@ -0,0 +1,1447 @@
+@@ -0,0 +1,1445 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -2411,14 +2411,21 @@
 +			 struct file **to_free, int *idx)
 +{
 +	int err;
-+	unsigned char matched, unmatched;
++	unsigned char matched, root;
 +	aufs_bindex_t bindex, bend;
 +	struct au_fidir *fidir;
 +	struct au_hfile *hfile;
 +
 +	err = 0;
++	root = IS_ROOT(file->f_dentry);
++	if (root) {
++		get_file(file);
++		to_free[*idx] = file;
++		(*idx)++;
++		goto out;
++	}
++
 +	matched = 0;
-+	unmatched = 0;
 +	fidir = au_fi(file)->fi_hdir;
 +	AuDebugOn(!fidir);
 +	bend = au_fbend_dir(file);
@@ -2427,21 +2434,12 @@
 +		if (!hfile->hf_file)
 +			continue;
 +
-+		if (hfile->hf_br->br_id == br_id)
++		if (hfile->hf_br->br_id == br_id) {
 +			matched = 1;
-+		else
-+			unmatched = 1;
-+		if (matched && unmatched)
 +			break;
++		}
 +	}
-+	if (!matched)
-+		goto out; /* success */
-+
-+	if (unmatched) {
-+		get_file(file);
-+		to_free[*idx] = file;
-+		(*idx)++;
-+	} else
++	if (matched)
 +		err = -EBUSY;
 +
 +out:
@@ -5636,7 +5634,7 @@
 +#endif /* __AUFS_DCSUB_H__ */
 --- /dev/null
 +++ b/fs/aufs/debug.c
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,520 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -5695,6 +5693,7 @@
 +MODULE_PARM_DESC(debug, "debug print");
 +module_param_named(debug, aufs_debug, atomic_t, S_IRUGO | S_IWUSR | S_IWGRP);
 +
++DEFINE_MUTEX(au_dbg_mtx);	/* just to serialize the dbg msgs */
 +char *au_plevel = KERN_DEBUG;
 +#define dpri(fmt, ...) do {					\
 +	if ((au_plevel						\
@@ -6158,7 +6157,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/debug.h
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,262 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -6271,6 +6270,7 @@
 +struct au_finfo;
 +struct dentry;
 +#ifdef CONFIG_AUFS_DEBUG
++extern struct mutex au_dbg_mtx;
 +extern char *au_plevel;
 +struct au_nhash;
 +void au_dpri_whlist(struct au_nhash *whlist);
@@ -6299,38 +6299,52 @@
 +int __init au_debug_init(void);
 +void au_debug_sbinfo_init(struct au_sbinfo *sbinfo);
 +#define AuDbgWhlist(w) do { \
++	mutex_lock(&au_dbg_mtx); \
 +	AuDbg(#w "\n"); \
 +	au_dpri_whlist(w); \
++	mutex_unlock(&au_dbg_mtx); \
 +} while (0)
 +
 +#define AuDbgVdir(v) do { \
++	mutex_lock(&au_dbg_mtx); \
 +	AuDbg(#v "\n"); \
 +	au_dpri_vdir(v); \
++	mutex_unlock(&au_dbg_mtx); \
 +} while (0)
 +
 +#define AuDbgInode(i) do { \
++	mutex_lock(&au_dbg_mtx); \
 +	AuDbg(#i "\n"); \
 +	au_dpri_inode(i); \
++	mutex_unlock(&au_dbg_mtx); \
 +} while (0)
 +
 +#define AuDbgDAlias(i) do { \
++	mutex_lock(&au_dbg_mtx); \
 +	AuDbg(#i "\n"); \
 +	au_dpri_dalias(i); \
++	mutex_unlock(&au_dbg_mtx); \
 +} while (0)
 +
 +#define AuDbgDentry(d) do { \
++	mutex_lock(&au_dbg_mtx); \
 +	AuDbg(#d "\n"); \
 +	au_dpri_dentry(d); \
++	mutex_unlock(&au_dbg_mtx); \
 +} while (0)
 +
 +#define AuDbgFile(f) do { \
++	mutex_lock(&au_dbg_mtx); \
 +	AuDbg(#f "\n"); \
 +	au_dpri_file(f); \
++	mutex_unlock(&au_dbg_mtx); \
 +} while (0)
 +
 +#define AuDbgSb(sb) do { \
++	mutex_lock(&au_dbg_mtx); \
 +	AuDbg(#sb "\n"); \
 +	au_dpri_sb(sb); \
++	mutex_unlock(&au_dbg_mtx); \
 +} while (0)
 +
 +#define AuDbgSleep(sec) do { \
@@ -6408,7 +6422,7 @@
 +#endif /* __AUFS_DEBUG_H__ */
 --- /dev/null
 +++ b/fs/aufs/dentry.c
-@@ -0,0 +1,1094 @@
+@@ -0,0 +1,1096 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -7415,10 +7429,6 @@
 +	if (unlikely(!au_di(dentry)))
 +		goto out;
 +
-+	inode = dentry->d_inode;
-+	if (inode && is_bad_inode(inode))
-+		goto out;
-+
 +	valid = 1;
 +	sb = dentry->d_sb;
 +	/*
@@ -7431,6 +7441,12 @@
 +		valid = err;
 +		AuTraceErr(err);
 +		goto out;
++	}
++	inode = dentry->d_inode;
++	if (unlikely(inode && is_bad_inode(inode))) {
++		err = -EINVAL;
++		AuTraceErr(err);
++		goto out_dgrade;
 +	}
 +	if (unlikely(au_dbrange_test(dentry))) {
 +		err = -EINVAL;
@@ -10798,7 +10814,7 @@
 +}
 --- /dev/null
 +++ b/fs/aufs/file.c
-@@ -0,0 +1,835 @@
+@@ -0,0 +1,833 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -11423,8 +11439,7 @@
 +			if (p->hf_file) {
 +				if (file_inode(p->hf_file))
 +					break;
-+				else
-+					au_hfput(p, file);
++				au_hfput(p, file);
 +			}
 +	} else {
 +		bend = au_br_index(sb, brid);
@@ -11441,8 +11456,7 @@
 +		if (p->hf_file) {
 +			if (file_inode(p->hf_file))
 +				break;
-+			else
-+				au_hfput(p, file);
++			au_hfput(p, file);
 +		}
 +	AuDebugOn(fidir->fd_bbot < finfo->fi_btop);
 +}
@@ -15815,7 +15829,7 @@
 +#endif /* __AUFS_INODE_H__ */
 --- /dev/null
 +++ b/fs/aufs/ioctl.c
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,219 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -15940,6 +15954,7 @@
 +long aufs_ioctl_dir(struct file *file, unsigned int cmd, unsigned long arg)
 +{
 +	long err;
++	struct dentry *dentry;
 +
 +	switch (cmd) {
 +	case AUFS_CTL_RDU:
@@ -15960,7 +15975,11 @@
 +		break;
 +
 +	case AUFS_CTL_FHSM_FD:
-+		err = au_fhsm_fd(file->f_dentry->d_sb, arg);
++		dentry = file->f_dentry;
++		if (IS_ROOT(dentry))
++			err = au_fhsm_fd(dentry->d_sb, arg);
++		else
++			err = -ENOTTY;
 +		break;
 +
 +	default:
@@ -16032,7 +16051,7 @@
 +#endif
 --- /dev/null
 +++ b/fs/aufs/i_op_add.c
-@@ -0,0 +1,885 @@
+@@ -0,0 +1,891 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -16577,7 +16596,10 @@
 +			      dget(au_h_dptr(src_dentry, a->bsrc)));
 +		dget(a->h_path.dentry);
 +		au_set_h_dptr(dentry, a->bdst, NULL);
++		AuDbg("temporary d_inode...\n");
++		spin_lock(&dentry->d_lock);
 +		dentry->d_inode = src_dentry->d_inode; /* tmp */
++		spin_unlock(&dentry->d_lock);
 +		h_file = au_h_open_pre(dentry, a->bsrc, /*force_wr*/0);
 +		if (IS_ERR(h_file))
 +			err = PTR_ERR(h_file);
@@ -16599,7 +16621,10 @@
 +				au_set_h_dptr(dentry, a->bdst,
 +					      a->h_path.dentry);
 +		}
++		spin_lock(&dentry->d_lock);
 +		dentry->d_inode = NULL; /* restore */
++		spin_unlock(&dentry->d_lock);
++		AuDbg("temporary d_inode...done\n");
 +		au_set_h_dptr(dentry, a->bsrc, NULL);
 +		au_set_dbend(dentry, bend);
 +	} else {
@@ -17126,11 +17151,11 @@
 +
 +	if (npositive) {
 +		inode = au_new_inode(dentry, /*must_new*/0);
-+		ret = (void *)inode;
-+	}
-+	if (IS_ERR(inode)) {
-+		inode = NULL;
-+		goto out_unlock;
++		if (IS_ERR(inode)) {
++			ret = (void *)inode;
++			inode = NULL;
++			goto out_unlock;
++		}
 +	}
 +
 +	ret = d_splice_alias(inode, dentry);
@@ -25959,7 +25984,7 @@
 +};
 --- /dev/null
 +++ b/fs/aufs/super.h
-@@ -0,0 +1,645 @@
+@@ -0,0 +1,644 @@
 +/*
 + * Copyright (C) 2005-2014 Junjiro R. Okajima
 + *
@@ -26430,8 +26455,7 @@
 +	bit = si_pid_bit();
 +	if (bit < PID_MAX_DEFAULT)
 +		return test_bit(bit, au_sbi(sb)->au_si_pid.bitmap);
-+	else
-+		return si_pid_test_slow(sb);
++	return si_pid_test_slow(sb);
 +}
 +
 +static inline void si_pid_set(struct super_block *sb)
@@ -32909,7 +32933,7 @@
 +
 +#include <linux/limits.h>
 +
-+#define AUFS_VERSION	"3.16-20140818"
++#define AUFS_VERSION	"3.16-20140825"
 +
 +/* todo? move this to linux-2.6.19/include/magic.h */
 +#define AUFS_SUPER_MAGIC	('a' << 24 | 'u' << 16 | 'f' << 8 | 's')
