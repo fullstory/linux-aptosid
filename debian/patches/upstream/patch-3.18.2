@@ -1,15 +1,13 @@
 --- a/Makefile
 +++ b/Makefile
-@@ -1,7 +1,7 @@
+@@ -1,6 +1,6 @@
  VERSION = 3
  PATCHLEVEL = 18
--SUBLEVEL = 1
--EXTRAVERSION =
+-SUBLEVEL = 0
 +SUBLEVEL = 2
-+EXTRAVERSION = -rc1
+ EXTRAVERSION =
  NAME = Diseased Newt
  
- # *DOCUMENTATION*
 --- a/arch/arm/boot/dts/armada-370-db.dts
 +++ b/arch/arm/boot/dts/armada-370-db.dts
 @@ -102,30 +102,6 @@
@@ -309,6 +307,37 @@
  	if (build_body(&ctx)) {
  		bpf_jit_binary_free(header);
  		goto out;
+--- a/arch/mips/net/bpf_jit.c
++++ b/arch/mips/net/bpf_jit.c
+@@ -426,7 +426,7 @@ static inline void emit_mod(unsigned int
+ 		u32 *p = &ctx->target[ctx->idx];
+ 		uasm_i_divu(&p, dst, src);
+ 		p = &ctx->target[ctx->idx + 1];
+-		uasm_i_mflo(&p, dst);
++		uasm_i_mfhi(&p, dst);
+ 	}
+ 	ctx->idx += 2; /* 2 insts */
+ }
+@@ -971,7 +971,7 @@ load_ind:
+ 			break;
+ 		case BPF_ALU | BPF_MOD | BPF_K:
+ 			/* A %= k */
+-			if (k == 1 || optimize_div(&k)) {
++			if (k == 1) {
+ 				ctx->flags |= SEEN_A;
+ 				emit_jit_reg_move(r_A, r_zero, ctx);
+ 			} else {
+--- a/arch/powerpc/platforms/cell/spufs/inode.c
++++ b/arch/powerpc/platforms/cell/spufs/inode.c
+@@ -164,7 +164,7 @@ static void spufs_prune_dir(struct dentr
+ 	struct dentry *dentry, *tmp;
+ 
+ 	mutex_lock(&dir->d_inode->i_mutex);
+-	list_for_each_entry_safe(dentry, tmp, &dir->d_subdirs, d_u.d_child) {
++	list_for_each_entry_safe(dentry, tmp, &dir->d_subdirs, d_child) {
+ 		spin_lock(&dentry->d_lock);
+ 		if (!(d_unhashed(dentry)) && dentry->d_inode) {
+ 			dget_dlock(dentry);
 --- a/arch/s390/kernel/compat_linux.c
 +++ b/arch/s390/kernel/compat_linux.c
 @@ -249,7 +249,7 @@ COMPAT_SYSCALL_DEFINE2(s390_setgroups16,
@@ -1184,6 +1213,62 @@
  	pci_write_config_dword(chip->pdev, O2_SD_FUNC_REG3, scratch_32);
  
  	/* Set L1 Entrance Timer */
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@ -216,7 +216,7 @@
+ /* Various constants */
+ 
+ /* Coalescing */
+-#define MVNETA_TXDONE_COAL_PKTS		16
++#define MVNETA_TXDONE_COAL_PKTS		1
+ #define MVNETA_RX_COAL_PKTS		32
+ #define MVNETA_RX_COAL_USEC		100
+ 
+@@ -1721,6 +1721,7 @@ static int mvneta_tx(struct sk_buff *skb
+ 	u16 txq_id = skb_get_queue_mapping(skb);
+ 	struct mvneta_tx_queue *txq = &pp->txqs[txq_id];
+ 	struct mvneta_tx_desc *tx_desc;
++	int len = skb->len;
+ 	int frags = 0;
+ 	u32 tx_cmd;
+ 
+@@ -1788,7 +1789,7 @@ out:
+ 
+ 		u64_stats_update_begin(&stats->syncp);
+ 		stats->tx_packets++;
+-		stats->tx_bytes  += skb->len;
++		stats->tx_bytes  += len;
+ 		u64_stats_update_end(&stats->syncp);
+ 	} else {
+ 		dev->stats.tx_dropped++;
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -1995,9 +1995,8 @@ static int vxlan_init(struct net_device
+ 	spin_lock(&vn->sock_lock);
+ 	vs = vxlan_find_sock(vxlan->net, ipv6 ? AF_INET6 : AF_INET,
+ 			     vxlan->dst_port);
+-	if (vs) {
++	if (vs && atomic_add_unless(&vs->refcnt, 1, 0)) {
+ 		/* If we have a socket with same port already, reuse it */
+-		atomic_inc(&vs->refcnt);
+ 		vxlan_vs_add_dev(vs, vxlan);
+ 	} else {
+ 		/* otherwise make new socket outside of RTNL */
+@@ -2396,12 +2395,9 @@ struct vxlan_sock *vxlan_sock_add(struct
+ 
+ 	spin_lock(&vn->sock_lock);
+ 	vs = vxlan_find_sock(net, ipv6 ? AF_INET6 : AF_INET, port);
+-	if (vs) {
+-		if (vs->rcv == rcv)
+-			atomic_inc(&vs->refcnt);
+-		else
++	if (vs && ((vs->rcv != rcv) ||
++		   !atomic_add_unless(&vs->refcnt, 1, 0)))
+ 			vs = ERR_PTR(-EBUSY);
+-	}
+ 	spin_unlock(&vn->sock_lock);
+ 
+ 	if (!vs)
 --- a/drivers/net/wireless/brcm80211/brcmfmac/msgbuf.c
 +++ b/drivers/net/wireless/brcm80211/brcmfmac/msgbuf.c
 @@ -1355,6 +1355,7 @@ int brcmf_proto_msgbuf_attach(struct brc
@@ -1194,6 +1279,113 @@
  	msgbuf->flow_map = kzalloc(count, GFP_KERNEL);
  	if (!msgbuf->flow_map)
  		goto fail;
+--- a/drivers/net/wireless/rtlwifi/rtl8192ce/hw.c
++++ b/drivers/net/wireless/rtlwifi/rtl8192ce/hw.c
+@@ -1287,6 +1287,7 @@ void rtl92ce_enable_interrupt(struct iee
+ 
+ 	rtl_write_dword(rtlpriv, REG_HIMR, rtlpci->irq_mask[0] & 0xFFFFFFFF);
+ 	rtl_write_dword(rtlpriv, REG_HIMRE, rtlpci->irq_mask[1] & 0xFFFFFFFF);
++	rtlpci->irq_enabled = true;
+ }
+ 
+ void rtl92ce_disable_interrupt(struct ieee80211_hw *hw)
+@@ -1296,7 +1297,7 @@ void rtl92ce_disable_interrupt(struct ie
+ 
+ 	rtl_write_dword(rtlpriv, REG_HIMR, IMR8190_DISABLED);
+ 	rtl_write_dword(rtlpriv, REG_HIMRE, IMR8190_DISABLED);
+-	synchronize_irq(rtlpci->pdev->irq);
++	rtlpci->irq_enabled = false;
+ }
+ 
+ static void _rtl92ce_poweroff_adapter(struct ieee80211_hw *hw)
+--- a/drivers/net/wireless/rtlwifi/rtl8192ce/sw.c
++++ b/drivers/net/wireless/rtlwifi/rtl8192ce/sw.c
+@@ -228,6 +228,7 @@ static struct rtl_hal_ops rtl8192ce_hal_
+ 	.led_control = rtl92ce_led_control,
+ 	.set_desc = rtl92ce_set_desc,
+ 	.get_desc = rtl92ce_get_desc,
++	.is_tx_desc_closed = rtl92ce_is_tx_desc_closed,
+ 	.tx_polling = rtl92ce_tx_polling,
+ 	.enable_hw_sec = rtl92ce_enable_hw_security_config,
+ 	.set_key = rtl92ce_set_key,
+@@ -271,6 +272,8 @@ static struct rtl_hal_cfg rtl92ce_hal_cf
+ 	.maps[MAC_RCR_ACRC32] = ACRC32,
+ 	.maps[MAC_RCR_ACF] = ACF,
+ 	.maps[MAC_RCR_AAP] = AAP,
++	.maps[MAC_HIMR] = REG_HIMR,
++	.maps[MAC_HIMRE] = REG_HIMRE,
+ 
+ 	.maps[EFUSE_TEST] = REG_EFUSE_TEST,
+ 	.maps[EFUSE_CTRL] = REG_EFUSE_CTRL,
+--- a/drivers/net/wireless/rtlwifi/rtl8192ce/trx.c
++++ b/drivers/net/wireless/rtlwifi/rtl8192ce/trx.c
+@@ -720,16 +720,15 @@ u32 rtl92ce_get_desc(u8 *p_desc, bool is
+ 			break;
+ 		}
+ 	} else {
+-		struct rx_desc_92c *pdesc = (struct rx_desc_92c *)p_desc;
+ 		switch (desc_name) {
+ 		case HW_DESC_OWN:
+-			ret = GET_RX_DESC_OWN(pdesc);
++			ret = GET_RX_DESC_OWN(p_desc);
+ 			break;
+ 		case HW_DESC_RXPKT_LEN:
+-			ret = GET_RX_DESC_PKT_LEN(pdesc);
++			ret = GET_RX_DESC_PKT_LEN(p_desc);
+ 			break;
+ 		case HW_DESC_RXBUFF_ADDR:
+-			ret = GET_RX_STATUS_DESC_BUFF_ADDR(pdesc);
++			ret = GET_RX_DESC_BUFF_ADDR(p_desc);
+ 			break;
+ 		default:
+ 			RT_ASSERT(false, "ERR rxdesc :%d not process\n",
+@@ -740,6 +739,23 @@ u32 rtl92ce_get_desc(u8 *p_desc, bool is
+ 	return ret;
+ }
+ 
++bool rtl92ce_is_tx_desc_closed(struct ieee80211_hw *hw,
++			       u8 hw_queue, u16 index)
++{
++	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
++	struct rtl8192_tx_ring *ring = &rtlpci->tx_ring[hw_queue];
++	u8 *entry = (u8 *)(&ring->desc[ring->idx]);
++	u8 own = (u8)rtl92ce_get_desc(entry, true, HW_DESC_OWN);
++
++	/*beacon packet will only use the first
++	 *descriptor defautly,and the own may not
++	 *be cleared by the hardware
++	 */
++	if (own)
++		return false;
++	return true;
++}
++
+ void rtl92ce_tx_polling(struct ieee80211_hw *hw, u8 hw_queue)
+ {
+ 	struct rtl_priv *rtlpriv = rtl_priv(hw);
+--- a/drivers/net/wireless/rtlwifi/rtl8192ce/trx.h
++++ b/drivers/net/wireless/rtlwifi/rtl8192ce/trx.h
+@@ -723,6 +723,8 @@ bool rtl92ce_rx_query_desc(struct ieee80
+ void rtl92ce_set_desc(struct ieee80211_hw *hw, u8 *pdesc, bool istx,
+ 		      u8 desc_name, u8 *val);
+ u32 rtl92ce_get_desc(u8 *pdesc, bool istx, u8 desc_name);
++bool rtl92ce_is_tx_desc_closed(struct ieee80211_hw *hw,
++			       u8 hw_queue, u16 index);
+ void rtl92ce_tx_polling(struct ieee80211_hw *hw, u8 hw_queue);
+ void rtl92ce_tx_fill_cmddesc(struct ieee80211_hw *hw, u8 *pdesc,
+ 			     bool b_firstseg, bool b_lastseg,
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@ -627,6 +627,9 @@ static int xennet_start_xmit(struct sk_b
+ 				    slots, skb->len);
+ 		if (skb_linearize(skb))
+ 			goto drop;
++		data = skb->data;
++		offset = offset_in_page(data);
++		len = skb_headlen(skb);
+ 	}
+ 
+ 	spin_lock_irqsave(&queue->tx_lock, flags);
 --- a/drivers/regulator/anatop-regulator.c
 +++ b/drivers/regulator/anatop-regulator.c
 @@ -283,6 +283,14 @@ static int anatop_regulator_probe(struct
@@ -1466,6 +1658,65 @@
   */
  
  static int NCR5380_abort(struct scsi_cmnd *cmd)
+--- a/drivers/staging/lustre/lustre/llite/dcache.c
++++ b/drivers/staging/lustre/lustre/llite/dcache.c
+@@ -258,7 +258,7 @@ void ll_invalidate_aliases(struct inode
+ 	       inode->i_ino, inode->i_generation, inode);
+ 
+ 	ll_lock_dcache(inode);
+-	ll_d_hlist_for_each_entry(dentry, p, &inode->i_dentry, d_alias) {
++	ll_d_hlist_for_each_entry(dentry, p, &inode->i_dentry, d_u.d_alias) {
+ 		CDEBUG(D_DENTRY, "dentry in drop %.*s (%p) parent %p "
+ 		       "inode %p flags %d\n", dentry->d_name.len,
+ 		       dentry->d_name.name, dentry, dentry->d_parent,
+--- a/drivers/staging/lustre/lustre/llite/llite_lib.c
++++ b/drivers/staging/lustre/lustre/llite/llite_lib.c
+@@ -711,7 +711,7 @@ void lustre_dump_dentry(struct dentry *d
+ 		return;
+ 
+ 	list_for_each(tmp, &dentry->d_subdirs) {
+-		struct dentry *d = list_entry(tmp, struct dentry, d_u.d_child);
++		struct dentry *d = list_entry(tmp, struct dentry, d_child);
+ 		lustre_dump_dentry(d, recur - 1);
+ 	}
+ }
+--- a/drivers/staging/lustre/lustre/llite/namei.c
++++ b/drivers/staging/lustre/lustre/llite/namei.c
+@@ -167,14 +167,14 @@ static void ll_invalidate_negative_child
+ 	struct ll_d_hlist_node *p;
+ 
+ 	ll_lock_dcache(dir);
+-	ll_d_hlist_for_each_entry(dentry, p, &dir->i_dentry, d_alias) {
++	ll_d_hlist_for_each_entry(dentry, p, &dir->i_dentry, d_u.d_alias) {
+ 		spin_lock(&dentry->d_lock);
+ 		if (!list_empty(&dentry->d_subdirs)) {
+ 			struct dentry *child;
+ 
+ 			list_for_each_entry_safe(child, tmp_subdir,
+ 						 &dentry->d_subdirs,
+-						 d_u.d_child) {
++						 d_child) {
+ 				if (child->d_inode == NULL)
+ 					d_lustre_invalidate(child, 1);
+ 			}
+@@ -362,7 +362,7 @@ static struct dentry *ll_find_alias(stru
+ 	discon_alias = invalid_alias = NULL;
+ 
+ 	ll_lock_dcache(inode);
+-	ll_d_hlist_for_each_entry(alias, p, &inode->i_dentry, d_alias) {
++	ll_d_hlist_for_each_entry(alias, p, &inode->i_dentry, d_u.d_alias) {
+ 		LASSERT(alias != dentry);
+ 
+ 		spin_lock(&alias->d_lock);
+@@ -953,7 +953,7 @@ static void ll_get_child_fid(struct inod
+ {
+ 	struct dentry *parent, *child;
+ 
+-	parent = ll_d_hlist_entry(dir->i_dentry, struct dentry, d_alias);
++	parent = ll_d_hlist_entry(dir->i_dentry, struct dentry, d_u.d_alias);
+ 	child = d_lookup(parent, name);
+ 	if (child) {
+ 		if (child->d_inode)
 --- a/drivers/thermal/thermal_core.c
 +++ b/drivers/thermal/thermal_core.c
 @@ -1835,10 +1835,10 @@ static int __init thermal_init(void)
@@ -1481,6 +1732,80 @@
  error:
  	idr_destroy(&thermal_tz_idr);
  	idr_destroy(&thermal_cdev_idr);
+--- a/fs/affs/amigaffs.c
++++ b/fs/affs/amigaffs.c
+@@ -125,7 +125,7 @@ affs_fix_dcache(struct inode *inode, u32
+ {
+ 	struct dentry *dentry;
+ 	spin_lock(&inode->i_lock);
+-	hlist_for_each_entry(dentry, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+ 		if (entry_ino == (u32)(long)dentry->d_fsdata) {
+ 			dentry->d_fsdata = (void *)inode->i_ino;
+ 			break;
+--- a/fs/autofs4/expire.c
++++ b/fs/autofs4/expire.c
+@@ -85,7 +85,7 @@ static struct dentry *get_next_positive_
+ 	spin_lock(&root->d_lock);
+ 
+ 	if (prev)
+-		next = prev->d_u.d_child.next;
++		next = prev->d_child.next;
+ 	else {
+ 		prev = dget_dlock(root);
+ 		next = prev->d_subdirs.next;
+@@ -99,13 +99,13 @@ cont:
+ 		return NULL;
+ 	}
+ 
+-	q = list_entry(next, struct dentry, d_u.d_child);
++	q = list_entry(next, struct dentry, d_child);
+ 
+ 	spin_lock_nested(&q->d_lock, DENTRY_D_LOCK_NESTED);
+ 	/* Already gone or negative dentry (under construction) - try next */
+ 	if (!d_count(q) || !simple_positive(q)) {
+ 		spin_unlock(&q->d_lock);
+-		next = q->d_u.d_child.next;
++		next = q->d_child.next;
+ 		goto cont;
+ 	}
+ 	dget_dlock(q);
+@@ -155,13 +155,13 @@ again:
+ 				goto relock;
+ 			}
+ 			spin_unlock(&p->d_lock);
+-			next = p->d_u.d_child.next;
++			next = p->d_child.next;
+ 			p = parent;
+ 			if (next != &parent->d_subdirs)
+ 				break;
+ 		}
+ 	}
+-	ret = list_entry(next, struct dentry, d_u.d_child);
++	ret = list_entry(next, struct dentry, d_child);
+ 
+ 	spin_lock_nested(&ret->d_lock, DENTRY_D_LOCK_NESTED);
+ 	/* Negative dentry - try next */
+@@ -489,7 +489,7 @@ found:
+ 	spin_lock(&sbi->lookup_lock);
+ 	spin_lock(&expired->d_parent->d_lock);
+ 	spin_lock_nested(&expired->d_lock, DENTRY_D_LOCK_NESTED);
+-	list_move(&expired->d_parent->d_subdirs, &expired->d_u.d_child);
++	list_move(&expired->d_parent->d_subdirs, &expired->d_child);
+ 	spin_unlock(&expired->d_lock);
+ 	spin_unlock(&expired->d_parent->d_lock);
+ 	spin_unlock(&sbi->lookup_lock);
+--- a/fs/autofs4/root.c
++++ b/fs/autofs4/root.c
+@@ -687,7 +687,7 @@ static void autofs_clear_leaf_automount_
+ 	/* only consider parents below dentrys in the root */
+ 	if (IS_ROOT(parent->d_parent))
+ 		return;
+-	d_child = &dentry->d_u.d_child;
++	d_child = &dentry->d_child;
+ 	/* Set parent managed if it's becoming empty */
+ 	if (d_child->next == &parent->d_subdirs &&
+ 	    d_child->prev == &parent->d_subdirs)
 --- a/fs/btrfs/disk-io.c
 +++ b/fs/btrfs/disk-io.c
 @@ -4106,12 +4106,6 @@ again:
@@ -1788,8 +2113,318 @@
  					       &token);
  	if (test_bit(EXTENT_FLAG_PREALLOC, &em->flags))
  		btrfs_set_token_file_extent_type(leaf, fi,
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@ -111,7 +111,7 @@ static int fpos_cmp(loff_t l, loff_t r)
+ /*
+  * When possible, we try to satisfy a readdir by peeking at the
+  * dcache.  We make this work by carefully ordering dentries on
+- * d_u.d_child when we initially get results back from the MDS, and
++ * d_child when we initially get results back from the MDS, and
+  * falling back to a "normal" sync readdir if any dentries in the dir
+  * are dropped.
+  *
+@@ -147,11 +147,11 @@ static int __dcache_readdir(struct file
+ 		p = parent->d_subdirs.prev;
+ 		dout(" initial p %p/%p\n", p->prev, p->next);
+ 	} else {
+-		p = last->d_u.d_child.prev;
++		p = last->d_child.prev;
+ 	}
+ 
+ more:
+-	dentry = list_entry(p, struct dentry, d_u.d_child);
++	dentry = list_entry(p, struct dentry, d_child);
+ 	di = ceph_dentry(dentry);
+ 	while (1) {
+ 		dout(" p %p/%p %s d_subdirs %p/%p\n", p->prev, p->next,
+@@ -174,7 +174,7 @@ more:
+ 		     !dentry->d_inode ? " null" : "");
+ 		spin_unlock(&dentry->d_lock);
+ 		p = p->prev;
+-		dentry = list_entry(p, struct dentry, d_u.d_child);
++		dentry = list_entry(p, struct dentry, d_child);
+ 		di = ceph_dentry(dentry);
+ 	}
+ 
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -1399,7 +1399,7 @@ retry_lookup:
+ 			/* reorder parent's d_subdirs */
+ 			spin_lock(&parent->d_lock);
+ 			spin_lock_nested(&dn->d_lock, DENTRY_D_LOCK_NESTED);
+-			list_move(&dn->d_u.d_child, &parent->d_subdirs);
++			list_move(&dn->d_child, &parent->d_subdirs);
+ 			spin_unlock(&dn->d_lock);
+ 			spin_unlock(&parent->d_lock);
+ 		}
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@ -895,7 +895,7 @@ inode_has_hashed_dentries(struct inode *
+ 	struct dentry *dentry;
+ 
+ 	spin_lock(&inode->i_lock);
+-	hlist_for_each_entry(dentry, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+ 		if (!d_unhashed(dentry) || IS_ROOT(dentry)) {
+ 			spin_unlock(&inode->i_lock);
+ 			return true;
+--- a/fs/coda/cache.c
++++ b/fs/coda/cache.c
+@@ -92,7 +92,7 @@ static void coda_flag_children(struct de
+ 	struct dentry *de;
+ 
+ 	spin_lock(&parent->d_lock);
+-	list_for_each_entry(de, &parent->d_subdirs, d_u.d_child) {
++	list_for_each_entry(de, &parent->d_subdirs, d_child) {
+ 		/* don't know what to do with negative dentries */
+ 		if (de->d_inode ) 
+ 			coda_flag_inode(de->d_inode, flag);
 --- a/fs/dcache.c
 +++ b/fs/dcache.c
+@@ -44,7 +44,7 @@
+ /*
+  * Usage:
+  * dcache->d_inode->i_lock protects:
+- *   - i_dentry, d_alias, d_inode of aliases
++ *   - i_dentry, d_u.d_alias, d_inode of aliases
+  * dcache_hash_bucket lock protects:
+  *   - the dcache hash table
+  * s_anon bl list spinlock protects:
+@@ -59,7 +59,7 @@
+  *   - d_unhashed()
+  *   - d_parent and d_subdirs
+  *   - childrens' d_child and d_parent
+- *   - d_alias, d_inode
++ *   - d_u.d_alias, d_inode
+  *
+  * Ordering:
+  * dentry->d_inode->i_lock
+@@ -252,14 +252,12 @@ static void __d_free(struct rcu_head *he
+ {
+ 	struct dentry *dentry = container_of(head, struct dentry, d_u.d_rcu);
+ 
+-	WARN_ON(!hlist_unhashed(&dentry->d_alias));
+ 	kmem_cache_free(dentry_cache, dentry); 
+ }
+ 
+ static void __d_free_external(struct rcu_head *head)
+ {
+ 	struct dentry *dentry = container_of(head, struct dentry, d_u.d_rcu);
+-	WARN_ON(!hlist_unhashed(&dentry->d_alias));
+ 	kfree(external_name(dentry));
+ 	kmem_cache_free(dentry_cache, dentry); 
+ }
+@@ -271,6 +269,7 @@ static inline int dname_external(const s
+ 
+ static void dentry_free(struct dentry *dentry)
+ {
++	WARN_ON(!hlist_unhashed(&dentry->d_u.d_alias));
+ 	if (unlikely(dname_external(dentry))) {
+ 		struct external_name *p = external_name(dentry);
+ 		if (likely(atomic_dec_and_test(&p->u.count))) {
+@@ -311,7 +310,7 @@ static void dentry_iput(struct dentry *
+ 	struct inode *inode = dentry->d_inode;
+ 	if (inode) {
+ 		dentry->d_inode = NULL;
+-		hlist_del_init(&dentry->d_alias);
++		hlist_del_init(&dentry->d_u.d_alias);
+ 		spin_unlock(&dentry->d_lock);
+ 		spin_unlock(&inode->i_lock);
+ 		if (!inode->i_nlink)
+@@ -336,7 +335,7 @@ static void dentry_unlink_inode(struct d
+ 	struct inode *inode = dentry->d_inode;
+ 	__d_clear_type(dentry);
+ 	dentry->d_inode = NULL;
+-	hlist_del_init(&dentry->d_alias);
++	hlist_del_init(&dentry->d_u.d_alias);
+ 	dentry_rcuwalk_barrier(dentry);
+ 	spin_unlock(&dentry->d_lock);
+ 	spin_unlock(&inode->i_lock);
+@@ -496,7 +495,7 @@ static void __dentry_kill(struct dentry
+ 	}
+ 	/* if it was on the hash then remove it */
+ 	__d_drop(dentry);
+-	list_del(&dentry->d_u.d_child);
++	__list_del_entry(&dentry->d_child);
+ 	/*
+ 	 * Inform d_walk() that we are no longer attached to the
+ 	 * dentry tree
+@@ -722,7 +721,7 @@ static struct dentry *__d_find_alias(str
+ 
+ again:
+ 	discon_alias = NULL;
+-	hlist_for_each_entry(alias, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(alias, &inode->i_dentry, d_u.d_alias) {
+ 		spin_lock(&alias->d_lock);
+  		if (S_ISDIR(inode->i_mode) || !d_unhashed(alias)) {
+ 			if (IS_ROOT(alias) &&
+@@ -772,7 +771,7 @@ void d_prune_aliases(struct inode *inode
+ 	struct dentry *dentry;
+ restart:
+ 	spin_lock(&inode->i_lock);
+-	hlist_for_each_entry(dentry, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+ 		spin_lock(&dentry->d_lock);
+ 		if (!dentry->d_lockref.count) {
+ 			struct dentry *parent = lock_parent(dentry);
+@@ -1051,7 +1050,7 @@ repeat:
+ resume:
+ 	while (next != &this_parent->d_subdirs) {
+ 		struct list_head *tmp = next;
+-		struct dentry *dentry = list_entry(tmp, struct dentry, d_u.d_child);
++		struct dentry *dentry = list_entry(tmp, struct dentry, d_child);
+ 		next = tmp->next;
+ 
+ 		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
+@@ -1083,33 +1082,31 @@ resume:
+ 	/*
+ 	 * All done at this level ... ascend and resume the search.
+ 	 */
++	rcu_read_lock();
++ascend:
+ 	if (this_parent != parent) {
+ 		struct dentry *child = this_parent;
+ 		this_parent = child->d_parent;
+ 
+-		rcu_read_lock();
+ 		spin_unlock(&child->d_lock);
+ 		spin_lock(&this_parent->d_lock);
+ 
+-		/*
+-		 * might go back up the wrong parent if we have had a rename
+-		 * or deletion
+-		 */
+-		if (this_parent != child->d_parent ||
+-			 (child->d_flags & DCACHE_DENTRY_KILLED) ||
+-			 need_seqretry(&rename_lock, seq)) {
+-			spin_unlock(&this_parent->d_lock);
+-			rcu_read_unlock();
++		/* might go back up the wrong parent if we have had a rename. */
++		if (need_seqretry(&rename_lock, seq))
+ 			goto rename_retry;
++		next = child->d_child.next;
++		while (unlikely(child->d_flags & DCACHE_DENTRY_KILLED)) {
++			if (next == &this_parent->d_subdirs)
++				goto ascend;
++			child = list_entry(next, struct dentry, d_child);
++			next = next->next;
+ 		}
+ 		rcu_read_unlock();
+-		next = child->d_u.d_child.next;
+ 		goto resume;
+ 	}
+-	if (need_seqretry(&rename_lock, seq)) {
+-		spin_unlock(&this_parent->d_lock);
++	if (need_seqretry(&rename_lock, seq))
+ 		goto rename_retry;
+-	}
++	rcu_read_unlock();
+ 	if (finish)
+ 		finish(data);
+ 
+@@ -1119,6 +1116,9 @@ out_unlock:
+ 	return;
+ 
+ rename_retry:
++	spin_unlock(&this_parent->d_lock);
++	rcu_read_unlock();
++	BUG_ON(seq & 1);
+ 	if (!retry)
+ 		return;
+ 	seq = 1;
+@@ -1455,8 +1455,8 @@ struct dentry *__d_alloc(struct super_bl
+ 	INIT_HLIST_BL_NODE(&dentry->d_hash);
+ 	INIT_LIST_HEAD(&dentry->d_lru);
+ 	INIT_LIST_HEAD(&dentry->d_subdirs);
+-	INIT_HLIST_NODE(&dentry->d_alias);
+-	INIT_LIST_HEAD(&dentry->d_u.d_child);
++	INIT_HLIST_NODE(&dentry->d_u.d_alias);
++	INIT_LIST_HEAD(&dentry->d_child);
+ 	d_set_d_op(dentry, dentry->d_sb->s_d_op);
+ 
+ 	this_cpu_inc(nr_dentry);
+@@ -1486,7 +1486,7 @@ struct dentry *d_alloc(struct dentry * p
+ 	 */
+ 	__dget_dlock(parent);
+ 	dentry->d_parent = parent;
+-	list_add(&dentry->d_u.d_child, &parent->d_subdirs);
++	list_add(&dentry->d_child, &parent->d_subdirs);
+ 	spin_unlock(&parent->d_lock);
+ 
+ 	return dentry;
+@@ -1579,7 +1579,7 @@ static void __d_instantiate(struct dentr
+ 	spin_lock(&dentry->d_lock);
+ 	__d_set_type(dentry, add_flags);
+ 	if (inode)
+-		hlist_add_head(&dentry->d_alias, &inode->i_dentry);
++		hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
+ 	dentry->d_inode = inode;
+ 	dentry_rcuwalk_barrier(dentry);
+ 	spin_unlock(&dentry->d_lock);
+@@ -1603,7 +1603,7 @@ static void __d_instantiate(struct dentr
+  
+ void d_instantiate(struct dentry *entry, struct inode * inode)
+ {
+-	BUG_ON(!hlist_unhashed(&entry->d_alias));
++	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
+ 	if (inode)
+ 		spin_lock(&inode->i_lock);
+ 	__d_instantiate(entry, inode);
+@@ -1642,7 +1642,7 @@ static struct dentry *__d_instantiate_un
+ 		return NULL;
+ 	}
+ 
+-	hlist_for_each_entry(alias, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(alias, &inode->i_dentry, d_u.d_alias) {
+ 		/*
+ 		 * Don't need alias->d_lock here, because aliases with
+ 		 * d_parent == entry->d_parent are not subject to name or
+@@ -1668,7 +1668,7 @@ struct dentry *d_instantiate_unique(stru
+ {
+ 	struct dentry *result;
+ 
+-	BUG_ON(!hlist_unhashed(&entry->d_alias));
++	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
+ 
+ 	if (inode)
+ 		spin_lock(&inode->i_lock);
+@@ -1699,7 +1699,7 @@ EXPORT_SYMBOL(d_instantiate_unique);
+  */
+ int d_instantiate_no_diralias(struct dentry *entry, struct inode *inode)
+ {
+-	BUG_ON(!hlist_unhashed(&entry->d_alias));
++	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
+ 
+ 	spin_lock(&inode->i_lock);
+ 	if (S_ISDIR(inode->i_mode) && !hlist_empty(&inode->i_dentry)) {
+@@ -1738,7 +1738,7 @@ static struct dentry * __d_find_any_alia
+ 
+ 	if (hlist_empty(&inode->i_dentry))
+ 		return NULL;
+-	alias = hlist_entry(inode->i_dentry.first, struct dentry, d_alias);
++	alias = hlist_entry(inode->i_dentry.first, struct dentry, d_u.d_alias);
+ 	__dget(alias);
+ 	return alias;
+ }
+@@ -1800,7 +1800,7 @@ static struct dentry *__d_obtain_alias(s
+ 	spin_lock(&tmp->d_lock);
+ 	tmp->d_inode = inode;
+ 	tmp->d_flags |= add_flags;
+-	hlist_add_head(&tmp->d_alias, &inode->i_dentry);
++	hlist_add_head(&tmp->d_u.d_alias, &inode->i_dentry);
+ 	hlist_bl_lock(&tmp->d_sb->s_anon);
+ 	hlist_bl_add_head(&tmp->d_hash, &tmp->d_sb->s_anon);
+ 	hlist_bl_unlock(&tmp->d_sb->s_anon);
+@@ -2235,7 +2235,7 @@ int d_validate(struct dentry *dentry, st
+ 	struct dentry *child;
+ 
+ 	spin_lock(&dparent->d_lock);
+-	list_for_each_entry(child, &dparent->d_subdirs, d_u.d_child) {
++	list_for_each_entry(child, &dparent->d_subdirs, d_child) {
+ 		if (dentry == child) {
+ 			spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
+ 			__dget_dlock(dentry);
 @@ -2393,6 +2393,8 @@ static void swap_names(struct dentry *de
  			 */
  			unsigned int i;
@@ -1799,6 +2434,44 @@
  			for (i = 0; i < DNAME_INLINE_LEN / sizeof(long); i++) {
  				swap(((long *) &dentry->d_iname)[i],
  				     ((long *) &target->d_iname)[i]);
+@@ -2526,13 +2528,13 @@ static void __d_move(struct dentry *dent
+ 		/* splicing a tree */
+ 		dentry->d_parent = target->d_parent;
+ 		target->d_parent = target;
+-		list_del_init(&target->d_u.d_child);
+-		list_move(&dentry->d_u.d_child, &dentry->d_parent->d_subdirs);
++		list_del_init(&target->d_child);
++		list_move(&dentry->d_child, &dentry->d_parent->d_subdirs);
+ 	} else {
+ 		/* swapping two dentries */
+ 		swap(dentry->d_parent, target->d_parent);
+-		list_move(&target->d_u.d_child, &target->d_parent->d_subdirs);
+-		list_move(&dentry->d_u.d_child, &dentry->d_parent->d_subdirs);
++		list_move(&target->d_child, &target->d_parent->d_subdirs);
++		list_move(&dentry->d_child, &dentry->d_parent->d_subdirs);
+ 		if (exchange)
+ 			fsnotify_d_move(target);
+ 		fsnotify_d_move(dentry);
+@@ -3321,7 +3323,7 @@ void d_tmpfile(struct dentry *dentry, st
+ {
+ 	inode_dec_link_count(inode);
+ 	BUG_ON(dentry->d_name.name != dentry->d_iname ||
+-		!hlist_unhashed(&dentry->d_alias) ||
++		!hlist_unhashed(&dentry->d_u.d_alias) ||
+ 		!d_unlinked(dentry));
+ 	spin_lock(&dentry->d_parent->d_lock);
+ 	spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
+--- a/fs/debugfs/inode.c
++++ b/fs/debugfs/inode.c
+@@ -553,7 +553,7 @@ void debugfs_remove_recursive(struct den
+ 	 * use the d_u.d_child as the rcu head and corrupt this list.
+ 	 */
+ 	spin_lock(&parent->d_lock);
+-	list_for_each_entry(child, &parent->d_subdirs, d_u.d_child) {
++	list_for_each_entry(child, &parent->d_subdirs, d_child) {
+ 		if (!debugfs_positive(child))
+ 			continue;
+ 
 --- a/fs/ecryptfs/crypto.c
 +++ b/fs/ecryptfs/crypto.c
 @@ -1917,7 +1917,6 @@ ecryptfs_decode_from_filename(unsigned c
@@ -1876,6 +2549,17 @@
  
  	s->s_maxbytes = path.dentry->d_sb->s_maxbytes;
  	s->s_blocksize = path.dentry->d_sb->s_blocksize;
+--- a/fs/exportfs/expfs.c
++++ b/fs/exportfs/expfs.c
+@@ -50,7 +50,7 @@ find_acceptable_alias(struct dentry *res
+ 
+ 	inode = result->d_inode;
+ 	spin_lock(&inode->i_lock);
+-	hlist_for_each_entry(dentry, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+ 		dget(dentry);
+ 		spin_unlock(&inode->i_lock);
+ 		if (toput)
 --- a/fs/f2fs/data.c
 +++ b/fs/f2fs/data.c
 @@ -1007,21 +1007,19 @@ inline_data:
@@ -1968,6 +2652,57 @@
  			ISOFS_SB(inode->i_sb)->s_rock = 1;
  			printk(KERN_DEBUG "ISO 9660 Extensions: ");
  			{
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@ -114,18 +114,18 @@ loff_t dcache_dir_lseek(struct file *fil
+ 
+ 			spin_lock(&dentry->d_lock);
+ 			/* d_lock not required for cursor */
+-			list_del(&cursor->d_u.d_child);
++			list_del(&cursor->d_child);
+ 			p = dentry->d_subdirs.next;
+ 			while (n && p != &dentry->d_subdirs) {
+ 				struct dentry *next;
+-				next = list_entry(p, struct dentry, d_u.d_child);
++				next = list_entry(p, struct dentry, d_child);
+ 				spin_lock_nested(&next->d_lock, DENTRY_D_LOCK_NESTED);
+ 				if (simple_positive(next))
+ 					n--;
+ 				spin_unlock(&next->d_lock);
+ 				p = p->next;
+ 			}
+-			list_add_tail(&cursor->d_u.d_child, p);
++			list_add_tail(&cursor->d_child, p);
+ 			spin_unlock(&dentry->d_lock);
+ 		}
+ 	}
+@@ -150,7 +150,7 @@ int dcache_readdir(struct file *file, st
+ {
+ 	struct dentry *dentry = file->f_path.dentry;
+ 	struct dentry *cursor = file->private_data;
+-	struct list_head *p, *q = &cursor->d_u.d_child;
++	struct list_head *p, *q = &cursor->d_child;
+ 
+ 	if (!dir_emit_dots(file, ctx))
+ 		return 0;
+@@ -159,7 +159,7 @@ int dcache_readdir(struct file *file, st
+ 		list_move(q, &dentry->d_subdirs);
+ 
+ 	for (p = q->next; p != &dentry->d_subdirs; p = p->next) {
+-		struct dentry *next = list_entry(p, struct dentry, d_u.d_child);
++		struct dentry *next = list_entry(p, struct dentry, d_child);
+ 		spin_lock_nested(&next->d_lock, DENTRY_D_LOCK_NESTED);
+ 		if (!simple_positive(next)) {
+ 			spin_unlock(&next->d_lock);
+@@ -287,7 +287,7 @@ int simple_empty(struct dentry *dentry)
+ 	int ret = 0;
+ 
+ 	spin_lock(&dentry->d_lock);
+-	list_for_each_entry(child, &dentry->d_subdirs, d_u.d_child) {
++	list_for_each_entry(child, &dentry->d_subdirs, d_child) {
+ 		spin_lock_nested(&child->d_lock, DENTRY_D_LOCK_NESTED);
+ 		if (simple_positive(child)) {
+ 			spin_unlock(&child->d_lock);
 --- a/fs/namespace.c
 +++ b/fs/namespace.c
 @@ -1369,6 +1369,8 @@ void umount_tree(struct mount *mnt, int
@@ -2004,6 +2739,17 @@
  	}
  	if ((mnt->mnt.mnt_flags & MNT_LOCK_NOSUID) &&
  	    !(mnt_flags & MNT_NOSUID)) {
+--- a/fs/ncpfs/dir.c
++++ b/fs/ncpfs/dir.c
+@@ -403,7 +403,7 @@ ncp_dget_fpos(struct dentry *dentry, str
+ 
+ 	/* If a pointer is invalid, we search the dentry. */
+ 	spin_lock(&parent->d_lock);
+-	list_for_each_entry(dent, &parent->d_subdirs, d_u.d_child) {
++	list_for_each_entry(dent, &parent->d_subdirs, d_child) {
+ 		if ((unsigned long)dent->d_fsdata == fpos) {
+ 			if (dent->d_inode)
+ 				dget(dent);
 --- a/fs/ncpfs/ioctl.c
 +++ b/fs/ncpfs/ioctl.c
 @@ -447,7 +447,6 @@ static long __ncp_ioctl(struct inode *in
@@ -2014,6 +2760,37 @@
  			}
  			mutex_unlock(&server->root_setup_lock);
  
+--- a/fs/ncpfs/ncplib_kernel.h
++++ b/fs/ncpfs/ncplib_kernel.h
+@@ -191,7 +191,7 @@ ncp_renew_dentries(struct dentry *parent
+ 	struct dentry *dentry;
+ 
+ 	spin_lock(&parent->d_lock);
+-	list_for_each_entry(dentry, &parent->d_subdirs, d_u.d_child) {
++	list_for_each_entry(dentry, &parent->d_subdirs, d_child) {
+ 		if (dentry->d_fsdata == NULL)
+ 			ncp_age_dentry(server, dentry);
+ 		else
+@@ -207,7 +207,7 @@ ncp_invalidate_dircache_entries(struct d
+ 	struct dentry *dentry;
+ 
+ 	spin_lock(&parent->d_lock);
+-	list_for_each_entry(dentry, &parent->d_subdirs, d_u.d_child) {
++	list_for_each_entry(dentry, &parent->d_subdirs, d_child) {
+ 		dentry->d_fsdata = NULL;
+ 		ncp_age_dentry(server, dentry);
+ 	}
+--- a/fs/nfs/getroot.c
++++ b/fs/nfs/getroot.c
+@@ -58,7 +58,7 @@ static int nfs_superblock_set_dummy_root
+ 		 */
+ 		spin_lock(&sb->s_root->d_inode->i_lock);
+ 		spin_lock(&sb->s_root->d_lock);
+-		hlist_del_init(&sb->s_root->d_alias);
++		hlist_del_init(&sb->s_root->d_u.d_alias);
+ 		spin_unlock(&sb->s_root->d_lock);
+ 		spin_unlock(&sb->s_root->d_inode->i_lock);
+ 	}
 --- a/fs/nfs/nfs4proc.c
 +++ b/fs/nfs/nfs4proc.c
 @@ -7704,6 +7704,9 @@ nfs4_proc_layoutget(struct nfs4_layoutge
@@ -2036,6 +2813,36 @@
  	task = rpc_run_task(&task_setup_data);
  	if (IS_ERR(task))
  		return ERR_CAST(task);
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -63,14 +63,14 @@ void __fsnotify_update_child_dentry_flag
+ 	spin_lock(&inode->i_lock);
+ 	/* run all of the dentries associated with this inode.  Since this is a
+ 	 * directory, there damn well better only be one item on this list */
+-	hlist_for_each_entry(alias, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(alias, &inode->i_dentry, d_u.d_alias) {
+ 		struct dentry *child;
+ 
+ 		/* run all of the children of the original inode and fix their
+ 		 * d_flags to indicate parental interest (their parent is the
+ 		 * original inode) */
+ 		spin_lock(&alias->d_lock);
+-		list_for_each_entry(child, &alias->d_subdirs, d_u.d_child) {
++		list_for_each_entry(child, &alias->d_subdirs, d_child) {
+ 			if (!child->d_inode)
+ 				continue;
+ 
+--- a/fs/ocfs2/dcache.c
++++ b/fs/ocfs2/dcache.c
+@@ -172,7 +172,7 @@ struct dentry *ocfs2_find_local_alias(st
+ 	struct dentry *dentry;
+ 
+ 	spin_lock(&inode->i_lock);
+-	hlist_for_each_entry(dentry, &inode->i_dentry, d_alias) {
++	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+ 		spin_lock(&dentry->d_lock);
+ 		if (ocfs2_match_dentry(dentry, parent_blkno, skip_unhashed)) {
+ 			trace_ocfs2_find_local_alias(dentry->d_name.len,
 --- a/fs/proc/base.c
 +++ b/fs/proc/base.c
 @@ -2464,6 +2464,57 @@ static const struct file_operations proc
@@ -2420,6 +3227,28 @@
  
  /* access the groups "array" with this macro */
  #define GROUP_AT(gi, i) \
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -124,15 +124,15 @@ struct dentry {
+ 	void *d_fsdata;			/* fs-specific data */
+ 
+ 	struct list_head d_lru;		/* LRU list */
++	struct list_head d_child;	/* child of parent list */
++	struct list_head d_subdirs;	/* our children */
+ 	/*
+-	 * d_child and d_rcu can share memory
++	 * d_alias and d_rcu can share memory
+ 	 */
+ 	union {
+-		struct list_head d_child;	/* child of parent list */
++		struct hlist_node d_alias;	/* inode alias list */
+ 	 	struct rcu_head d_rcu;
+ 	} d_u;
+-	struct list_head d_subdirs;	/* our children */
+-	struct hlist_node d_alias;	/* inode alias list */
+ };
+ 
+ /*
 --- a/include/linux/user_namespace.h
 +++ b/include/linux/user_namespace.h
 @@ -17,6 +17,10 @@ struct uid_gid_map {	/* 64 bytes -- 1 ca
@@ -2594,6 +3423,37 @@
  out_free:
  	while (++i <= ns->level)
  		free_pidmap(pid->numbers + i);
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -6417,7 +6417,7 @@ static int instance_mkdir (struct inode
+ 	int ret;
+ 
+ 	/* Paranoid: Make sure the parent is the "instances" directory */
+-	parent = hlist_entry(inode->i_dentry.first, struct dentry, d_alias);
++	parent = hlist_entry(inode->i_dentry.first, struct dentry, d_u.d_alias);
+ 	if (WARN_ON_ONCE(parent != trace_instance_dir))
+ 		return -ENOENT;
+ 
+@@ -6444,7 +6444,7 @@ static int instance_rmdir(struct inode *
+ 	int ret;
+ 
+ 	/* Paranoid: Make sure the parent is the "instances" directory */
+-	parent = hlist_entry(inode->i_dentry.first, struct dentry, d_alias);
++	parent = hlist_entry(inode->i_dentry.first, struct dentry, d_u.d_alias);
+ 	if (WARN_ON_ONCE(parent != trace_instance_dir))
+ 		return -ENOENT;
+ 
+--- a/kernel/trace/trace_events.c
++++ b/kernel/trace/trace_events.c
+@@ -461,7 +461,7 @@ static void remove_event_file_dir(struct
+ 
+ 	if (dir) {
+ 		spin_lock(&dir->d_lock);	/* probably unneeded */
+-		list_for_each_entry(child, &dir->d_subdirs, d_u.d_child) {
++		list_for_each_entry(child, &dir->d_subdirs, d_child) {
+ 			if (child->d_inode)	/* probably unneeded */
+ 				child->d_inode->i_private = NULL;
+ 		}
 --- a/kernel/uid16.c
 +++ b/kernel/uid16.c
 @@ -176,7 +176,7 @@ SYSCALL_DEFINE2(setgroups16, int, gidset
@@ -2826,6 +3686,119 @@
  	pr_debug("%s(size %pa, base %pa, limit %pa alignment %pa)\n",
  		__func__, &size, &base, &limit, &alignment);
  
+--- a/net/ipv4/gre_offload.c
++++ b/net/ipv4/gre_offload.c
+@@ -247,6 +247,9 @@ static int gre_gro_complete(struct sk_bu
+ 		err = ptype->callbacks.gro_complete(skb, nhoff + grehlen);
+ 
+ 	rcu_read_unlock();
++
++	skb_set_inner_mac_header(skb, nhoff + grehlen);
++
+ 	return err;
+ }
+ 
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -623,6 +623,7 @@ static void tcp_v4_send_reset(struct soc
+ 	arg.iov[0].iov_base = (unsigned char *)&rep;
+ 	arg.iov[0].iov_len  = sizeof(rep.th);
+ 
++	net = sk ? sock_net(sk) : dev_net(skb_dst(skb)->dev);
+ #ifdef CONFIG_TCP_MD5SIG
+ 	hash_location = tcp_parse_md5sig_option(th);
+ 	if (!sk && hash_location) {
+@@ -633,7 +634,7 @@ static void tcp_v4_send_reset(struct soc
+ 		 * Incoming packet is checked with md5 hash with finding key,
+ 		 * no RST generated if md5 hash doesn't match.
+ 		 */
+-		sk1 = __inet_lookup_listener(dev_net(skb_dst(skb)->dev),
++		sk1 = __inet_lookup_listener(net,
+ 					     &tcp_hashinfo, ip_hdr(skb)->saddr,
+ 					     th->source, ip_hdr(skb)->daddr,
+ 					     ntohs(th->source), inet_iif(skb));
+@@ -681,7 +682,6 @@ static void tcp_v4_send_reset(struct soc
+ 	if (sk)
+ 		arg.bound_dev_if = sk->sk_bound_dev_if;
+ 
+-	net = dev_net(skb_dst(skb)->dev);
+ 	arg.tos = ip_hdr(skb)->tos;
+ 	ip_send_unicast_reply(net, skb, &TCP_SKB_CB(skb)->header.h4.opt,
+ 			      ip_hdr(skb)->saddr, ip_hdr(skb)->daddr,
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -787,16 +787,16 @@ static const struct tcp_request_sock_ops
+ 	.queue_hash_add =	inet6_csk_reqsk_queue_hash_add,
+ };
+ 
+-static void tcp_v6_send_response(struct sk_buff *skb, u32 seq, u32 ack, u32 win,
+-				 u32 tsval, u32 tsecr, int oif,
+-				 struct tcp_md5sig_key *key, int rst, u8 tclass,
+-				 u32 label)
++static void tcp_v6_send_response(struct sock *sk, struct sk_buff *skb, u32 seq,
++				 u32 ack, u32 win, u32 tsval, u32 tsecr,
++				 int oif, struct tcp_md5sig_key *key, int rst,
++				 u8 tclass, u32 label)
+ {
+ 	const struct tcphdr *th = tcp_hdr(skb);
+ 	struct tcphdr *t1;
+ 	struct sk_buff *buff;
+ 	struct flowi6 fl6;
+-	struct net *net = dev_net(skb_dst(skb)->dev);
++	struct net *net = sk ? sock_net(sk) : dev_net(skb_dst(skb)->dev);
+ 	struct sock *ctl_sk = net->ipv6.tcp_sk;
+ 	unsigned int tot_len = sizeof(struct tcphdr);
+ 	struct dst_entry *dst;
+@@ -946,7 +946,7 @@ static void tcp_v6_send_reset(struct soc
+ 			  (th->doff << 2);
+ 
+ 	oif = sk ? sk->sk_bound_dev_if : 0;
+-	tcp_v6_send_response(skb, seq, ack_seq, 0, 0, 0, oif, key, 1, 0, 0);
++	tcp_v6_send_response(sk, skb, seq, ack_seq, 0, 0, 0, oif, key, 1, 0, 0);
+ 
+ #ifdef CONFIG_TCP_MD5SIG
+ release_sk1:
+@@ -957,13 +957,13 @@ release_sk1:
+ #endif
+ }
+ 
+-static void tcp_v6_send_ack(struct sk_buff *skb, u32 seq, u32 ack,
+-			    u32 win, u32 tsval, u32 tsecr, int oif,
++static void tcp_v6_send_ack(struct sock *sk, struct sk_buff *skb, u32 seq,
++			    u32 ack, u32 win, u32 tsval, u32 tsecr, int oif,
+ 			    struct tcp_md5sig_key *key, u8 tclass,
+ 			    u32 label)
+ {
+-	tcp_v6_send_response(skb, seq, ack, win, tsval, tsecr, oif, key, 0, tclass,
+-			     label);
++	tcp_v6_send_response(sk, skb, seq, ack, win, tsval, tsecr, oif, key, 0,
++			     tclass, label);
+ }
+ 
+ static void tcp_v6_timewait_ack(struct sock *sk, struct sk_buff *skb)
+@@ -971,7 +971,7 @@ static void tcp_v6_timewait_ack(struct s
+ 	struct inet_timewait_sock *tw = inet_twsk(sk);
+ 	struct tcp_timewait_sock *tcptw = tcp_twsk(sk);
+ 
+-	tcp_v6_send_ack(skb, tcptw->tw_snd_nxt, tcptw->tw_rcv_nxt,
++	tcp_v6_send_ack(sk, skb, tcptw->tw_snd_nxt, tcptw->tw_rcv_nxt,
+ 			tcptw->tw_rcv_wnd >> tw->tw_rcv_wscale,
+ 			tcp_time_stamp + tcptw->tw_ts_offset,
+ 			tcptw->tw_ts_recent, tw->tw_bound_dev_if, tcp_twsk_md5_key(tcptw),
+@@ -986,10 +986,10 @@ static void tcp_v6_reqsk_send_ack(struct
+ 	/* sk->sk_state == TCP_LISTEN -> for regular TCP_SYN_RECV
+ 	 * sk->sk_state == TCP_SYN_RECV -> for Fast Open.
+ 	 */
+-	tcp_v6_send_ack(skb, (sk->sk_state == TCP_LISTEN) ?
++	tcp_v6_send_ack(sk, skb, (sk->sk_state == TCP_LISTEN) ?
+ 			tcp_rsk(req)->snt_isn + 1 : tcp_sk(sk)->snd_nxt,
+-			tcp_rsk(req)->rcv_nxt,
+-			req->rcv_wnd, tcp_time_stamp, req->ts_recent, sk->sk_bound_dev_if,
++			tcp_rsk(req)->rcv_nxt, req->rcv_wnd,
++			tcp_time_stamp, req->ts_recent, sk->sk_bound_dev_if,
+ 			tcp_v6_md5_do_lookup(sk, &ipv6_hdr(skb)->daddr),
+ 			0, 0);
+ }
 --- a/net/mac80211/chan.c
 +++ b/net/mac80211/chan.c
 @@ -929,6 +929,21 @@ ieee80211_vif_chanctx_reservation_comple
@@ -2950,6 +3923,65 @@
  	return RX_CONTINUE;
  }
  
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -3130,7 +3130,7 @@ static int __init netlink_proto_init(voi
+ 		.head_offset = offsetof(struct netlink_sock, node),
+ 		.key_offset = offsetof(struct netlink_sock, portid),
+ 		.key_len = sizeof(u32), /* portid */
+-		.hashfn = arch_fast_hash,
++		.hashfn = jhash,
+ 		.max_shift = 16, /* 64K */
+ 		.grow_decision = rht_grow_above_75,
+ 		.shrink_decision = rht_shrink_below_30,
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@ -145,7 +145,7 @@ static bool match_validate(const struct
+ 	if (match->key->eth.type == htons(ETH_P_ARP)
+ 			|| match->key->eth.type == htons(ETH_P_RARP)) {
+ 		key_expected |= 1 << OVS_KEY_ATTR_ARP;
+-		if (match->mask && (match->mask->key.tp.src == htons(0xff)))
++		if (match->mask && (match->mask->key.eth.type == htons(0xffff)))
+ 			mask_allowed |= 1 << OVS_KEY_ATTR_ARP;
+ 	}
+ 
+@@ -220,7 +220,7 @@ static bool match_validate(const struct
+ 						htons(NDISC_NEIGHBOUR_SOLICITATION) ||
+ 				    match->key->tp.src == htons(NDISC_NEIGHBOUR_ADVERTISEMENT)) {
+ 					key_expected |= 1 << OVS_KEY_ATTR_ND;
+-					if (match->mask && (match->mask->key.tp.src == htons(0xffff)))
++					if (match->mask && (match->mask->key.tp.src == htons(0xff)))
+ 						mask_allowed |= 1 << OVS_KEY_ATTR_ND;
+ 				}
+ 			}
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -94,7 +94,7 @@ static unsigned int fq_codel_classify(st
+ 	    TC_H_MIN(skb->priority) <= q->flows_cnt)
+ 		return TC_H_MIN(skb->priority);
+ 
+-	filter = rcu_dereference(q->filter_list);
++	filter = rcu_dereference_bh(q->filter_list);
+ 	if (!filter)
+ 		return fq_codel_hash(q, skb) + 1;
+ 
+--- a/net/sctp/output.c
++++ b/net/sctp/output.c
+@@ -401,12 +401,12 @@ int sctp_packet_transmit(struct sctp_pac
+ 	sk = chunk->skb->sk;
+ 
+ 	/* Allocate the new skb.  */
+-	nskb = alloc_skb(packet->size + LL_MAX_HEADER, GFP_ATOMIC);
++	nskb = alloc_skb(packet->size + MAX_HEADER, GFP_ATOMIC);
+ 	if (!nskb)
+ 		goto nomem;
+ 
+ 	/* Make sure the outbound skb has enough header room reserved. */
+-	skb_reserve(nskb, packet->overhead + LL_MAX_HEADER);
++	skb_reserve(nskb, packet->overhead + MAX_HEADER);
+ 
+ 	/* Set the owning socket so that we know where to get the
+ 	 * destination IP address.
 --- a/security/keys/encrypted-keys/encrypted.c
 +++ b/security/keys/encrypted-keys/encrypted.c
 @@ -1017,10 +1017,13 @@ static int __init init_encrypted(void)
@@ -2967,6 +3999,63 @@
  out:
  	encrypted_shash_release();
  	return ret;
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -1200,7 +1200,7 @@ static void sel_remove_entries(struct de
+ 	spin_lock(&de->d_lock);
+ 	node = de->d_subdirs.next;
+ 	while (node != &de->d_subdirs) {
+-		struct dentry *d = list_entry(node, struct dentry, d_u.d_child);
++		struct dentry *d = list_entry(node, struct dentry, d_child);
+ 
+ 		spin_lock_nested(&d->d_lock, DENTRY_D_LOCK_NESTED);
+ 		list_del_init(node);
+@@ -1674,12 +1674,12 @@ static void sel_remove_classes(void)
+ 
+ 	list_for_each(class_node, &class_dir->d_subdirs) {
+ 		struct dentry *class_subdir = list_entry(class_node,
+-					struct dentry, d_u.d_child);
++					struct dentry, d_child);
+ 		struct list_head *class_subdir_node;
+ 
+ 		list_for_each(class_subdir_node, &class_subdir->d_subdirs) {
+ 			struct dentry *d = list_entry(class_subdir_node,
+-						struct dentry, d_u.d_child);
++						struct dentry, d_child);
+ 
+ 			if (d->d_inode)
+ 				if (d->d_inode->i_mode & S_IFDIR)
+--- a/sound/pci/hda/patch_analog.c
++++ b/sound/pci/hda/patch_analog.c
+@@ -332,6 +332,7 @@ static const struct hda_fixup ad1986a_fi
+ 
+ static const struct snd_pci_quirk ad1986a_fixup_tbl[] = {
+ 	SND_PCI_QUIRK(0x103c, 0x30af, "HP B2800", AD1986A_FIXUP_LAPTOP_IMIC),
++	SND_PCI_QUIRK(0x1043, 0x1443, "ASUS Z99He", AD1986A_FIXUP_EAPD),
+ 	SND_PCI_QUIRK(0x1043, 0x1447, "ASUS A8JN", AD1986A_FIXUP_EAPD),
+ 	SND_PCI_QUIRK_MASK(0x1043, 0xff00, 0x8100, "ASUS P5", AD1986A_FIXUP_3STACK),
+ 	SND_PCI_QUIRK_MASK(0x1043, 0xff00, 0x8200, "ASUS M2", AD1986A_FIXUP_3STACK),
+--- a/sound/pci/hda/patch_realtek.c
++++ b/sound/pci/hda/patch_realtek.c
+@@ -4887,6 +4887,7 @@ static const struct snd_pci_quirk alc269
+ 	SND_PCI_QUIRK(0x17aa, 0x2212, "Thinkpad T440", ALC292_FIXUP_TPT440_DOCK),
+ 	SND_PCI_QUIRK(0x17aa, 0x2214, "Thinkpad X240", ALC292_FIXUP_TPT440_DOCK),
+ 	SND_PCI_QUIRK(0x17aa, 0x2215, "Thinkpad", ALC269_FIXUP_LIMIT_INT_MIC_BOOST),
++	SND_PCI_QUIRK(0x17aa, 0x3977, "IdeaPad S210", ALC283_FIXUP_INT_MIC),
+ 	SND_PCI_QUIRK(0x17aa, 0x3978, "IdeaPad Y410P", ALC269_FIXUP_NO_SHUTUP),
+ 	SND_PCI_QUIRK(0x17aa, 0x5013, "Thinkpad", ALC269_FIXUP_LIMIT_INT_MIC_BOOST),
+ 	SND_PCI_QUIRK(0x17aa, 0x501a, "Thinkpad", ALC283_FIXUP_INT_MIC),
+--- a/sound/usb/midi.c
++++ b/sound/usb/midi.c
+@@ -365,6 +365,8 @@ static void snd_usbmidi_error_timer(unsi
+ 		if (in && in->error_resubmit) {
+ 			in->error_resubmit = 0;
+ 			for (j = 0; j < INPUT_URBS; ++j) {
++				if (atomic_read(&in->urbs[j]->use_count))
++					continue;
+ 				in->urbs[j]->dev = umidi->dev;
+ 				snd_usbmidi_submit_urb(in->urbs[j], GFP_ATOMIC);
+ 			}
 --- a/tools/testing/selftests/mount/unprivileged-remount-test.c
 +++ b/tools/testing/selftests/mount/unprivileged-remount-test.c
 @@ -6,6 +6,8 @@
