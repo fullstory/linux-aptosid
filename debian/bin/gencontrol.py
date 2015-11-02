@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import sys
 sys.path.append("debian/lib/python")
@@ -77,6 +77,11 @@ class Gencontrol(Base):
                 f.write('# THIS IS A GENERATED FILE; DO NOT EDIT IT!\n'
                         '# Translators should edit %s instead.\n'
                         '#\n' % path)
+
+        """
+        # Prepare to generate debian/tests/control
+        self.tests_control = None
+        """
 
     def do_main_makefile(self, makefile, makeflags, extra):
         fs_enabled = [featureset
@@ -161,9 +166,9 @@ class Gencontrol(Base):
         if os.getenv('DEBIAN_KERNEL_DISABLE_INSTALLER'):
             if self.changelog[0].distribution == 'UNRELEASED':
                 import warnings
-                warnings.warn(u'Disable installer modules on request (DEBIAN_KERNEL_DISABLE_INSTALLER set)')
+                warnings.warn('Disable installer modules on request (DEBIAN_KERNEL_DISABLE_INSTALLER set)')
             else:
-                raise RuntimeError(u'Unable to disable installer modules in release build (DEBIAN_KERNEL_DISABLE_INSTALLER set)')
+                raise RuntimeError('Unable to disable installer modules in release build (DEBIAN_KERNEL_DISABLE_INSTALLER set)')
         else:
             # Add udebs using kernel-wedge
             installer_def_dir = 'debian/installer'
@@ -333,7 +338,8 @@ class Gencontrol(Base):
 
         vars.setdefault('desc', None)
 
-        packages_own.append(self.process_real_image(image[0], image_fields, vars))
+        image_main = self.process_real_image(image[0], image_fields, vars)
+        packages_own.append(image_main)
         packages_own.extend(self.process_packages(image[1:], vars))
 
         if config_entry_build.get('modules', True):
@@ -350,16 +356,28 @@ class Gencontrol(Base):
         if os.getenv('DEBIAN_KERNEL_DISABLE_DEBUG'):
             if self.changelog[0].distribution == 'UNRELEASED':
                 import warnings
-                warnings.warn(u'Disable debug infos on request (DEBIAN_KERNEL_DISABLE_DEBUG set)')
+                warnings.warn('Disable debug infos on request (DEBIAN_KERNEL_DISABLE_DEBUG set)')
                 build_debug = False
             else:
-                raise RuntimeError(u'Unable to disable debug infos in release build (DEBIAN_KERNEL_DISABLE_DEBUG set)')
+                raise RuntimeError('Unable to disable debug infos in release build (DEBIAN_KERNEL_DISABLE_DEBUG set)')
 
         if build_debug:
             makeflags['DEBUG'] = True
             packages_own.extend(self.process_packages(self.templates['control.image-dbg'], vars))
 
         self.merge_packages(packages, packages_own + packages_dummy, arch)
+
+        """
+        tests_control = self.process_package(
+            self.templates['tests-control.main'][0], vars)
+        tests_control['Depends'].append(
+            PackageRelationGroup(image_main['Package'],
+                                 override_arches=(arch,)))
+        if self.tests_control:
+            self.tests_control['Depends'].extend(tests_control['Depends'])
+        else:
+            self.tests_control = tests_control
+        """
 
         def get_config(*entry_name):
             entry_real = ('image',) + entry_name
@@ -519,11 +537,18 @@ class Gencontrol(Base):
     def write(self, packages, makefile):
         self.write_config()
         super(Gencontrol, self).write(packages, makefile)
+        """
+        self.write_tests_control()
+        """
 
     def write_config(self):
         f = open("debian/config.defines.dump", 'wb')
         self.config.dump(f)
         f.close()
+
+    def write_tests_control(self):
+        self.write_rfc822(codecs.open("debian/tests/control", 'w', 'utf-8'),
+                          [self.tests_control])
 
 if __name__ == '__main__':
     Gencontrol()()
