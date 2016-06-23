@@ -1,0 +1,3165 @@
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 4
+ PATCHLEVEL = 6
+-SUBLEVEL = 2
+-EXTRAVERSION =
++SUBLEVEL = 3
++EXTRAVERSION = -rc1
+ NAME = Charred Weasel
+ 
+ # *DOCUMENTATION*
+--- a/arch/arm/kernel/ptrace.c
++++ b/arch/arm/kernel/ptrace.c
+@@ -733,8 +733,8 @@ static int vfp_set(struct task_struct *t
+ 	if (ret)
+ 		return ret;
+ 
+-	vfp_flush_hwstate(thread);
+ 	thread->vfpstate.hard = new_vfp;
++	vfp_flush_hwstate(thread);
+ 
+ 	return 0;
+ }
+--- a/arch/arm64/include/asm/elf.h
++++ b/arch/arm64/include/asm/elf.h
+@@ -160,14 +160,14 @@ extern int arch_setup_additional_pages(s
+ #define STACK_RND_MASK			(0x3ffff >> (PAGE_SHIFT - 12))
+ #endif
+ 
+-#ifdef CONFIG_COMPAT
+-
+ #ifdef __AARCH64EB__
+ #define COMPAT_ELF_PLATFORM		("v8b")
+ #else
+ #define COMPAT_ELF_PLATFORM		("v8l")
+ #endif
+ 
++#ifdef CONFIG_COMPAT
++
+ #define COMPAT_ELF_ET_DYN_BASE		(2 * TASK_SIZE_32 / 3)
+ 
+ /* AArch32 registers. */
+--- a/arch/arm64/kernel/cpuinfo.c
++++ b/arch/arm64/kernel/cpuinfo.c
+@@ -22,6 +22,8 @@
+ 
+ #include <linux/bitops.h>
+ #include <linux/bug.h>
++#include <linux/compat.h>
++#include <linux/elf.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/personality.h>
+@@ -104,6 +106,7 @@ static const char *const compat_hwcap2_s
+ static int c_show(struct seq_file *m, void *v)
+ {
+ 	int i, j;
++	bool compat = personality(current->personality) == PER_LINUX32;
+ 
+ 	for_each_online_cpu(i) {
+ 		struct cpuinfo_arm64 *cpuinfo = &per_cpu(cpu_data, i);
+@@ -115,6 +118,9 @@ static int c_show(struct seq_file *m, vo
+ 		 * "processor".  Give glibc what it expects.
+ 		 */
+ 		seq_printf(m, "processor\t: %d\n", i);
++		if (compat)
++			seq_printf(m, "model name\t: ARMv8 Processor rev %d (%s)\n",
++				   MIDR_REVISION(midr), COMPAT_ELF_PLATFORM);
+ 
+ 		seq_printf(m, "BogoMIPS\t: %lu.%02lu\n",
+ 			   loops_per_jiffy / (500000UL/HZ),
+@@ -127,7 +133,7 @@ static int c_show(struct seq_file *m, vo
+ 		 * software which does already (at least for 32-bit).
+ 		 */
+ 		seq_puts(m, "Features\t:");
+-		if (personality(current->personality) == PER_LINUX32) {
++		if (compat) {
+ #ifdef CONFIG_COMPAT
+ 			for (j = 0; compat_hwcap_str[j]; j++)
+ 				if (compat_elf_hwcap & (1 << j))
+--- a/arch/arm64/kvm/hyp/vgic-v3-sr.c
++++ b/arch/arm64/kvm/hyp/vgic-v3-sr.c
+@@ -190,12 +190,11 @@ void __hyp_text __vgic_v3_save_state(str
+ 			if (!(vcpu->arch.vgic_cpu.live_lrs & (1UL << i)))
+ 				continue;
+ 
+-			if (cpu_if->vgic_elrsr & (1 << i)) {
++			if (cpu_if->vgic_elrsr & (1 << i))
+ 				cpu_if->vgic_lr[i] &= ~ICH_LR_STATE;
+-				continue;
+-			}
++			else
++				cpu_if->vgic_lr[i] = __gic_v3_get_lr(i);
+ 
+-			cpu_if->vgic_lr[i] = __gic_v3_get_lr(i);
+ 			__gic_v3_set_lr(0, i);
+ 		}
+ 
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -109,7 +109,7 @@ int ptep_set_access_flags(struct vm_area
+ 	 * PTE_RDONLY is cleared by default in the asm below, so set it in
+ 	 * back if necessary (read-only or clean PTE).
+ 	 */
+-	if (!pte_write(entry) || !dirty)
++	if (!pte_write(entry) || !pte_sw_dirty(entry))
+ 		pte_val(entry) |= PTE_RDONLY;
+ 
+ 	/*
+--- a/arch/parisc/kernel/unaligned.c
++++ b/arch/parisc/kernel/unaligned.c
+@@ -666,7 +666,7 @@ void handle_unaligned(struct pt_regs *re
+ 		break;
+ 	}
+ 
+-	if (modify && R1(regs->iir))
++	if (ret == 0 && modify && R1(regs->iir))
+ 		regs->gr[R1(regs->iir)] = newbase;
+ 
+ 
+@@ -677,6 +677,14 @@ void handle_unaligned(struct pt_regs *re
+ 
+ 	if (ret)
+ 	{
++		/*
++		 * The unaligned handler failed.
++		 * If we were called by __get_user() or __put_user() jump
++		 * to it's exception fixup handler instead of crashing.
++		 */
++		if (!user_mode(regs) && fixup_exception(regs))
++			return;
++
+ 		printk(KERN_CRIT "Unaligned handler failed, ret = %d\n", ret);
+ 		die_if_kernel("Unaligned data reference", regs, 28);
+ 
+--- a/arch/powerpc/include/asm/reg.h
++++ b/arch/powerpc/include/asm/reg.h
+@@ -715,7 +715,7 @@
+ #define   MMCR0_FCWAIT	0x00000002UL /* freeze counter in WAIT state */
+ #define   MMCR0_FCHV	0x00000001UL /* freeze conditions in hypervisor mode */
+ #define SPRN_MMCR1	798
+-#define SPRN_MMCR2	769
++#define SPRN_MMCR2	785
+ #define SPRN_MMCRA	0x312
+ #define   MMCRA_SDSYNC	0x80000000UL /* SDAR synced with SIAR */
+ #define   MMCRA_SDAR_DCACHE_MISS 0x40000000UL
+@@ -752,13 +752,13 @@
+ #define SPRN_PMC6	792
+ #define SPRN_PMC7	793
+ #define SPRN_PMC8	794
+-#define SPRN_SIAR	780
+-#define SPRN_SDAR	781
+ #define SPRN_SIER	784
+ #define   SIER_SIPR		0x2000000	/* Sampled MSR_PR */
+ #define   SIER_SIHV		0x1000000	/* Sampled MSR_HV */
+ #define   SIER_SIAR_VALID	0x0400000	/* SIAR contents valid */
+ #define   SIER_SDAR_VALID	0x0200000	/* SDAR contents valid */
++#define SPRN_SIAR	796
++#define SPRN_SDAR	797
+ #define SPRN_TACR	888
+ #define SPRN_TCSCR	889
+ #define SPRN_CSIGR	890
+--- a/arch/powerpc/kernel/prom_init.c
++++ b/arch/powerpc/kernel/prom_init.c
+@@ -656,6 +656,7 @@ unsigned char ibm_architecture_vec[] = {
+ 	W(0xffff0000), W(0x003e0000),	/* POWER6 */
+ 	W(0xffff0000), W(0x003f0000),	/* POWER7 */
+ 	W(0xffff0000), W(0x004b0000),	/* POWER8E */
++	W(0xffff0000), W(0x004c0000),   /* POWER8NVL */
+ 	W(0xffff0000), W(0x004d0000),	/* POWER8 */
+ 	W(0xffffffff), W(0x0f000004),	/* all 2.07-compliant */
+ 	W(0xffffffff), W(0x0f000003),	/* all 2.06-compliant */
+--- a/arch/powerpc/mm/hash_utils_64.c
++++ b/arch/powerpc/mm/hash_utils_64.c
+@@ -159,6 +159,19 @@ static struct mmu_psize_def mmu_psize_de
+ 	},
+ };
+ 
++/*
++ * 'R' and 'C' update notes:
++ *  - Under pHyp or KVM, the updatepp path will not set C, thus it *will*
++ *     create writeable HPTEs without C set, because the hcall H_PROTECT
++ *     that we use in that case will not update C
++ *  - The above is however not a problem, because we also don't do that
++ *     fancy "no flush" variant of eviction and we use H_REMOVE which will
++ *     do the right thing and thus we don't have the race I described earlier
++ *
++ *    - Under bare metal,  we do have the race, so we need R and C set
++ *    - We make sure R is always set and never lost
++ *    - C is _PAGE_DIRTY, and *should* always be set for a writeable mapping
++ */
+ unsigned long htab_convert_pte_flags(unsigned long pteflags)
+ {
+ 	unsigned long rflags = 0;
+@@ -180,9 +193,14 @@ unsigned long htab_convert_pte_flags(uns
+ 			rflags |= 0x1;
+ 	}
+ 	/*
+-	 * Always add "C" bit for perf. Memory coherence is always enabled
++	 * We can't allow hardware to update hpte bits. Hence always
++	 * set 'R' bit and set 'C' if it is a write fault
++	 * Memory coherence is always enabled
+ 	 */
+-	rflags |=  HPTE_R_C | HPTE_R_M;
++	rflags |=  HPTE_R_R | HPTE_R_M;
++
++	if (pteflags & _PAGE_DIRTY)
++		rflags |= HPTE_R_C;
+ 	/*
+ 	 * Add in WIG bits
+ 	 */
+--- a/arch/powerpc/platforms/pseries/eeh_pseries.c
++++ b/arch/powerpc/platforms/pseries/eeh_pseries.c
+@@ -615,29 +615,50 @@ static int pseries_eeh_configure_bridge(
+ {
+ 	int config_addr;
+ 	int ret;
++	/* Waiting 0.2s maximum before skipping configuration */
++	int max_wait = 200;
+ 
+ 	/* Figure out the PE address */
+ 	config_addr = pe->config_addr;
+ 	if (pe->addr)
+ 		config_addr = pe->addr;
+ 
+-	/* Use new configure-pe function, if supported */
+-	if (ibm_configure_pe != RTAS_UNKNOWN_SERVICE) {
+-		ret = rtas_call(ibm_configure_pe, 3, 1, NULL,
+-				config_addr, BUID_HI(pe->phb->buid),
+-				BUID_LO(pe->phb->buid));
+-	} else if (ibm_configure_bridge != RTAS_UNKNOWN_SERVICE) {
+-		ret = rtas_call(ibm_configure_bridge, 3, 1, NULL,
+-				config_addr, BUID_HI(pe->phb->buid),
+-				BUID_LO(pe->phb->buid));
+-	} else {
+-		return -EFAULT;
+-	}
++	while (max_wait > 0) {
++		/* Use new configure-pe function, if supported */
++		if (ibm_configure_pe != RTAS_UNKNOWN_SERVICE) {
++			ret = rtas_call(ibm_configure_pe, 3, 1, NULL,
++					config_addr, BUID_HI(pe->phb->buid),
++					BUID_LO(pe->phb->buid));
++		} else if (ibm_configure_bridge != RTAS_UNKNOWN_SERVICE) {
++			ret = rtas_call(ibm_configure_bridge, 3, 1, NULL,
++					config_addr, BUID_HI(pe->phb->buid),
++					BUID_LO(pe->phb->buid));
++		} else {
++			return -EFAULT;
++		}
++
++		if (!ret)
++			return ret;
++
++		/*
++		 * If RTAS returns a delay value that's above 100ms, cut it
++		 * down to 100ms in case firmware made a mistake.  For more
++		 * on how these delay values work see rtas_busy_delay_time
++		 */
++		if (ret > RTAS_EXTENDED_DELAY_MIN+2 &&
++		    ret <= RTAS_EXTENDED_DELAY_MAX)
++			ret = RTAS_EXTENDED_DELAY_MIN+2;
+ 
+-	if (ret)
+-		pr_warn("%s: Unable to configure bridge PHB#%d-PE#%x (%d)\n",
+-			__func__, pe->phb->global_number, pe->addr, ret);
++		max_wait -= rtas_busy_delay_time(ret);
++
++		if (max_wait < 0)
++			break;
++
++		rtas_busy_delay(ret);
++	}
+ 
++	pr_warn("%s: Unable to configure bridge PHB#%d-PE#%x (%d)\n",
++		__func__, pe->phb->global_number, pe->addr, ret);
+ 	return ret;
+ }
+ 
+--- a/arch/s390/net/bpf_jit.h
++++ b/arch/s390/net/bpf_jit.h
+@@ -37,7 +37,7 @@ extern u8 sk_load_word[], sk_load_half[]
+  *	      |		      |     |
+  *	      +---------------+     |
+  *	      | 8 byte skbp   |     |
+- * R15+170 -> +---------------+     |
++ * R15+176 -> +---------------+     |
+  *	      | 8 byte hlen   |     |
+  * R15+168 -> +---------------+     |
+  *	      | 4 byte align  |     |
+@@ -58,7 +58,7 @@ extern u8 sk_load_word[], sk_load_half[]
+ #define STK_OFF		(STK_SPACE - STK_160_UNUSED)
+ #define STK_OFF_TMP	160	/* Offset of tmp buffer on stack */
+ #define STK_OFF_HLEN	168	/* Offset of SKB header length on stack */
+-#define STK_OFF_SKBP	170	/* Offset of SKB pointer on stack */
++#define STK_OFF_SKBP	176	/* Offset of SKB pointer on stack */
+ 
+ #define STK_OFF_R6	(160 - 11 * 8)	/* Offset of r6 on stack */
+ #define STK_OFF_TCCNT	(160 - 12 * 8)	/* Offset of tail_call_cnt on stack */
+--- a/arch/s390/net/bpf_jit_comp.c
++++ b/arch/s390/net/bpf_jit_comp.c
+@@ -45,7 +45,7 @@ struct bpf_jit {
+ 	int labels[1];		/* Labels for local jumps */
+ };
+ 
+-#define BPF_SIZE_MAX	0x7ffff	/* Max size for program (20 bit signed displ) */
++#define BPF_SIZE_MAX	0xffff	/* Max size for program (16 bit branches) */
+ 
+ #define SEEN_SKB	1	/* skb access */
+ #define SEEN_MEM	2	/* use mem[] for temporary storage */
+@@ -446,7 +446,7 @@ static void bpf_jit_prologue(struct bpf_
+ 		emit_load_skb_data_hlen(jit);
+ 	if (jit->seen & SEEN_SKB_CHANGE)
+ 		/* stg %b1,ST_OFF_SKBP(%r0,%r15) */
+-		EMIT6_DISP_LH(0xe3000000, 0x0024, REG_W1, REG_0, REG_15,
++		EMIT6_DISP_LH(0xe3000000, 0x0024, BPF_REG_1, REG_0, REG_15,
+ 			      STK_OFF_SKBP);
+ }
+ 
+--- a/arch/sparc/include/asm/head_64.h
++++ b/arch/sparc/include/asm/head_64.h
+@@ -15,6 +15,10 @@
+ 
+ #define	PTREGS_OFF	(STACK_BIAS + STACKFRAME_SZ)
+ 
++#define	RTRAP_PSTATE		(PSTATE_TSO|PSTATE_PEF|PSTATE_PRIV|PSTATE_IE)
++#define	RTRAP_PSTATE_IRQOFF	(PSTATE_TSO|PSTATE_PEF|PSTATE_PRIV)
++#define RTRAP_PSTATE_AG_IRQOFF	(PSTATE_TSO|PSTATE_PEF|PSTATE_PRIV|PSTATE_AG)
++
+ #define __CHEETAH_ID	0x003e0014
+ #define __JALAPENO_ID	0x003e0016
+ #define __SERRANO_ID	0x003e0022
+--- a/arch/sparc/include/asm/pgtable_64.h
++++ b/arch/sparc/include/asm/pgtable_64.h
+@@ -375,7 +375,7 @@ static inline pgprot_t pgprot_noncached(
+ #define pgprot_noncached pgprot_noncached
+ 
+ #if defined(CONFIG_HUGETLB_PAGE) || defined(CONFIG_TRANSPARENT_HUGEPAGE)
+-static inline pte_t pte_mkhuge(pte_t pte)
++static inline unsigned long __pte_huge_mask(void)
+ {
+ 	unsigned long mask;
+ 
+@@ -390,8 +390,19 @@ static inline pte_t pte_mkhuge(pte_t pte
+ 	: "=r" (mask)
+ 	: "i" (_PAGE_SZHUGE_4U), "i" (_PAGE_SZHUGE_4V));
+ 
+-	return __pte(pte_val(pte) | mask);
++	return mask;
++}
++
++static inline pte_t pte_mkhuge(pte_t pte)
++{
++	return __pte(pte_val(pte) | __pte_huge_mask());
++}
++
++static inline bool is_hugetlb_pte(pte_t pte)
++{
++	return !!(pte_val(pte) & __pte_huge_mask());
+ }
++
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ static inline pmd_t pmd_mkhuge(pmd_t pmd)
+ {
+@@ -403,6 +414,11 @@ static inline pmd_t pmd_mkhuge(pmd_t pmd
+ 	return __pmd(pte_val(pte));
+ }
+ #endif
++#else
++static inline bool is_hugetlb_pte(pte_t pte)
++{
++	return false;
++}
+ #endif
+ 
+ static inline pte_t pte_mkdirty(pte_t pte)
+@@ -858,6 +874,19 @@ static inline unsigned long pud_pfn(pud_
+ void tlb_batch_add(struct mm_struct *mm, unsigned long vaddr,
+ 		   pte_t *ptep, pte_t orig, int fullmm);
+ 
++static void maybe_tlb_batch_add(struct mm_struct *mm, unsigned long vaddr,
++				pte_t *ptep, pte_t orig, int fullmm)
++{
++	/* It is more efficient to let flush_tlb_kernel_range()
++	 * handle init_mm tlb flushes.
++	 *
++	 * SUN4V NOTE: _PAGE_VALID is the same value in both the SUN4U
++	 *             and SUN4V pte layout, so this inline test is fine.
++	 */
++	if (likely(mm != &init_mm) && pte_accessible(mm, orig))
++		tlb_batch_add(mm, vaddr, ptep, orig, fullmm);
++}
++
+ #define __HAVE_ARCH_PMDP_HUGE_GET_AND_CLEAR
+ static inline pmd_t pmdp_huge_get_and_clear(struct mm_struct *mm,
+ 					    unsigned long addr,
+@@ -874,15 +903,7 @@ static inline void __set_pte_at(struct m
+ 	pte_t orig = *ptep;
+ 
+ 	*ptep = pte;
+-
+-	/* It is more efficient to let flush_tlb_kernel_range()
+-	 * handle init_mm tlb flushes.
+-	 *
+-	 * SUN4V NOTE: _PAGE_VALID is the same value in both the SUN4U
+-	 *             and SUN4V pte layout, so this inline test is fine.
+-	 */
+-	if (likely(mm != &init_mm) && pte_accessible(mm, orig))
+-		tlb_batch_add(mm, addr, ptep, orig, fullmm);
++	maybe_tlb_batch_add(mm, addr, ptep, orig, fullmm);
+ }
+ 
+ #define set_pte_at(mm,addr,ptep,pte)	\
+--- a/arch/sparc/include/asm/tlbflush_64.h
++++ b/arch/sparc/include/asm/tlbflush_64.h
+@@ -8,6 +8,7 @@
+ #define TLB_BATCH_NR	192
+ 
+ struct tlb_batch {
++	bool huge;
+ 	struct mm_struct *mm;
+ 	unsigned long tlb_nr;
+ 	unsigned long active;
+@@ -16,7 +17,7 @@ struct tlb_batch {
+ 
+ void flush_tsb_kernel_range(unsigned long start, unsigned long end);
+ void flush_tsb_user(struct tlb_batch *tb);
+-void flush_tsb_user_page(struct mm_struct *mm, unsigned long vaddr);
++void flush_tsb_user_page(struct mm_struct *mm, unsigned long vaddr, bool huge);
+ 
+ /* TLB flush operations. */
+ 
+--- a/arch/sparc/include/asm/ttable.h
++++ b/arch/sparc/include/asm/ttable.h
+@@ -589,8 +589,8 @@ user_rtt_fill_64bit:					\
+ 	 restored;					\
+ 	nop; nop; nop; nop; nop; nop;			\
+ 	nop; nop; nop; nop; nop;			\
+-	ba,a,pt	%xcc, user_rtt_fill_fixup;		\
+-	ba,a,pt	%xcc, user_rtt_fill_fixup;		\
++	ba,a,pt	%xcc, user_rtt_fill_fixup_dax;		\
++	ba,a,pt	%xcc, user_rtt_fill_fixup_mna;		\
+ 	ba,a,pt	%xcc, user_rtt_fill_fixup;
+ 
+ 
+@@ -652,8 +652,8 @@ user_rtt_fill_32bit:					\
+ 	 restored;					\
+ 	nop; nop; nop; nop; nop;			\
+ 	nop; nop; nop;					\
+-	ba,a,pt	%xcc, user_rtt_fill_fixup;		\
+-	ba,a,pt	%xcc, user_rtt_fill_fixup;		\
++	ba,a,pt	%xcc, user_rtt_fill_fixup_dax;		\
++	ba,a,pt	%xcc, user_rtt_fill_fixup_mna;		\
+ 	ba,a,pt	%xcc, user_rtt_fill_fixup;
+ 
+ 
+--- a/arch/sparc/kernel/Makefile
++++ b/arch/sparc/kernel/Makefile
+@@ -21,6 +21,7 @@ CFLAGS_REMOVE_perf_event.o := -pg
+ CFLAGS_REMOVE_pcr.o := -pg
+ endif
+ 
++obj-$(CONFIG_SPARC64)   += urtt_fill.o
+ obj-$(CONFIG_SPARC32)   += entry.o wof.o wuf.o
+ obj-$(CONFIG_SPARC32)   += etrap_32.o
+ obj-$(CONFIG_SPARC32)   += rtrap_32.o
+--- a/arch/sparc/kernel/rtrap_64.S
++++ b/arch/sparc/kernel/rtrap_64.S
+@@ -14,10 +14,6 @@
+ #include <asm/visasm.h>
+ #include <asm/processor.h>
+ 
+-#define		RTRAP_PSTATE		(PSTATE_TSO|PSTATE_PEF|PSTATE_PRIV|PSTATE_IE)
+-#define		RTRAP_PSTATE_IRQOFF	(PSTATE_TSO|PSTATE_PEF|PSTATE_PRIV)
+-#define		RTRAP_PSTATE_AG_IRQOFF	(PSTATE_TSO|PSTATE_PEF|PSTATE_PRIV|PSTATE_AG)
+-
+ #ifdef CONFIG_CONTEXT_TRACKING
+ # define SCHEDULE_USER schedule_user
+ #else
+@@ -242,52 +238,17 @@ rt_continue:	ldx			[%sp + PTREGS_OFF + P
+ 		 wrpr			%g1, %cwp
+ 		ba,a,pt			%xcc, user_rtt_fill_64bit
+ 
+-user_rtt_fill_fixup:
+-		rdpr	%cwp, %g1
+-		add	%g1, 1, %g1
+-		wrpr	%g1, 0x0, %cwp
+-
+-		rdpr	%wstate, %g2
+-		sll	%g2, 3, %g2
+-		wrpr	%g2, 0x0, %wstate
+-
+-		/* We know %canrestore and %otherwin are both zero.  */
+-
+-		sethi	%hi(sparc64_kern_pri_context), %g2
+-		ldx	[%g2 + %lo(sparc64_kern_pri_context)], %g2
+-		mov	PRIMARY_CONTEXT, %g1
+-
+-661:		stxa	%g2, [%g1] ASI_DMMU
+-		.section .sun4v_1insn_patch, "ax"
+-		.word	661b
+-		stxa	%g2, [%g1] ASI_MMU
+-		.previous
+-
+-		sethi	%hi(KERNBASE), %g1
+-		flush	%g1
++user_rtt_fill_fixup_dax:
++		ba,pt	%xcc, user_rtt_fill_fixup_common
++		 mov	1, %g3
++
++user_rtt_fill_fixup_mna:
++		ba,pt	%xcc, user_rtt_fill_fixup_common
++		 mov	2, %g3
+ 
+-		or	%g4, FAULT_CODE_WINFIXUP, %g4
+-		stb	%g4, [%g6 + TI_FAULT_CODE]
+-		stx	%g5, [%g6 + TI_FAULT_ADDR]
+-
+-		mov	%g6, %l1
+-		wrpr	%g0, 0x0, %tl
+-
+-661:		nop
+-		.section		.sun4v_1insn_patch, "ax"
+-		.word			661b
+-		SET_GL(0)
+-		.previous
+-
+-		wrpr	%g0, RTRAP_PSTATE, %pstate
+-
+-		mov	%l1, %g6
+-		ldx	[%g6 + TI_TASK], %g4
+-		LOAD_PER_CPU_BASE(%g5, %g6, %g1, %g2, %g3)
+-		call	do_sparc64_fault
+-		 add	%sp, PTREGS_OFF, %o0
+-		ba,pt	%xcc, rtrap
+-		 nop
++user_rtt_fill_fixup:
++		ba,pt	%xcc, user_rtt_fill_fixup_common
++		 clr	%g3
+ 
+ user_rtt_pre_restore:
+ 		add			%g1, 1, %g1
+--- a/arch/sparc/kernel/signal32.c
++++ b/arch/sparc/kernel/signal32.c
+@@ -138,12 +138,24 @@ int copy_siginfo_from_user32(siginfo_t *
+ 	return 0;
+ }
+ 
++/* Checks if the fp is valid.  We always build signal frames which are
++ * 16-byte aligned, therefore we can always enforce that the restore
++ * frame has that property as well.
++ */
++static bool invalid_frame_pointer(void __user *fp, int fplen)
++{
++	if ((((unsigned long) fp) & 15) ||
++	    ((unsigned long)fp) > 0x100000000ULL - fplen)
++		return true;
++	return false;
++}
++
+ void do_sigreturn32(struct pt_regs *regs)
+ {
+ 	struct signal_frame32 __user *sf;
+ 	compat_uptr_t fpu_save;
+ 	compat_uptr_t rwin_save;
+-	unsigned int psr;
++	unsigned int psr, ufp;
+ 	unsigned int pc, npc;
+ 	sigset_t set;
+ 	compat_sigset_t seta;
+@@ -158,11 +170,16 @@ void do_sigreturn32(struct pt_regs *regs
+ 	sf = (struct signal_frame32 __user *) regs->u_regs[UREG_FP];
+ 
+ 	/* 1. Make sure we are not getting garbage from the user */
+-	if (!access_ok(VERIFY_READ, sf, sizeof(*sf)) ||
+-	    (((unsigned long) sf) & 3))
++	if (invalid_frame_pointer(sf, sizeof(*sf)))
++		goto segv;
++
++	if (get_user(ufp, &sf->info.si_regs.u_regs[UREG_FP]))
++		goto segv;
++
++	if (ufp & 0x7)
+ 		goto segv;
+ 
+-	if (get_user(pc, &sf->info.si_regs.pc) ||
++	if (__get_user(pc, &sf->info.si_regs.pc) ||
+ 	    __get_user(npc, &sf->info.si_regs.npc))
+ 		goto segv;
+ 
+@@ -227,7 +244,7 @@ segv:
+ asmlinkage void do_rt_sigreturn32(struct pt_regs *regs)
+ {
+ 	struct rt_signal_frame32 __user *sf;
+-	unsigned int psr, pc, npc;
++	unsigned int psr, pc, npc, ufp;
+ 	compat_uptr_t fpu_save;
+ 	compat_uptr_t rwin_save;
+ 	sigset_t set;
+@@ -242,11 +259,16 @@ asmlinkage void do_rt_sigreturn32(struct
+ 	sf = (struct rt_signal_frame32 __user *) regs->u_regs[UREG_FP];
+ 
+ 	/* 1. Make sure we are not getting garbage from the user */
+-	if (!access_ok(VERIFY_READ, sf, sizeof(*sf)) ||
+-	    (((unsigned long) sf) & 3))
++	if (invalid_frame_pointer(sf, sizeof(*sf)))
+ 		goto segv;
+ 
+-	if (get_user(pc, &sf->regs.pc) || 
++	if (get_user(ufp, &sf->regs.u_regs[UREG_FP]))
++		goto segv;
++
++	if (ufp & 0x7)
++		goto segv;
++
++	if (__get_user(pc, &sf->regs.pc) ||
+ 	    __get_user(npc, &sf->regs.npc))
+ 		goto segv;
+ 
+@@ -307,14 +329,6 @@ segv:
+ 	force_sig(SIGSEGV, current);
+ }
+ 
+-/* Checks if the fp is valid */
+-static int invalid_frame_pointer(void __user *fp, int fplen)
+-{
+-	if ((((unsigned long) fp) & 7) || ((unsigned long)fp) > 0x100000000ULL - fplen)
+-		return 1;
+-	return 0;
+-}
+-
+ static void __user *get_sigframe(struct ksignal *ksig, struct pt_regs *regs, unsigned long framesize)
+ {
+ 	unsigned long sp;
+--- a/arch/sparc/kernel/signal_32.c
++++ b/arch/sparc/kernel/signal_32.c
+@@ -60,10 +60,22 @@ struct rt_signal_frame {
+ #define SF_ALIGNEDSZ  (((sizeof(struct signal_frame) + 7) & (~7)))
+ #define RT_ALIGNEDSZ  (((sizeof(struct rt_signal_frame) + 7) & (~7)))
+ 
++/* Checks if the fp is valid.  We always build signal frames which are
++ * 16-byte aligned, therefore we can always enforce that the restore
++ * frame has that property as well.
++ */
++static inline bool invalid_frame_pointer(void __user *fp, int fplen)
++{
++	if ((((unsigned long) fp) & 15) || !__access_ok((unsigned long)fp, fplen))
++		return true;
++
++	return false;
++}
++
+ asmlinkage void do_sigreturn(struct pt_regs *regs)
+ {
++	unsigned long up_psr, pc, npc, ufp;
+ 	struct signal_frame __user *sf;
+-	unsigned long up_psr, pc, npc;
+ 	sigset_t set;
+ 	__siginfo_fpu_t __user *fpu_save;
+ 	__siginfo_rwin_t __user *rwin_save;
+@@ -77,10 +89,13 @@ asmlinkage void do_sigreturn(struct pt_r
+ 	sf = (struct signal_frame __user *) regs->u_regs[UREG_FP];
+ 
+ 	/* 1. Make sure we are not getting garbage from the user */
+-	if (!access_ok(VERIFY_READ, sf, sizeof(*sf)))
++	if (!invalid_frame_pointer(sf, sizeof(*sf)))
+ 		goto segv_and_exit;
+ 
+-	if (((unsigned long) sf) & 3)
++	if (get_user(ufp, &sf->info.si_regs.u_regs[UREG_FP]))
++		goto segv_and_exit;
++
++	if (ufp & 0x7)
+ 		goto segv_and_exit;
+ 
+ 	err = __get_user(pc,  &sf->info.si_regs.pc);
+@@ -127,7 +142,7 @@ segv_and_exit:
+ asmlinkage void do_rt_sigreturn(struct pt_regs *regs)
+ {
+ 	struct rt_signal_frame __user *sf;
+-	unsigned int psr, pc, npc;
++	unsigned int psr, pc, npc, ufp;
+ 	__siginfo_fpu_t __user *fpu_save;
+ 	__siginfo_rwin_t __user *rwin_save;
+ 	sigset_t set;
+@@ -135,8 +150,13 @@ asmlinkage void do_rt_sigreturn(struct p
+ 
+ 	synchronize_user_stack();
+ 	sf = (struct rt_signal_frame __user *) regs->u_regs[UREG_FP];
+-	if (!access_ok(VERIFY_READ, sf, sizeof(*sf)) ||
+-	    (((unsigned long) sf) & 0x03))
++	if (!invalid_frame_pointer(sf, sizeof(*sf)))
++		goto segv;
++
++	if (get_user(ufp, &sf->regs.u_regs[UREG_FP]))
++		goto segv;
++
++	if (ufp & 0x7)
+ 		goto segv;
+ 
+ 	err = __get_user(pc, &sf->regs.pc);
+@@ -178,15 +198,6 @@ segv:
+ 	force_sig(SIGSEGV, current);
+ }
+ 
+-/* Checks if the fp is valid */
+-static inline int invalid_frame_pointer(void __user *fp, int fplen)
+-{
+-	if ((((unsigned long) fp) & 7) || !__access_ok((unsigned long)fp, fplen))
+-		return 1;
+-
+-	return 0;
+-}
+-
+ static inline void __user *get_sigframe(struct ksignal *ksig, struct pt_regs *regs, unsigned long framesize)
+ {
+ 	unsigned long sp = regs->u_regs[UREG_FP];
+--- a/arch/sparc/kernel/signal_64.c
++++ b/arch/sparc/kernel/signal_64.c
+@@ -234,6 +234,17 @@ do_sigsegv:
+ 	goto out;
+ }
+ 
++/* Checks if the fp is valid.  We always build rt signal frames which
++ * are 16-byte aligned, therefore we can always enforce that the
++ * restore frame has that property as well.
++ */
++static bool invalid_frame_pointer(void __user *fp)
++{
++	if (((unsigned long) fp) & 15)
++		return true;
++	return false;
++}
++
+ struct rt_signal_frame {
+ 	struct sparc_stackf	ss;
+ 	siginfo_t		info;
+@@ -246,8 +257,8 @@ struct rt_signal_frame {
+ 
+ void do_rt_sigreturn(struct pt_regs *regs)
+ {
++	unsigned long tpc, tnpc, tstate, ufp;
+ 	struct rt_signal_frame __user *sf;
+-	unsigned long tpc, tnpc, tstate;
+ 	__siginfo_fpu_t __user *fpu_save;
+ 	__siginfo_rwin_t __user *rwin_save;
+ 	sigset_t set;
+@@ -261,10 +272,16 @@ void do_rt_sigreturn(struct pt_regs *reg
+ 		(regs->u_regs [UREG_FP] + STACK_BIAS);
+ 
+ 	/* 1. Make sure we are not getting garbage from the user */
+-	if (((unsigned long) sf) & 3)
++	if (invalid_frame_pointer(sf))
++		goto segv;
++
++	if (get_user(ufp, &sf->regs.u_regs[UREG_FP]))
+ 		goto segv;
+ 
+-	err = get_user(tpc, &sf->regs.tpc);
++	if ((ufp + STACK_BIAS) & 0x7)
++		goto segv;
++
++	err = __get_user(tpc, &sf->regs.tpc);
+ 	err |= __get_user(tnpc, &sf->regs.tnpc);
+ 	if (test_thread_flag(TIF_32BIT)) {
+ 		tpc &= 0xffffffff;
+@@ -308,14 +325,6 @@ segv:
+ 	force_sig(SIGSEGV, current);
+ }
+ 
+-/* Checks if the fp is valid */
+-static int invalid_frame_pointer(void __user *fp)
+-{
+-	if (((unsigned long) fp) & 15)
+-		return 1;
+-	return 0;
+-}
+-
+ static inline void __user *get_sigframe(struct ksignal *ksig, struct pt_regs *regs, unsigned long framesize)
+ {
+ 	unsigned long sp = regs->u_regs[UREG_FP] + STACK_BIAS;
+--- a/arch/sparc/kernel/sigutil_32.c
++++ b/arch/sparc/kernel/sigutil_32.c
+@@ -48,6 +48,10 @@ int save_fpu_state(struct pt_regs *regs,
+ int restore_fpu_state(struct pt_regs *regs, __siginfo_fpu_t __user *fpu)
+ {
+ 	int err;
++
++	if (((unsigned long) fpu) & 3)
++		return -EFAULT;
++
+ #ifdef CONFIG_SMP
+ 	if (test_tsk_thread_flag(current, TIF_USEDFPU))
+ 		regs->psr &= ~PSR_EF;
+@@ -97,7 +101,10 @@ int restore_rwin_state(__siginfo_rwin_t
+ 	struct thread_info *t = current_thread_info();
+ 	int i, wsaved, err;
+ 
+-	__get_user(wsaved, &rp->wsaved);
++	if (((unsigned long) rp) & 3)
++		return -EFAULT;
++
++	get_user(wsaved, &rp->wsaved);
+ 	if (wsaved > NSWINS)
+ 		return -EFAULT;
+ 
+--- a/arch/sparc/kernel/sigutil_64.c
++++ b/arch/sparc/kernel/sigutil_64.c
+@@ -37,7 +37,10 @@ int restore_fpu_state(struct pt_regs *re
+ 	unsigned long fprs;
+ 	int err;
+ 
+-	err = __get_user(fprs, &fpu->si_fprs);
++	if (((unsigned long) fpu) & 7)
++		return -EFAULT;
++
++	err = get_user(fprs, &fpu->si_fprs);
+ 	fprs_write(0);
+ 	regs->tstate &= ~TSTATE_PEF;
+ 	if (fprs & FPRS_DL)
+@@ -72,7 +75,10 @@ int restore_rwin_state(__siginfo_rwin_t
+ 	struct thread_info *t = current_thread_info();
+ 	int i, wsaved, err;
+ 
+-	__get_user(wsaved, &rp->wsaved);
++	if (((unsigned long) rp) & 7)
++		return -EFAULT;
++
++	get_user(wsaved, &rp->wsaved);
+ 	if (wsaved > NSWINS)
+ 		return -EFAULT;
+ 
+--- /dev/null
++++ b/arch/sparc/kernel/urtt_fill.S
+@@ -0,0 +1,98 @@
++#include <asm/thread_info.h>
++#include <asm/trap_block.h>
++#include <asm/spitfire.h>
++#include <asm/ptrace.h>
++#include <asm/head.h>
++
++		.text
++		.align	8
++		.globl	user_rtt_fill_fixup_common
++user_rtt_fill_fixup_common:
++		rdpr	%cwp, %g1
++		add	%g1, 1, %g1
++		wrpr	%g1, 0x0, %cwp
++
++		rdpr	%wstate, %g2
++		sll	%g2, 3, %g2
++		wrpr	%g2, 0x0, %wstate
++
++		/* We know %canrestore and %otherwin are both zero.  */
++
++		sethi	%hi(sparc64_kern_pri_context), %g2
++		ldx	[%g2 + %lo(sparc64_kern_pri_context)], %g2
++		mov	PRIMARY_CONTEXT, %g1
++
++661:		stxa	%g2, [%g1] ASI_DMMU
++		.section .sun4v_1insn_patch, "ax"
++		.word	661b
++		stxa	%g2, [%g1] ASI_MMU
++		.previous
++
++		sethi	%hi(KERNBASE), %g1
++		flush	%g1
++
++		mov	%g4, %l4
++		mov	%g5, %l5
++		brnz,pn	%g3, 1f
++		 mov	%g3, %l3
++
++		or	%g4, FAULT_CODE_WINFIXUP, %g4
++		stb	%g4, [%g6 + TI_FAULT_CODE]
++		stx	%g5, [%g6 + TI_FAULT_ADDR]
++1:
++		mov	%g6, %l1
++		wrpr	%g0, 0x0, %tl
++
++661:		nop
++		.section		.sun4v_1insn_patch, "ax"
++		.word			661b
++		SET_GL(0)
++		.previous
++
++		wrpr	%g0, RTRAP_PSTATE, %pstate
++
++		mov	%l1, %g6
++		ldx	[%g6 + TI_TASK], %g4
++		LOAD_PER_CPU_BASE(%g5, %g6, %g1, %g2, %g3)
++
++		brnz,pn	%l3, 1f
++		 nop
++
++		call	do_sparc64_fault
++		 add	%sp, PTREGS_OFF, %o0
++		ba,pt	%xcc, rtrap
++		 nop
++
++1:		cmp	%g3, 2
++		bne,pn	%xcc, 2f
++		 nop
++
++		sethi	%hi(tlb_type), %g1
++		lduw	[%g1 + %lo(tlb_type)], %g1
++		cmp	%g1, 3
++		bne,pt	%icc, 1f
++		 add	%sp, PTREGS_OFF, %o0
++		mov	%l4, %o2
++		call	sun4v_do_mna
++		 mov	%l5, %o1
++		ba,a,pt	%xcc, rtrap
++1:		mov	%l4, %o1
++		mov	%l5, %o2
++		call	mem_address_unaligned
++		 nop
++		ba,a,pt	%xcc, rtrap
++
++2:		sethi	%hi(tlb_type), %g1
++		mov	%l4, %o1
++		lduw	[%g1 + %lo(tlb_type)], %g1
++		mov	%l5, %o2
++		cmp	%g1, 3
++		bne,pt	%icc, 1f
++		 add	%sp, PTREGS_OFF, %o0
++		call	sun4v_data_access_exception
++		 nop
++		ba,a,pt	%xcc, rtrap
++
++1:		call	spitfire_data_access_exception
++		 nop
++		ba,a,pt	%xcc, rtrap
+--- a/arch/sparc/mm/hugetlbpage.c
++++ b/arch/sparc/mm/hugetlbpage.c
+@@ -176,17 +176,31 @@ void set_huge_pte_at(struct mm_struct *m
+ 		     pte_t *ptep, pte_t entry)
+ {
+ 	int i;
++	pte_t orig[2];
++	unsigned long nptes;
+ 
+ 	if (!pte_present(*ptep) && pte_present(entry))
+ 		mm->context.huge_pte_count++;
+ 
+ 	addr &= HPAGE_MASK;
+-	for (i = 0; i < (1 << HUGETLB_PAGE_ORDER); i++) {
+-		set_pte_at(mm, addr, ptep, entry);
++
++	nptes = 1 << HUGETLB_PAGE_ORDER;
++	orig[0] = *ptep;
++	orig[1] = *(ptep + nptes / 2);
++	for (i = 0; i < nptes; i++) {
++		*ptep = entry;
+ 		ptep++;
+ 		addr += PAGE_SIZE;
+ 		pte_val(entry) += PAGE_SIZE;
+ 	}
++
++	/* Issue TLB flush at REAL_HPAGE_SIZE boundaries */
++	addr -= REAL_HPAGE_SIZE;
++	ptep -= nptes / 2;
++	maybe_tlb_batch_add(mm, addr, ptep, orig[1], 0);
++	addr -= REAL_HPAGE_SIZE;
++	ptep -= nptes / 2;
++	maybe_tlb_batch_add(mm, addr, ptep, orig[0], 0);
+ }
+ 
+ pte_t huge_ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
+@@ -194,19 +208,28 @@ pte_t huge_ptep_get_and_clear(struct mm_
+ {
+ 	pte_t entry;
+ 	int i;
++	unsigned long nptes;
+ 
+ 	entry = *ptep;
+ 	if (pte_present(entry))
+ 		mm->context.huge_pte_count--;
+ 
+ 	addr &= HPAGE_MASK;
+-
+-	for (i = 0; i < (1 << HUGETLB_PAGE_ORDER); i++) {
+-		pte_clear(mm, addr, ptep);
++	nptes = 1 << HUGETLB_PAGE_ORDER;
++	for (i = 0; i < nptes; i++) {
++		*ptep = __pte(0UL);
+ 		addr += PAGE_SIZE;
+ 		ptep++;
+ 	}
+ 
++	/* Issue TLB flush at REAL_HPAGE_SIZE boundaries */
++	addr -= REAL_HPAGE_SIZE;
++	ptep -= nptes / 2;
++	maybe_tlb_batch_add(mm, addr, ptep, entry, 0);
++	addr -= REAL_HPAGE_SIZE;
++	ptep -= nptes / 2;
++	maybe_tlb_batch_add(mm, addr, ptep, entry, 0);
++
+ 	return entry;
+ }
+ 
+--- a/arch/sparc/mm/init_64.c
++++ b/arch/sparc/mm/init_64.c
+@@ -324,18 +324,6 @@ static void __update_mmu_tsb_insert(stru
+ 	tsb_insert(tsb, tag, tte);
+ }
+ 
+-#if defined(CONFIG_HUGETLB_PAGE) || defined(CONFIG_TRANSPARENT_HUGEPAGE)
+-static inline bool is_hugetlb_pte(pte_t pte)
+-{
+-	if ((tlb_type == hypervisor &&
+-	     (pte_val(pte) & _PAGE_SZALL_4V) == _PAGE_SZHUGE_4V) ||
+-	    (tlb_type != hypervisor &&
+-	     (pte_val(pte) & _PAGE_SZALL_4U) == _PAGE_SZHUGE_4U))
+-		return true;
+-	return false;
+-}
+-#endif
+-
+ void update_mmu_cache(struct vm_area_struct *vma, unsigned long address, pte_t *ptep)
+ {
+ 	struct mm_struct *mm;
+@@ -2836,9 +2824,10 @@ void hugetlb_setup(struct pt_regs *regs)
+ 	 * the Data-TLB for huge pages.
+ 	 */
+ 	if (tlb_type == cheetah_plus) {
++		bool need_context_reload = false;
+ 		unsigned long ctx;
+ 
+-		spin_lock(&ctx_alloc_lock);
++		spin_lock_irq(&ctx_alloc_lock);
+ 		ctx = mm->context.sparc64_ctx_val;
+ 		ctx &= ~CTX_PGSZ_MASK;
+ 		ctx |= CTX_PGSZ_BASE << CTX_PGSZ0_SHIFT;
+@@ -2857,9 +2846,12 @@ void hugetlb_setup(struct pt_regs *regs)
+ 			 * also executing in this address space.
+ 			 */
+ 			mm->context.sparc64_ctx_val = ctx;
+-			on_each_cpu(context_reload, mm, 0);
++			need_context_reload = true;
+ 		}
+-		spin_unlock(&ctx_alloc_lock);
++		spin_unlock_irq(&ctx_alloc_lock);
++
++		if (need_context_reload)
++			on_each_cpu(context_reload, mm, 0);
+ 	}
+ }
+ #endif
+--- a/arch/sparc/mm/tlb.c
++++ b/arch/sparc/mm/tlb.c
+@@ -67,7 +67,7 @@ void arch_leave_lazy_mmu_mode(void)
+ }
+ 
+ static void tlb_batch_add_one(struct mm_struct *mm, unsigned long vaddr,
+-			      bool exec)
++			      bool exec, bool huge)
+ {
+ 	struct tlb_batch *tb = &get_cpu_var(tlb_batch);
+ 	unsigned long nr;
+@@ -84,13 +84,21 @@ static void tlb_batch_add_one(struct mm_
+ 	}
+ 
+ 	if (!tb->active) {
+-		flush_tsb_user_page(mm, vaddr);
++		flush_tsb_user_page(mm, vaddr, huge);
+ 		global_flush_tlb_page(mm, vaddr);
+ 		goto out;
+ 	}
+ 
+-	if (nr == 0)
++	if (nr == 0) {
+ 		tb->mm = mm;
++		tb->huge = huge;
++	}
++
++	if (tb->huge != huge) {
++		flush_tlb_pending();
++		tb->huge = huge;
++		nr = 0;
++	}
+ 
+ 	tb->vaddrs[nr] = vaddr;
+ 	tb->tlb_nr = ++nr;
+@@ -104,6 +112,8 @@ out:
+ void tlb_batch_add(struct mm_struct *mm, unsigned long vaddr,
+ 		   pte_t *ptep, pte_t orig, int fullmm)
+ {
++	bool huge = is_hugetlb_pte(orig);
++
+ 	if (tlb_type != hypervisor &&
+ 	    pte_dirty(orig)) {
+ 		unsigned long paddr, pfn = pte_pfn(orig);
+@@ -129,7 +139,7 @@ void tlb_batch_add(struct mm_struct *mm,
+ 
+ no_cache_flush:
+ 	if (!fullmm)
+-		tlb_batch_add_one(mm, vaddr, pte_exec(orig));
++		tlb_batch_add_one(mm, vaddr, pte_exec(orig), huge);
+ }
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+@@ -145,7 +155,7 @@ static void tlb_batch_pmd_scan(struct mm
+ 		if (pte_val(*pte) & _PAGE_VALID) {
+ 			bool exec = pte_exec(*pte);
+ 
+-			tlb_batch_add_one(mm, vaddr, exec);
++			tlb_batch_add_one(mm, vaddr, exec, false);
+ 		}
+ 		pte++;
+ 		vaddr += PAGE_SIZE;
+@@ -185,8 +195,9 @@ void set_pmd_at(struct mm_struct *mm, un
+ 			pte_t orig_pte = __pte(pmd_val(orig));
+ 			bool exec = pte_exec(orig_pte);
+ 
+-			tlb_batch_add_one(mm, addr, exec);
+-			tlb_batch_add_one(mm, addr + REAL_HPAGE_SIZE, exec);
++			tlb_batch_add_one(mm, addr, exec, true);
++			tlb_batch_add_one(mm, addr + REAL_HPAGE_SIZE, exec,
++					true);
+ 		} else {
+ 			tlb_batch_pmd_scan(mm, addr, orig);
+ 		}
+--- a/arch/sparc/mm/tsb.c
++++ b/arch/sparc/mm/tsb.c
+@@ -76,14 +76,15 @@ void flush_tsb_user(struct tlb_batch *tb
+ 
+ 	spin_lock_irqsave(&mm->context.lock, flags);
+ 
+-	base = (unsigned long) mm->context.tsb_block[MM_TSB_BASE].tsb;
+-	nentries = mm->context.tsb_block[MM_TSB_BASE].tsb_nentries;
+-	if (tlb_type == cheetah_plus || tlb_type == hypervisor)
+-		base = __pa(base);
+-	__flush_tsb_one(tb, PAGE_SHIFT, base, nentries);
+-
++	if (!tb->huge) {
++		base = (unsigned long) mm->context.tsb_block[MM_TSB_BASE].tsb;
++		nentries = mm->context.tsb_block[MM_TSB_BASE].tsb_nentries;
++		if (tlb_type == cheetah_plus || tlb_type == hypervisor)
++			base = __pa(base);
++		__flush_tsb_one(tb, PAGE_SHIFT, base, nentries);
++	}
+ #if defined(CONFIG_HUGETLB_PAGE) || defined(CONFIG_TRANSPARENT_HUGEPAGE)
+-	if (mm->context.tsb_block[MM_TSB_HUGE].tsb) {
++	if (tb->huge && mm->context.tsb_block[MM_TSB_HUGE].tsb) {
+ 		base = (unsigned long) mm->context.tsb_block[MM_TSB_HUGE].tsb;
+ 		nentries = mm->context.tsb_block[MM_TSB_HUGE].tsb_nentries;
+ 		if (tlb_type == cheetah_plus || tlb_type == hypervisor)
+@@ -94,20 +95,21 @@ void flush_tsb_user(struct tlb_batch *tb
+ 	spin_unlock_irqrestore(&mm->context.lock, flags);
+ }
+ 
+-void flush_tsb_user_page(struct mm_struct *mm, unsigned long vaddr)
++void flush_tsb_user_page(struct mm_struct *mm, unsigned long vaddr, bool huge)
+ {
+ 	unsigned long nentries, base, flags;
+ 
+ 	spin_lock_irqsave(&mm->context.lock, flags);
+ 
+-	base = (unsigned long) mm->context.tsb_block[MM_TSB_BASE].tsb;
+-	nentries = mm->context.tsb_block[MM_TSB_BASE].tsb_nentries;
+-	if (tlb_type == cheetah_plus || tlb_type == hypervisor)
+-		base = __pa(base);
+-	__flush_tsb_one_entry(base, vaddr, PAGE_SHIFT, nentries);
+-
++	if (!huge) {
++		base = (unsigned long) mm->context.tsb_block[MM_TSB_BASE].tsb;
++		nentries = mm->context.tsb_block[MM_TSB_BASE].tsb_nentries;
++		if (tlb_type == cheetah_plus || tlb_type == hypervisor)
++			base = __pa(base);
++		__flush_tsb_one_entry(base, vaddr, PAGE_SHIFT, nentries);
++	}
+ #if defined(CONFIG_HUGETLB_PAGE) || defined(CONFIG_TRANSPARENT_HUGEPAGE)
+-	if (mm->context.tsb_block[MM_TSB_HUGE].tsb) {
++	if (huge && mm->context.tsb_block[MM_TSB_HUGE].tsb) {
+ 		base = (unsigned long) mm->context.tsb_block[MM_TSB_HUGE].tsb;
+ 		nentries = mm->context.tsb_block[MM_TSB_HUGE].tsb_nentries;
+ 		if (tlb_type == cheetah_plus || tlb_type == hypervisor)
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -95,6 +95,12 @@ static inline void cond_local_irq_disabl
+ 		local_irq_disable();
+ }
+ 
++/*
++ * In IST context, we explicitly disable preemption.  This serves two
++ * purposes: it makes it much less likely that we would accidentally
++ * schedule in IST context and it will force a warning if we somehow
++ * manage to schedule by accident.
++ */
+ void ist_enter(struct pt_regs *regs)
+ {
+ 	if (user_mode(regs)) {
+@@ -109,13 +115,7 @@ void ist_enter(struct pt_regs *regs)
+ 		rcu_nmi_enter();
+ 	}
+ 
+-	/*
+-	 * We are atomic because we're on the IST stack; or we're on
+-	 * x86_32, in which case we still shouldn't schedule; or we're
+-	 * on x86_64 and entered from user mode, in which case we're
+-	 * still atomic unless ist_begin_non_atomic is called.
+-	 */
+-	preempt_count_add(HARDIRQ_OFFSET);
++	preempt_disable();
+ 
+ 	/* This code is a bit fragile.  Test it. */
+ 	RCU_LOCKDEP_WARN(!rcu_is_watching(), "ist_enter didn't work");
+@@ -123,7 +123,7 @@ void ist_enter(struct pt_regs *regs)
+ 
+ void ist_exit(struct pt_regs *regs)
+ {
+-	preempt_count_sub(HARDIRQ_OFFSET);
++	preempt_enable_no_resched();
+ 
+ 	if (!user_mode(regs))
+ 		rcu_nmi_exit();
+@@ -154,7 +154,7 @@ void ist_begin_non_atomic(struct pt_regs
+ 	BUG_ON((unsigned long)(current_top_of_stack() -
+ 			       current_stack_pointer()) >= THREAD_SIZE);
+ 
+-	preempt_count_sub(HARDIRQ_OFFSET);
++	preempt_enable_no_resched();
+ }
+ 
+ /**
+@@ -164,7 +164,7 @@ void ist_begin_non_atomic(struct pt_regs
+  */
+ void ist_end_non_atomic(void)
+ {
+-	preempt_count_add(HARDIRQ_OFFSET);
++	preempt_disable();
+ }
+ 
+ static nokprobe_inline int
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3032,6 +3032,11 @@ static int kvm_vcpu_ioctl_x86_set_debugr
+ 	if (dbgregs->flags)
+ 		return -EINVAL;
+ 
++	if (dbgregs->dr6 & ~0xffffffffull)
++		return -EINVAL;
++	if (dbgregs->dr7 & ~0xffffffffull)
++		return -EINVAL;
++
+ 	memcpy(vcpu->arch.db, dbgregs->db, sizeof(vcpu->arch.db));
+ 	kvm_update_dr0123(vcpu);
+ 	vcpu->arch.dr6 = dbgregs->dr6;
+--- a/crypto/asymmetric_keys/Kconfig
++++ b/crypto/asymmetric_keys/Kconfig
+@@ -13,6 +13,7 @@ config ASYMMETRIC_PUBLIC_KEY_SUBTYPE
+ 	tristate "Asymmetric public-key crypto algorithm subtype"
+ 	select MPILIB
+ 	select CRYPTO_HASH_INFO
++	select CRYPTO_AKCIPHER
+ 	help
+ 	  This option provides support for asymmetric public key type handling.
+ 	  If signature generation and/or verification are to be used,
+--- a/drivers/crypto/ccp/ccp-crypto-aes-xts.c
++++ b/drivers/crypto/ccp/ccp-crypto-aes-xts.c
+@@ -122,6 +122,7 @@ static int ccp_aes_xts_crypt(struct ablk
+ 	struct ccp_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
+ 	struct ccp_aes_req_ctx *rctx = ablkcipher_request_ctx(req);
+ 	unsigned int unit;
++	u32 unit_size;
+ 	int ret;
+ 
+ 	if (!ctx->u.aes.key_len)
+@@ -133,11 +134,17 @@ static int ccp_aes_xts_crypt(struct ablk
+ 	if (!req->info)
+ 		return -EINVAL;
+ 
+-	for (unit = 0; unit < ARRAY_SIZE(unit_size_map); unit++)
+-		if (!(req->nbytes & (unit_size_map[unit].size - 1)))
+-			break;
++	unit_size = CCP_XTS_AES_UNIT_SIZE__LAST;
++	if (req->nbytes <= unit_size_map[0].size) {
++		for (unit = 0; unit < ARRAY_SIZE(unit_size_map); unit++) {
++			if (!(req->nbytes & (unit_size_map[unit].size - 1))) {
++				unit_size = unit_size_map[unit].value;
++				break;
++			}
++		}
++	}
+ 
+-	if ((unit_size_map[unit].value == CCP_XTS_AES_UNIT_SIZE__LAST) ||
++	if ((unit_size == CCP_XTS_AES_UNIT_SIZE__LAST) ||
+ 	    (ctx->u.aes.key_len != AES_KEYSIZE_128)) {
+ 		/* Use the fallback to process the request for any
+ 		 * unsupported unit sizes or key sizes
+@@ -158,7 +165,7 @@ static int ccp_aes_xts_crypt(struct ablk
+ 	rctx->cmd.engine = CCP_ENGINE_XTS_AES_128;
+ 	rctx->cmd.u.xts.action = (encrypt) ? CCP_AES_ACTION_ENCRYPT
+ 					   : CCP_AES_ACTION_DECRYPT;
+-	rctx->cmd.u.xts.unit_size = unit_size_map[unit].value;
++	rctx->cmd.u.xts.unit_size = unit_size;
+ 	rctx->cmd.u.xts.key = &ctx->u.aes.key_sg;
+ 	rctx->cmd.u.xts.key_len = ctx->u.aes.key_len;
+ 	rctx->cmd.u.xts.iv = &rctx->iv_sg;
+--- a/drivers/gpio/gpio-bcm-kona.c
++++ b/drivers/gpio/gpio-bcm-kona.c
+@@ -546,11 +546,11 @@ static void bcm_kona_gpio_reset(struct b
+ 	/* disable interrupts and clear status */
+ 	for (i = 0; i < kona_gpio->num_bank; i++) {
+ 		/* Unlock the entire bank first */
+-		bcm_kona_gpio_write_lock_regs(kona_gpio, i, UNLOCK_CODE);
++		bcm_kona_gpio_write_lock_regs(reg_base, i, UNLOCK_CODE);
+ 		writel(0xffffffff, reg_base + GPIO_INT_MASK(i));
+ 		writel(0xffffffff, reg_base + GPIO_INT_STATUS(i));
+ 		/* Now re-lock the bank */
+-		bcm_kona_gpio_write_lock_regs(kona_gpio, i, LOCK_CODE);
++		bcm_kona_gpio_write_lock_regs(reg_base, i, LOCK_CODE);
+ 	}
+ }
+ 
+--- a/drivers/gpio/gpio-zynq.c
++++ b/drivers/gpio/gpio-zynq.c
+@@ -709,11 +709,17 @@ static int zynq_gpio_probe(struct platfo
+ 		dev_err(&pdev->dev, "input clock not found.\n");
+ 		return PTR_ERR(gpio->clk);
+ 	}
++	ret = clk_prepare_enable(gpio->clk);
++	if (ret) {
++		dev_err(&pdev->dev, "Unable to enable clock.\n");
++		return ret;
++	}
+ 
++	pm_runtime_set_active(&pdev->dev);
+ 	pm_runtime_enable(&pdev->dev);
+ 	ret = pm_runtime_get_sync(&pdev->dev);
+ 	if (ret < 0)
+-		return ret;
++		goto err_pm_dis;
+ 
+ 	/* report a bug if gpio chip registration fails */
+ 	ret = gpiochip_add_data(chip, gpio);
+@@ -745,6 +751,9 @@ err_rm_gpiochip:
+ 	gpiochip_remove(chip);
+ err_pm_put:
+ 	pm_runtime_put(&pdev->dev);
++err_pm_dis:
++	pm_runtime_disable(&pdev->dev);
++	clk_disable_unprepare(gpio->clk);
+ 
+ 	return ret;
+ }
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@ -438,7 +438,6 @@ static void gpiodevice_release(struct de
+ {
+ 	struct gpio_device *gdev = dev_get_drvdata(dev);
+ 
+-	cdev_del(&gdev->chrdev);
+ 	list_del(&gdev->list);
+ 	ida_simple_remove(&gpio_ida, gdev->id);
+ 	kfree(gdev->label);
+@@ -471,7 +470,6 @@ static int gpiochip_setup_dev(struct gpi
+ 
+ 	/* From this point, the .release() function cleans up gpio_device */
+ 	gdev->dev.release = gpiodevice_release;
+-	get_device(&gdev->dev);
+ 	pr_debug("%s: registered GPIOs %d to %d on device: %s (%s)\n",
+ 		 __func__, gdev->base, gdev->base + gdev->ngpio - 1,
+ 		 dev_name(&gdev->dev), gdev->chip->label ? : "generic");
+@@ -742,6 +740,8 @@ void gpiochip_remove(struct gpio_chip *c
+ 	 * be removed, else it will be dangling until the last user is
+ 	 * gone.
+ 	 */
++	cdev_del(&gdev->chrdev);
++	device_del(&gdev->dev);
+ 	put_device(&gdev->dev);
+ }
+ EXPORT_SYMBOL_GPL(gpiochip_remove);
+@@ -841,7 +841,7 @@ struct gpio_chip *gpiochip_find(void *da
+ 
+ 	spin_lock_irqsave(&gpio_lock, flags);
+ 	list_for_each_entry(gdev, &gpio_devices, list)
+-		if (match(gdev->chip, data))
++		if (gdev->chip && match(gdev->chip, data))
+ 			break;
+ 
+ 	/* No match? */
+@@ -1339,10 +1339,13 @@ done:
+ /*
+  * This descriptor validation needs to be inserted verbatim into each
+  * function taking a descriptor, so we need to use a preprocessor
+- * macro to avoid endless duplication.
++ * macro to avoid endless duplication. If the desc is NULL it is an
++ * optional GPIO and calls should just bail out.
+  */
+ #define VALIDATE_DESC(desc) do { \
+-	if (!desc || !desc->gdev) { \
++	if (!desc) \
++		return 0; \
++	if (!desc->gdev) { \
+ 		pr_warn("%s: invalid GPIO\n", __func__); \
+ 		return -EINVAL; \
+ 	} \
+@@ -1353,7 +1356,9 @@ done:
+ 	} } while (0)
+ 
+ #define VALIDATE_DESC_VOID(desc) do { \
+-	if (!desc || !desc->gdev) { \
++	if (!desc) \
++		return; \
++	if (!desc->gdev) { \
+ 		pr_warn("%s: invalid GPIO\n", __func__); \
+ 		return; \
+ 	} \
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -3434,6 +3434,24 @@ int drm_mode_addfb2(struct drm_device *d
+ 	return 0;
+ }
+ 
++struct drm_mode_rmfb_work {
++	struct work_struct work;
++	struct list_head fbs;
++};
++
++static void drm_mode_rmfb_work_fn(struct work_struct *w)
++{
++	struct drm_mode_rmfb_work *arg = container_of(w, typeof(*arg), work);
++
++	while (!list_empty(&arg->fbs)) {
++		struct drm_framebuffer *fb =
++			list_first_entry(&arg->fbs, typeof(*fb), filp_head);
++
++		list_del_init(&fb->filp_head);
++		drm_framebuffer_remove(fb);
++	}
++}
++
+ /**
+  * drm_mode_rmfb - remove an FB from the configuration
+  * @dev: drm device for the ioctl
+@@ -3474,7 +3492,25 @@ int drm_mode_rmfb(struct drm_device *dev
+ 	mutex_unlock(&dev->mode_config.fb_lock);
+ 	mutex_unlock(&file_priv->fbs_lock);
+ 
+-	drm_framebuffer_unreference(fb);
++	/*
++	 * we now own the reference that was stored in the fbs list
++	 *
++	 * drm_framebuffer_remove may fail with -EINTR on pending signals,
++	 * so run this in a separate stack as there's no way to correctly
++	 * handle this after the fb is already removed from the lookup table.
++	 */
++	if (atomic_read(&fb->refcount.refcount) > 1) {
++		struct drm_mode_rmfb_work arg;
++
++		INIT_WORK_ONSTACK(&arg.work, drm_mode_rmfb_work_fn);
++		INIT_LIST_HEAD(&arg.fbs);
++		list_add_tail(&fb->filp_head, &arg.fbs);
++
++		schedule_work(&arg.work);
++		flush_work(&arg.work);
++		destroy_work_on_stack(&arg.work);
++	} else
++		drm_framebuffer_unreference(fb);
+ 
+ 	return 0;
+ 
+@@ -3627,7 +3663,6 @@ out_err1:
+ 	return ret;
+ }
+ 
+-
+ /**
+  * drm_fb_release - remove and free the FBs on this file
+  * @priv: drm file for the ioctl
+@@ -3642,6 +3677,9 @@ out_err1:
+ void drm_fb_release(struct drm_file *priv)
+ {
+ 	struct drm_framebuffer *fb, *tfb;
++	struct drm_mode_rmfb_work arg;
++
++	INIT_LIST_HEAD(&arg.fbs);
+ 
+ 	/*
+ 	 * When the file gets released that means no one else can access the fb
+@@ -3654,10 +3692,22 @@ void drm_fb_release(struct drm_file *pri
+ 	 * at it any more.
+ 	 */
+ 	list_for_each_entry_safe(fb, tfb, &priv->fbs, filp_head) {
+-		list_del_init(&fb->filp_head);
++		if (atomic_read(&fb->refcount.refcount) > 1) {
++			list_move_tail(&fb->filp_head, &arg.fbs);
++		} else {
++			list_del_init(&fb->filp_head);
+ 
+-		/* This drops the fpriv->fbs reference. */
+-		drm_framebuffer_unreference(fb);
++			/* This drops the fpriv->fbs reference. */
++			drm_framebuffer_unreference(fb);
++		}
++	}
++
++	if (!list_empty(&arg.fbs)) {
++		INIT_WORK_ONSTACK(&arg.work, drm_mode_rmfb_work_fn);
++
++		schedule_work(&arg.work);
++		flush_work(&arg.work);
++		destroy_work_on_stack(&arg.work);
+ 	}
+ }
+ 
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1829,7 +1829,7 @@ static irqreturn_t cherryview_irq_handle
+ 	/* IRQs are synced during runtime_suspend, we don't require a wakeref */
+ 	disable_rpm_wakeref_asserts(dev_priv);
+ 
+-	do {
++	for (;;) {
+ 		master_ctl = I915_READ(GEN8_MASTER_IRQ) & ~GEN8_MASTER_IRQ_CONTROL;
+ 		iir = I915_READ(VLV_IIR);
+ 
+@@ -1857,7 +1857,7 @@ static irqreturn_t cherryview_irq_handle
+ 
+ 		I915_WRITE(GEN8_MASTER_IRQ, DE_MASTER_IRQ_CONTROL);
+ 		POSTING_READ(GEN8_MASTER_IRQ);
+-	} while (0);
++	}
+ 
+ 	enable_rpm_wakeref_asserts(dev_priv);
+ 
+--- a/drivers/net/ethernet/atheros/alx/alx.h
++++ b/drivers/net/ethernet/atheros/alx/alx.h
+@@ -96,6 +96,10 @@ struct alx_priv {
+ 	unsigned int rx_ringsz;
+ 	unsigned int rxbuf_size;
+ 
++	struct page  *rx_page;
++	unsigned int rx_page_offset;
++	unsigned int rx_frag_size;
++
+ 	struct napi_struct napi;
+ 	struct alx_tx_queue txq;
+ 	struct alx_rx_queue rxq;
+--- a/drivers/net/ethernet/atheros/alx/main.c
++++ b/drivers/net/ethernet/atheros/alx/main.c
+@@ -70,6 +70,35 @@ static void alx_free_txbuf(struct alx_pr
+ 	}
+ }
+ 
++static struct sk_buff *alx_alloc_skb(struct alx_priv *alx, gfp_t gfp)
++{
++	struct sk_buff *skb;
++	struct page *page;
++
++	if (alx->rx_frag_size > PAGE_SIZE)
++		return __netdev_alloc_skb(alx->dev, alx->rxbuf_size, gfp);
++
++	page = alx->rx_page;
++	if (!page) {
++		alx->rx_page = page = alloc_page(gfp);
++		if (unlikely(!page))
++			return NULL;
++		alx->rx_page_offset = 0;
++	}
++
++	skb = build_skb(page_address(page) + alx->rx_page_offset,
++			alx->rx_frag_size);
++	if (likely(skb)) {
++		alx->rx_page_offset += alx->rx_frag_size;
++		if (alx->rx_page_offset >= PAGE_SIZE)
++			alx->rx_page = NULL;
++		else
++			get_page(page);
++	}
++	return skb;
++}
++
++
+ static int alx_refill_rx_ring(struct alx_priv *alx, gfp_t gfp)
+ {
+ 	struct alx_rx_queue *rxq = &alx->rxq;
+@@ -86,7 +115,7 @@ static int alx_refill_rx_ring(struct alx
+ 	while (!cur_buf->skb && next != rxq->read_idx) {
+ 		struct alx_rfd *rfd = &rxq->rfd[cur];
+ 
+-		skb = __netdev_alloc_skb(alx->dev, alx->rxbuf_size, gfp);
++		skb = alx_alloc_skb(alx, gfp);
+ 		if (!skb)
+ 			break;
+ 		dma = dma_map_single(&alx->hw.pdev->dev,
+@@ -124,6 +153,7 @@ static int alx_refill_rx_ring(struct alx
+ 		alx_write_mem16(&alx->hw, ALX_RFD_PIDX, cur);
+ 	}
+ 
++
+ 	return count;
+ }
+ 
+@@ -592,6 +622,11 @@ static void alx_free_rings(struct alx_pr
+ 	kfree(alx->txq.bufs);
+ 	kfree(alx->rxq.bufs);
+ 
++	if (alx->rx_page) {
++		put_page(alx->rx_page);
++		alx->rx_page = NULL;
++	}
++
+ 	dma_free_coherent(&alx->hw.pdev->dev,
+ 			  alx->descmem.size,
+ 			  alx->descmem.virt,
+@@ -646,6 +681,7 @@ static int alx_request_irq(struct alx_pr
+ 				  alx->dev->name, alx);
+ 		if (!err)
+ 			goto out;
++
+ 		/* fall back to legacy interrupt */
+ 		pci_disable_msi(alx->hw.pdev);
+ 	}
+@@ -689,6 +725,7 @@ static int alx_init_sw(struct alx_priv *
+ 	struct pci_dev *pdev = alx->hw.pdev;
+ 	struct alx_hw *hw = &alx->hw;
+ 	int err;
++	unsigned int head_size;
+ 
+ 	err = alx_identify_hw(alx);
+ 	if (err) {
+@@ -704,7 +741,12 @@ static int alx_init_sw(struct alx_priv *
+ 
+ 	hw->smb_timer = 400;
+ 	hw->mtu = alx->dev->mtu;
++
+ 	alx->rxbuf_size = ALX_MAX_FRAME_LEN(hw->mtu);
++	head_size = SKB_DATA_ALIGN(alx->rxbuf_size + NET_SKB_PAD) +
++		    SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++	alx->rx_frag_size = roundup_pow_of_two(head_size);
++
+ 	alx->tx_ringsz = 256;
+ 	alx->rx_ringsz = 512;
+ 	hw->imt = 200;
+@@ -806,6 +848,7 @@ static int alx_change_mtu(struct net_dev
+ {
+ 	struct alx_priv *alx = netdev_priv(netdev);
+ 	int max_frame = ALX_MAX_FRAME_LEN(mtu);
++	unsigned int head_size;
+ 
+ 	if ((max_frame < ALX_MIN_FRAME_SIZE) ||
+ 	    (max_frame > ALX_MAX_FRAME_SIZE))
+@@ -817,6 +860,9 @@ static int alx_change_mtu(struct net_dev
+ 	netdev->mtu = mtu;
+ 	alx->hw.mtu = mtu;
+ 	alx->rxbuf_size = max(max_frame, ALX_DEF_RXBUF_SIZE);
++	head_size = SKB_DATA_ALIGN(alx->rxbuf_size + NET_SKB_PAD) +
++		    SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++	alx->rx_frag_size = roundup_pow_of_two(head_size);
+ 	netdev_update_features(netdev);
+ 	if (netif_running(netdev))
+ 		alx_reinit(alx);
+--- a/drivers/net/ethernet/ezchip/nps_enet.c
++++ b/drivers/net/ethernet/ezchip/nps_enet.c
+@@ -205,8 +205,10 @@ static int nps_enet_poll(struct napi_str
+ 		 * re-adding ourselves to the poll list.
+ 		 */
+ 
+-		if (priv->tx_skb && !tx_ctrl_ct)
++		if (priv->tx_skb && !tx_ctrl_ct) {
++			nps_enet_reg_set(priv, NPS_ENET_REG_BUF_INT_ENABLE, 0);
+ 			napi_reschedule(napi);
++		}
+ 	}
+ 
+ 	return work_done;
+--- a/drivers/net/ethernet/marvell/mvneta_bm.c
++++ b/drivers/net/ethernet/marvell/mvneta_bm.c
+@@ -189,6 +189,7 @@ struct mvneta_bm_pool *mvneta_bm_pool_us
+ 			SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+ 		hwbm_pool->construct = mvneta_bm_construct;
+ 		hwbm_pool->priv = new_pool;
++		spin_lock_init(&hwbm_pool->lock);
+ 
+ 		/* Create new pool */
+ 		err = mvneta_bm_pool_create(priv, new_pool);
+--- a/drivers/net/ethernet/rocker/rocker_ofdpa.c
++++ b/drivers/net/ethernet/rocker/rocker_ofdpa.c
+@@ -2727,7 +2727,7 @@ static int ofdpa_port_obj_fib4_add(struc
+ 
+ 	return ofdpa_port_fib_ipv4(ofdpa_port, trans,
+ 				   htonl(fib4->dst), fib4->dst_len,
+-				   &fib4->fi, fib4->tb_id, 0);
++				   fib4->fi, fib4->tb_id, 0);
+ }
+ 
+ static int ofdpa_port_obj_fib4_del(struct rocker_port *rocker_port,
+@@ -2737,7 +2737,7 @@ static int ofdpa_port_obj_fib4_del(struc
+ 
+ 	return ofdpa_port_fib_ipv4(ofdpa_port, NULL,
+ 				   htonl(fib4->dst), fib4->dst_len,
+-				   &fib4->fi, fib4->tb_id,
++				   fib4->fi, fib4->tb_id,
+ 				   OFDPA_OP_FLAG_REMOVE);
+ }
+ 
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@ -619,6 +619,17 @@ fail:
+ 	return rc;
+ }
+ 
++static void efx_ef10_forget_old_piobufs(struct efx_nic *efx)
++{
++	struct efx_channel *channel;
++	struct efx_tx_queue *tx_queue;
++
++	/* All our existing PIO buffers went away */
++	efx_for_each_channel(channel, efx)
++		efx_for_each_channel_tx_queue(tx_queue, channel)
++			tx_queue->piobuf = NULL;
++}
++
+ #else /* !EFX_USE_PIO */
+ 
+ static int efx_ef10_alloc_piobufs(struct efx_nic *efx, unsigned int n)
+@@ -635,6 +646,10 @@ static void efx_ef10_free_piobufs(struct
+ {
+ }
+ 
++static void efx_ef10_forget_old_piobufs(struct efx_nic *efx)
++{
++}
++
+ #endif /* EFX_USE_PIO */
+ 
+ static void efx_ef10_remove(struct efx_nic *efx)
+@@ -1018,6 +1033,7 @@ static void efx_ef10_reset_mc_allocation
+ 	nic_data->must_realloc_vis = true;
+ 	nic_data->must_restore_filters = true;
+ 	nic_data->must_restore_piobufs = true;
++	efx_ef10_forget_old_piobufs(efx);
+ 	nic_data->rx_rss_context = EFX_EF10_RSS_CONTEXT_INVALID;
+ 
+ 	/* Driver-created vswitches and vports must be re-created */
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
+@@ -209,7 +209,7 @@ int stmmac_mdio_register(struct net_devi
+ 		return -ENOMEM;
+ 
+ 	if (mdio_bus_data->irqs)
+-		memcpy(new_bus->irq, mdio_bus_data, sizeof(new_bus->irq));
++		memcpy(new_bus->irq, mdio_bus_data->irqs, sizeof(new_bus->irq));
+ 
+ #ifdef CONFIG_OF
+ 	if (priv->device->of_node)
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@ -336,15 +336,15 @@ static int geneve_udp_encap_recv(struct
+ 
+ 	/* Need Geneve and inner Ethernet header to be present */
+ 	if (unlikely(!pskb_may_pull(skb, GENEVE_BASE_HLEN)))
+-		goto error;
++		goto drop;
+ 
+ 	/* Return packets with reserved bits set */
+ 	geneveh = geneve_hdr(skb);
+ 	if (unlikely(geneveh->ver != GENEVE_VER))
+-		goto error;
++		goto drop;
+ 
+ 	if (unlikely(geneveh->proto_type != htons(ETH_P_TEB)))
+-		goto error;
++		goto drop;
+ 
+ 	gs = rcu_dereference_sk_user_data(sk);
+ 	if (!gs)
+@@ -367,10 +367,6 @@ drop:
+ 	/* Consume bad packet */
+ 	kfree_skb(skb);
+ 	return 0;
+-
+-error:
+-	/* Let the UDP layer deal with the skb */
+-	return 1;
+ }
+ 
+ static struct socket *geneve_create_sock(struct net *net, bool ipv6,
+--- a/drivers/net/macsec.c
++++ b/drivers/net/macsec.c
+@@ -1645,7 +1645,7 @@ static int macsec_add_rxsa(struct sk_buf
+ 	if (tb_sa[MACSEC_SA_ATTR_ACTIVE])
+ 		rx_sa->active = !!nla_get_u8(tb_sa[MACSEC_SA_ATTR_ACTIVE]);
+ 
+-	nla_memcpy(rx_sa->key.id, tb_sa[MACSEC_SA_ATTR_KEY], MACSEC_KEYID_LEN);
++	nla_memcpy(rx_sa->key.id, tb_sa[MACSEC_SA_ATTR_KEYID], MACSEC_KEYID_LEN);
+ 	rx_sa->sc = rx_sc;
+ 	rcu_assign_pointer(rx_sc->sa[assoc_num], rx_sa);
+ 
+@@ -1784,7 +1784,7 @@ static int macsec_add_txsa(struct sk_buf
+ 		return -ENOMEM;
+ 	}
+ 
+-	nla_memcpy(tx_sa->key.id, tb_sa[MACSEC_SA_ATTR_KEY], MACSEC_KEYID_LEN);
++	nla_memcpy(tx_sa->key.id, tb_sa[MACSEC_SA_ATTR_KEYID], MACSEC_KEYID_LEN);
+ 
+ 	spin_lock_bh(&tx_sa->lock);
+ 	tx_sa->next_pn = nla_get_u32(tb_sa[MACSEC_SA_ATTR_PN]);
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -990,7 +990,7 @@ static void team_port_disable(struct tea
+ #define TEAM_ENC_FEATURES	(NETIF_F_HW_CSUM | NETIF_F_SG | \
+ 				 NETIF_F_RXCSUM | NETIF_F_ALL_TSO)
+ 
+-static void __team_compute_features(struct team *team)
++static void ___team_compute_features(struct team *team)
+ {
+ 	struct team_port *port;
+ 	u32 vlan_features = TEAM_VLAN_FEATURES & NETIF_F_ALL_FOR_ALL;
+@@ -1021,15 +1021,20 @@ static void __team_compute_features(stru
+ 	team->dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
+ 	if (dst_release_flag == (IFF_XMIT_DST_RELEASE | IFF_XMIT_DST_RELEASE_PERM))
+ 		team->dev->priv_flags |= IFF_XMIT_DST_RELEASE;
++}
+ 
++static void __team_compute_features(struct team *team)
++{
++	___team_compute_features(team);
+ 	netdev_change_features(team->dev);
+ }
+ 
+ static void team_compute_features(struct team *team)
+ {
+ 	mutex_lock(&team->lock);
+-	__team_compute_features(team);
++	___team_compute_features(team);
+ 	mutex_unlock(&team->lock);
++	netdev_change_features(team->dev);
+ }
+ 
+ static int team_port_enter(struct team *team, struct team_port *port)
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@ -568,11 +568,13 @@ static void tun_detach_all(struct net_de
+ 	for (i = 0; i < n; i++) {
+ 		tfile = rtnl_dereference(tun->tfiles[i]);
+ 		BUG_ON(!tfile);
++		tfile->socket.sk->sk_shutdown = RCV_SHUTDOWN;
+ 		tfile->socket.sk->sk_data_ready(tfile->socket.sk);
+ 		RCU_INIT_POINTER(tfile->tun, NULL);
+ 		--tun->numqueues;
+ 	}
+ 	list_for_each_entry(tfile, &tun->disabled, next) {
++		tfile->socket.sk->sk_shutdown = RCV_SHUTDOWN;
+ 		tfile->socket.sk->sk_data_ready(tfile->socket.sk);
+ 		RCU_INIT_POINTER(tfile->tun, NULL);
+ 	}
+@@ -628,6 +630,7 @@ static int tun_attach(struct tun_struct
+ 			goto out;
+ 	}
+ 	tfile->queue_index = tun->numqueues;
++	tfile->socket.sk->sk_shutdown &= ~RCV_SHUTDOWN;
+ 	rcu_assign_pointer(tfile->tun, tun);
+ 	rcu_assign_pointer(tun->tfiles[tun->numqueues], tfile);
+ 	tun->numqueues++;
+@@ -1425,9 +1428,6 @@ static ssize_t tun_do_read(struct tun_st
+ 	if (!iov_iter_count(to))
+ 		return 0;
+ 
+-	if (tun->dev->reg_state != NETREG_REGISTERED)
+-		return -EIO;
+-
+ 	/* Read frames from queue */
+ 	skb = __skb_recv_datagram(tfile->socket.sk, noblock ? MSG_DONTWAIT : 0,
+ 				  &peeked, &off, &err);
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -1262,7 +1262,7 @@ static int vxlan_rcv(struct sock *sk, st
+ 
+ 	/* Need Vxlan and inner Ethernet header to be present */
+ 	if (!pskb_may_pull(skb, VXLAN_HLEN))
+-		return 1;
++		goto drop;
+ 
+ 	unparsed = *vxlan_hdr(skb);
+ 	/* VNI flag always required to be set */
+@@ -1271,7 +1271,7 @@ static int vxlan_rcv(struct sock *sk, st
+ 			   ntohl(vxlan_hdr(skb)->vx_flags),
+ 			   ntohl(vxlan_hdr(skb)->vx_vni));
+ 		/* Return non vxlan pkt */
+-		return 1;
++		goto drop;
+ 	}
+ 	unparsed.vx_flags &= ~VXLAN_HF_VNI;
+ 	unparsed.vx_vni &= ~VXLAN_VNI_MASK;
+@@ -2959,6 +2959,9 @@ static int vxlan_newlink(struct net *src
+ 	if (data[IFLA_VXLAN_REMCSUM_NOPARTIAL])
+ 		conf.flags |= VXLAN_F_REMCSUM_NOPARTIAL;
+ 
++	if (tb[IFLA_MTU])
++		conf.mtu = nla_get_u32(tb[IFLA_MTU]);
++
+ 	err = vxlan_dev_configure(src_net, dev, &conf);
+ 	switch (err) {
+ 	case -ENODEV:
+--- a/drivers/perf/arm_pmu.c
++++ b/drivers/perf/arm_pmu.c
+@@ -987,9 +987,6 @@ int arm_pmu_device_probe(struct platform
+ 
+ 	armpmu_init(pmu);
+ 
+-	if (!__oprofile_cpu_pmu)
+-		__oprofile_cpu_pmu = pmu;
+-
+ 	pmu->plat_device = pdev;
+ 
+ 	if (node && (of_id = of_match_node(of_table, pdev->dev.of_node))) {
+@@ -1025,6 +1022,9 @@ int arm_pmu_device_probe(struct platform
+ 	if (ret)
+ 		goto out_destroy;
+ 
++	if (!__oprofile_cpu_pmu)
++		__oprofile_cpu_pmu = pmu;
++
+ 	pr_info("enabled with %s PMU driver, %d counters available\n",
+ 			pmu->name, pmu->num_events);
+ 
+--- a/drivers/pinctrl/mediatek/pinctrl-mtk-common.c
++++ b/drivers/pinctrl/mediatek/pinctrl-mtk-common.c
+@@ -1256,9 +1256,10 @@ static void mtk_eint_irq_handler(struct
+ 	const struct mtk_desc_pin *pin;
+ 
+ 	chained_irq_enter(chip, desc);
+-	for (eint_num = 0; eint_num < pctl->devdata->ap_num; eint_num += 32) {
++	for (eint_num = 0;
++	     eint_num < pctl->devdata->ap_num;
++	     eint_num += 32, reg += 4) {
+ 		status = readl(reg);
+-		reg += 4;
+ 		while (status) {
+ 			offset = __ffs(status);
+ 			index = eint_num + offset;
+--- a/drivers/scsi/scsi_devinfo.c
++++ b/drivers/scsi/scsi_devinfo.c
+@@ -230,6 +230,7 @@ static struct {
+ 	{"PIONEER", "CD-ROM DRM-624X", NULL, BLIST_FORCELUN | BLIST_SINGLELUN},
+ 	{"Promise", "VTrak E610f", NULL, BLIST_SPARSELUN | BLIST_NO_RSOC},
+ 	{"Promise", "", NULL, BLIST_SPARSELUN},
++	{"QEMU", "QEMU CD-ROM", NULL, BLIST_SKIP_VPD_PAGES},
+ 	{"QNAP", "iSCSI Storage", NULL, BLIST_MAX_1024},
+ 	{"SYNOLOGY", "iSCSI Storage", NULL, BLIST_MAX_1024},
+ 	{"QUANTUM", "XP34301", "1071", BLIST_NOTQ},
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -911,9 +911,12 @@ void scsi_io_completion(struct scsi_cmnd
+ 	}
+ 
+ 	/*
+-	 * If we finished all bytes in the request we are done now.
++	 * special case: failed zero length commands always need to
++	 * drop down into the retry code. Otherwise, if we finished
++	 * all bytes in the request we are done now.
+ 	 */
+-	if (!scsi_end_request(req, error, good_bytes, 0))
++	if (!(blk_rq_bytes(req) == 0 && error) &&
++	    !scsi_end_request(req, error, good_bytes, 0))
+ 		return;
+ 
+ 	/*
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1619,7 +1619,7 @@ struct dentry *d_alloc(struct dentry * p
+ 	struct dentry *dentry = __d_alloc(parent->d_sb, name);
+ 	if (!dentry)
+ 		return NULL;
+-
++	dentry->d_flags |= DCACHE_RCUACCESS;
+ 	spin_lock(&parent->d_lock);
+ 	/*
+ 	 * don't need child lock because it is not subject
+@@ -2338,7 +2338,6 @@ static void __d_rehash(struct dentry * e
+ {
+ 	BUG_ON(!d_unhashed(entry));
+ 	hlist_bl_lock(b);
+-	entry->d_flags |= DCACHE_RCUACCESS;
+ 	hlist_bl_add_head_rcu(&entry->d_hash, b);
+ 	hlist_bl_unlock(b);
+ }
+@@ -2637,6 +2636,7 @@ static void __d_move(struct dentry *dent
+ 	/* ... and switch them in the tree */
+ 	if (IS_ROOT(dentry)) {
+ 		/* splicing a tree */
++		dentry->d_flags |= DCACHE_RCUACCESS;
+ 		dentry->d_parent = target->d_parent;
+ 		target->d_parent = target;
+ 		list_del_init(&target->d_child);
+--- a/fs/ecryptfs/kthread.c
++++ b/fs/ecryptfs/kthread.c
+@@ -25,6 +25,7 @@
+ #include <linux/slab.h>
+ #include <linux/wait.h>
+ #include <linux/mount.h>
++#include <linux/file.h>
+ #include "ecryptfs_kernel.h"
+ 
+ struct ecryptfs_open_req {
+@@ -147,7 +148,7 @@ int ecryptfs_privileged_open(struct file
+ 	flags |= IS_RDONLY(d_inode(lower_dentry)) ? O_RDONLY : O_RDWR;
+ 	(*lower_file) = dentry_open(&req.path, flags, cred);
+ 	if (!IS_ERR(*lower_file))
+-		goto out;
++		goto have_file;
+ 	if ((flags & O_ACCMODE) == O_RDONLY) {
+ 		rc = PTR_ERR((*lower_file));
+ 		goto out;
+@@ -165,8 +166,16 @@ int ecryptfs_privileged_open(struct file
+ 	mutex_unlock(&ecryptfs_kthread_ctl.mux);
+ 	wake_up(&ecryptfs_kthread_ctl.wait);
+ 	wait_for_completion(&req.done);
+-	if (IS_ERR(*lower_file))
++	if (IS_ERR(*lower_file)) {
+ 		rc = PTR_ERR(*lower_file);
++		goto out;
++	}
++have_file:
++	if ((*lower_file)->f_op->mmap == NULL) {
++		fput(*lower_file);
++		*lower_file = NULL;
++		rc = -EMEDIUMTYPE;
++	}
+ out:
+ 	return rc;
+ }
+--- a/fs/proc/root.c
++++ b/fs/proc/root.c
+@@ -121,6 +121,13 @@ static struct dentry *proc_mount(struct
+ 	if (IS_ERR(sb))
+ 		return ERR_CAST(sb);
+ 
++	/*
++	 * procfs isn't actually a stacking filesystem; however, there is
++	 * too much magic going on inside it to permit stacking things on
++	 * top of it
++	 */
++	sb->s_stack_depth = FILESYSTEM_MAX_STACK_DEPTH;
++
+ 	if (!proc_parse_options(options, ns)) {
+ 		deactivate_locked_super(sb);
+ 		return ERR_PTR(-EINVAL);
+--- a/include/linux/irqchip/arm-gic-v3.h
++++ b/include/linux/irqchip/arm-gic-v3.h
+@@ -301,7 +301,7 @@
+ #define ICC_SGI1R_AFFINITY_1_SHIFT	16
+ #define ICC_SGI1R_AFFINITY_1_MASK	(0xff << ICC_SGI1R_AFFINITY_1_SHIFT)
+ #define ICC_SGI1R_SGI_ID_SHIFT		24
+-#define ICC_SGI1R_SGI_ID_MASK		(0xff << ICC_SGI1R_SGI_ID_SHIFT)
++#define ICC_SGI1R_SGI_ID_MASK		(0xfULL << ICC_SGI1R_SGI_ID_SHIFT)
+ #define ICC_SGI1R_AFFINITY_2_SHIFT	32
+ #define ICC_SGI1R_AFFINITY_2_MASK	(0xffULL << ICC_SGI1R_AFFINITY_1_SHIFT)
+ #define ICC_SGI1R_IRQ_ROUTING_MODE_BIT	40
+--- a/include/linux/netfilter/x_tables.h
++++ b/include/linux/netfilter/x_tables.h
+@@ -242,6 +242,10 @@ void xt_unregister_match(struct xt_match
+ int xt_register_matches(struct xt_match *match, unsigned int n);
+ void xt_unregister_matches(struct xt_match *match, unsigned int n);
+ 
++int xt_check_entry_offsets(const void *base, const char *elems,
++			   unsigned int target_offset,
++			   unsigned int next_offset);
++
+ int xt_check_match(struct xt_mtchk_param *, unsigned int size, u_int8_t proto,
+ 		   bool inv_proto);
+ int xt_check_target(struct xt_tgchk_param *, unsigned int size, u_int8_t proto,
+@@ -490,6 +494,9 @@ void xt_compat_target_from_user(struct x
+ 				unsigned int *size);
+ int xt_compat_target_to_user(const struct xt_entry_target *t,
+ 			     void __user **dstptr, unsigned int *size);
++int xt_compat_check_entry_offsets(const void *base, const char *elems,
++				  unsigned int target_offset,
++				  unsigned int next_offset);
+ 
+ #endif /* CONFIG_COMPAT */
+ #endif /* _X_TABLES_H */
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -97,7 +97,7 @@ struct switchdev_obj_ipv4_fib {
+ 	struct switchdev_obj obj;
+ 	u32 dst;
+ 	int dst_len;
+-	struct fib_info fi;
++	struct fib_info *fi;
+ 	u8 tos;
+ 	u8 type;
+ 	u32 nlflags;
+--- a/include/uapi/linux/libc-compat.h
++++ b/include/uapi/linux/libc-compat.h
+@@ -52,7 +52,7 @@
+ #if defined(__GLIBC__)
+ 
+ /* Coordinate with glibc net/if.h header. */
+-#if defined(_NET_IF_H)
++#if defined(_NET_IF_H) && defined(__USE_MISC)
+ 
+ /* GLIBC headers included first so don't define anything
+  * that would already be defined. */
+--- a/kernel/bpf/inode.c
++++ b/kernel/bpf/inode.c
+@@ -378,7 +378,7 @@ static int bpf_fill_super(struct super_b
+ static struct dentry *bpf_mount(struct file_system_type *type, int flags,
+ 				const char *dev_name, void *data)
+ {
+-	return mount_ns(type, flags, current->nsproxy->mnt_ns, bpf_fill_super);
++	return mount_nodev(type, flags, data, bpf_fill_super);
+ }
+ 
+ static struct file_system_type bpf_fs_type = {
+@@ -386,7 +386,6 @@ static struct file_system_type bpf_fs_ty
+ 	.name		= "bpf",
+ 	.mount		= bpf_mount,
+ 	.kill_sb	= kill_litter_super,
+-	.fs_flags	= FS_USERNS_MOUNT,
+ };
+ 
+ MODULE_ALIAS_FS("bpf");
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3047,7 +3047,8 @@ static noinline void __schedule_bug(stru
+ static inline void schedule_debug(struct task_struct *prev)
+ {
+ #ifdef CONFIG_SCHED_STACK_END_CHECK
+-	BUG_ON(task_stack_end_corrupted(prev));
++	if (task_stack_end_corrupted(prev))
++		panic("corrupted stack end detected inside scheduler\n");
+ #endif
+ 
+ 	if (unlikely(in_atomic_preempt_off())) {
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -194,7 +194,7 @@ static u64 bpf_perf_event_read(u64 r1, u
+ 	if (unlikely(index >= array->map.max_entries))
+ 		return -E2BIG;
+ 
+-	file = (struct file *)array->ptrs[index];
++	file = READ_ONCE(array->ptrs[index]);
+ 	if (unlikely(!file))
+ 		return -ENOENT;
+ 
+@@ -238,7 +238,7 @@ static u64 bpf_perf_event_output(u64 r1,
+ 	if (unlikely(index >= array->map.max_entries))
+ 		return -E2BIG;
+ 
+-	file = (struct file *)array->ptrs[index];
++	file = READ_ONCE(array->ptrs[index]);
+ 	if (unlikely(!file))
+ 		return -ENOENT;
+ 
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2877,6 +2877,7 @@ static void memcg_offline_kmem(struct me
+ 	 * ordering is imposed by list_lru_node->lock taken by
+ 	 * memcg_drain_all_list_lrus().
+ 	 */
++	rcu_read_lock(); /* can be called from css_free w/o cgroup_mutex */
+ 	css_for_each_descendant_pre(css, &memcg->css) {
+ 		child = mem_cgroup_from_css(css);
+ 		BUG_ON(child->kmemcg_id != kmemcg_id);
+@@ -2884,6 +2885,8 @@ static void memcg_offline_kmem(struct me
+ 		if (!memcg->use_hierarchy)
+ 			break;
+ 	}
++	rcu_read_unlock();
++
+ 	memcg_drain_all_list_lrus(kmemcg_id, parent->kmemcg_id);
+ 
+ 	memcg_free_cache_id(kmemcg_id);
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -252,7 +252,10 @@ static inline void free_swap_cache(struc
+ void free_page_and_swap_cache(struct page *page)
+ {
+ 	free_swap_cache(page);
+-	put_page(page);
++	if (is_huge_zero_page(page))
++		put_huge_zero_page();
++	else
++		put_page(page);
+ }
+ 
+ /*
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -279,6 +279,8 @@ void br_fdb_change_mac_address(struct ne
+ 	 * change from under us.
+ 	 */
+ 	list_for_each_entry(v, &vg->vlan_list, vlist) {
++		if (!br_vlan_should_use(v))
++			continue;
+ 		f = __br_fdb_get(br, br->dev->dev_addr, v->vid);
+ 		if (f && f->is_local && !f->dst)
+ 			fdb_delete_local(br, NULL, f);
+--- a/net/core/hwbm.c
++++ b/net/core/hwbm.c
+@@ -55,18 +55,21 @@ int hwbm_pool_add(struct hwbm_pool *bm_p
+ 	spin_lock_irqsave(&bm_pool->lock, flags);
+ 	if (bm_pool->buf_num == bm_pool->size) {
+ 		pr_warn("pool already filled\n");
++		spin_unlock_irqrestore(&bm_pool->lock, flags);
+ 		return bm_pool->buf_num;
+ 	}
+ 
+ 	if (buf_num + bm_pool->buf_num > bm_pool->size) {
+ 		pr_warn("cannot allocate %d buffers for pool\n",
+ 			buf_num);
++		spin_unlock_irqrestore(&bm_pool->lock, flags);
+ 		return 0;
+ 	}
+ 
+ 	if ((buf_num + bm_pool->buf_num) < bm_pool->buf_num) {
+ 		pr_warn("Adding %d buffers to the %d current buffers will overflow\n",
+ 			buf_num,  bm_pool->buf_num);
++		spin_unlock_irqrestore(&bm_pool->lock, flags);
+ 		return 0;
+ 	}
+ 
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -1660,6 +1660,14 @@ static __net_init int inet_init_net(stru
+ 	 */
+ 	net->ipv4.ping_group_range.range[0] = make_kgid(&init_user_ns, 1);
+ 	net->ipv4.ping_group_range.range[1] = make_kgid(&init_user_ns, 0);
++
++	/* Default values for sysctl-controlled parameters.
++	 * We set them here, in case sysctl is not compiled.
++	 */
++	net->ipv4.sysctl_ip_default_ttl = IPDEFTTL;
++	net->ipv4.sysctl_ip_dynaddr = 0;
++	net->ipv4.sysctl_ip_early_demux = 1;
++
+ 	return 0;
+ }
+ 
+--- a/net/ipv4/netfilter/arp_tables.c
++++ b/net/ipv4/netfilter/arp_tables.c
+@@ -367,6 +367,18 @@ static inline bool unconditional(const s
+ 	       memcmp(&e->arp, &uncond, sizeof(uncond)) == 0;
+ }
+ 
++static bool find_jump_target(const struct xt_table_info *t,
++			     const struct arpt_entry *target)
++{
++	struct arpt_entry *iter;
++
++	xt_entry_foreach(iter, t->entries, t->size) {
++		 if (iter == target)
++			return true;
++	}
++	return false;
++}
++
+ /* Figures out from what hook each rule can be called: returns 0 if
+  * there are loops.  Puts hook bitmask in comefrom.
+  */
+@@ -439,6 +451,8 @@ static int mark_source_chains(const stru
+ 				size = e->next_offset;
+ 				e = (struct arpt_entry *)
+ 					(entry0 + pos + size);
++				if (pos + size >= newinfo->size)
++					return 0;
+ 				e->counters.pcnt = pos;
+ 				pos += size;
+ 			} else {
+@@ -458,9 +472,15 @@ static int mark_source_chains(const stru
+ 					/* This a jump; chase it. */
+ 					duprintf("Jump rule %u -> %u\n",
+ 						 pos, newpos);
++					e = (struct arpt_entry *)
++						(entry0 + newpos);
++					if (!find_jump_target(newinfo, e))
++						return 0;
+ 				} else {
+ 					/* ... this is a fallthru */
+ 					newpos = pos + e->next_offset;
++					if (newpos >= newinfo->size)
++						return 0;
+ 				}
+ 				e = (struct arpt_entry *)
+ 					(entry0 + newpos);
+@@ -474,23 +494,6 @@ next:
+ 	return 1;
+ }
+ 
+-static inline int check_entry(const struct arpt_entry *e)
+-{
+-	const struct xt_entry_target *t;
+-
+-	if (!arp_checkentry(&e->arp))
+-		return -EINVAL;
+-
+-	if (e->target_offset + sizeof(struct xt_entry_target) > e->next_offset)
+-		return -EINVAL;
+-
+-	t = arpt_get_target_c(e);
+-	if (e->target_offset + t->u.target_size > e->next_offset)
+-		return -EINVAL;
+-
+-	return 0;
+-}
+-
+ static inline int check_target(struct arpt_entry *e, const char *name)
+ {
+ 	struct xt_entry_target *t = arpt_get_target(e);
+@@ -586,7 +589,11 @@ static inline int check_entry_size_and_h
+ 		return -EINVAL;
+ 	}
+ 
+-	err = check_entry(e);
++	if (!arp_checkentry(&e->arp))
++		return -EINVAL;
++
++	err = xt_check_entry_offsets(e, e->elems, e->target_offset,
++				     e->next_offset);
+ 	if (err)
+ 		return err;
+ 
+@@ -691,10 +698,8 @@ static int translate_table(struct xt_tab
+ 		}
+ 	}
+ 
+-	if (!mark_source_chains(newinfo, repl->valid_hooks, entry0)) {
+-		duprintf("Looping hook\n");
++	if (!mark_source_chains(newinfo, repl->valid_hooks, entry0))
+ 		return -ELOOP;
+-	}
+ 
+ 	/* Finally, each sanity check must pass */
+ 	i = 0;
+@@ -1247,8 +1252,11 @@ check_compat_entry_size_and_hooks(struct
+ 		return -EINVAL;
+ 	}
+ 
+-	/* For purposes of check_entry casting the compat entry is fine */
+-	ret = check_entry((struct arpt_entry *)e);
++	if (!arp_checkentry(&e->arp))
++		return -EINVAL;
++
++	ret = xt_compat_check_entry_offsets(e, e->elems, e->target_offset,
++					    e->next_offset);
+ 	if (ret)
+ 		return ret;
+ 
+--- a/net/ipv4/netfilter/ip_tables.c
++++ b/net/ipv4/netfilter/ip_tables.c
+@@ -443,6 +443,18 @@ ipt_do_table(struct sk_buff *skb,
+ #endif
+ }
+ 
++static bool find_jump_target(const struct xt_table_info *t,
++			     const struct ipt_entry *target)
++{
++	struct ipt_entry *iter;
++
++	xt_entry_foreach(iter, t->entries, t->size) {
++		 if (iter == target)
++			return true;
++	}
++	return false;
++}
++
+ /* Figures out from what hook each rule can be called: returns 0 if
+    there are loops.  Puts hook bitmask in comefrom. */
+ static int
+@@ -520,6 +532,8 @@ mark_source_chains(const struct xt_table
+ 				size = e->next_offset;
+ 				e = (struct ipt_entry *)
+ 					(entry0 + pos + size);
++				if (pos + size >= newinfo->size)
++					return 0;
+ 				e->counters.pcnt = pos;
+ 				pos += size;
+ 			} else {
+@@ -538,9 +552,15 @@ mark_source_chains(const struct xt_table
+ 					/* This a jump; chase it. */
+ 					duprintf("Jump rule %u -> %u\n",
+ 						 pos, newpos);
++					e = (struct ipt_entry *)
++						(entry0 + newpos);
++					if (!find_jump_target(newinfo, e))
++						return 0;
+ 				} else {
+ 					/* ... this is a fallthru */
+ 					newpos = pos + e->next_offset;
++					if (newpos >= newinfo->size)
++						return 0;
+ 				}
+ 				e = (struct ipt_entry *)
+ 					(entry0 + newpos);
+@@ -568,25 +588,6 @@ static void cleanup_match(struct xt_entr
+ }
+ 
+ static int
+-check_entry(const struct ipt_entry *e)
+-{
+-	const struct xt_entry_target *t;
+-
+-	if (!ip_checkentry(&e->ip))
+-		return -EINVAL;
+-
+-	if (e->target_offset + sizeof(struct xt_entry_target) >
+-	    e->next_offset)
+-		return -EINVAL;
+-
+-	t = ipt_get_target_c(e);
+-	if (e->target_offset + t->u.target_size > e->next_offset)
+-		return -EINVAL;
+-
+-	return 0;
+-}
+-
+-static int
+ check_match(struct xt_entry_match *m, struct xt_mtchk_param *par)
+ {
+ 	const struct ipt_ip *ip = par->entryinfo;
+@@ -750,7 +751,11 @@ check_entry_size_and_hooks(struct ipt_en
+ 		return -EINVAL;
+ 	}
+ 
+-	err = check_entry(e);
++	if (!ip_checkentry(&e->ip))
++		return -EINVAL;
++
++	err = xt_check_entry_offsets(e, e->elems, e->target_offset,
++				     e->next_offset);
+ 	if (err)
+ 		return err;
+ 
+@@ -1506,8 +1511,11 @@ check_compat_entry_size_and_hooks(struct
+ 		return -EINVAL;
+ 	}
+ 
+-	/* For purposes of check_entry casting the compat entry is fine */
+-	ret = check_entry((struct ipt_entry *)e);
++	if (!ip_checkentry(&e->ip))
++		return -EINVAL;
++
++	ret = xt_compat_check_entry_offsets(e, e->elems,
++					    e->target_offset, e->next_offset);
+ 	if (ret)
+ 		return ret;
+ 
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -988,10 +988,6 @@ static __net_init int ipv4_sysctl_init_n
+ 	if (!net->ipv4.sysctl_local_reserved_ports)
+ 		goto err_ports;
+ 
+-	net->ipv4.sysctl_ip_default_ttl = IPDEFTTL;
+-	net->ipv4.sysctl_ip_dynaddr = 0;
+-	net->ipv4.sysctl_ip_early_demux = 1;
+-
+ 	return 0;
+ 
+ err_ports:
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1616,7 +1616,7 @@ int udp_queue_rcv_skb(struct sock *sk, s
+ 
+ 		/* if we're overly short, let UDP handle it */
+ 		encap_rcv = ACCESS_ONCE(up->encap_rcv);
+-		if (skb->len > sizeof(struct udphdr) && encap_rcv) {
++		if (encap_rcv) {
+ 			int ret;
+ 
+ 			/* Verify checksum before giving to encap */
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -1071,17 +1071,12 @@ struct dst_entry *ip6_sk_dst_lookup_flow
+ 					 const struct in6_addr *final_dst)
+ {
+ 	struct dst_entry *dst = sk_dst_check(sk, inet6_sk(sk)->dst_cookie);
+-	int err;
+ 
+ 	dst = ip6_sk_dst_check(sk, dst, fl6);
++	if (!dst)
++		dst = ip6_dst_lookup_flow(sk, fl6, final_dst);
+ 
+-	err = ip6_dst_lookup_tail(sock_net(sk), sk, &dst, fl6);
+-	if (err)
+-		return ERR_PTR(err);
+-	if (final_dst)
+-		fl6->daddr = *final_dst;
+-
+-	return xfrm_lookup_route(sock_net(sk), dst, flowi6_to_flowi(fl6), sk, 0);
++	return dst;
+ }
+ EXPORT_SYMBOL_GPL(ip6_sk_dst_lookup_flow);
+ 
+--- a/net/ipv6/netfilter/ip6_tables.c
++++ b/net/ipv6/netfilter/ip6_tables.c
+@@ -455,6 +455,18 @@ ip6t_do_table(struct sk_buff *skb,
+ #endif
+ }
+ 
++static bool find_jump_target(const struct xt_table_info *t,
++			     const struct ip6t_entry *target)
++{
++	struct ip6t_entry *iter;
++
++	xt_entry_foreach(iter, t->entries, t->size) {
++		 if (iter == target)
++			return true;
++	}
++	return false;
++}
++
+ /* Figures out from what hook each rule can be called: returns 0 if
+    there are loops.  Puts hook bitmask in comefrom. */
+ static int
+@@ -532,6 +544,8 @@ mark_source_chains(const struct xt_table
+ 				size = e->next_offset;
+ 				e = (struct ip6t_entry *)
+ 					(entry0 + pos + size);
++				if (pos + size >= newinfo->size)
++					return 0;
+ 				e->counters.pcnt = pos;
+ 				pos += size;
+ 			} else {
+@@ -550,9 +564,15 @@ mark_source_chains(const struct xt_table
+ 					/* This a jump; chase it. */
+ 					duprintf("Jump rule %u -> %u\n",
+ 						 pos, newpos);
++					e = (struct ip6t_entry *)
++						(entry0 + newpos);
++					if (!find_jump_target(newinfo, e))
++						return 0;
+ 				} else {
+ 					/* ... this is a fallthru */
+ 					newpos = pos + e->next_offset;
++					if (newpos >= newinfo->size)
++						return 0;
+ 				}
+ 				e = (struct ip6t_entry *)
+ 					(entry0 + newpos);
+@@ -579,25 +599,6 @@ static void cleanup_match(struct xt_entr
+ 	module_put(par.match->me);
+ }
+ 
+-static int
+-check_entry(const struct ip6t_entry *e)
+-{
+-	const struct xt_entry_target *t;
+-
+-	if (!ip6_checkentry(&e->ipv6))
+-		return -EINVAL;
+-
+-	if (e->target_offset + sizeof(struct xt_entry_target) >
+-	    e->next_offset)
+-		return -EINVAL;
+-
+-	t = ip6t_get_target_c(e);
+-	if (e->target_offset + t->u.target_size > e->next_offset)
+-		return -EINVAL;
+-
+-	return 0;
+-}
+-
+ static int check_match(struct xt_entry_match *m, struct xt_mtchk_param *par)
+ {
+ 	const struct ip6t_ip6 *ipv6 = par->entryinfo;
+@@ -762,7 +763,11 @@ check_entry_size_and_hooks(struct ip6t_e
+ 		return -EINVAL;
+ 	}
+ 
+-	err = check_entry(e);
++	if (!ip6_checkentry(&e->ipv6))
++		return -EINVAL;
++
++	err = xt_check_entry_offsets(e, e->elems, e->target_offset,
++				     e->next_offset);
+ 	if (err)
+ 		return err;
+ 
+@@ -1518,8 +1523,11 @@ check_compat_entry_size_and_hooks(struct
+ 		return -EINVAL;
+ 	}
+ 
+-	/* For purposes of check_entry casting the compat entry is fine */
+-	ret = check_entry((struct ip6t_entry *)e);
++	if (!ip6_checkentry(&e->ipv6))
++		return -EINVAL;
++
++	ret = xt_compat_check_entry_offsets(e, e->elems,
++					    e->target_offset, e->next_offset);
+ 	if (ret)
+ 		return ret;
+ 
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -1717,7 +1717,9 @@ static void get_tcp6_sock(struct seq_fil
+ 	destp = ntohs(inet->inet_dport);
+ 	srcp  = ntohs(inet->inet_sport);
+ 
+-	if (icsk->icsk_pending == ICSK_TIME_RETRANS) {
++	if (icsk->icsk_pending == ICSK_TIME_RETRANS ||
++	    icsk->icsk_pending == ICSK_TIME_EARLY_RETRANS ||
++	    icsk->icsk_pending == ICSK_TIME_LOSS_PROBE) {
+ 		timer_active	= 1;
+ 		timer_expires	= icsk->icsk_timeout;
+ 	} else if (icsk->icsk_pending == ICSK_TIME_PROBE0) {
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -653,7 +653,7 @@ int udpv6_queue_rcv_skb(struct sock *sk,
+ 
+ 		/* if we're overly short, let UDP handle it */
+ 		encap_rcv = ACCESS_ONCE(up->encap_rcv);
+-		if (skb->len > sizeof(struct udphdr) && encap_rcv) {
++		if (encap_rcv) {
+ 			int ret;
+ 
+ 			/* Verify checksum before giving to encap */
+--- a/net/l2tp/l2tp_core.c
++++ b/net/l2tp/l2tp_core.c
+@@ -1581,7 +1581,7 @@ int l2tp_tunnel_create(struct net *net,
+ 	/* Mark socket as an encapsulation socket. See net/ipv4/udp.c */
+ 	tunnel->encap = encap;
+ 	if (encap == L2TP_ENCAPTYPE_UDP) {
+-		struct udp_tunnel_sock_cfg udp_cfg;
++		struct udp_tunnel_sock_cfg udp_cfg = { };
+ 
+ 		udp_cfg.sk_user_data = tunnel;
+ 		udp_cfg.encap_type = UDP_ENCAP_L2TPINUDP;
+--- a/net/netfilter/x_tables.c
++++ b/net/netfilter/x_tables.c
+@@ -416,6 +416,47 @@ int xt_check_match(struct xt_mtchk_param
+ }
+ EXPORT_SYMBOL_GPL(xt_check_match);
+ 
++/** xt_check_entry_match - check that matches end before start of target
++ *
++ * @match: beginning of xt_entry_match
++ * @target: beginning of this rules target (alleged end of matches)
++ * @alignment: alignment requirement of match structures
++ *
++ * Validates that all matches add up to the beginning of the target,
++ * and that each match covers at least the base structure size.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++static int xt_check_entry_match(const char *match, const char *target,
++				const size_t alignment)
++{
++	const struct xt_entry_match *pos;
++	int length = target - match;
++
++	if (length == 0) /* no matches */
++		return 0;
++
++	pos = (struct xt_entry_match *)match;
++	do {
++		if ((unsigned long)pos % alignment)
++			return -EINVAL;
++
++		if (length < (int)sizeof(struct xt_entry_match))
++			return -EINVAL;
++
++		if (pos->u.match_size < sizeof(struct xt_entry_match))
++			return -EINVAL;
++
++		if (pos->u.match_size > length)
++			return -EINVAL;
++
++		length -= pos->u.match_size;
++		pos = ((void *)((char *)(pos) + (pos)->u.match_size));
++	} while (length > 0);
++
++	return 0;
++}
++
+ #ifdef CONFIG_COMPAT
+ int xt_compat_add_offset(u_int8_t af, unsigned int offset, int delta)
+ {
+@@ -539,8 +580,125 @@ int xt_compat_match_to_user(const struct
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(xt_compat_match_to_user);
++
++/* non-compat version may have padding after verdict */
++struct compat_xt_standard_target {
++	struct compat_xt_entry_target t;
++	compat_uint_t verdict;
++};
++
++int xt_compat_check_entry_offsets(const void *base, const char *elems,
++				  unsigned int target_offset,
++				  unsigned int next_offset)
++{
++	long size_of_base_struct = elems - (const char *)base;
++	const struct compat_xt_entry_target *t;
++	const char *e = base;
++
++	if (target_offset < size_of_base_struct)
++		return -EINVAL;
++
++	if (target_offset + sizeof(*t) > next_offset)
++		return -EINVAL;
++
++	t = (void *)(e + target_offset);
++	if (t->u.target_size < sizeof(*t))
++		return -EINVAL;
++
++	if (target_offset + t->u.target_size > next_offset)
++		return -EINVAL;
++
++	if (strcmp(t->u.user.name, XT_STANDARD_TARGET) == 0 &&
++	    COMPAT_XT_ALIGN(target_offset + sizeof(struct compat_xt_standard_target)) != next_offset)
++		return -EINVAL;
++
++	/* compat_xt_entry match has less strict aligment requirements,
++	 * otherwise they are identical.  In case of padding differences
++	 * we need to add compat version of xt_check_entry_match.
++	 */
++	BUILD_BUG_ON(sizeof(struct compat_xt_entry_match) != sizeof(struct xt_entry_match));
++
++	return xt_check_entry_match(elems, base + target_offset,
++				    __alignof__(struct compat_xt_entry_match));
++}
++EXPORT_SYMBOL(xt_compat_check_entry_offsets);
+ #endif /* CONFIG_COMPAT */
+ 
++/**
++ * xt_check_entry_offsets - validate arp/ip/ip6t_entry
++ *
++ * @base: pointer to arp/ip/ip6t_entry
++ * @elems: pointer to first xt_entry_match, i.e. ip(6)t_entry->elems
++ * @target_offset: the arp/ip/ip6_t->target_offset
++ * @next_offset: the arp/ip/ip6_t->next_offset
++ *
++ * validates that target_offset and next_offset are sane and that all
++ * match sizes (if any) align with the target offset.
++ *
++ * This function does not validate the targets or matches themselves, it
++ * only tests that all the offsets and sizes are correct, that all
++ * match structures are aligned, and that the last structure ends where
++ * the target structure begins.
++ *
++ * Also see xt_compat_check_entry_offsets for CONFIG_COMPAT version.
++ *
++ * The arp/ip/ip6t_entry structure @base must have passed following tests:
++ * - it must point to a valid memory location
++ * - base to base + next_offset must be accessible, i.e. not exceed allocated
++ *   length.
++ *
++ * A well-formed entry looks like this:
++ *
++ * ip(6)t_entry   match [mtdata]  match [mtdata] target [tgdata] ip(6)t_entry
++ * e->elems[]-----'                              |               |
++ *                matchsize                      |               |
++ *                                matchsize      |               |
++ *                                               |               |
++ * target_offset---------------------------------'               |
++ * next_offset---------------------------------------------------'
++ *
++ * elems[]: flexible array member at end of ip(6)/arpt_entry struct.
++ *          This is where matches (if any) and the target reside.
++ * target_offset: beginning of target.
++ * next_offset: start of the next rule; also: size of this rule.
++ * Since targets have a minimum size, target_offset + minlen <= next_offset.
++ *
++ * Every match stores its size, sum of sizes must not exceed target_offset.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++int xt_check_entry_offsets(const void *base,
++			   const char *elems,
++			   unsigned int target_offset,
++			   unsigned int next_offset)
++{
++	long size_of_base_struct = elems - (const char *)base;
++	const struct xt_entry_target *t;
++	const char *e = base;
++
++	/* target start is within the ip/ip6/arpt_entry struct */
++	if (target_offset < size_of_base_struct)
++		return -EINVAL;
++
++	if (target_offset + sizeof(*t) > next_offset)
++		return -EINVAL;
++
++	t = (void *)(e + target_offset);
++	if (t->u.target_size < sizeof(*t))
++		return -EINVAL;
++
++	if (target_offset + t->u.target_size > next_offset)
++		return -EINVAL;
++
++	if (strcmp(t->u.user.name, XT_STANDARD_TARGET) == 0 &&
++	    XT_ALIGN(target_offset + sizeof(struct xt_standard_target)) != next_offset)
++		return -EINVAL;
++
++	return xt_check_entry_match(elems, base + target_offset,
++				    __alignof__(struct xt_entry_match));
++}
++EXPORT_SYMBOL(xt_check_entry_offsets);
++
+ int xt_check_target(struct xt_tgchk_param *par,
+ 		    unsigned int size, u_int8_t proto, bool inv_proto)
+ {
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -2059,6 +2059,7 @@ static int netlink_dump(struct sock *sk)
+ 	struct netlink_callback *cb;
+ 	struct sk_buff *skb = NULL;
+ 	struct nlmsghdr *nlh;
++	struct module *module;
+ 	int len, err = -ENOBUFS;
+ 	int alloc_min_size;
+ 	int alloc_size;
+@@ -2134,9 +2135,11 @@ static int netlink_dump(struct sock *sk)
+ 		cb->done(cb);
+ 
+ 	nlk->cb_running = false;
++	module = cb->module;
++	skb = cb->skb;
+ 	mutex_unlock(nlk->cb_mutex);
+-	module_put(cb->module);
+-	consume_skb(cb->skb);
++	module_put(module);
++	consume_skb(skb);
+ 	return 0;
+ 
+ errout_skb:
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@ -1188,6 +1188,7 @@ int switchdev_fib_ipv4_add(u32 dst, int
+ 		.obj.id = SWITCHDEV_OBJ_ID_IPV4_FIB,
+ 		.dst = dst,
+ 		.dst_len = dst_len,
++		.fi = fi,
+ 		.tos = tos,
+ 		.type = type,
+ 		.nlflags = nlflags,
+@@ -1196,8 +1197,6 @@ int switchdev_fib_ipv4_add(u32 dst, int
+ 	struct net_device *dev;
+ 	int err = 0;
+ 
+-	memcpy(&ipv4_fib.fi, fi, sizeof(ipv4_fib.fi));
+-
+ 	/* Don't offload route if using custom ip rules or if
+ 	 * IPv4 FIB offloading has been disabled completely.
+ 	 */
+@@ -1242,6 +1241,7 @@ int switchdev_fib_ipv4_del(u32 dst, int
+ 		.obj.id = SWITCHDEV_OBJ_ID_IPV4_FIB,
+ 		.dst = dst,
+ 		.dst_len = dst_len,
++		.fi = fi,
+ 		.tos = tos,
+ 		.type = type,
+ 		.nlflags = 0,
+@@ -1250,8 +1250,6 @@ int switchdev_fib_ipv4_del(u32 dst, int
+ 	struct net_device *dev;
+ 	int err = 0;
+ 
+-	memcpy(&ipv4_fib.fi, fi, sizeof(ipv4_fib.fi));
+-
+ 	if (!(fi->fib_flags & RTNH_F_OFFLOAD))
+ 		return 0;
+ 
+--- a/net/tipc/netlink_compat.c
++++ b/net/tipc/netlink_compat.c
+@@ -802,7 +802,7 @@ static int tipc_nl_compat_name_table_dum
+ 		goto out;
+ 
+ 	tipc_tlv_sprintf(msg->rep, "%-10u %s",
+-			 nla_get_u32(publ[TIPC_NLA_PUBL_REF]),
++			 nla_get_u32(publ[TIPC_NLA_PUBL_KEY]),
+ 			 scope_str[nla_get_u32(publ[TIPC_NLA_PUBL_SCOPE])]);
+ out:
+ 	tipc_tlv_sprintf(msg->rep, "\n");
+--- a/net/tipc/socket.c
++++ b/net/tipc/socket.c
+@@ -2807,6 +2807,9 @@ int tipc_nl_publ_dump(struct sk_buff *sk
+ 		if (err)
+ 			return err;
+ 
++		if (!attrs[TIPC_NLA_SOCK])
++			return -EINVAL;
++
+ 		err = nla_parse_nested(sock, TIPC_NLA_SOCK_MAX,
+ 				       attrs[TIPC_NLA_SOCK],
+ 				       tipc_nl_sock_policy);
+--- a/net/wireless/wext-core.c
++++ b/net/wireless/wext-core.c
+@@ -955,8 +955,29 @@ static int wireless_process_ioctl(struct
+ 			return private(dev, iwr, cmd, info, handler);
+ 	}
+ 	/* Old driver API : call driver ioctl handler */
+-	if (dev->netdev_ops->ndo_do_ioctl)
+-		return dev->netdev_ops->ndo_do_ioctl(dev, ifr, cmd);
++	if (dev->netdev_ops->ndo_do_ioctl) {
++#ifdef CONFIG_COMPAT
++		if (info->flags & IW_REQUEST_FLAG_COMPAT) {
++			int ret = 0;
++			struct iwreq iwr_lcl;
++			struct compat_iw_point *iwp_compat = (void *) &iwr->u.data;
++
++			memcpy(&iwr_lcl, iwr, sizeof(struct iwreq));
++			iwr_lcl.u.data.pointer = compat_ptr(iwp_compat->pointer);
++			iwr_lcl.u.data.length = iwp_compat->length;
++			iwr_lcl.u.data.flags = iwp_compat->flags;
++
++			ret = dev->netdev_ops->ndo_do_ioctl(dev, (void *) &iwr_lcl, cmd);
++
++			iwp_compat->pointer = ptr_to_compat(iwr_lcl.u.data.pointer);
++			iwp_compat->length = iwr_lcl.u.data.length;
++			iwp_compat->flags = iwr_lcl.u.data.flags;
++
++			return ret;
++		} else
++#endif
++			return dev->netdev_ops->ndo_do_ioctl(dev, ifr, cmd);
++	}
+ 	return -EOPNOTSUPP;
+ }
+ 
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@ -365,8 +365,11 @@ enum {
+ 
+ #define IS_SKL(pci) ((pci)->vendor == 0x8086 && (pci)->device == 0xa170)
+ #define IS_SKL_LP(pci) ((pci)->vendor == 0x8086 && (pci)->device == 0x9d70)
++#define IS_KBL(pci) ((pci)->vendor == 0x8086 && (pci)->device == 0xa171)
++#define IS_KBL_LP(pci) ((pci)->vendor == 0x8086 && (pci)->device == 0x9d71)
+ #define IS_BXT(pci) ((pci)->vendor == 0x8086 && (pci)->device == 0x5a98)
+-#define IS_SKL_PLUS(pci) (IS_SKL(pci) || IS_SKL_LP(pci) || IS_BXT(pci))
++#define IS_SKL_PLUS(pci) (IS_SKL(pci) || IS_SKL_LP(pci) || IS_BXT(pci)) || \
++			IS_KBL(pci) || IS_KBL_LP(pci)
+ 
+ static char *driver_short_names[] = {
+ 	[AZX_DRIVER_ICH] = "HDA Intel",
+@@ -2181,6 +2184,12 @@ static const struct pci_device_id azx_id
+ 	/* Sunrise Point-LP */
+ 	{ PCI_DEVICE(0x8086, 0x9d70),
+ 	  .driver_data = AZX_DRIVER_PCH | AZX_DCAPS_INTEL_SKYLAKE },
++	/* Kabylake */
++	{ PCI_DEVICE(0x8086, 0xa171),
++	  .driver_data = AZX_DRIVER_PCH | AZX_DCAPS_INTEL_SKYLAKE },
++	/* Kabylake-LP */
++	{ PCI_DEVICE(0x8086, 0x9d71),
++	  .driver_data = AZX_DRIVER_PCH | AZX_DCAPS_INTEL_SKYLAKE },
+ 	/* Broxton-P(Apollolake) */
+ 	{ PCI_DEVICE(0x8086, 0x5a98),
+ 	  .driver_data = AZX_DRIVER_PCH | AZX_DCAPS_INTEL_BROXTON },
+--- a/sound/pci/hda/patch_realtek.c
++++ b/sound/pci/hda/patch_realtek.c
+@@ -346,6 +346,9 @@ static void alc_fill_eapd_coef(struct hd
+ 	case 0x10ec0234:
+ 	case 0x10ec0274:
+ 	case 0x10ec0294:
++	case 0x10ec0700:
++	case 0x10ec0701:
++	case 0x10ec0703:
+ 		alc_update_coef_idx(codec, 0x10, 1<<15, 0);
+ 		break;
+ 	case 0x10ec0662:
+@@ -2655,6 +2658,7 @@ enum {
+ 	ALC269_TYPE_ALC256,
+ 	ALC269_TYPE_ALC225,
+ 	ALC269_TYPE_ALC294,
++	ALC269_TYPE_ALC700,
+ };
+ 
+ /*
+@@ -2686,6 +2690,7 @@ static int alc269_parse_auto_config(stru
+ 	case ALC269_TYPE_ALC256:
+ 	case ALC269_TYPE_ALC225:
+ 	case ALC269_TYPE_ALC294:
++	case ALC269_TYPE_ALC700:
+ 		ssids = alc269_ssids;
+ 		break;
+ 	default:
+@@ -3618,13 +3623,20 @@ static void alc269_fixup_hp_line1_mic1_l
+ static void alc_headset_mode_unplugged(struct hda_codec *codec)
+ {
+ 	static struct coef_fw coef0255[] = {
+-		WRITE_COEF(0x1b, 0x0c0b), /* LDO and MISC control */
+ 		WRITE_COEF(0x45, 0xd089), /* UAJ function set to menual mode */
+ 		UPDATE_COEFEX(0x57, 0x05, 1<<14, 0), /* Direct Drive HP Amp control(Set to verb control)*/
+ 		WRITE_COEF(0x06, 0x6104), /* Set MIC2 Vref gate with HP */
+ 		WRITE_COEFEX(0x57, 0x03, 0x8aa6), /* Direct Drive HP Amp control */
+ 		{}
+ 	};
++	static struct coef_fw coef0255_1[] = {
++		WRITE_COEF(0x1b, 0x0c0b), /* LDO and MISC control */
++		{}
++	};
++	static struct coef_fw coef0256[] = {
++		WRITE_COEF(0x1b, 0x0c4b), /* LDO and MISC control */
++		{}
++	};
+ 	static struct coef_fw coef0233[] = {
+ 		WRITE_COEF(0x1b, 0x0c0b),
+ 		WRITE_COEF(0x45, 0xc429),
+@@ -3677,7 +3689,11 @@ static void alc_headset_mode_unplugged(s
+ 
+ 	switch (codec->core.vendor_id) {
+ 	case 0x10ec0255:
++		alc_process_coef_fw(codec, coef0255_1);
++		alc_process_coef_fw(codec, coef0255);
++		break;
+ 	case 0x10ec0256:
++		alc_process_coef_fw(codec, coef0256);
+ 		alc_process_coef_fw(codec, coef0255);
+ 		break;
+ 	case 0x10ec0233:
+@@ -3896,6 +3912,12 @@ static void alc_headset_mode_ctia(struct
+ 		WRITE_COEFEX(0x57, 0x03, 0x8ea6),
+ 		{}
+ 	};
++	static struct coef_fw coef0256[] = {
++		WRITE_COEF(0x45, 0xd489), /* Set to CTIA type */
++		WRITE_COEF(0x1b, 0x0c6b),
++		WRITE_COEFEX(0x57, 0x03, 0x8ea6),
++		{}
++	};
+ 	static struct coef_fw coef0233[] = {
+ 		WRITE_COEF(0x45, 0xd429),
+ 		WRITE_COEF(0x1b, 0x0c2b),
+@@ -3936,9 +3958,11 @@ static void alc_headset_mode_ctia(struct
+ 
+ 	switch (codec->core.vendor_id) {
+ 	case 0x10ec0255:
+-	case 0x10ec0256:
+ 		alc_process_coef_fw(codec, coef0255);
+ 		break;
++	case 0x10ec0256:
++		alc_process_coef_fw(codec, coef0256);
++		break;
+ 	case 0x10ec0233:
+ 	case 0x10ec0283:
+ 		alc_process_coef_fw(codec, coef0233);
+@@ -3978,6 +4002,12 @@ static void alc_headset_mode_omtp(struct
+ 		WRITE_COEFEX(0x57, 0x03, 0x8ea6),
+ 		{}
+ 	};
++	static struct coef_fw coef0256[] = {
++		WRITE_COEF(0x45, 0xe489), /* Set to OMTP Type */
++		WRITE_COEF(0x1b, 0x0c6b),
++		WRITE_COEFEX(0x57, 0x03, 0x8ea6),
++		{}
++	};
+ 	static struct coef_fw coef0233[] = {
+ 		WRITE_COEF(0x45, 0xe429),
+ 		WRITE_COEF(0x1b, 0x0c2b),
+@@ -4018,9 +4048,11 @@ static void alc_headset_mode_omtp(struct
+ 
+ 	switch (codec->core.vendor_id) {
+ 	case 0x10ec0255:
+-	case 0x10ec0256:
+ 		alc_process_coef_fw(codec, coef0255);
+ 		break;
++	case 0x10ec0256:
++		alc_process_coef_fw(codec, coef0256);
++		break;
+ 	case 0x10ec0233:
+ 	case 0x10ec0283:
+ 		alc_process_coef_fw(codec, coef0233);
+@@ -4266,7 +4298,7 @@ static void alc_fixup_headset_mode_no_hp
+ static void alc255_set_default_jack_type(struct hda_codec *codec)
+ {
+ 	/* Set to iphone type */
+-	static struct coef_fw fw[] = {
++	static struct coef_fw alc255fw[] = {
+ 		WRITE_COEF(0x1b, 0x880b),
+ 		WRITE_COEF(0x45, 0xd089),
+ 		WRITE_COEF(0x1b, 0x080b),
+@@ -4274,7 +4306,22 @@ static void alc255_set_default_jack_type
+ 		WRITE_COEF(0x1b, 0x0c0b),
+ 		{}
+ 	};
+-	alc_process_coef_fw(codec, fw);
++	static struct coef_fw alc256fw[] = {
++		WRITE_COEF(0x1b, 0x884b),
++		WRITE_COEF(0x45, 0xd089),
++		WRITE_COEF(0x1b, 0x084b),
++		WRITE_COEF(0x46, 0x0004),
++		WRITE_COEF(0x1b, 0x0c4b),
++		{}
++	};
++	switch (codec->core.vendor_id) {
++	case 0x10ec0255:
++		alc_process_coef_fw(codec, alc255fw);
++		break;
++	case 0x10ec0256:
++		alc_process_coef_fw(codec, alc256fw);
++		break;
++	}
+ 	msleep(30);
+ }
+ 
+@@ -5587,6 +5634,7 @@ static const struct snd_pci_quirk alc269
+ 	SND_PCI_QUIRK(0x17aa, 0x2218, "Thinkpad X1 Carbon 2nd", ALC292_FIXUP_TPT440_DOCK),
+ 	SND_PCI_QUIRK(0x17aa, 0x2223, "ThinkPad T550", ALC292_FIXUP_TPT440_DOCK),
+ 	SND_PCI_QUIRK(0x17aa, 0x2226, "ThinkPad X250", ALC292_FIXUP_TPT440_DOCK),
++	SND_PCI_QUIRK(0x17aa, 0x2231, "Thinkpad T560", ALC292_FIXUP_TPT460),
+ 	SND_PCI_QUIRK(0x17aa, 0x2233, "Thinkpad", ALC292_FIXUP_TPT460),
+ 	SND_PCI_QUIRK(0x17aa, 0x30bb, "ThinkCentre AIO", ALC233_FIXUP_LENOVO_LINE2_MIC_HOTKEY),
+ 	SND_PCI_QUIRK(0x17aa, 0x30e2, "ThinkCentre AIO", ALC233_FIXUP_LENOVO_LINE2_MIC_HOTKEY),
+@@ -5775,6 +5823,10 @@ static const struct snd_hda_pin_quirk al
+ 		{0x12, 0x90a60180},
+ 		{0x14, 0x90170130},
+ 		{0x21, 0x02211040}),
++	SND_HDA_PIN_QUIRK(0x10ec0255, 0x1028, "Dell Inspiron 5565", ALC255_FIXUP_DELL1_MIC_NO_PRESENCE,
++		{0x12, 0x90a60180},
++		{0x14, 0x90170120},
++		{0x21, 0x02211030}),
+ 	SND_HDA_PIN_QUIRK(0x10ec0256, 0x1028, "Dell", ALC255_FIXUP_DELL1_MIC_NO_PRESENCE,
+ 		{0x12, 0x90a60160},
+ 		{0x14, 0x90170120},
+@@ -6053,6 +6105,14 @@ static int patch_alc269(struct hda_codec
+ 	case 0x10ec0294:
+ 		spec->codec_variant = ALC269_TYPE_ALC294;
+ 		break;
++	case 0x10ec0700:
++	case 0x10ec0701:
++	case 0x10ec0703:
++		spec->codec_variant = ALC269_TYPE_ALC700;
++		spec->gen.mixer_nid = 0; /* ALC700 does not have any loopback mixer path */
++		alc_update_coef_idx(codec, 0x4a, 0, 1 << 15); /* Combo jack auto trigger control */
++		break;
++
+ 	}
+ 
+ 	if (snd_hda_codec_read(codec, 0x51, 0, AC_VERB_PARAMETERS, 0) == 0x10ec5505) {
+@@ -7008,6 +7068,9 @@ static const struct hda_device_id snd_hd
+ 	HDA_CODEC_ENTRY(0x10ec0670, "ALC670", patch_alc662),
+ 	HDA_CODEC_ENTRY(0x10ec0671, "ALC671", patch_alc662),
+ 	HDA_CODEC_ENTRY(0x10ec0680, "ALC680", patch_alc680),
++	HDA_CODEC_ENTRY(0x10ec0700, "ALC700", patch_alc269),
++	HDA_CODEC_ENTRY(0x10ec0701, "ALC701", patch_alc269),
++	HDA_CODEC_ENTRY(0x10ec0703, "ALC703", patch_alc269),
+ 	HDA_CODEC_ENTRY(0x10ec0867, "ALC891", patch_alc882),
+ 	HDA_CODEC_ENTRY(0x10ec0880, "ALC880", patch_alc880),
+ 	HDA_CODEC_ENTRY(0x10ec0882, "ALC882", patch_alc882),
+--- a/virt/kvm/arm/hyp/vgic-v2-sr.c
++++ b/virt/kvm/arm/hyp/vgic-v2-sr.c
+@@ -93,12 +93,11 @@ static void __hyp_text save_lrs(struct k
+ 		if (!(vcpu->arch.vgic_cpu.live_lrs & (1UL << i)))
+ 			continue;
+ 
+-		if (cpu_if->vgic_elrsr & (1UL << i)) {
++		if (cpu_if->vgic_elrsr & (1UL << i))
+ 			cpu_if->vgic_lr[i] &= ~GICH_LR_STATE;
+-			continue;
+-		}
++		else
++			cpu_if->vgic_lr[i] = readl_relaxed(base + GICH_LR0 + (i * 4));
+ 
+-		cpu_if->vgic_lr[i] = readl_relaxed(base + GICH_LR0 + (i * 4));
+ 		writel_relaxed(0, base + GICH_LR0 + (i * 4));
+ 	}
+ }
+--- a/virt/kvm/irqchip.c
++++ b/virt/kvm/irqchip.c
+@@ -40,7 +40,7 @@ int kvm_irq_map_gsi(struct kvm *kvm,
+ 
+ 	irq_rt = srcu_dereference_check(kvm->irq_routing, &kvm->irq_srcu,
+ 					lockdep_is_held(&kvm->irq_lock));
+-	if (gsi < irq_rt->nr_rt_entries) {
++	if (irq_rt && gsi < irq_rt->nr_rt_entries) {
+ 		hlist_for_each_entry(e, &irq_rt->map[gsi], link) {
+ 			entries[n] = *e;
+ 			++n;
