@@ -13,9 +13,8 @@ import subprocess
 
 from debian_linux import config
 from debian_linux.debian import *
-from debian_linux.gencontrol import Gencontrol as Base
+from debian_linux.gencontrol import Gencontrol as Base, merge_packages
 from debian_linux.utils import Templates, read_control
-
 
 class Gencontrol(Base):
     config_schema = {
@@ -24,7 +23,6 @@ class Gencontrol(Base):
         },
         'build': {
             'debug-info': config.SchemaItemBoolean(),
-            'modules': config.SchemaItemBoolean(),
         },
         'description': {
             'parts': config.SchemaItemList(),
@@ -57,6 +55,10 @@ class Gencontrol(Base):
             if src in data or not optional:
                 makeflags[dst] = data[src]
 
+    def _substitute_file(self, template, vars, target, append=False):
+        with codecs.open(target, 'a' if append else 'w', 'utf-8') as f:
+            f.write(self.substitute(self.templates[template], vars))
+
     def do_main_setup(self, vars, makeflags, extra):
         super(Gencontrol, self).do_main_setup(vars, makeflags, extra)
         makeflags.update({
@@ -65,18 +67,6 @@ class Gencontrol(Base):
             'ABINAME': self.abiname_version + self.abiname_part,
             'SOURCEVERSION': self.version.complete,
         })
-
-        # Prepare to generate template-substituted translations
-        try:
-            os.mkdir('debian/po')
-        except OSError:
-            pass
-        for path in glob.glob('debian/templates/po/*.po'):
-            target = 'debian/po/' + os.path.basename(path)
-            with open(target, 'w') as f:
-                f.write('# THIS IS A GENERATED FILE; DO NOT EDIT IT!\n'
-                        '# Translators should edit %s instead.\n'
-                        '#\n' % path)
 
         """
         # Prepare to generate debian/tests/control
@@ -152,7 +142,7 @@ class Gencontrol(Base):
         packages_headers_arch[-1]['Depends'].extend(PackageRelation())
         extra['headers_arch_depends'] = packages_headers_arch[-1]['Depends']
 
-        self.merge_packages(packages, packages_headers_arch, arch)
+        merge_packages(packages, packages_headers_arch, arch)
 
         cmds_binary_arch = ["$(MAKE) -f debian/rules.real binary-arch-arch %s" % makeflags]
         makefile.add('binary-arch_%s_real' % arch, cmds=cmds_binary_arch)
@@ -190,7 +180,7 @@ class Gencontrol(Base):
                     raise RuntimeError('kernel-wedge exited with code %d' %
                                        kw_proc.returncode)
 
-                self.merge_packages(packages, udeb_packages, arch)
+                merge_packages(packages, udeb_packages, arch)
 
                 # These packages must be built after the per-flavour/
                 # per-featureset packages.  Also, this won't work
@@ -213,7 +203,7 @@ class Gencontrol(Base):
         headers_featureset = self.templates["control.headers.featureset"]
         package_headers = self.process_package(headers_featureset[0], vars)
 
-        self.merge_packages(packages, (package_headers,), arch)
+        merge_packages(packages, (package_headers,), arch)
 
         cmds_binary_arch = ["$(MAKE) -f debian/rules.real binary-arch-featureset %s" % makeflags]
         makefile.add('binary-arch_%s_%s_real' % (arch, featureset), cmds=cmds_binary_arch)
@@ -231,7 +221,6 @@ class Gencontrol(Base):
     )
 
     flavour_makeflags_image = (
-        ('type', 'TYPE', False),
         ('install-stem', 'IMAGE_INSTALL_STEM', True),
     )
 
@@ -325,7 +314,7 @@ class Gencontrol(Base):
         packages_dummy = []
         packages_own = []
 
-        image = self.templates["control.image.type-%s" % config_entry_image['type']]
+        image = self.templates["control.image"]
 
         config_entry_xen = self.config.merge('xen', arch, featureset, flavour)
         if config_entry_xen:
@@ -342,14 +331,12 @@ class Gencontrol(Base):
         packages_own.append(image_main)
         packages_own.extend(self.process_packages(image[1:], vars))
 
-        if config_entry_build.get('modules', True):
-            makeflags['MODULES'] = True
-            package_headers = self.process_package(headers[0], vars)
-            package_headers['Depends'].extend(relations_compiler_headers)
-            packages_own.append(package_headers)
-            """
-            extra['headers_arch_depends'].append('%s (= ${binary:Version})' % packages_own[-1]['Package'])
-            """
+        package_headers = self.process_package(headers[0], vars)
+        package_headers['Depends'].extend(relations_compiler_headers)
+        packages_own.append(package_headers)
+        """
+        extra['headers_arch_depends'].append('%s (= ${binary:Version})' % packages_own[-1]['Package'])
+        """
 
         build_debug = config_entry_build.get('debug-info')
 
@@ -365,7 +352,7 @@ class Gencontrol(Base):
             makeflags['DEBUG'] = True
             packages_own.extend(self.process_packages(self.templates['control.image-dbg'], vars))
 
-        self.merge_packages(packages, packages_own + packages_dummy, arch)
+        merge_packages(packages, packages_own + packages_dummy, arch)
 
         """
         tests_control = self.process_package(
@@ -429,53 +416,25 @@ class Gencontrol(Base):
             cmds_binary_arch.append(
                 "$(MAKE) -f debian/rules.real install-dummy DH_OPTIONS='%s' %s"
                 % (' '.join("-p%s" % i['Package'] for i in packages_dummy), makeflags))
-        cmds_build = ["$(MAKE) -f debian/rules.real build-arch %s" % makeflags]
-        cmds_setup = ["$(MAKE) -f debian/rules.real setup-flavour %s" % makeflags]
+        cmds_build = ["$(MAKE) -f debian/rules.real build-arch-flavour %s" % makeflags]
+        cmds_setup = ["$(MAKE) -f debian/rules.real setup-arch-flavour %s" % makeflags]
         makefile.add('binary-arch_%s_%s_%s_real' % (arch, featureset, flavour), cmds=cmds_binary_arch)
         makefile.add('build-arch_%s_%s_%s_real' % (arch, featureset, flavour), cmds=cmds_build)
         makefile.add('setup_%s_%s_%s_real' % (arch, featureset, flavour), cmds=cmds_setup)
 
         # Substitute kernel version etc. into maintainer scripts,
         # translations and lintian overrides
-        def substitute_file(template, target, append=False):
-            with codecs.open(target, 'a' if append else 'w',
-                             'utf-8') as f:
-                f.write(self.substitute(self.templates[template], vars))
-        if config_entry_image['type'] == 'plain':
-            substitute_file('headers.plain.postinst',
-                            'debian/linux-headers-%s%s.postinst' %
-                            (vars['abiname'], vars['localversion']))
-            for name in ['postinst', 'postrm', 'preinst', 'prerm', 'templates']:
-                substitute_file('image.plain.%s' % name,
-                                'debian/linux-image-%s%s.%s' %
-                                (vars['abiname'], vars['localversion'], name))
-            for path in glob.glob('debian/templates/po/*.po'):
-                substitute_file('po/' + os.path.basename(path),
-                                'debian/po/' + os.path.basename(path),
-                                append=True)
+        self._substitute_file('headers.postinst', vars,
+                              'debian/linux-headers-%s%s.postinst' %
+                              (vars['abiname'], vars['localversion']))
+        for name in ['postinst', 'postrm', 'preinst', 'prerm']:
+            self._substitute_file('image.%s' % name, vars,
+                                  'debian/linux-image-%s%s.%s' %
+                                  (vars['abiname'], vars['localversion'], name))
         if build_debug:
-            substitute_file('image-dbg.lintian-override',
-                            'debian/linux-image-%s%s-dbg.lintian-overrides' %
-                            (vars['abiname'], vars['localversion']))
-
-    def merge_packages(self, packages, new, arch):
-        for new_package in new:
-            name = new_package['Package']
-            if name in packages:
-                package = packages.get(name)
-                package['Architecture'].add(arch)
-
-                for field in 'Depends', 'Provides', 'Suggests', 'Recommends', 'Conflicts':
-                    if field in new_package:
-                        if field in package:
-                            v = package[field]
-                            v.extend(new_package[field])
-                        else:
-                            package[field] = new_package[field]
-
-            else:
-                new_package['Architecture'] = arch
-                packages.append(new_package)
+            self._substitute_file('image-dbg.lintian-override', vars,
+                                  'debian/linux-image-%s%s-dbgsym.lintian-overrides' %
+                                  (vars['abiname'], vars['localversion']))
 
     def process_changelog(self):
         act_upstream = self.changelog[0].version.upstream
