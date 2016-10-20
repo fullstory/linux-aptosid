@@ -10,16 +10,14 @@
 +supported.
 --- a/Makefile
 +++ b/Makefile
-@@ -1,7 +1,7 @@
+@@ -1,6 +1,6 @@
  VERSION = 4
  PATCHLEVEL = 8
--SUBLEVEL = 1
--EXTRAVERSION =
-+SUBLEVEL = 2
-+EXTRAVERSION = -rc1
+-SUBLEVEL = 0
++SUBLEVEL = 3
+ EXTRAVERSION =
  NAME = Psychotic Stoned Sheep
  
- # *DOCUMENTATION*
 --- a/arch/arm/boot/dts/armada-390.dtsi
 +++ b/arch/arm/boot/dts/armada-390.dtsi
 @@ -47,6 +47,8 @@
@@ -245,6 +243,21 @@
  #define UDELAY_SHIFT	31
  
  #ifndef __ASSEMBLY__
+--- a/arch/arm64/kernel/debug-monitors.c
++++ b/arch/arm64/kernel/debug-monitors.c
+@@ -435,8 +435,10 @@ NOKPROBE_SYMBOL(kernel_active_single_ste
+ /* ptrace API */
+ void user_enable_single_step(struct task_struct *task)
+ {
+-	set_ti_thread_flag(task_thread_info(task), TIF_SINGLESTEP);
+-	set_regs_spsr_ss(task_pt_regs(task));
++	struct thread_info *ti = task_thread_info(task);
++
++	if (!test_and_set_ti_thread_flag(ti, TIF_SINGLESTEP))
++		set_regs_spsr_ss(task_pt_regs(task));
+ }
+ NOKPROBE_SYMBOL(user_enable_single_step);
+ 
 --- a/arch/arm64/kernel/stacktrace.c
 +++ b/arch/arm64/kernel/stacktrace.c
 @@ -43,6 +43,9 @@ int notrace unwind_frame(struct task_str
@@ -1514,6 +1527,76 @@
  	RAPL_CPU(INTEL_FAM6_ATOM_GOLDMONT,	rapl_defaults_core),
  	RAPL_CPU(INTEL_FAM6_ATOM_DENVERTON,	rapl_defaults_core),
  
+--- a/drivers/scsi/hosts.c
++++ b/drivers/scsi/hosts.c
+@@ -246,10 +246,6 @@ int scsi_add_host_with_dma(struct Scsi_H
+ 
+ 	shost->dma_dev = dma_dev;
+ 
+-	error = device_add(&shost->shost_gendev);
+-	if (error)
+-		goto out_destroy_freelist;
+-
+ 	/*
+ 	 * Increase usage count temporarily here so that calling
+ 	 * scsi_autopm_put_host() will trigger runtime idle if there is
+@@ -260,6 +256,10 @@ int scsi_add_host_with_dma(struct Scsi_H
+ 	pm_runtime_enable(&shost->shost_gendev);
+ 	device_enable_async_suspend(&shost->shost_gendev);
+ 
++	error = device_add(&shost->shost_gendev);
++	if (error)
++		goto out_destroy_freelist;
++
+ 	scsi_host_set_state(shost, SHOST_RUNNING);
+ 	get_device(shost->shost_gendev.parent);
+ 
+@@ -309,6 +309,10 @@ int scsi_add_host_with_dma(struct Scsi_H
+  out_del_gendev:
+ 	device_del(&shost->shost_gendev);
+  out_destroy_freelist:
++	device_disable_async_suspend(&shost->shost_gendev);
++	pm_runtime_disable(&shost->shost_gendev);
++	pm_runtime_set_suspended(&shost->shost_gendev);
++	pm_runtime_put_noidle(&shost->shost_gendev);
+ 	scsi_destroy_command_freelist(shost);
+  out_destroy_tags:
+ 	if (shost_use_blk_mq(shost))
+--- a/drivers/staging/fbtft/fbtft-core.c
++++ b/drivers/staging/fbtft/fbtft-core.c
+@@ -391,11 +391,11 @@ static void fbtft_update_display(struct
+ 
+ 	if (unlikely(timeit)) {
+ 		ts_end = ktime_get();
+-		if (ktime_to_ns(par->update_time))
++		if (!ktime_to_ns(par->update_time))
+ 			par->update_time = ts_start;
+ 
+-		par->update_time = ts_start;
+ 		fps = ktime_us_delta(ts_start, par->update_time);
++		par->update_time = ts_start;
+ 		fps = fps ? 1000000 / fps : 0;
+ 
+ 		throughput = ktime_us_delta(ts_end, ts_start);
+--- a/drivers/usb/class/usbtmc.c
++++ b/drivers/usb/class/usbtmc.c
+@@ -141,6 +141,7 @@ static void usbtmc_delete(struct kref *k
+ 	struct usbtmc_device_data *data = to_usbtmc_data(kref);
+ 
+ 	usb_put_dev(data->usb_dev);
++	kfree(data);
+ }
+ 
+ static int usbtmc_open(struct inode *inode, struct file *filp)
+@@ -1379,7 +1380,7 @@ static int usbtmc_probe(struct usb_inter
+ 
+ 	dev_dbg(&intf->dev, "%s called\n", __func__);
+ 
+-	data = devm_kzalloc(&intf->dev, sizeof(*data), GFP_KERNEL);
++	data = kmalloc(sizeof(*data), GFP_KERNEL);
+ 	if (!data)
+ 		return -ENOMEM;
+ 
 --- a/drivers/usb/dwc3/gadget.c
 +++ b/drivers/usb/dwc3/gadget.c
 @@ -348,7 +348,8 @@ static int dwc3_send_clear_stall_ep_cmd(
@@ -1526,6 +1609,67 @@
  		cmd |= DWC3_DEPCMD_CLEARPENDIN;
  
  	memset(&params, 0, sizeof(params));
+--- a/drivers/usb/misc/legousbtower.c
++++ b/drivers/usb/misc/legousbtower.c
+@@ -898,24 +898,6 @@ static int tower_probe (struct usb_inter
+ 	dev->interrupt_in_interval = interrupt_in_interval ? interrupt_in_interval : dev->interrupt_in_endpoint->bInterval;
+ 	dev->interrupt_out_interval = interrupt_out_interval ? interrupt_out_interval : dev->interrupt_out_endpoint->bInterval;
+ 
+-	/* we can register the device now, as it is ready */
+-	usb_set_intfdata (interface, dev);
+-
+-	retval = usb_register_dev (interface, &tower_class);
+-
+-	if (retval) {
+-		/* something prevented us from registering this driver */
+-		dev_err(idev, "Not able to get a minor for this device.\n");
+-		usb_set_intfdata (interface, NULL);
+-		goto error;
+-	}
+-	dev->minor = interface->minor;
+-
+-	/* let the user know what node this device is now attached to */
+-	dev_info(&interface->dev, "LEGO USB Tower #%d now attached to major "
+-		 "%d minor %d\n", (dev->minor - LEGO_USB_TOWER_MINOR_BASE),
+-		 USB_MAJOR, dev->minor);
+-
+ 	/* get the firmware version and log it */
+ 	result = usb_control_msg (udev,
+ 				  usb_rcvctrlpipe(udev, 0),
+@@ -936,6 +918,23 @@ static int tower_probe (struct usb_inter
+ 		 get_version_reply.minor,
+ 		 le16_to_cpu(get_version_reply.build_no));
+ 
++	/* we can register the device now, as it is ready */
++	usb_set_intfdata (interface, dev);
++
++	retval = usb_register_dev (interface, &tower_class);
++
++	if (retval) {
++		/* something prevented us from registering this driver */
++		dev_err(idev, "Not able to get a minor for this device.\n");
++		usb_set_intfdata (interface, NULL);
++		goto error;
++	}
++	dev->minor = interface->minor;
++
++	/* let the user know what node this device is now attached to */
++	dev_info(&interface->dev, "LEGO USB Tower #%d now attached to major "
++		 "%d minor %d\n", (dev->minor - LEGO_USB_TOWER_MINOR_BASE),
++		 USB_MAJOR, dev->minor);
+ 
+ exit:
+ 	return retval;
+--- a/drivers/usb/serial/cp210x.c
++++ b/drivers/usb/serial/cp210x.c
+@@ -118,6 +118,7 @@ static const struct usb_device_id id_tab
+ 	{ USB_DEVICE(0x10C4, 0x8411) }, /* Kyocera GPS Module */
+ 	{ USB_DEVICE(0x10C4, 0x8418) }, /* IRZ Automation Teleport SG-10 GSM/GPRS Modem */
+ 	{ USB_DEVICE(0x10C4, 0x846E) }, /* BEI USB Sensor Interface (VCP) */
++	{ USB_DEVICE(0x10C4, 0x8470) }, /* Juniper Networks BX Series System Console */
+ 	{ USB_DEVICE(0x10C4, 0x8477) }, /* Balluff RFID */
+ 	{ USB_DEVICE(0x10C4, 0x84B6) }, /* Starizona Hyperion */
+ 	{ USB_DEVICE(0x10C4, 0x85EA) }, /* AC-Services IBUS-IF */
 --- a/drivers/usb/storage/usb.c
 +++ b/drivers/usb/storage/usb.c
 @@ -1070,17 +1070,17 @@ int usb_stor_probe2(struct us_data *us)
@@ -1557,6 +1701,27 @@
  BadDevice:
  	usb_stor_dbg(us, "storage_probe() failed\n");
  	release_everything(us);
+--- a/drivers/usb/usbip/vudc_rx.c
++++ b/drivers/usb/usbip/vudc_rx.c
+@@ -142,7 +142,7 @@ static int v_recv_cmd_submit(struct vudc
+ 	urb_p->urb->status = -EINPROGRESS;
+ 
+ 	/* FIXME: more pipe setup to please usbip_common */
+-	urb_p->urb->pipe &= ~(11 << 30);
++	urb_p->urb->pipe &= ~(3 << 30);
+ 	switch (urb_p->ep->type) {
+ 	case USB_ENDPOINT_XFER_BULK:
+ 		urb_p->urb->pipe |= (PIPE_BULK << 30);
+--- a/fs/xfs/xfs_xattr.c
++++ b/fs/xfs/xfs_xattr.c
+@@ -147,6 +147,7 @@ __xfs_xattr_put_listent(
+ 	arraytop = context->count + prefix_len + namelen + 1;
+ 	if (arraytop > context->firstu) {
+ 		context->count = -1;	/* insufficient space */
++		context->seen_enough = 1;
+ 		return 0;
+ 	}
+ 	offset = (char *)context->alist + context->count;
 --- a/include/linux/mfd/88pm80x.h
 +++ b/include/linux/mfd/88pm80x.h
 @@ -350,7 +350,7 @@ static inline int pm80x_dev_suspend(stru
@@ -1577,6 +1742,47 @@
  
  	return 0;
  }
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2234,6 +2234,7 @@ static inline struct page *follow_page(s
+ #define FOLL_TRIED	0x800	/* a retry, previous pass started an IO */
+ #define FOLL_MLOCK	0x1000	/* lock present pages */
+ #define FOLL_REMOTE	0x2000	/* we are working on non-current tsk/mm */
++#define FOLL_COW	0x4000	/* internal GUP flag */
+ 
+ typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
+ 			void *data);
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -257,7 +257,7 @@ static inline void workingset_node_pages
+ 
+ static inline void workingset_node_pages_dec(struct radix_tree_node *node)
+ {
+-	VM_BUG_ON(!workingset_node_pages(node));
++	VM_WARN_ON_ONCE(!workingset_node_pages(node));
+ 	node->count--;
+ }
+ 
+@@ -273,7 +273,7 @@ static inline void workingset_node_shado
+ 
+ static inline void workingset_node_shadows_dec(struct radix_tree_node *node)
+ {
+-	VM_BUG_ON(!workingset_node_shadows(node));
++	VM_WARN_ON_ONCE(!workingset_node_shadows(node));
+ 	node->count -= 1U << RADIX_TREE_COUNT_SHIFT;
+ }
+ 
+--- a/include/media/rcar-fcp.h
++++ b/include/media/rcar-fcp.h
+@@ -29,7 +29,7 @@ static inline struct rcar_fcp_device *rc
+ static inline void rcar_fcp_put(struct rcar_fcp_device *fcp) { }
+ static inline int rcar_fcp_enable(struct rcar_fcp_device *fcp)
+ {
+-	return -ENOSYS;
++	return 0;
+ }
+ static inline void rcar_fcp_disable(struct rcar_fcp_device *fcp) { }
+ #endif
 --- a/kernel/time/timekeeping.c
 +++ b/kernel/time/timekeeping.c
 @@ -403,8 +403,11 @@ static __always_inline u64 __ktime_get_f
@@ -1593,6 +1799,43 @@
  	} while (read_seqcount_retry(&tkf->seq, seq));
  
  	return now;
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -60,6 +60,16 @@ static int follow_pfn_pte(struct vm_area
+ 	return -EEXIST;
+ }
+ 
++/*
++ * FOLL_FORCE can write to even unwritable pte's, but only
++ * after we've gone through a COW cycle and they are dirty.
++ */
++static inline bool can_follow_write_pte(pte_t pte, unsigned int flags)
++{
++	return pte_write(pte) ||
++		((flags & FOLL_FORCE) && (flags & FOLL_COW) && pte_dirty(pte));
++}
++
+ static struct page *follow_page_pte(struct vm_area_struct *vma,
+ 		unsigned long address, pmd_t *pmd, unsigned int flags)
+ {
+@@ -95,7 +105,7 @@ retry:
+ 	}
+ 	if ((flags & FOLL_NUMA) && pte_protnone(pte))
+ 		goto no_page;
+-	if ((flags & FOLL_WRITE) && !pte_write(pte)) {
++	if ((flags & FOLL_WRITE) && !can_follow_write_pte(pte, flags)) {
+ 		pte_unmap_unlock(ptep, ptl);
+ 		return NULL;
+ 	}
+@@ -412,7 +422,7 @@ static int faultin_page(struct task_stru
+ 	 * reCOWed by userspace write).
+ 	 */
+ 	if ((ret & VM_FAULT_WRITE) && !(vma->vm_flags & VM_WRITE))
+-		*flags &= ~FOLL_WRITE;
++	        *flags |= FOLL_COW;
+ 	return 0;
+ }
+ 
 --- a/security/integrity/ima/ima_appraise.c
 +++ b/security/integrity/ima/ima_appraise.c
 @@ -190,7 +190,7 @@ int ima_appraise_measurement(enum ima_ho
@@ -1642,6 +1885,86 @@
  	return cso;
  }
  
+--- a/sound/pci/hda/patch_conexant.c
++++ b/sound/pci/hda/patch_conexant.c
+@@ -261,6 +261,7 @@ enum {
+ 	CXT_FIXUP_HP_530,
+ 	CXT_FIXUP_CAP_MIX_AMP_5047,
+ 	CXT_FIXUP_MUTE_LED_EAPD,
++	CXT_FIXUP_HP_SPECTRE,
+ };
+ 
+ /* for hda_fixup_thinkpad_acpi() */
+@@ -765,6 +766,14 @@ static const struct hda_fixup cxt_fixups
+ 		.type = HDA_FIXUP_FUNC,
+ 		.v.func = cxt_fixup_mute_led_eapd,
+ 	},
++	[CXT_FIXUP_HP_SPECTRE] = {
++		.type = HDA_FIXUP_PINS,
++		.v.pins = (const struct hda_pintbl[]) {
++			/* enable NID 0x1d for the speaker on top */
++			{ 0x1d, 0x91170111 },
++			{ }
++		}
++	},
+ };
+ 
+ static const struct snd_pci_quirk cxt5045_fixups[] = {
+@@ -814,6 +823,7 @@ static const struct snd_pci_quirk cxt506
+ 	SND_PCI_QUIRK(0x1025, 0x0543, "Acer Aspire One 522", CXT_FIXUP_STEREO_DMIC),
+ 	SND_PCI_QUIRK(0x1025, 0x054c, "Acer Aspire 3830TG", CXT_FIXUP_ASPIRE_DMIC),
+ 	SND_PCI_QUIRK(0x1025, 0x054f, "Acer Aspire 4830T", CXT_FIXUP_ASPIRE_DMIC),
++	SND_PCI_QUIRK(0x103c, 0x8174, "HP Spectre x360", CXT_FIXUP_HP_SPECTRE),
+ 	SND_PCI_QUIRK(0x1043, 0x138d, "Asus", CXT_FIXUP_HEADPHONE_MIC_PIN),
+ 	SND_PCI_QUIRK(0x152d, 0x0833, "OLPC XO-1.5", CXT_FIXUP_OLPC_XO),
+ 	SND_PCI_QUIRK(0x17aa, 0x20f2, "Lenovo T400", CXT_PINCFG_LENOVO_TP410),
+--- a/sound/pci/hda/patch_realtek.c
++++ b/sound/pci/hda/patch_realtek.c
+@@ -5806,6 +5806,13 @@ static const struct hda_model_fixup alc2
+ 	{0x14, 0x90170110}, \
+ 	{0x15, 0x0221401f}
+ 
++#define ALC295_STANDARD_PINS \
++	{0x12, 0xb7a60130}, \
++	{0x14, 0x90170110}, \
++	{0x17, 0x21014020}, \
++	{0x18, 0x21a19030}, \
++	{0x21, 0x04211020}
++
+ #define ALC298_STANDARD_PINS \
+ 	{0x12, 0x90a60130}, \
+ 	{0x21, 0x03211020}
+@@ -5846,6 +5853,10 @@ static const struct snd_hda_pin_quirk al
+ 		{0x14, 0x90170120},
+ 		{0x21, 0x02211030}),
+ 	SND_HDA_PIN_QUIRK(0x10ec0255, 0x1028, "Dell", ALC255_FIXUP_DELL1_MIC_NO_PRESENCE,
++		{0x14, 0x90170110},
++		{0x1b, 0x02011020},
++		{0x21, 0x0221101f}),
++	SND_HDA_PIN_QUIRK(0x10ec0255, 0x1028, "Dell", ALC255_FIXUP_DELL1_MIC_NO_PRESENCE,
+ 		{0x14, 0x90170130},
+ 		{0x1b, 0x01014020},
+ 		{0x21, 0x0221103f}),
+@@ -5911,6 +5922,10 @@ static const struct snd_hda_pin_quirk al
+ 		{0x14, 0x90170120},
+ 		{0x21, 0x02211030}),
+ 	SND_HDA_PIN_QUIRK(0x10ec0256, 0x1028, "Dell", ALC255_FIXUP_DELL1_MIC_NO_PRESENCE,
++		{0x12, 0xb7a60130},
++		{0x14, 0x90170110},
++		{0x21, 0x02211020}),
++	SND_HDA_PIN_QUIRK(0x10ec0256, 0x1028, "Dell", ALC255_FIXUP_DELL1_MIC_NO_PRESENCE,
+ 		ALC256_STANDARD_PINS),
+ 	SND_HDA_PIN_QUIRK(0x10ec0280, 0x103c, "HP", ALC280_FIXUP_HP_GPIO4,
+ 		{0x12, 0x90a60130},
+@@ -6021,6 +6036,8 @@ static const struct snd_hda_pin_quirk al
+ 	SND_HDA_PIN_QUIRK(0x10ec0293, 0x1028, "Dell", ALC293_FIXUP_DELL1_MIC_NO_PRESENCE,
+ 		ALC292_STANDARD_PINS,
+ 		{0x13, 0x90a60140}),
++	SND_HDA_PIN_QUIRK(0x10ec0295, 0x1028, "Dell", ALC269_FIXUP_DELL1_MIC_NO_PRESENCE,
++		ALC295_STANDARD_PINS),
+ 	SND_HDA_PIN_QUIRK(0x10ec0298, 0x1028, "Dell", ALC298_FIXUP_DELL1_MIC_NO_PRESENCE,
+ 		ALC298_STANDARD_PINS,
+ 		{0x17, 0x90170110}),
 --- a/sound/usb/line6/driver.c
 +++ b/sound/usb/line6/driver.c
 @@ -29,7 +29,7 @@
