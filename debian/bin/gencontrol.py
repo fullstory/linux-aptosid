@@ -36,10 +36,6 @@ class Gencontrol(Base):
         },
         'relations': {
         },
-        'xen': {
-            'flavours': config.SchemaItemList(),
-            'versions': config.SchemaItemList(),
-        }
     }
 
     def __init__(self, config_dirs=["debian/config"], template_dirs=["debian/templates"]):
@@ -315,15 +311,6 @@ class Gencontrol(Base):
         packages_own = []
 
         image = self.templates["control.image"]
-
-        config_entry_xen = self.config.merge('xen', arch, featureset, flavour)
-        if config_entry_xen:
-            p = self.process_packages(self.templates['control.xen-linux-system'], vars)
-            l = PackageRelationGroup()
-            for xen_flavour in config_entry_xen['flavours']:
-                l.append("xen-system-%s" % xen_flavour)
-            p[0]['Depends'].append(l)
-            packages_dummy.extend(p)
 
         vars.setdefault('desc', None)
 
