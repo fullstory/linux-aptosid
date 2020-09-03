@@ -78,7 +78,7 @@
  VERSION = 5
  PATCHLEVEL = 8
 -SUBLEVEL = 0
-+SUBLEVEL = 4
++SUBLEVEL = 5
  EXTRAVERSION =
  NAME = Kleptomaniac Octopus
  
@@ -12989,6 +12989,15 @@
  	rtnl_unlock();
  }
  
+@@ -3614,7 +3609,7 @@ static int check_missing_comp_in_tx_queu
+ 	}
+ 
+ 	u64_stats_update_begin(&tx_ring->syncp);
+-	tx_ring->tx_stats.missed_tx = missed_tx;
++	tx_ring->tx_stats.missed_tx += missed_tx;
+ 	u64_stats_update_end(&tx_ring->syncp);
+ 
+ 	return rc;
 @@ -4366,8 +4361,11 @@ static void __ena_shutoff(struct pci_dev
  		netdev->rx_cpu_rmap = NULL;
  	}
@@ -13002,6 +13011,16 @@
  	cancel_work_sync(&adapter->reset_task);
  
  	rtnl_lock(); /* lock released inside the below if-else block */
+@@ -4539,6 +4537,9 @@ static void ena_keep_alive_wd(void *adap
+ 	tx_drops = ((u64)desc->tx_drops_high << 32) | desc->tx_drops_low;
+ 
+ 	u64_stats_update_begin(&adapter->syncp);
++	/* These stats are accumulated by the device, so the counters indicate
++	 * all drops since last reset.
++	 */
+ 	adapter->dev_stats.rx_drops = rx_drops;
+ 	adapter->dev_stats.tx_drops = tx_drops;
+ 	u64_stats_update_end(&adapter->syncp);
 --- a/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
 +++ b/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
 @@ -123,21 +123,21 @@ static const char aq_macsec_stat_names[]
@@ -19135,6 +19154,70 @@
  	kfree(op);
  	return ret;
  }
+--- a/fs/binfmt_flat.c
++++ b/fs/binfmt_flat.c
+@@ -576,7 +576,7 @@ static int load_flat_file(struct linux_b
+ 			goto err;
+ 		}
+ 
+-		len = data_len + extra;
++		len = data_len + extra + MAX_SHARED_LIBS * sizeof(unsigned long);
+ 		len = PAGE_ALIGN(len);
+ 		realdatastart = vm_mmap(NULL, 0, len,
+ 			PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE, 0);
+@@ -590,7 +590,9 @@ static int load_flat_file(struct linux_b
+ 			vm_munmap(textpos, text_len);
+ 			goto err;
+ 		}
+-		datapos = ALIGN(realdatastart, FLAT_DATA_ALIGN);
++		datapos = ALIGN(realdatastart +
++				MAX_SHARED_LIBS * sizeof(unsigned long),
++				FLAT_DATA_ALIGN);
+ 
+ 		pr_debug("Allocated data+bss+stack (%u bytes): %lx\n",
+ 			 data_len + bss_len + stack_len, datapos);
+@@ -620,7 +622,7 @@ static int load_flat_file(struct linux_b
+ 		memp_size = len;
+ 	} else {
+ 
+-		len = text_len + data_len + extra;
++		len = text_len + data_len + extra + MAX_SHARED_LIBS * sizeof(u32);
+ 		len = PAGE_ALIGN(len);
+ 		textpos = vm_mmap(NULL, 0, len,
+ 			PROT_READ | PROT_EXEC | PROT_WRITE, MAP_PRIVATE, 0);
+@@ -635,7 +637,9 @@ static int load_flat_file(struct linux_b
+ 		}
+ 
+ 		realdatastart = textpos + ntohl(hdr->data_start);
+-		datapos = ALIGN(realdatastart, FLAT_DATA_ALIGN);
++		datapos = ALIGN(realdatastart +
++				MAX_SHARED_LIBS * sizeof(u32),
++				FLAT_DATA_ALIGN);
+ 
+ 		reloc = (__be32 __user *)
+ 			(datapos + (ntohl(hdr->reloc_start) - text_len));
+@@ -652,9 +656,8 @@ static int load_flat_file(struct linux_b
+ 					 (text_len + full_data
+ 						  - sizeof(struct flat_hdr)),
+ 					 0);
+-			if (datapos != realdatastart)
+-				memmove((void *)datapos, (void *)realdatastart,
+-						full_data);
++			memmove((void *) datapos, (void *) realdatastart,
++					full_data);
+ #else
+ 			/*
+ 			 * This is used on MMU systems mainly for testing.
+@@ -710,7 +713,8 @@ static int load_flat_file(struct linux_b
+ 		if (IS_ERR_VALUE(result)) {
+ 			ret = result;
+ 			pr_err("Unable to read code+data+bss, errno %d\n", ret);
+-			vm_munmap(textpos, text_len + data_len + extra);
++			vm_munmap(textpos, text_len + data_len + extra +
++				MAX_SHARED_LIBS * sizeof(u32));
+ 			goto err;
+ 		}
+ 	}
 --- a/fs/btrfs/backref.c
 +++ b/fs/btrfs/backref.c
 @@ -2303,7 +2303,7 @@ struct btrfs_backref_iter *btrfs_backref
@@ -21540,7 +21623,17 @@
  		spin_unlock(&poll->head->lock);
  		if (!done)
  			__io_async_wake(req, poll, mask, io_poll_task_func);
-@@ -4332,6 +4382,7 @@ static void io_async_task_func(struct ca
+@@ -4313,7 +4363,8 @@ static int io_sq_thread_acquire_mm(struc
+ 				   struct io_kiocb *req)
+ {
+ 	if (io_op_defs[req->opcode].needs_mm && !current->mm) {
+-		if (unlikely(!mmget_not_zero(ctx->sqo_mm)))
++		if (unlikely(!(ctx->flags & IORING_SETUP_SQPOLL) ||
++			     !mmget_not_zero(ctx->sqo_mm)))
+ 			return -EFAULT;
+ 		kthread_use_mm(ctx->sqo_mm);
+ 	}
+@@ -4332,6 +4383,7 @@ static void io_async_task_func(struct ca
  
  	if (io_poll_rewait(req, &apoll->poll)) {
  		spin_unlock_irq(&ctx->completion_lock);
@@ -21548,7 +21641,7 @@
  		return;
  	}
  
-@@ -4346,7 +4397,7 @@ static void io_async_task_func(struct ca
+@@ -4346,7 +4398,7 @@ static void io_async_task_func(struct ca
  		}
  	}
  
@@ -21557,7 +21650,7 @@
  	spin_unlock_irq(&ctx->completion_lock);
  
  	/* restore ->work in case we need to retry again */
-@@ -4356,7 +4407,6 @@ static void io_async_task_func(struct ca
+@@ -4356,7 +4408,6 @@ static void io_async_task_func(struct ca
  	kfree(apoll);
  
  	if (!canceled) {
@@ -21565,7 +21658,7 @@
  		if (io_sq_thread_acquire_mm(ctx, req)) {
  			io_cqring_add_event(req, -EFAULT);
  			goto end_req;
-@@ -4370,6 +4420,7 @@ end_req:
+@@ -4370,6 +4421,7 @@ end_req:
  		req_set_fail_links(req);
  		io_double_put_req(req);
  	}
@@ -21573,7 +21666,7 @@
  }
  
  static int io_async_wake(struct wait_queue_entry *wait, unsigned mode, int sync,
-@@ -4472,8 +4523,8 @@ static bool io_arm_poll_handler(struct i
+@@ -4472,8 +4524,8 @@ static bool io_arm_poll_handler(struct i
  
  	ret = __io_arm_poll_handler(req, &apoll->poll, &ipt, mask,
  					io_async_wake);
@@ -21584,7 +21677,7 @@
  		spin_unlock_irq(&ctx->completion_lock);
  		if (req->flags & REQ_F_WORK_INITIALIZED)
  			memcpy(&req->work, &apoll->work, sizeof(req->work));
-@@ -4507,14 +4558,13 @@ static bool io_poll_remove_one(struct io
+@@ -4507,14 +4559,13 @@ static bool io_poll_remove_one(struct io
  {
  	bool do_complete;
  
@@ -21601,7 +21694,7 @@
  		/* non-poll requests have submit ref still */
  		do_complete = __io_poll_remove_one(req, &apoll->poll);
  		if (do_complete) {
-@@ -4536,6 +4586,7 @@ static bool io_poll_remove_one(struct io
+@@ -4536,6 +4587,7 @@ static bool io_poll_remove_one(struct io
  		io_cqring_fill_event(req, -ECANCELED);
  		io_commit_cqring(req->ctx);
  		req->flags |= REQ_F_COMP_LOCKED;
@@ -21609,7 +21702,7 @@
  		io_put_req(req);
  	}
  
-@@ -4709,6 +4760,23 @@ static enum hrtimer_restart io_timeout_f
+@@ -4709,6 +4761,23 @@ static enum hrtimer_restart io_timeout_f
  	return HRTIMER_NORESTART;
  }
  
@@ -21633,7 +21726,7 @@
  static int io_timeout_cancel(struct io_ring_ctx *ctx, __u64 user_data)
  {
  	struct io_kiocb *req;
-@@ -4716,7 +4784,6 @@ static int io_timeout_cancel(struct io_r
+@@ -4716,7 +4785,6 @@ static int io_timeout_cancel(struct io_r
  
  	list_for_each_entry(req, &ctx->timeout_list, list) {
  		if (user_data == req->user_data) {
@@ -21641,7 +21734,7 @@
  			ret = 0;
  			break;
  		}
-@@ -4725,14 +4792,7 @@ static int io_timeout_cancel(struct io_r
+@@ -4725,14 +4793,7 @@ static int io_timeout_cancel(struct io_r
  	if (ret == -ENOENT)
  		return ret;
  
@@ -21657,7 +21750,7 @@
  }
  
  static int io_timeout_remove_prep(struct io_kiocb *req,
-@@ -6082,8 +6142,7 @@ static int io_sq_thread(void *data)
+@@ -6082,8 +6143,7 @@ static int io_sq_thread(void *data)
  			if (!list_empty(&ctx->poll_list) || need_resched() ||
  			    (!time_after(jiffies, timeout) && ret != -EBUSY &&
  			    !percpu_ref_is_dying(&ctx->refs))) {
@@ -21667,7 +21760,7 @@
  				cond_resched();
  				continue;
  			}
-@@ -6115,8 +6174,7 @@ static int io_sq_thread(void *data)
+@@ -6115,8 +6175,7 @@ static int io_sq_thread(void *data)
  					finish_wait(&ctx->sqo_wait, &wait);
  					break;
  				}
@@ -21677,7 +21770,7 @@
  					finish_wait(&ctx->sqo_wait, &wait);
  					continue;
  				}
-@@ -6145,8 +6203,7 @@ static int io_sq_thread(void *data)
+@@ -6145,8 +6204,7 @@ static int io_sq_thread(void *data)
  		timeout = jiffies + ctx->sq_thread_idle;
  	}
  
@@ -21687,7 +21780,7 @@
  
  	io_sq_thread_drop_mm(ctx);
  	revert_creds(old_cred);
-@@ -6211,9 +6268,8 @@ static int io_cqring_wait(struct io_ring
+@@ -6211,9 +6269,8 @@ static int io_cqring_wait(struct io_ring
  	do {
  		if (io_cqring_events(ctx, false) >= min_events)
  			return 0;
@@ -21698,7 +21791,7 @@
  	} while (1);
  
  	if (sig) {
-@@ -6235,8 +6291,8 @@ static int io_cqring_wait(struct io_ring
+@@ -6235,8 +6292,8 @@ static int io_cqring_wait(struct io_ring
  		prepare_to_wait_exclusive(&ctx->wait, &iowq.wq,
  						TASK_INTERRUPTIBLE);
  		/* make sure we run task_work before checking for signals */
@@ -21709,7 +21802,7 @@
  		if (signal_pending(current)) {
  			if (current->jobctl & JOBCTL_TASK_WORK) {
  				spin_lock_irq(&current->sighand->siglock);
-@@ -7086,6 +7142,9 @@ static unsigned long rings_size(unsigned
+@@ -7086,6 +7143,9 @@ static unsigned long rings_size(unsigned
  		return SIZE_MAX;
  #endif
  
@@ -21719,7 +21812,7 @@
  	sq_array_size = array_size(sizeof(u32), sq_entries);
  	if (sq_array_size == SIZE_MAX)
  		return SIZE_MAX;
-@@ -7093,9 +7152,6 @@ static unsigned long rings_size(unsigned
+@@ -7093,9 +7153,6 @@ static unsigned long rings_size(unsigned
  	if (check_add_overflow(off, sq_array_size, &off))
  		return SIZE_MAX;
  
@@ -21729,7 +21822,7 @@
  	return off;
  }
  
-@@ -7488,6 +7544,98 @@ static bool io_wq_files_match(struct io_
+@@ -7488,6 +7545,98 @@ static bool io_wq_files_match(struct io_
  	return work->files == files;
  }
  
@@ -21828,7 +21921,7 @@
  static void io_uring_cancel_files(struct io_ring_ctx *ctx,
  				  struct files_struct *files)
  {
-@@ -7529,10 +7677,10 @@ static void io_uring_cancel_files(struct
+@@ -7529,10 +7678,10 @@ static void io_uring_cancel_files(struct
  				clear_bit(0, &ctx->cq_check_overflow);
  				ctx->rings->sq_flags &= ~IORING_SQ_CQ_OVERFLOW;
  			}
@@ -21841,7 +21934,7 @@
  
  			/*
  			 * Put inflight ref and overflow ref. If that's
-@@ -7544,7 +7692,8 @@ static void io_uring_cancel_files(struct
+@@ -7544,7 +7693,8 @@ static void io_uring_cancel_files(struct
  				continue;
  			}
  		} else {
@@ -21851,7 +21944,7 @@
  			io_put_req(cancel_req);
  		}
  
-@@ -7655,8 +7804,7 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned
+@@ -7655,8 +7805,7 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned
  	int submitted = 0;
  	struct fd f;
  
@@ -21861,7 +21954,7 @@
  
  	if (flags & ~(IORING_ENTER_GETEVENTS | IORING_ENTER_SQ_WAKEUP))
  		return -EINVAL;
-@@ -7828,6 +7976,10 @@ static int io_allocate_scq_urings(struct
+@@ -7828,6 +7977,10 @@ static int io_allocate_scq_urings(struct
  	struct io_rings *rings;
  	size_t size, sq_array_offset;
  
@@ -21872,7 +21965,7 @@
  	size = rings_size(p->sq_entries, p->cq_entries, &sq_array_offset);
  	if (size == SIZE_MAX)
  		return -EOVERFLOW;
-@@ -7844,8 +7996,6 @@ static int io_allocate_scq_urings(struct
+@@ -7844,8 +7997,6 @@ static int io_allocate_scq_urings(struct
  	rings->cq_ring_entries = p->cq_entries;
  	ctx->sq_mask = rings->sq_ring_mask;
  	ctx->cq_mask = rings->cq_ring_mask;
@@ -26177,6 +26270,19 @@
  		break;
  	}
  	return insn - insn_buf;
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -5419,8 +5419,8 @@ struct sk_buff *skb_vlan_untag(struct sk
+ 	skb = skb_share_check(skb, GFP_ATOMIC);
+ 	if (unlikely(!skb))
+ 		goto err_free;
+-
+-	if (unlikely(!pskb_may_pull(skb, VLAN_HLEN)))
++	/* We may access the two bytes after vlan_hdr in vlan_set_encap_proto(). */
++	if (unlikely(!pskb_may_pull(skb, VLAN_HLEN + sizeof(unsigned short))))
+ 		goto err_free;
+ 
+ 	vhdr = (struct vlan_hdr *)skb->data;
 --- a/net/core/sock.c
 +++ b/net/core/sock.c
 @@ -2842,6 +2842,27 @@ int sock_no_mmap(struct file *file, stru
@@ -26265,6 +26371,51 @@
 +	tw_prot_cleanup(prot->twsk_prot);
  }
  EXPORT_SYMBOL(proto_unregister);
+ 
+--- a/net/ethtool/features.c
++++ b/net/ethtool/features.c
+@@ -224,7 +224,9 @@ int ethnl_set_features(struct sk_buff *s
+ 	DECLARE_BITMAP(wanted_diff_mask, NETDEV_FEATURE_COUNT);
+ 	DECLARE_BITMAP(active_diff_mask, NETDEV_FEATURE_COUNT);
+ 	DECLARE_BITMAP(old_active, NETDEV_FEATURE_COUNT);
++	DECLARE_BITMAP(old_wanted, NETDEV_FEATURE_COUNT);
+ 	DECLARE_BITMAP(new_active, NETDEV_FEATURE_COUNT);
++	DECLARE_BITMAP(new_wanted, NETDEV_FEATURE_COUNT);
+ 	DECLARE_BITMAP(req_wanted, NETDEV_FEATURE_COUNT);
+ 	DECLARE_BITMAP(req_mask, NETDEV_FEATURE_COUNT);
+ 	struct nlattr *tb[ETHTOOL_A_FEATURES_MAX + 1];
+@@ -250,6 +252,7 @@ int ethnl_set_features(struct sk_buff *s
+ 
+ 	rtnl_lock();
+ 	ethnl_features_to_bitmap(old_active, dev->features);
++	ethnl_features_to_bitmap(old_wanted, dev->wanted_features);
+ 	ret = ethnl_parse_bitset(req_wanted, req_mask, NETDEV_FEATURE_COUNT,
+ 				 tb[ETHTOOL_A_FEATURES_WANTED],
+ 				 netdev_features_strings, info->extack);
+@@ -261,17 +264,15 @@ int ethnl_set_features(struct sk_buff *s
+ 		goto out_rtnl;
+ 	}
+ 
+-	/* set req_wanted bits not in req_mask from old_active */
++	/* set req_wanted bits not in req_mask from old_wanted */
+ 	bitmap_and(req_wanted, req_wanted, req_mask, NETDEV_FEATURE_COUNT);
+-	bitmap_andnot(new_active, old_active, req_mask, NETDEV_FEATURE_COUNT);
+-	bitmap_or(req_wanted, new_active, req_wanted, NETDEV_FEATURE_COUNT);
+-	if (bitmap_equal(req_wanted, old_active, NETDEV_FEATURE_COUNT)) {
+-		ret = 0;
+-		goto out_rtnl;
++	bitmap_andnot(new_wanted, old_wanted, req_mask, NETDEV_FEATURE_COUNT);
++	bitmap_or(req_wanted, new_wanted, req_wanted, NETDEV_FEATURE_COUNT);
++	if (!bitmap_equal(req_wanted, old_wanted, NETDEV_FEATURE_COUNT)) {
++		dev->wanted_features &= ~dev->hw_features;
++		dev->wanted_features |= ethnl_bitmap_to_features(req_wanted) & dev->hw_features;
++		__netdev_update_features(dev);
+ 	}
+-
+-	dev->wanted_features = ethnl_bitmap_to_features(req_wanted);
+-	__netdev_update_features(dev);
+ 	ethnl_features_to_bitmap(new_active, dev->features);
+ 	mod = !bitmap_equal(old_active, new_active, NETDEV_FEATURE_COUNT);
  
 --- a/net/ipv4/inet_connection_sock.c
 +++ b/net/ipv4/inet_connection_sock.c
@@ -26396,6 +26547,27 @@
  	}
  	inet_bind_hash(child, tb, port);
  	spin_unlock(&head->lock);
+--- a/net/ipv4/nexthop.c
++++ b/net/ipv4/nexthop.c
+@@ -446,7 +446,7 @@ static int nh_check_attr_group(struct ne
+ 	unsigned int i, j;
+ 	u8 nhg_fdb = 0;
+ 
+-	if (len & (sizeof(struct nexthop_grp) - 1)) {
++	if (!len || len & (sizeof(struct nexthop_grp) - 1)) {
+ 		NL_SET_ERR_MSG(extack,
+ 			       "Invalid length for nexthop group attribute");
+ 		return -EINVAL;
+@@ -1187,6 +1187,9 @@ static struct nexthop *nexthop_create_gr
+ 	struct nexthop *nh;
+ 	int i;
+ 
++	if (WARN_ON(!num_nh))
++		return ERR_PTR(-EINVAL);
++
+ 	nh = nexthop_alloc();
+ 	if (!nh)
+ 		return ERR_PTR(-ENOMEM);
 --- a/net/ipv4/sysctl_net_ipv4.c
 +++ b/net/ipv4/sysctl_net_ipv4.c
 @@ -301,24 +301,16 @@ static int proc_tcp_fastopen_key(struct
@@ -26488,6 +26660,25 @@
  static bool __tcp_fastopen_cookie_gen_cipher(struct request_sock *req,
  					     struct sk_buff *syn,
  					     const siphash_key_t *key,
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -913,7 +913,15 @@ int ip6_tnl_rcv(struct ip6_tnl *t, struc
+ 		struct metadata_dst *tun_dst,
+ 		bool log_ecn_err)
+ {
+-	return __ip6_tnl_rcv(t, skb, tpi, tun_dst, ip6ip6_dscp_ecn_decapsulate,
++	int (*dscp_ecn_decapsulate)(const struct ip6_tnl *t,
++				    const struct ipv6hdr *ipv6h,
++				    struct sk_buff *skb);
++
++	dscp_ecn_decapsulate = ip6ip6_dscp_ecn_decapsulate;
++	if (tpi->proto == htons(ETH_P_IP))
++		dscp_ecn_decapsulate = ip4ip6_dscp_ecn_decapsulate;
++
++	return __ip6_tnl_rcv(t, skb, tpi, tun_dst, dscp_ecn_decapsulate,
+ 			     log_ecn_err);
+ }
+ EXPORT_SYMBOL(ip6_tnl_rcv);
 --- a/net/mac80211/sta_info.c
 +++ b/net/mac80211/sta_info.c
 @@ -1050,7 +1050,7 @@ static void __sta_info_destroy_part2(str
@@ -26570,6 +26761,18 @@
  			return false;
  		break;
  	case NFT_META_OIFGROUP:
+--- a/net/netlink/policy.c
++++ b/net/netlink/policy.c
+@@ -51,6 +51,9 @@ static int add_policy(struct nl_policy_d
+ 	if (!state)
+ 		return -ENOMEM;
+ 
++	memset(&state->policies[state->n_alloc], 0,
++	       flex_array_size(state, policies, n_alloc - state->n_alloc));
++
+ 	state->policies[state->n_alloc].policy = policy;
+ 	state->policies[state->n_alloc].maxtype = maxtype;
+ 	state->n_alloc = n_alloc;
 --- a/net/nfc/rawsock.c
 +++ b/net/nfc/rawsock.c
 @@ -332,10 +332,13 @@ static int rawsock_create(struct net *ne
@@ -26628,6 +26831,111 @@
  		prb_clear_blk_fill_status(&po->rx_ring);
  	}
  
+--- a/net/qrtr/qrtr.c
++++ b/net/qrtr/qrtr.c
+@@ -692,23 +692,25 @@ static void qrtr_port_remove(struct qrtr
+  */
+ static int qrtr_port_assign(struct qrtr_sock *ipc, int *port)
+ {
++	u32 min_port;
+ 	int rc;
+ 
+ 	mutex_lock(&qrtr_port_lock);
+ 	if (!*port) {
+-		rc = idr_alloc(&qrtr_ports, ipc,
+-			       QRTR_MIN_EPH_SOCKET, QRTR_MAX_EPH_SOCKET + 1,
+-			       GFP_ATOMIC);
+-		if (rc >= 0)
+-			*port = rc;
++		min_port = QRTR_MIN_EPH_SOCKET;
++		rc = idr_alloc_u32(&qrtr_ports, ipc, &min_port, QRTR_MAX_EPH_SOCKET, GFP_ATOMIC);
++		if (!rc)
++			*port = min_port;
+ 	} else if (*port < QRTR_MIN_EPH_SOCKET && !capable(CAP_NET_ADMIN)) {
+ 		rc = -EACCES;
+ 	} else if (*port == QRTR_PORT_CTRL) {
+-		rc = idr_alloc(&qrtr_ports, ipc, 0, 1, GFP_ATOMIC);
++		min_port = 0;
++		rc = idr_alloc_u32(&qrtr_ports, ipc, &min_port, 0, GFP_ATOMIC);
+ 	} else {
+-		rc = idr_alloc(&qrtr_ports, ipc, *port, *port + 1, GFP_ATOMIC);
+-		if (rc >= 0)
+-			*port = rc;
++		min_port = *port;
++		rc = idr_alloc_u32(&qrtr_ports, ipc, &min_port, *port, GFP_ATOMIC);
++		if (!rc)
++			*port = min_port;
+ 	}
+ 	mutex_unlock(&qrtr_port_lock);
+ 
+--- a/net/sched/act_ct.c
++++ b/net/sched/act_ct.c
+@@ -704,7 +704,7 @@ static int tcf_ct_handle_fragments(struc
+ 		err = ip_defrag(net, skb, user);
+ 		local_bh_enable();
+ 		if (err && err != -EINPROGRESS)
+-			goto out_free;
++			return err;
+ 
+ 		if (!err)
+ 			*defrag = true;
+--- a/net/sctp/stream.c
++++ b/net/sctp/stream.c
+@@ -88,12 +88,13 @@ static int sctp_stream_alloc_out(struct
+ 	int ret;
+ 
+ 	if (outcnt <= stream->outcnt)
+-		return 0;
++		goto out;
+ 
+ 	ret = genradix_prealloc(&stream->out, outcnt, gfp);
+ 	if (ret)
+ 		return ret;
+ 
++out:
+ 	stream->outcnt = outcnt;
+ 	return 0;
+ }
+@@ -104,12 +105,13 @@ static int sctp_stream_alloc_in(struct s
+ 	int ret;
+ 
+ 	if (incnt <= stream->incnt)
+-		return 0;
++		goto out;
+ 
+ 	ret = genradix_prealloc(&stream->in, incnt, gfp);
+ 	if (ret)
+ 		return ret;
+ 
++out:
+ 	stream->incnt = incnt;
+ 	return 0;
+ }
+--- a/net/smc/smc_diag.c
++++ b/net/smc/smc_diag.c
+@@ -170,13 +170,15 @@ static int __smc_diag_dump(struct sock *
+ 	    (req->diag_ext & (1 << (SMC_DIAG_DMBINFO - 1))) &&
+ 	    !list_empty(&smc->conn.lgr->list)) {
+ 		struct smc_connection *conn = &smc->conn;
+-		struct smcd_diag_dmbinfo dinfo = {
+-			.linkid = *((u32 *)conn->lgr->id),
+-			.peer_gid = conn->lgr->peer_gid,
+-			.my_gid = conn->lgr->smcd->local_gid,
+-			.token = conn->rmb_desc->token,
+-			.peer_token = conn->peer_token
+-		};
++		struct smcd_diag_dmbinfo dinfo;
++
++		memset(&dinfo, 0, sizeof(dinfo));
++
++		dinfo.linkid = *((u32 *)conn->lgr->id);
++		dinfo.peer_gid = conn->lgr->peer_gid;
++		dinfo.my_gid = conn->lgr->smcd->local_gid;
++		dinfo.token = conn->rmb_desc->token;
++		dinfo.peer_token = conn->peer_token;
+ 
+ 		if (nla_put(skb, SMC_DIAG_DMBINFO, sizeof(dinfo), &dinfo) < 0)
+ 			goto errout;
 --- a/net/socket.c
 +++ b/net/socket.c
 @@ -500,7 +500,7 @@ static struct socket *sockfd_lookup_ligh
@@ -26729,6 +27037,50 @@
  	return 0;
  
  out_err:
+--- a/net/tipc/crypto.c
++++ b/net/tipc/crypto.c
+@@ -757,10 +757,12 @@ static void tipc_aead_encrypt_done(struc
+ 	switch (err) {
+ 	case 0:
+ 		this_cpu_inc(tx->stats->stat[STAT_ASYNC_OK]);
++		rcu_read_lock();
+ 		if (likely(test_bit(0, &b->up)))
+ 			b->media->send_msg(net, skb, b, &tx_ctx->dst);
+ 		else
+ 			kfree_skb(skb);
++		rcu_read_unlock();
+ 		break;
+ 	case -EINPROGRESS:
+ 		return;
+--- a/net/tipc/netlink_compat.c
++++ b/net/tipc/netlink_compat.c
+@@ -275,8 +275,9 @@ err_out:
+ static int tipc_nl_compat_dumpit(struct tipc_nl_compat_cmd_dump *cmd,
+ 				 struct tipc_nl_compat_msg *msg)
+ {
+-	int err;
++	struct nlmsghdr *nlh;
+ 	struct sk_buff *arg;
++	int err;
+ 
+ 	if (msg->req_type && (!msg->req_size ||
+ 			      !TLV_CHECK_TYPE(msg->req, msg->req_type)))
+@@ -305,6 +306,15 @@ static int tipc_nl_compat_dumpit(struct
+ 		return -ENOMEM;
+ 	}
+ 
++	nlh = nlmsg_put(arg, 0, 0, tipc_genl_family.id, 0, NLM_F_MULTI);
++	if (!nlh) {
++		kfree_skb(arg);
++		kfree_skb(msg->rep);
++		msg->rep = NULL;
++		return -EMSGSIZE;
++	}
++	nlmsg_end(arg, nlh);
++
+ 	err = __tipc_nl_compat_dumpit(cmd, msg, arg);
+ 	if (err) {
+ 		kfree_skb(msg->rep);
 --- a/net/tls/tls_device.c
 +++ b/net/tls/tls_device.c
 @@ -561,7 +561,7 @@ int tls_device_sendpage(struct sock *sk,
