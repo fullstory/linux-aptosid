@@ -1,16 +1,24 @@
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -5663,6 +5663,7 @@
+ 					device);
+ 				j = NO_REPORT_LUNS (don't use report luns
+ 					command, uas only);
++				k = NO_SAME (do not use WRITE_SAME, uas only)
+ 				l = NOT_LOCKABLE (don't try to lock and
+ 					unlock ejectable media, not on uas);
+ 				m = MAX_SECTORS_64 (don't transfer more
 --- a/Makefile
 +++ b/Makefile
-@@ -1,8 +1,8 @@
+@@ -1,7 +1,7 @@
  # SPDX-License-Identifier: GPL-2.0
  VERSION = 5
  PATCHLEVEL = 10
--SUBLEVEL = 2
--EXTRAVERSION =
+-SUBLEVEL = 0
 +SUBLEVEL = 3
-+EXTRAVERSION = -rc1
+ EXTRAVERSION =
  NAME = Kleptomaniac Octopus
  
- # *DOCUMENTATION*
 --- a/arch/arm/boot/dts/exynos5410-odroidxu.dts
 +++ b/arch/arm/boot/dts/exynos5410-odroidxu.dts
 @@ -327,6 +327,8 @@
@@ -373,6 +381,28 @@
  	tmc_etr_sync_perf_buffer(etr_perf, offset, size);
  
  	/*
+--- a/drivers/md/dm-raid.c
++++ b/drivers/md/dm-raid.c
+@@ -3730,14 +3730,12 @@ static void raid_io_hints(struct dm_targ
+ 	blk_limits_io_opt(limits, chunk_size_bytes * mddev_data_stripes(rs));
+ 
+ 	/*
+-	 * RAID10 personality requires bio splitting,
+-	 * RAID0/1/4/5/6 don't and process large discard bios properly.
++	 * RAID1 and RAID10 personalities require bio splitting,
++	 * RAID0/4/5/6 don't and process large discard bios properly.
+ 	 */
+-	if (rs_is_raid10(rs)) {
+-		limits->discard_granularity = max(chunk_size_bytes,
+-						  limits->discard_granularity);
+-		limits->max_discard_sectors = min_not_zero(rs->md.chunk_sectors,
+-							   limits->max_discard_sectors);
++	if (rs_is_raid1(rs) || rs_is_raid10(rs)) {
++		limits->discard_granularity = chunk_size_bytes;
++		limits->max_discard_sectors = rs->md.chunk_sectors;
+ 	}
+ }
+ 
 --- a/drivers/md/md.c
 +++ b/drivers/md/md.c
 @@ -7590,8 +7590,11 @@ static int md_ioctl(struct block_device
@@ -389,6 +419,26 @@
  		did_set_md_closing = true;
  		mutex_unlock(&mddev->open_mutex);
  		sync_blockdev(bdev);
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -311,7 +311,7 @@ struct mddev {
+ 	int				external;	/* metadata is
+ 							 * managed externally */
+ 	char				metadata_type[17]; /* externally set*/
+-	unsigned int			chunk_sectors;
++	int				chunk_sectors;
+ 	time64_t			ctime, utime;
+ 	int				level, layout;
+ 	char				clevel[16];
+@@ -339,7 +339,7 @@ struct mddev {
+ 	 */
+ 	sector_t			reshape_position;
+ 	int				delta_disks, new_level, new_layout;
+-	unsigned int			new_chunk_sectors;
++	int				new_chunk_sectors;
+ 	int				reshape_backwards;
+ 
+ 	struct md_thread		*thread;	/* management thread */
 --- a/drivers/media/usb/msi2500/msi2500.c
 +++ b/drivers/media/usb/msi2500/msi2500.c
 @@ -1230,7 +1230,7 @@ static int msi2500_probe(struct usb_inte
@@ -452,6 +502,20 @@
  			return i;
  
  	return -EINVAL;
+--- a/drivers/tty/serial/8250/8250_omap.c
++++ b/drivers/tty/serial/8250/8250_omap.c
+@@ -184,11 +184,6 @@ static void omap_8250_mdr1_errataset(str
+ 				     struct omap8250_priv *priv)
+ {
+ 	u8 timeout = 255;
+-	u8 old_mdr1;
+-
+-	old_mdr1 = serial_in(up, UART_OMAP_MDR1);
+-	if (old_mdr1 == priv->mdr1)
+-		return;
+ 
+ 	serial_out(up, UART_OMAP_MDR1, priv->mdr1);
+ 	udelay(2);
 --- a/drivers/tty/serial/serial_core.c
 +++ b/drivers/tty/serial/serial_core.c
 @@ -1467,6 +1467,10 @@ static void uart_set_ldisc(struct tty_st
@@ -477,6 +541,18 @@
  };
  
  static const struct ci_hdrc_imx_platform_flag imx7d_usb_data = {
+--- a/drivers/usb/core/quirks.c
++++ b/drivers/usb/core/quirks.c
+@@ -342,6 +342,9 @@ static const struct usb_device_id usb_qu
+ 	{ USB_DEVICE(0x06a3, 0x0006), .driver_info =
+ 			USB_QUIRK_CONFIG_INTF_STRINGS },
+ 
++	/* Agfa SNAPSCAN 1212U */
++	{ USB_DEVICE(0x06bd, 0x0001), .driver_info = USB_QUIRK_RESET_RESUME },
++
+ 	/* Guillemot Webcam Hercules Dualpix Exchange (2nd ID) */
+ 	{ USB_DEVICE(0x06f8, 0x0804), .driver_info = USB_QUIRK_RESET_RESUME },
+ 
 --- a/drivers/usb/gadget/function/f_acm.c
 +++ b/drivers/usb/gadget/function/f_acm.c
 @@ -686,7 +686,7 @@ acm_bind(struct usb_configuration *c, st
@@ -545,6 +621,109 @@
  	else if (gadget_is_dualspeed(g) && g->speed == USB_SPEED_HIGH)
  		return 13 * 512 * 8 * 1000 * 8;
  	else
+--- a/drivers/usb/gadget/udc/dummy_hcd.c
++++ b/drivers/usb/gadget/udc/dummy_hcd.c
+@@ -2734,7 +2734,7 @@ static int __init init(void)
+ {
+ 	int	retval = -ENOMEM;
+ 	int	i;
+-	struct	dummy *dum[MAX_NUM_UDC];
++	struct	dummy *dum[MAX_NUM_UDC] = {};
+ 
+ 	if (usb_disabled())
+ 		return -ENODEV;
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -1712,6 +1712,10 @@ retry:
+ 	hcd->state = HC_STATE_SUSPENDED;
+ 	bus_state->next_statechange = jiffies + msecs_to_jiffies(10);
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
++
++	if (bus_state->bus_suspended)
++		usleep_range(5000, 10000);
++
+ 	return 0;
+ }
+ 
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -47,6 +47,7 @@
+ #define PCI_DEVICE_ID_INTEL_DNV_XHCI			0x19d0
+ #define PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_2C_XHCI	0x15b5
+ #define PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_4C_XHCI	0x15b6
++#define PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_LP_XHCI	0x15c1
+ #define PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_C_2C_XHCI	0x15db
+ #define PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_C_4C_XHCI	0x15d4
+ #define PCI_DEVICE_ID_INTEL_TITAN_RIDGE_2C_XHCI		0x15e9
+@@ -55,6 +56,7 @@
+ #define PCI_DEVICE_ID_INTEL_ICE_LAKE_XHCI		0x8a13
+ #define PCI_DEVICE_ID_INTEL_CML_XHCI			0xa3af
+ #define PCI_DEVICE_ID_INTEL_TIGER_LAKE_XHCI		0x9a13
++#define PCI_DEVICE_ID_INTEL_MAPLE_RIDGE_XHCI		0x1138
+ 
+ #define PCI_DEVICE_ID_AMD_PROMONTORYA_4			0x43b9
+ #define PCI_DEVICE_ID_AMD_PROMONTORYA_3			0x43ba
+@@ -232,13 +234,15 @@ static void xhci_pci_quirks(struct devic
+ 	if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
+ 	    (pdev->device == PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_2C_XHCI ||
+ 	     pdev->device == PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_4C_XHCI ||
++	     pdev->device == PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_LP_XHCI ||
+ 	     pdev->device == PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_C_2C_XHCI ||
+ 	     pdev->device == PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_C_4C_XHCI ||
+ 	     pdev->device == PCI_DEVICE_ID_INTEL_TITAN_RIDGE_2C_XHCI ||
+ 	     pdev->device == PCI_DEVICE_ID_INTEL_TITAN_RIDGE_4C_XHCI ||
+ 	     pdev->device == PCI_DEVICE_ID_INTEL_TITAN_RIDGE_DD_XHCI ||
+ 	     pdev->device == PCI_DEVICE_ID_INTEL_ICE_LAKE_XHCI ||
+-	     pdev->device == PCI_DEVICE_ID_INTEL_TIGER_LAKE_XHCI))
++	     pdev->device == PCI_DEVICE_ID_INTEL_TIGER_LAKE_XHCI ||
++	     pdev->device == PCI_DEVICE_ID_INTEL_MAPLE_RIDGE_XHCI))
+ 		xhci->quirks |= XHCI_DEFAULT_PM_RUNTIME_ALLOW;
+ 
+ 	if (pdev->vendor == PCI_VENDOR_ID_ETRON &&
+--- a/drivers/usb/host/xhci-plat.c
++++ b/drivers/usb/host/xhci-plat.c
+@@ -333,6 +333,9 @@ static int xhci_plat_probe(struct platfo
+ 	if (priv && (priv->quirks & XHCI_SKIP_PHY_INIT))
+ 		hcd->skip_phy_initialization = 1;
+ 
++	if (priv && (priv->quirks & XHCI_SG_TRB_CACHE_SIZE_QUIRK))
++		xhci->quirks |= XHCI_SG_TRB_CACHE_SIZE_QUIRK;
++
+ 	ret = usb_add_hcd(hcd, irq, IRQF_SHARED);
+ 	if (ret)
+ 		goto disable_usb_phy;
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1878,6 +1878,7 @@ struct xhci_hcd {
+ #define XHCI_RENESAS_FW_QUIRK	BIT_ULL(36)
+ #define XHCI_SKIP_PHY_INIT	BIT_ULL(37)
+ #define XHCI_DISABLE_SPARSE	BIT_ULL(38)
++#define XHCI_SG_TRB_CACHE_SIZE_QUIRK	BIT_ULL(39)
+ 
+ 	unsigned int		num_active_eps;
+ 	unsigned int		limit_active_eps;
+--- a/drivers/usb/misc/legousbtower.c
++++ b/drivers/usb/misc/legousbtower.c
+@@ -797,7 +797,7 @@ static int tower_probe(struct usb_interf
+ 				      &get_version_reply,
+ 				      sizeof(get_version_reply),
+ 				      1000, GFP_KERNEL);
+-	if (!result) {
++	if (result) {
+ 		dev_err(idev, "get version request failed: %d\n", result);
+ 		retval = result;
+ 		goto error;
+--- a/drivers/usb/misc/sisusbvga/Kconfig
++++ b/drivers/usb/misc/sisusbvga/Kconfig
+@@ -16,7 +16,7 @@ config USB_SISUSBVGA
+ 
+ config USB_SISUSBVGA_CON
+ 	bool "Text console and mode switching support" if USB_SISUSBVGA
+-	depends on VT
++	depends on VT && BROKEN
+ 	select FONT_8x16
+ 	help
+ 	  Say Y here if you want a VGA text console via the USB dongle or
 --- a/drivers/usb/mtu3/mtu3_debugfs.c
 +++ b/drivers/usb/mtu3/mtu3_debugfs.c
 @@ -127,7 +127,7 @@ static void mtu3_debugfs_regset(struct m
@@ -616,6 +795,50 @@
  		data->use_send_setup = 1;
  
  	if (device_flags & ZLP)
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -867,6 +867,9 @@ static int uas_slave_configure(struct sc
+ 	if (devinfo->flags & US_FL_NO_READ_CAPACITY_16)
+ 		sdev->no_read_capacity_16 = 1;
+ 
++	/* Some disks cannot handle WRITE_SAME */
++	if (devinfo->flags & US_FL_NO_SAME)
++		sdev->no_write_same = 1;
+ 	/*
+ 	 * Some disks return the total number of blocks in response
+ 	 * to READ CAPACITY rather than the highest block number.
+--- a/drivers/usb/storage/unusual_uas.h
++++ b/drivers/usb/storage/unusual_uas.h
+@@ -35,12 +35,15 @@ UNUSUAL_DEV(0x054c, 0x087d, 0x0000, 0x99
+ 		USB_SC_DEVICE, USB_PR_DEVICE, NULL,
+ 		US_FL_NO_REPORT_OPCODES),
+ 
+-/* Reported-by: Julian Groß <julian.g@posteo.de> */
++/*
++ *  Initially Reported-by: Julian Groß <julian.g@posteo.de>
++ *  Further reports David C. Partridge <david.partridge@perdrix.co.uk>
++ */
+ UNUSUAL_DEV(0x059f, 0x105f, 0x0000, 0x9999,
+ 		"LaCie",
+ 		"2Big Quadra USB3",
+ 		USB_SC_DEVICE, USB_PR_DEVICE, NULL,
+-		US_FL_NO_REPORT_OPCODES),
++		US_FL_NO_REPORT_OPCODES | US_FL_NO_SAME),
+ 
+ /*
+  * Apricorn USB3 dongle sometimes returns "USBSUSBSUSBS" in response to SCSI
+--- a/drivers/usb/storage/usb.c
++++ b/drivers/usb/storage/usb.c
+@@ -541,6 +541,9 @@ void usb_stor_adjust_quirks(struct usb_d
+ 		case 'j':
+ 			f |= US_FL_NO_REPORT_LUNS;
+ 			break;
++		case 'k':
++			f |= US_FL_NO_SAME;
++			break;
+ 		case 'l':
+ 			f |= US_FL_NOT_LOCKABLE;
+ 			break;
 --- a/fs/crypto/fscrypt_private.h
 +++ b/fs/crypto/fscrypt_private.h
 @@ -25,6 +25,9 @@
@@ -931,6 +1154,17 @@
  /* crypto.c */
  static inline void fscrypt_enqueue_decrypt_work(struct work_struct *work)
  {
+--- a/include/linux/usb_usual.h
++++ b/include/linux/usb_usual.h
+@@ -84,6 +84,8 @@
+ 		/* Cannot handle REPORT_LUNS */			\
+ 	US_FLAG(ALWAYS_SYNC, 0x20000000)			\
+ 		/* lies about caching, so always sync */	\
++	US_FLAG(NO_SAME, 0x40000000)				\
++		/* Cannot handle WRITE_SAME */			\
+ 
+ #define US_FLAG(name, value)	US_FL_##name = value ,
+ enum { US_DO_ALL_FLAGS };
 --- a/include/uapi/linux/fscrypt.h
 +++ b/include/uapi/linux/fscrypt.h
 @@ -20,7 +20,6 @@
@@ -984,6 +1218,18 @@
  struct af_alg_iv {
  	__u32	ivlen;
  	__u8	iv[0];
+--- a/include/uapi/linux/ptrace.h
++++ b/include/uapi/linux/ptrace.h
+@@ -81,7 +81,8 @@ struct seccomp_metadata {
+ 
+ struct ptrace_syscall_info {
+ 	__u8 op;	/* PTRACE_SYSCALL_INFO_* */
+-	__u32 arch __attribute__((__aligned__(sizeof(__u32))));
++	__u8 pad[3];
++	__u32 arch;
+ 	__u64 instruction_pointer;
+ 	__u64 stack_pointer;
+ 	union {
 --- a/net/bluetooth/hci_event.c
 +++ b/net/bluetooth/hci_event.c
 @@ -5868,21 +5868,19 @@ static void hci_le_direct_adv_report_evt
@@ -1160,3 +1406,95 @@
  		return -EINVAL;
  
  	if (!pairwise && mac_addr && !(rdev->wiphy.flags & WIPHY_FLAG_IBSS_RSN))
+--- a/sound/core/oss/pcm_oss.c
++++ b/sound/core/oss/pcm_oss.c
+@@ -1935,11 +1935,15 @@ static int snd_pcm_oss_set_subdivide(str
+ static int snd_pcm_oss_set_fragment1(struct snd_pcm_substream *substream, unsigned int val)
+ {
+ 	struct snd_pcm_runtime *runtime;
++	int fragshift;
+ 
+ 	runtime = substream->runtime;
+ 	if (runtime->oss.subdivision || runtime->oss.fragshift)
+ 		return -EINVAL;
+-	runtime->oss.fragshift = val & 0xffff;
++	fragshift = val & 0xffff;
++	if (fragshift >= 31)
++		return -EINVAL;
++	runtime->oss.fragshift = fragshift;
+ 	runtime->oss.maxfrags = (val >> 16) & 0xffff;
+ 	if (runtime->oss.fragshift < 4)		/* < 16 */
+ 		runtime->oss.fragshift = 4;
+--- a/sound/usb/format.c
++++ b/sound/usb/format.c
+@@ -40,6 +40,8 @@ static u64 parse_audio_format_i_type(str
+ 	case UAC_VERSION_1:
+ 	default: {
+ 		struct uac_format_type_i_discrete_descriptor *fmt = _fmt;
++		if (format >= 64)
++			return 0; /* invalid format */
+ 		sample_width = fmt->bBitResolution;
+ 		sample_bytes = fmt->bSubframeSize;
+ 		format = 1ULL << format;
+--- a/sound/usb/stream.c
++++ b/sound/usb/stream.c
+@@ -193,16 +193,16 @@ static int usb_chmap_ctl_get(struct snd_
+ 	struct snd_pcm_chmap *info = snd_kcontrol_chip(kcontrol);
+ 	struct snd_usb_substream *subs = info->private_data;
+ 	struct snd_pcm_chmap_elem *chmap = NULL;
+-	int i;
++	int i = 0;
+ 
+-	memset(ucontrol->value.integer.value, 0,
+-	       sizeof(ucontrol->value.integer.value));
+ 	if (subs->cur_audiofmt)
+ 		chmap = subs->cur_audiofmt->chmap;
+ 	if (chmap) {
+ 		for (i = 0; i < chmap->channels; i++)
+ 			ucontrol->value.integer.value[i] = chmap->map[i];
+ 	}
++	for (; i < subs->channels_max; i++)
++		ucontrol->value.integer.value[i] = 0;
+ 	return 0;
+ }
+ 
+--- a/tools/testing/ktest/ktest.pl
++++ b/tools/testing/ktest/ktest.pl
+@@ -1499,17 +1499,16 @@ sub dodie {
+ 	my $log_file;
+ 
+ 	if (defined($opt{"LOG_FILE"})) {
+-	    my $whence = 0; # beginning of file
+-	    my $pos = $test_log_start;
++	    my $whence = 2; # End of file
++	    my $log_size = tell LOG;
++	    my $size = $log_size - $test_log_start;
+ 
+ 	    if (defined($mail_max_size)) {
+-		my $log_size = tell LOG;
+-		$log_size -= $test_log_start;
+-		if ($log_size > $mail_max_size) {
+-		    $whence = 2; # end of file
+-		    $pos = - $mail_max_size;
++		if ($size > $mail_max_size) {
++		    $size = $mail_max_size;
+ 		}
+ 	    }
++	    my $pos = - $size;
+ 	    $log_file = "$tmpdir/log";
+ 	    open (L, "$opt{LOG_FILE}") or die "Can't open $opt{LOG_FILE} to read)";
+ 	    open (O, "> $tmpdir/log") or die "Can't open $tmpdir/log\n";
+@@ -4253,7 +4252,12 @@ sub do_send_mail {
+     $mail_command =~ s/\$SUBJECT/$subject/g;
+     $mail_command =~ s/\$MESSAGE/$message/g;
+ 
+-    run_command $mail_command;
++    my $ret = run_command $mail_command;
++    if (!$ret && defined($file)) {
++	# try again without the file
++	$message .= "\n\n*** FAILED TO SEND LOG ***\n\n";
++	do_send_email($subject, $message);
++    }
+ }
+ 
+ sub send_email {
