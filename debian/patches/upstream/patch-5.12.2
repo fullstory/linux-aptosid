@@ -1,16 +1,14 @@
 --- a/Makefile
 +++ b/Makefile
-@@ -1,8 +1,8 @@
+@@ -1,7 +1,7 @@
  # SPDX-License-Identifier: GPL-2.0
  VERSION = 5
  PATCHLEVEL = 12
--SUBLEVEL = 1
--EXTRAVERSION =
+-SUBLEVEL = 0
 +SUBLEVEL = 2
-+EXTRAVERSION = -rc1
+ EXTRAVERSION =
  NAME = Frozen Wasteland
  
- # *DOCUMENTATION*
 --- a/arch/mips/include/asm/vdso/gettimeofday.h
 +++ b/arch/mips/include/asm/vdso/gettimeofday.h
 @@ -20,6 +20,12 @@
@@ -108,6 +106,26 @@
  }
  
  static bool suspend_to_idle(struct drm_i915_private *dev_priv)
+--- a/drivers/misc/mei/hw-me-regs.h
++++ b/drivers/misc/mei/hw-me-regs.h
+@@ -105,6 +105,7 @@
+ 
+ #define MEI_DEV_ID_ADP_S      0x7AE8  /* Alder Lake Point S */
+ #define MEI_DEV_ID_ADP_LP     0x7A60  /* Alder Lake Point LP */
++#define MEI_DEV_ID_ADP_P      0x51E0  /* Alder Lake Point P */
+ 
+ /*
+  * MEI HW Section
+--- a/drivers/misc/mei/pci-me.c
++++ b/drivers/misc/mei/pci-me.c
+@@ -111,6 +111,7 @@ static const struct pci_device_id mei_me
+ 
+ 	{MEI_PCI_DEVICE(MEI_DEV_ID_ADP_S, MEI_ME_PCH15_CFG)},
+ 	{MEI_PCI_DEVICE(MEI_DEV_ID_ADP_LP, MEI_ME_PCH15_CFG)},
++	{MEI_PCI_DEVICE(MEI_DEV_ID_ADP_P, MEI_ME_PCH15_CFG)},
+ 
+ 	/* required last entry */
+ 	{0, }
 --- a/drivers/net/usb/ax88179_178a.c
 +++ b/drivers/net/usb/ax88179_178a.c
 @@ -296,12 +296,12 @@ static int ax88179_read_cmd(struct usbne
@@ -134,6 +152,53 @@
  	/* Maybe the boot loader passed the MAC address via device tree */
  	if (!eth_platform_get_mac_address(&dev->udev->dev, mac)) {
  		netif_dbg(dev, ifup, dev->net,
+--- a/drivers/net/usb/hso.c
++++ b/drivers/net/usb/hso.c
+@@ -3104,7 +3104,7 @@ static void hso_free_interface(struct us
+ 			cancel_work_sync(&serial_table[i]->async_put_intf);
+ 			cancel_work_sync(&serial_table[i]->async_get_intf);
+ 			hso_serial_tty_unregister(serial);
+-			kref_put(&serial_table[i]->ref, hso_serial_ref_free);
++			kref_put(&serial->parent->ref, hso_serial_ref_free);
+ 		}
+ 	}
+ 
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/tx-gen2.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/tx-gen2.c
+@@ -40,6 +40,7 @@ int iwl_pcie_gen2_enqueue_hcmd(struct iw
+ 	const u8 *cmddata[IWL_MAX_CMD_TBS_PER_TFD];
+ 	u16 cmdlen[IWL_MAX_CMD_TBS_PER_TFD];
+ 	struct iwl_tfh_tfd *tfd;
++	unsigned long flags;
+ 
+ 	copy_size = sizeof(struct iwl_cmd_header_wide);
+ 	cmd_size = sizeof(struct iwl_cmd_header_wide);
+@@ -108,14 +109,14 @@ int iwl_pcie_gen2_enqueue_hcmd(struct iw
+ 		goto free_dup_buf;
+ 	}
+ 
+-	spin_lock_bh(&txq->lock);
++	spin_lock_irqsave(&txq->lock, flags);
+ 
+ 	idx = iwl_txq_get_cmd_index(txq, txq->write_ptr);
+ 	tfd = iwl_txq_get_tfd(trans, txq, txq->write_ptr);
+ 	memset(tfd, 0, sizeof(*tfd));
+ 
+ 	if (iwl_txq_space(trans, txq) < ((cmd->flags & CMD_ASYNC) ? 2 : 1)) {
+-		spin_unlock_bh(&txq->lock);
++		spin_unlock_irqrestore(&txq->lock, flags);
+ 
+ 		IWL_ERR(trans, "No space in command queue\n");
+ 		iwl_op_mode_cmd_queue_full(trans->op_mode);
+@@ -250,7 +251,7 @@ int iwl_pcie_gen2_enqueue_hcmd(struct iw
+ 	spin_unlock(&trans_pcie->reg_lock);
+ 
+ out:
+-	spin_unlock_bh(&txq->lock);
++	spin_unlock_irqrestore(&txq->lock, flags);
+ free_dup_buf:
+ 	if (idx < 0)
+ 		kfree(dup_buf);
 --- a/drivers/platform/x86/thinkpad_acpi.c
 +++ b/drivers/platform/x86/thinkpad_acpi.c
 @@ -6260,6 +6260,7 @@ enum thermal_access_mode {
@@ -203,6 +268,23 @@
  		}
  	} else if (acpi_tmp7) {
  		if (tpacpi_is_ibm() &&
+--- a/drivers/usb/class/cdc-acm.c
++++ b/drivers/usb/class/cdc-acm.c
+@@ -1634,12 +1634,13 @@ static int acm_resume(struct usb_interfa
+ 	struct urb *urb;
+ 	int rv = 0;
+ 
+-	acm_unpoison_urbs(acm);
+ 	spin_lock_irq(&acm->write_lock);
+ 
+ 	if (--acm->susp_count)
+ 		goto out;
+ 
++	acm_unpoison_urbs(acm);
++
+ 	if (tty_port_initialized(&acm->port)) {
+ 		rv = usb_submit_urb(acm->ctrlurb, GFP_ATOMIC);
+ 
 --- a/drivers/usb/core/quirks.c
 +++ b/drivers/usb/core/quirks.c
 @@ -406,6 +406,7 @@ static const struct usb_device_id usb_qu
@@ -439,26 +521,104 @@
  	kfree_skb(skb);
  
  	return rc;
---- a/sound/soc/codecs/ak4458.c
-+++ b/sound/soc/codecs/ak4458.c
-@@ -823,6 +823,7 @@ static struct i2c_driver ak4458_i2c_driv
- 	.probe_new = ak4458_i2c_probe,
- 	.remove = ak4458_i2c_remove,
- };
-+MODULE_DEVICE_TABLE(of, ak4458_of_match);
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@ -332,14 +332,29 @@ static void cfg80211_event_work(struct w
+ void cfg80211_destroy_ifaces(struct cfg80211_registered_device *rdev)
+ {
+ 	struct wireless_dev *wdev, *tmp;
++	bool found = false;
  
- module_i2c_driver(ak4458_i2c_driver);
+ 	ASSERT_RTNL();
+-	lockdep_assert_wiphy(&rdev->wiphy);
  
---- a/sound/soc/codecs/ak5558.c
-+++ b/sound/soc/codecs/ak5558.c
-@@ -430,6 +430,7 @@ static struct i2c_driver ak5558_i2c_driv
- 	.probe_new = ak5558_i2c_probe,
- 	.remove = ak5558_i2c_remove,
- };
-+MODULE_DEVICE_TABLE(of, ak5558_i2c_dt_ids);
++	list_for_each_entry(wdev, &rdev->wiphy.wdev_list, list) {
++		if (wdev->nl_owner_dead) {
++			if (wdev->netdev)
++				dev_close(wdev->netdev);
++			found = true;
++		}
++	}
++
++	if (!found)
++		return;
++
++	wiphy_lock(&rdev->wiphy);
+ 	list_for_each_entry_safe(wdev, tmp, &rdev->wiphy.wdev_list, list) {
+-		if (wdev->nl_owner_dead)
++		if (wdev->nl_owner_dead) {
++			cfg80211_leave(rdev, wdev);
+ 			rdev_del_virtual_intf(rdev, wdev);
++		}
+ 	}
++	wiphy_unlock(&rdev->wiphy);
+ }
  
- module_i2c_driver(ak5558_i2c_driver);
+ static void cfg80211_destroy_iface_wk(struct work_struct *work)
+@@ -350,9 +365,7 @@ static void cfg80211_destroy_iface_wk(st
+ 			    destroy_work);
  
+ 	rtnl_lock();
+-	wiphy_lock(&rdev->wiphy);
+ 	cfg80211_destroy_ifaces(rdev);
+-	wiphy_unlock(&rdev->wiphy);
+ 	rtnl_unlock();
+ }
+ 
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -3929,7 +3929,7 @@ static int nl80211_set_interface(struct
+ 	return err;
+ }
+ 
+-static int nl80211_new_interface(struct sk_buff *skb, struct genl_info *info)
++static int _nl80211_new_interface(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct cfg80211_registered_device *rdev = info->user_ptr[0];
+ 	struct vif_params params;
+@@ -3938,9 +3938,6 @@ static int nl80211_new_interface(struct
+ 	int err;
+ 	enum nl80211_iftype type = NL80211_IFTYPE_UNSPECIFIED;
+ 
+-	/* to avoid failing a new interface creation due to pending removal */
+-	cfg80211_destroy_ifaces(rdev);
+-
+ 	memset(&params, 0, sizeof(params));
+ 
+ 	if (!info->attrs[NL80211_ATTR_IFNAME])
+@@ -4028,6 +4025,21 @@ static int nl80211_new_interface(struct
+ 	return genlmsg_reply(msg, info);
+ }
+ 
++static int nl80211_new_interface(struct sk_buff *skb, struct genl_info *info)
++{
++	struct cfg80211_registered_device *rdev = info->user_ptr[0];
++	int ret;
++
++	/* to avoid failing a new interface creation due to pending removal */
++	cfg80211_destroy_ifaces(rdev);
++
++	wiphy_lock(&rdev->wiphy);
++	ret = _nl80211_new_interface(skb, info);
++	wiphy_unlock(&rdev->wiphy);
++
++	return ret;
++}
++
+ static int nl80211_del_interface(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct cfg80211_registered_device *rdev = info->user_ptr[0];
+@@ -15040,7 +15052,9 @@ static const struct genl_small_ops nl802
+ 		.doit = nl80211_new_interface,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+-				  NL80211_FLAG_NEED_RTNL,
++				  NL80211_FLAG_NEED_RTNL |
++				  /* we take the wiphy mutex later ourselves */
++				  NL80211_FLAG_NO_WIPHY_MTX,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_DEL_INTERFACE,
 --- a/sound/usb/endpoint.c
 +++ b/sound/usb/endpoint.c
 @@ -1442,11 +1442,11 @@ void snd_usb_endpoint_stop(struct snd_us
