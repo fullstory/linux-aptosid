@@ -1,4 +1,5 @@
 import collections
+import collections.abc
 import os.path
 import re
 
@@ -175,7 +176,7 @@ $
         self.linux_revision_other = match.group('revision_other') and True
 
 
-class PackageArchitecture(collections.MutableSet):
+class PackageArchitecture(collections.abc.MutableSet):
     __slots__ = '_data'
 
     def __init__(self, value=None):
