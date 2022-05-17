@@ -564,7 +564,7 @@
  VERSION = 5
  PATCHLEVEL = 17
 -SUBLEVEL = 0
-+SUBLEVEL = 7
++SUBLEVEL = 8
  EXTRAVERSION =
  NAME = Superb Owl
  
@@ -71773,6 +71773,36 @@
  	mark_inode_clean(c, ubifs_inode(old_dir));
  	if (move)
  		mark_inode_clean(c, ubifs_inode(new_dir));
+--- a/fs/udf/namei.c
++++ b/fs/udf/namei.c
+@@ -75,11 +75,11 @@ int udf_write_fi(struct inode *inode, st
+ 
+ 	if (fileident) {
+ 		if (adinicb || (offset + lfi < 0)) {
+-			memcpy(udf_get_fi_ident(sfi), fileident, lfi);
++			memcpy(sfi->impUse + liu, fileident, lfi);
+ 		} else if (offset >= 0) {
+ 			memcpy(fibh->ebh->b_data + offset, fileident, lfi);
+ 		} else {
+-			memcpy(udf_get_fi_ident(sfi), fileident, -offset);
++			memcpy(sfi->impUse + liu, fileident, -offset);
+ 			memcpy(fibh->ebh->b_data, fileident - offset,
+ 				lfi + offset);
+ 		}
+@@ -88,11 +88,11 @@ int udf_write_fi(struct inode *inode, st
+ 	offset += lfi;
+ 
+ 	if (adinicb || (offset + padlen < 0)) {
+-		memset(udf_get_fi_ident(sfi) + lfi, 0x00, padlen);
++		memset(sfi->impUse + liu + lfi, 0x00, padlen);
+ 	} else if (offset >= 0) {
+ 		memset(fibh->ebh->b_data + offset, 0x00, padlen);
+ 	} else {
+-		memset(udf_get_fi_ident(sfi) + lfi, 0x00, -offset);
++		memset(sfi->impUse + liu + lfi, 0x00, -offset);
+ 		memset(fibh->ebh->b_data, 0x00, padlen + offset);
+ 	}
+ 
 --- a/fs/xattr.c
 +++ b/fs/xattr.c
 @@ -569,7 +569,8 @@ setxattr(struct user_namespace *mnt_user
@@ -72927,7 +72957,17 @@
  #define HCI_ERROR_REMOTE_POWER_OFF	0x15
 --- a/include/net/bluetooth/hci_core.h
 +++ b/include/net/bluetooth/hci_core.h
-@@ -294,6 +294,9 @@ struct adv_monitor {
+@@ -36,6 +36,9 @@
+ /* HCI priority */
+ #define HCI_PRIO_MAX	7
+ 
++/* HCI maximum id value */
++#define HCI_MAX_ID 10000
++
+ /* HCI Core structures */
+ struct inquiry_data {
+ 	bdaddr_t	bdaddr;
+@@ -294,6 +297,9 @@ struct adv_monitor {
  
  #define HCI_MAX_SHORT_NAME_LENGTH	10
  
@@ -73611,7 +73651,7 @@
  #define RFKILL_IOC_NOINPUT	1
  #define RFKILL_IOCTL_NOINPUT	_IO(RFKILL_IOC_MAGIC, RFKILL_IOC_NOINPUT)
 +#define RFKILL_IOC_MAX_SIZE	2
-+#define RFKILL_IOCTL_MAX_SIZE	_IOW(RFKILL_IOC_MAGIC, RFKILL_IOC_EXT_SIZE, __u32)
++#define RFKILL_IOCTL_MAX_SIZE	_IOW(RFKILL_IOC_MAGIC, RFKILL_IOC_MAX_SIZE, __u32)
  
  /* and that's all userspace gets */
  
@@ -77504,6 +77544,17 @@
  }
  EXPORT_SYMBOL_GPL(xas_split);
  #endif
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -465,7 +465,7 @@ static int follow_pfn_pte(struct vm_area
+ 		pte_t *pte, unsigned int flags)
+ {
+ 	/* No page to get reference */
+-	if (flags & FOLL_GET)
++	if (flags & (FOLL_GET | FOLL_PIN))
+ 		return -EFAULT;
+ 
+ 	if (flags & FOLL_TOUCH) {
 --- a/mm/highmem.c
 +++ b/mm/highmem.c
 @@ -624,7 +624,7 @@ void __kmap_local_sched_out(void)
@@ -77560,6 +77611,16 @@
  }
  
  #define HSTATE_ATTR_RO(_name) \
+@@ -5817,7 +5820,8 @@ int hugetlb_mcopy_atomic_pte(struct mm_s
+ 			*pagep = NULL;
+ 			goto out;
+ 		}
+-		folio_copy(page_folio(page), page_folio(*pagep));
++		copy_user_huge_page(page, *pagep, dst_addr, dst_vma,
++				    pages_per_huge_page(h));
+ 		put_page(*pagep);
+ 		*pagep = NULL;
+ 	}
 --- a/mm/kasan/quarantine.c
 +++ b/mm/kasan/quarantine.c
 @@ -315,6 +315,13 @@ static void per_cpu_remove_cache(void *a
@@ -77857,7 +77918,19 @@
  
 --- a/mm/memory-failure.c
 +++ b/mm/memory-failure.c
-@@ -1780,6 +1780,19 @@ try_again:
+@@ -707,8 +707,10 @@ static int kill_accessing_process(struct
+ 			      (void *)&priv);
+ 	if (ret == 1 && priv.tk.addr)
+ 		kill_proc(&priv.tk, pfn, flags);
++	else
++		ret = 0;
+ 	mmap_read_unlock(p->mm);
+-	return ret ? -EFAULT : -EHWPOISON;
++	return ret > 0 ? -EHWPOISON : -EFAULT;
+ }
+ 
+ static const char *action_name[] = {
+@@ -1780,6 +1782,19 @@ try_again:
  
  	if (PageTransHuge(hpage)) {
  		/*
@@ -77904,14 +77977,14 @@
 -	if (!details || !page)
 +	/* If we can make a decision without *page.. */
 +	if (should_zap_cows(details))
++		return false;
++
++	/* E.g. the caller passes NULL for the case of a zero page */
++	if (!page)
  		return false;
  
 -	return details->zap_mapping &&
 -		(details->zap_mapping != page_rmapping(page));
-+	/* E.g. the caller passes NULL for the case of a zero page */
-+	if (!page)
-+		return false;
-+
 +	return details->zap_mapping != page_rmapping(page);
  }
  
@@ -77972,6 +78045,15 @@
  	}
  
  	if (unlikely(!(ret & VM_FAULT_LOCKED)))
+@@ -5444,6 +5475,8 @@ long copy_huge_page_from_user(struct pag
+ 		if (rc)
+ 			break;
+ 
++		flush_dcache_page(subpage);
++
+ 		cond_resched();
+ 	}
+ 	return ret_val;
 --- a/mm/mempolicy.c
 +++ b/mm/mempolicy.c
 @@ -786,7 +786,6 @@ static int vma_replace_policy(struct vm_
@@ -78013,7 +78095,46 @@
  
 --- a/mm/migrate.c
 +++ b/mm/migrate.c
-@@ -3190,7 +3190,7 @@ again:
+@@ -916,9 +916,12 @@ static int move_to_new_page(struct page
+ 		if (!PageMappingFlags(page))
+ 			page->mapping = NULL;
+ 
+-		if (likely(!is_zone_device_page(newpage)))
+-			flush_dcache_page(newpage);
++		if (likely(!is_zone_device_page(newpage))) {
++			int i, nr = compound_nr(newpage);
+ 
++			for (i = 0; i < nr; i++)
++				flush_dcache_page(newpage + i);
++		}
+ 	}
+ out:
+ 	return rc;
+@@ -3082,18 +3085,21 @@ static int establish_migrate_target(int
+ 	if (best_distance != -1) {
+ 		val = node_distance(node, migration_target);
+ 		if (val > best_distance)
+-			return NUMA_NO_NODE;
++			goto out_clear;
+ 	}
+ 
+ 	index = nd->nr;
+ 	if (WARN_ONCE(index >= DEMOTION_TARGET_NODES,
+ 		      "Exceeds maximum demotion target nodes\n"))
+-		return NUMA_NO_NODE;
++		goto out_clear;
+ 
+ 	nd->nodes[index] = migration_target;
+ 	nd->nr++;
+ 
+ 	return migration_target;
++out_clear:
++	node_clear(migration_target, *used);
++	return NUMA_NO_NODE;
+ }
+ 
+ /*
+@@ -3190,7 +3196,7 @@ again:
  /*
   * For callers that do not hold get_online_mems() already.
   */
@@ -78022,7 +78143,7 @@
  {
  	get_online_mems();
  	__set_migration_target_nodes();
-@@ -3254,51 +3254,24 @@ static int __meminit migrate_on_reclaim_
+@@ -3254,51 +3260,24 @@ static int __meminit migrate_on_reclaim_
  	return notifier_from_errno(0);
  }
  
@@ -78057,24 +78178,25 @@
  
 -	ret = cpuhp_setup_state_nocalls(CPUHP_MM_DEMOTION_DEAD, "mm/demotion:offline",
 -					NULL, migration_offline_cpu);
-+	hotplug_memory_notifier(migrate_on_reclaim_callback, 100);
- 	/*
+-	/*
 -	 * In the unlikely case that this fails, the automatic
 -	 * migration targets may become suboptimal for nodes
 -	 * where N_CPU changes.  With such a small impact in a
 -	 * rare case, do not bother trying to do anything special.
-+	 * At this point, all numa nodes with memory/CPus have their state
-+	 * properly set, so we can build the demotion order now.
-+	 * Let us hold the cpu_hotplug lock just, as we could possibily have
-+	 * CPU hotplug events during boot.
- 	 */
+-	 */
 -	WARN_ON(ret < 0);
 -	ret = cpuhp_setup_state(CPUHP_AP_MM_DEMOTION_ONLINE, "mm/demotion:online",
 -				migration_online_cpu, NULL);
 -	WARN_ON(ret < 0);
 -
--	hotplug_memory_notifier(migrate_on_reclaim_callback, 100);
+ 	hotplug_memory_notifier(migrate_on_reclaim_callback, 100);
 -	return 0;
++	/*
++	 * At this point, all numa nodes with memory/CPus have their state
++	 * properly set, so we can build the demotion order now.
++	 * Let us hold the cpu_hotplug lock just, as we could possibily have
++	 * CPU hotplug events during boot.
++	 */
 +	cpus_read_lock();
 +	set_migration_target_nodes();
 +	cpus_read_unlock();
@@ -78085,7 +78207,7 @@
  bool numa_demotion_enabled = false;
 --- a/mm/mlock.c
 +++ b/mm/mlock.c
-@@ -827,13 +827,12 @@ int user_shm_lock(size_t size, struct uc
+@@ -827,18 +827,18 @@ int user_shm_lock(size_t size, struct uc
  
  	locked = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
  	lock_limit = rlimit(RLIMIT_MEMLOCK);
@@ -78102,6 +78224,12 @@
  		dec_rlimit_ucounts(ucounts, UCOUNT_RLIMIT_MEMLOCK, locked);
  		goto out;
  	}
+ 	if (!get_ucounts(ucounts)) {
+ 		dec_rlimit_ucounts(ucounts, UCOUNT_RLIMIT_MEMLOCK, locked);
++		allowed = 0;
+ 		goto out;
+ 	}
+ 	allowed = 1;
 --- a/mm/mmap.c
 +++ b/mm/mmap.c
 @@ -2119,14 +2119,6 @@ unsigned long vm_unmapped_area(struct vm
@@ -78462,6 +78590,20 @@
  	inode->i_mapping->a_ops = &secretmem_aops;
  
  	/* pretend we are a normal file with zero size */
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -2357,8 +2357,10 @@ int shmem_mfill_atomic_pte(struct mm_str
+ 				/* don't free the page */
+ 				goto out_unacct_blocks;
+ 			}
++
++			flush_dcache_page(page);
+ 		} else {		/* ZEROPAGE */
+-			clear_highpage(page);
++			clear_user_highpage(page, dst_addr);
+ 		}
+ 	} else {
+ 		page = *pagep;
 --- a/mm/slab.c
 +++ b/mm/slab.c
 @@ -3421,6 +3421,7 @@ static __always_inline void __cache_free
@@ -78577,6 +78719,23 @@
  
  	dst_pte = pte_offset_map_lock(dst_mm, dst_pmd, dst_addr, &ptl);
  
+@@ -150,6 +153,8 @@ static int mcopy_atomic_pte(struct mm_st
+ 			/* don't free the page */
+ 			goto out;
+ 		}
++
++		flush_dcache_page(page);
+ 	} else {
+ 		page = *pagep;
+ 		*pagep = NULL;
+@@ -625,6 +630,7 @@ retry:
+ 				err = -EFAULT;
+ 				goto out;
+ 			}
++			flush_dcache_page(page);
+ 			goto retry;
+ 		} else
+ 			BUG_ON(page);
 --- a/mm/vmstat.c
 +++ b/mm/vmstat.c
 @@ -28,6 +28,7 @@
@@ -78766,6 +78925,30 @@
  	conn->hdev  = hdev;
  	conn->type  = type;
  	conn->role  = role;
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@ -2554,10 +2554,10 @@ int hci_register_dev(struct hci_dev *hde
+ 	 */
+ 	switch (hdev->dev_type) {
+ 	case HCI_PRIMARY:
+-		id = ida_simple_get(&hci_index_ida, 0, 0, GFP_KERNEL);
++		id = ida_simple_get(&hci_index_ida, 0, HCI_MAX_ID, GFP_KERNEL);
+ 		break;
+ 	case HCI_AMP:
+-		id = ida_simple_get(&hci_index_ida, 1, 0, GFP_KERNEL);
++		id = ida_simple_get(&hci_index_ida, 1, HCI_MAX_ID, GFP_KERNEL);
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -2566,7 +2566,7 @@ int hci_register_dev(struct hci_dev *hde
+ 	if (id < 0)
+ 		return id;
+ 
+-	sprintf(hdev->name, "hci%d", id);
++	snprintf(hdev->name, sizeof(hdev->name), "hci%d", id);
+ 	hdev->id = id;
+ 
+ 	BT_DBG("%p name %s bus %d", hdev, hdev->name, hdev->bus);
 --- a/net/bluetooth/hci_event.c
 +++ b/net/bluetooth/hci_event.c
 @@ -3067,8 +3067,9 @@ static void hci_conn_complete_evt(struct
