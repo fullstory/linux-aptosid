@@ -21,17 +21,15 @@
    clock-names:
 --- a/Makefile
 +++ b/Makefile
-@@ -1,8 +1,8 @@
+@@ -1,7 +1,7 @@
  # SPDX-License-Identifier: GPL-2.0
  VERSION = 6
  PATCHLEVEL = 3
--SUBLEVEL = 1
--EXTRAVERSION =
+-SUBLEVEL = 0
 +SUBLEVEL = 2
-+EXTRAVERSION = -rc1
+ EXTRAVERSION =
  NAME = Hurr durr I'ma ninja sloth
  
- # *DOCUMENTATION*
 --- a/arch/arm/boot/dts/omap3-gta04.dtsi
 +++ b/arch/arm/boot/dts/omap3-gta04.dtsi
 @@ -612,6 +612,22 @@
@@ -4790,6 +4788,23 @@
  	else if (dev_is_platform(dev))
  		return viot_mmio_dev_iommu_init(to_platform_device(dev));
  	return -ENODEV;
+--- a/drivers/base/arch_topology.c
++++ b/drivers/base/arch_topology.c
+@@ -843,10 +843,11 @@ void __init init_cpu_topology(void)
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		ret = fetch_cache_info(cpu);
+-		if (ret) {
++		if (!ret)
++			continue;
++		else if (ret != -ENOENT)
+ 			pr_err("Early cacheinfo failed, ret = %d\n", ret);
+-			break;
+-		}
++		return;
+ 	}
+ }
+ 
 --- a/drivers/base/cacheinfo.c
 +++ b/drivers/base/cacheinfo.c
 @@ -38,11 +38,10 @@ static inline bool cache_leaves_are_shar
@@ -4878,6 +4893,22 @@
  }
  EXPORT_SYMBOL_GPL(cpu_is_hotpluggable);
  
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -708,7 +708,12 @@ static int really_probe_debug(struct dev
+ 	calltime = ktime_get();
+ 	ret = really_probe(dev, drv);
+ 	rettime = ktime_get();
+-	pr_debug("probe of %s returned %d after %lld usecs\n",
++	/*
++	 * Don't change this to pr_debug() because that requires
++	 * CONFIG_DYNAMIC_DEBUG and we want a simple 'initcall_debug' on the
++	 * kernel commandline to print this all the time at the debug level.
++	 */
++	printk(KERN_DEBUG "probe of %s returned %d after %lld usecs\n",
+ 		 dev_name(dev), ret, ktime_us_delta(rettime, calltime));
+ 	return ret;
+ }
 --- a/drivers/block/drbd/drbd_receiver.c
 +++ b/drivers/block/drbd/drbd_receiver.c
 @@ -1283,7 +1283,7 @@ static void one_flush_endio(struct bio *
@@ -8869,6 +8900,28 @@
   *
   * Given a device, get an exclusive reference to an fpga bridge.
   *
+--- a/drivers/gpio/gpiolib-acpi.c
++++ b/drivers/gpio/gpiolib-acpi.c
+@@ -1624,6 +1624,19 @@ static const struct dmi_system_id gpioli
+ 		 * https://gitlab.freedesktop.org/drm/amd/-/issues/1722#note_1720627
+ 		 */
+ 		.matches = {
++			DMI_MATCH(DMI_BOARD_NAME, "NL5xNU"),
++		},
++		.driver_data = &(struct acpi_gpiolib_dmi_quirk) {
++			.ignore_wake = "ELAN0415:00@9",
++		},
++	},
++	{
++		/*
++		 * Spurious wakeups from TP_ATTN# pin
++		 * Found in BIOS 1.7.8
++		 * https://gitlab.freedesktop.org/drm/amd/-/issues/1722#note_1720627
++		 */
++		.matches = {
+ 			DMI_MATCH(DMI_BOARD_NAME, "NL5xRU"),
+ 		},
+ 		.driver_data = &(struct acpi_gpiolib_dmi_quirk) {
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
 @@ -35,6 +35,7 @@
@@ -9054,6 +9107,18 @@
  
  	return MODE_OK;
  }
+--- a/drivers/gpu/drm/drm_fb_helper.c
++++ b/drivers/gpu/drm/drm_fb_helper.c
+@@ -1569,6 +1569,9 @@ int drm_fb_helper_check_var(struct fb_va
+ 		return -EINVAL;
+ 	}
+ 
++	var->xres_virtual = fb->width;
++	var->yres_virtual = fb->height;
++
+ 	/*
+ 	 * Workaround for SDL 1.2, which is known to be setting all pixel format
+ 	 * fields values to zero in some cases. We treat this situation as a
 --- a/drivers/gpu/drm/drm_probe_helper.c
 +++ b/drivers/gpu/drm/drm_probe_helper.c
 @@ -590,8 +590,9 @@ retry:
@@ -15295,9 +15360,55 @@
  }
  
  static int ath9k_hif_usb_alloc_rx_urbs(struct hif_device_usb *hif_dev)
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bcmsdh.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bcmsdh.c
+@@ -965,6 +965,12 @@ out:
+ 		.driver_data = BRCMF_FWVENDOR_ ## fw_vend \
+ 	}
+ 
++#define CYW_SDIO_DEVICE(dev_id, fw_vend) \
++	{ \
++		SDIO_DEVICE(SDIO_VENDOR_ID_CYPRESS, dev_id), \
++		.driver_data = BRCMF_FWVENDOR_ ## fw_vend \
++	}
++
+ /* devices we support, null terminated */
+ static const struct sdio_device_id brcmf_sdmmc_ids[] = {
+ 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_43143, WCC),
+@@ -979,6 +985,7 @@ static const struct sdio_device_id brcmf
+ 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_4335_4339, WCC),
+ 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_4339, WCC),
+ 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_43430, WCC),
++	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_43439, WCC),
+ 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_4345, WCC),
+ 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_43455, WCC),
+ 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_4354, WCC),
+@@ -986,9 +993,9 @@ static const struct sdio_device_id brcmf
+ 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_4359, WCC),
+ 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_CYPRESS_4373, CYW),
+ 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_CYPRESS_43012, CYW),
+-	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_CYPRESS_43439, CYW),
+ 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_CYPRESS_43752, CYW),
+ 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_CYPRESS_89359, CYW),
++	CYW_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_CYPRESS_43439, CYW),
+ 	{ /* end: all zeroes */ }
+ };
+ MODULE_DEVICE_TABLE(sdio, brcmf_sdmmc_ids);
 --- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
 +++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
-@@ -6494,18 +6494,20 @@ static s32 brcmf_notify_rssi(struct brcm
+@@ -6164,6 +6164,11 @@ static s32 brcmf_get_assoc_ies(struct br
+ 		(struct brcmf_cfg80211_assoc_ielen_le *)cfg->extra_buf;
+ 	req_len = le32_to_cpu(assoc_info->req_len);
+ 	resp_len = le32_to_cpu(assoc_info->resp_len);
++	if (req_len > WL_EXTRA_BUF_MAX || resp_len > WL_EXTRA_BUF_MAX) {
++		bphy_err(drvr, "invalid lengths in assoc info: req %u resp %u\n",
++			 req_len, resp_len);
++		return -EINVAL;
++	}
+ 	if (req_len) {
+ 		err = brcmf_fil_iovar_data_get(ifp, "assoc_req_ies",
+ 					       cfg->extra_buf,
+@@ -6489,18 +6494,20 @@ static s32 brcmf_notify_rssi(struct brcm
  {
  	struct brcmf_cfg80211_vif *vif = ifp->vif;
  	struct brcmf_rssi_be *info = data;
@@ -20031,24 +20142,6 @@
  }
  
  static const struct dev_pm_ops __maybe_unused atmel_qspi_pm_ops = {
---- a/drivers/spi/spi-bcm63xx.c
-+++ b/drivers/spi/spi-bcm63xx.c
-@@ -629,7 +629,6 @@ static int bcm63xx_spi_remove(struct pla
- 	return 0;
- }
- 
--#ifdef CONFIG_PM_SLEEP
- static int bcm63xx_spi_suspend(struct device *dev)
- {
- 	struct spi_master *master = dev_get_drvdata(dev);
-@@ -656,7 +655,6 @@ static int bcm63xx_spi_resume(struct dev
- 
- 	return 0;
- }
--#endif
- 
- static const struct dev_pm_ops bcm63xx_spi_pm_ops = {
- 	SET_SYSTEM_SLEEP_PM_OPS(bcm63xx_spi_suspend, bcm63xx_spi_resume)
 --- a/drivers/spi/spi-cadence-quadspi.c
 +++ b/drivers/spi/spi-cadence-quadspi.c
 @@ -1802,32 +1802,36 @@ static int cqspi_remove(struct platform_
@@ -22094,6 +22187,28 @@
  
  		mreq = next_request(mep);
  
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -595,6 +595,11 @@ static void option_instat_callback(struc
+ #define SIERRA_VENDOR_ID			0x1199
+ #define SIERRA_PRODUCT_EM9191			0x90d3
+ 
++/* UNISOC (Spreadtrum) products */
++#define UNISOC_VENDOR_ID			0x1782
++/* TOZED LT70-C based on UNISOC SL8563 uses UNISOC's vendor ID */
++#define TOZED_PRODUCT_LT70C			0x4055
++
+ /* Device flags */
+ 
+ /* Highest interface number which can be used with NCTRL() and RSVD() */
+@@ -2225,6 +2230,7 @@ static const struct usb_device_id option
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(OPPO_VENDOR_ID, OPPO_PRODUCT_R11, 0xff, 0xff, 0x30) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(SIERRA_VENDOR_ID, SIERRA_PRODUCT_EM9191, 0xff, 0xff, 0x30) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(SIERRA_VENDOR_ID, SIERRA_PRODUCT_EM9191, 0xff, 0, 0) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(UNISOC_VENDOR_ID, TOZED_PRODUCT_LT70C, 0xff, 0, 0) },
+ 	{ } /* Terminating entry */
+ };
+ MODULE_DEVICE_TABLE(usb, option_ids);
 --- a/drivers/vdpa/mlx5/net/mlx5_vnet.c
 +++ b/drivers/vdpa/mlx5/net/mlx5_vnet.c
 @@ -2298,6 +2298,113 @@ static void update_cvq_info(struct mlx5_
@@ -22643,6 +22758,28 @@
  	if (!(sa->flags & BTRFS_SCRUB_READONLY)) {
  		ret = mnt_want_write_file(file);
  		if (ret)
+--- a/fs/btrfs/send.c
++++ b/fs/btrfs/send.c
+@@ -1875,7 +1875,7 @@ static int get_cur_inode_state(struct se
+ 	int left_ret;
+ 	int right_ret;
+ 	u64 left_gen;
+-	u64 right_gen;
++	u64 right_gen = 0;
+ 	struct btrfs_inode_info info;
+ 
+ 	ret = get_inode_info(sctx->send_root, ino, &info);
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -2618,7 +2618,7 @@ int btrfs_init_new_device(struct btrfs_f
+ 	struct block_device *bdev;
+ 	struct super_block *sb = fs_info->sb;
+ 	struct btrfs_fs_devices *fs_devices = fs_info->fs_devices;
+-	struct btrfs_fs_devices *seed_devices;
++	struct btrfs_fs_devices *seed_devices = NULL;
+ 	u64 orig_super_total_bytes;
+ 	u64 orig_super_num_devices;
+ 	int ret = 0;
 --- a/fs/ceph/caps.c
 +++ b/fs/ceph/caps.c
 @@ -431,7 +431,7 @@ void ceph_reservation_status(struct ceph
@@ -25622,25 +25759,6 @@
  		ni->ni_flags |= NI_FLAG_DIR;
  
  		err = indx_init(&ni->dir, sbi, attr, INDEX_MUTEX_I30);
---- a/fs/ntfs3/namei.c
-+++ b/fs/ntfs3/namei.c
-@@ -88,6 +88,16 @@ static struct dentry *ntfs_lookup(struct
- 		__putname(uni);
- 	}
- 
-+	/*
-+	 * Check for a null pointer
-+	 * If the MFT record of ntfs inode is not a base record, inode->i_op can be NULL.
-+	 * This causes null pointer dereference in d_splice_alias().
-+	 */
-+	if (!IS_ERR(inode) && inode->i_op == NULL) {
-+		iput(inode);
-+		inode = ERR_PTR(-EINVAL);
-+	}
-+
- 	return d_splice_alias(inode, dentry);
- }
- 
 --- a/fs/ntfs3/ntfs_fs.h
 +++ b/fs/ntfs3/ntfs_fs.h
 @@ -581,6 +581,7 @@ int ni_rename(struct ntfs_inode *dir_ni,
@@ -25925,6 +26043,53 @@
  }
  
  /**
+--- a/fs/verity/enable.c
++++ b/fs/verity/enable.c
+@@ -13,6 +13,7 @@
+ 
+ struct block_buffer {
+ 	u32 filled;
++	bool is_root_hash;
+ 	u8 *data;
+ };
+ 
+@@ -24,6 +25,14 @@ static int hash_one_block(struct inode *
+ 	struct block_buffer *next = cur + 1;
+ 	int err;
+ 
++	/*
++	 * Safety check to prevent a buffer overflow in case of a filesystem bug
++	 * that allows the file size to change despite deny_write_access(), or a
++	 * bug in the Merkle tree logic itself
++	 */
++	if (WARN_ON_ONCE(next->is_root_hash && next->filled != 0))
++		return -EINVAL;
++
+ 	/* Zero-pad the block if it's shorter than the block size. */
+ 	memset(&cur->data[cur->filled], 0, params->block_size - cur->filled);
+ 
+@@ -97,6 +106,7 @@ static int build_merkle_tree(struct file
+ 		}
+ 	}
+ 	buffers[num_levels].data = root_hash;
++	buffers[num_levels].is_root_hash = true;
+ 
+ 	BUILD_BUG_ON(sizeof(level_offset) != sizeof(params->level_start));
+ 	memcpy(level_offset, params->level_start, sizeof(level_offset));
+@@ -347,6 +357,13 @@ int fsverity_ioctl_enable(struct file *f
+ 	err = file_permission(filp, MAY_WRITE);
+ 	if (err)
+ 		return err;
++	/*
++	 * __kernel_read() is used while building the Merkle tree.  So, we can't
++	 * allow file descriptors that were opened for ioctl access only, using
++	 * the special nonstandard access mode 3.  O_RDONLY only, please!
++	 */
++	if (!(filp->f_mode & FMODE_READ))
++		return -EBADF;
+ 
+ 	if (IS_APPEND(inode))
+ 		return -EPERM;
 --- a/fs/xfs/libxfs/xfs_sb.c
 +++ b/fs/xfs/libxfs/xfs_sb.c
 @@ -72,7 +72,8 @@ xfs_sb_validate_v5_features(
@@ -26103,6 +26268,23 @@
  	u8         flow_counter_bulk[0x8];
  };
  
+--- a/include/linux/mmc/sdio_ids.h
++++ b/include/linux/mmc/sdio_ids.h
+@@ -74,10 +74,13 @@
+ #define SDIO_DEVICE_ID_BROADCOM_43362		0xa962
+ #define SDIO_DEVICE_ID_BROADCOM_43364		0xa9a4
+ #define SDIO_DEVICE_ID_BROADCOM_43430		0xa9a6
+-#define SDIO_DEVICE_ID_BROADCOM_CYPRESS_43439	0xa9af
++#define SDIO_DEVICE_ID_BROADCOM_43439		0xa9af
+ #define SDIO_DEVICE_ID_BROADCOM_43455		0xa9bf
+ #define SDIO_DEVICE_ID_BROADCOM_CYPRESS_43752	0xaae8
+ 
++#define SDIO_VENDOR_ID_CYPRESS			0x04b4
++#define SDIO_DEVICE_ID_BROADCOM_CYPRESS_43439	0xbd3d
++
+ #define SDIO_VENDOR_ID_MARVELL			0x02df
+ #define SDIO_DEVICE_ID_MARVELL_LIBERTAS		0x9103
+ #define SDIO_DEVICE_ID_MARVELL_8688_WLAN	0x9104
 --- a/include/linux/netfilter/nfnetlink.h
 +++ b/include/linux/netfilter/nfnetlink.h
 @@ -45,7 +45,6 @@ struct nfnetlink_subsystem {
@@ -26237,6 +26419,16 @@
  }
  
  int __nf_ct_change_timeout(struct nf_conn *ct, u64 cta_timeout);
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -619,6 +619,7 @@ struct nft_set_binding {
+ };
+ 
+ enum nft_trans_phase;
++void nf_tables_activate_set(const struct nft_ctx *ctx, struct nft_set *set);
+ void nf_tables_deactivate_set(const struct nft_ctx *ctx, struct nft_set *set,
+ 			      struct nft_set_binding *binding,
+ 			      enum nft_trans_phase phase);
 --- a/include/net/scm.h
 +++ b/include/net/scm.h
 @@ -105,16 +105,27 @@ static inline void scm_passec(struct soc
@@ -28528,6 +28720,17 @@
  
  	pgoff = vma->vm_pgoff + ((vmstart - vma->vm_start) >> PAGE_SHIFT);
  	merged = vma_merge(vmi, vma->vm_mm, *prev, vmstart, vmend, vma->vm_flags,
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -978,7 +978,7 @@ struct vm_area_struct *vma_merge(struct
+ 			vma = next;			/* case 3 */
+ 			vma_start = addr;
+ 			vma_end = next->vm_end;
+-			vma_pgoff = mid->vm_pgoff;
++			vma_pgoff = next->vm_pgoff - pglen;
+ 			err = 0;
+ 			if (mid != next) {		/* case 8 */
+ 				remove = mid;
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -1911,6 +1911,16 @@ retry:
@@ -28558,6 +28761,24 @@
  			break;
  		fallthrough;
  	case SIOCGMIIPHY:
+--- a/net/bluetooth/hci_sock.c
++++ b/net/bluetooth/hci_sock.c
+@@ -1003,7 +1003,14 @@ static int hci_sock_ioctl(struct socket
+ 	if (hci_sock_gen_cookie(sk)) {
+ 		struct sk_buff *skb;
+ 
+-		if (capable(CAP_NET_ADMIN))
++		/* Perform careful checks before setting the HCI_SOCK_TRUSTED
++		 * flag. Make sure that not only the current task but also
++		 * the socket opener has the required capability, since
++		 * privileged programs can be tricked into making ioctl calls
++		 * on HCI sockets, and the socket should not be marked as
++		 * trusted simply because the ioctl caller is privileged.
++		 */
++		if (sk_capable(sk, CAP_NET_ADMIN))
+ 			hci_sock_set_flag(sk, HCI_SOCK_TRUSTED);
+ 
+ 		/* Send event to monitor */
 --- a/net/core/bpf_sk_storage.c
 +++ b/net/core/bpf_sk_storage.c
 @@ -100,8 +100,8 @@ static void *bpf_fd_sk_storage_lookup_el
@@ -28800,7 +29021,32 @@
  		if (err < 0)
 --- a/net/netfilter/nf_tables_api.c
 +++ b/net/netfilter/nf_tables_api.c
-@@ -8645,6 +8645,8 @@ static int nf_tables_validate(struct net
+@@ -5004,12 +5004,24 @@ static void nf_tables_unbind_set(const s
+ 	}
+ }
+ 
++void nf_tables_activate_set(const struct nft_ctx *ctx, struct nft_set *set)
++{
++	if (nft_set_is_anonymous(set))
++		nft_clear(ctx->net, set);
++
++	set->use++;
++}
++EXPORT_SYMBOL_GPL(nf_tables_activate_set);
++
+ void nf_tables_deactivate_set(const struct nft_ctx *ctx, struct nft_set *set,
+ 			      struct nft_set_binding *binding,
+ 			      enum nft_trans_phase phase)
+ {
+ 	switch (phase) {
+ 	case NFT_TRANS_PREPARE:
++		if (nft_set_is_anonymous(set))
++			nft_deactivate_next(ctx->net, set);
++
+ 		set->use--;
+ 		return;
+ 	case NFT_TRANS_ABORT:
+@@ -8645,6 +8657,8 @@ static int nf_tables_validate(struct net
  			if (nft_table_validate(net, table) < 0)
  				return -EAGAIN;
  		}
@@ -28809,7 +29055,7 @@
  		break;
  	}
  
-@@ -9586,11 +9588,6 @@ static int __nf_tables_abort(struct net
+@@ -9586,11 +9600,6 @@ static int __nf_tables_abort(struct net
  	return 0;
  }
  
@@ -28821,7 +29067,7 @@
  static int nf_tables_abort(struct net *net, struct sk_buff *skb,
  			   enum nfnl_abort_action action)
  {
-@@ -9624,7 +9621,6 @@ static const struct nfnetlink_subsystem
+@@ -9624,7 +9633,6 @@ static const struct nfnetlink_subsystem
  	.cb		= nf_tables_cb,
  	.commit		= nf_tables_commit,
  	.abort		= nf_tables_abort,
@@ -28840,6 +29086,39 @@
  
  	nfnl_err_deliver(&err_list, oskb);
  	kfree_skb(skb);
+--- a/net/netfilter/nft_dynset.c
++++ b/net/netfilter/nft_dynset.c
+@@ -342,7 +342,7 @@ static void nft_dynset_activate(const st
+ {
+ 	struct nft_dynset *priv = nft_expr_priv(expr);
+ 
+-	priv->set->use++;
++	nf_tables_activate_set(ctx, priv->set);
+ }
+ 
+ static void nft_dynset_destroy(const struct nft_ctx *ctx,
+--- a/net/netfilter/nft_lookup.c
++++ b/net/netfilter/nft_lookup.c
+@@ -167,7 +167,7 @@ static void nft_lookup_activate(const st
+ {
+ 	struct nft_lookup *priv = nft_expr_priv(expr);
+ 
+-	priv->set->use++;
++	nf_tables_activate_set(ctx, priv->set);
+ }
+ 
+ static void nft_lookup_destroy(const struct nft_ctx *ctx,
+--- a/net/netfilter/nft_objref.c
++++ b/net/netfilter/nft_objref.c
+@@ -185,7 +185,7 @@ static void nft_objref_map_activate(cons
+ {
+ 	struct nft_objref_map *priv = nft_expr_priv(expr);
+ 
+-	priv->set->use++;
++	nf_tables_activate_set(ctx, priv->set);
+ }
+ 
+ static void nft_objref_map_destroy(const struct nft_ctx *ctx,
 --- a/net/netlink/af_netlink.c
 +++ b/net/netlink/af_netlink.c
 @@ -1742,7 +1742,8 @@ static int netlink_getsockopt(struct soc
