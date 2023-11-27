@@ -159,7 +159,7 @@
 -SUBLEVEL = 2
 -EXTRAVERSION =
 +SUBLEVEL = 3
-+EXTRAVERSION = -rc1
++EXTRAVERSION = -rc4
  NAME = Hurr durr I'ma ninja sloth
  
  # *DOCUMENTATION*
@@ -825,38 +825,6 @@
  			mb();
  			isync();
  		}
---- a/arch/powerpc/platforms/pseries/iommu.c
-+++ b/arch/powerpc/platforms/pseries/iommu.c
-@@ -914,7 +914,8 @@ static int remove_ddw(struct device_node
- 	return 0;
- }
- 
--static bool find_existing_ddw(struct device_node *pdn, u64 *dma_addr, int *window_shift)
-+static bool find_existing_ddw(struct device_node *pdn, u64 *dma_addr, int *window_shift,
-+			      bool *direct_mapping)
- {
- 	struct dma_win *window;
- 	const struct dynamic_dma_window_prop *dma64;
-@@ -927,6 +928,7 @@ static bool find_existing_ddw(struct dev
- 			dma64 = window->prop;
- 			*dma_addr = be64_to_cpu(dma64->dma_base);
- 			*window_shift = be32_to_cpu(dma64->window_shift);
-+			*direct_mapping = window->direct;
- 			found = true;
- 			break;
- 		}
-@@ -1270,10 +1272,8 @@ static bool enable_ddw(struct pci_dev *d
- 
- 	mutex_lock(&dma_win_init_mutex);
- 
--	if (find_existing_ddw(pdn, &dev->dev.archdata.dma_offset, &len)) {
--		direct_mapping = (len >= max_ram_len);
-+	if (find_existing_ddw(pdn, &dev->dev.archdata.dma_offset, &len, &direct_mapping))
- 		goto out_unlock;
--	}
- 
- 	/*
- 	 * If we already went through this for a previous function of
 --- a/arch/riscv/include/asm/asm-prototypes.h
 +++ b/arch/riscv/include/asm/asm-prototypes.h
 @@ -25,7 +25,6 @@ DECLARE_DO_ERROR_INFO(do_trap_ecall_s);
@@ -1310,29 +1278,7 @@
  				set_bit(PG_arch_1, &page[i].flags);
  		}
  		mark_kernel_pud(p4d, addr, next);
-@@ -151,24 +151,31 @@ static void mark_kernel_p4d(pgd_t *pgd,
- 
- static void mark_kernel_pgd(void)
- {
--	unsigned long addr, next;
-+	unsigned long addr, next, max_addr;
- 	struct page *page;
- 	pgd_t *pgd;
- 	int i;
- 
- 	addr = 0;
-+	/*
-+	 * Figure out maximum virtual address accessible with the
-+	 * kernel ASCE. This is required to keep the page table walker
-+	 * from accessing non-existent entries.
-+	 */
-+	max_addr = (S390_lowcore.kernel_asce.val & _ASCE_TYPE_MASK) >> 2;
-+	max_addr = 1UL << (max_addr * 11 + 31);
- 	pgd = pgd_offset_k(addr);
- 	do {
--		next = pgd_addr_end(addr, MODULES_END);
-+		next = pgd_addr_end(addr, max_addr);
- 		if (pgd_none(*pgd))
+@@ -164,7 +164,7 @@ static void mark_kernel_pgd(void)
  			continue;
  		if (!pgd_folded(*pgd)) {
  			page = phys_to_page(pgd_val(*pgd));
@@ -1341,24 +1287,6 @@
  				set_bit(PG_arch_1, &page[i].flags);
  		}
  		mark_kernel_p4d(pgd, addr, next);
--	} while (pgd++, addr = next, addr != MODULES_END);
-+	} while (pgd++, addr = next, addr != max_addr);
- }
- 
- void __init cmma_init_nodat(void)
-@@ -181,6 +188,12 @@ void __init cmma_init_nodat(void)
- 		return;
- 	/* Mark pages used in kernel page tables */
- 	mark_kernel_pgd();
-+	page = virt_to_page(&swapper_pg_dir);
-+	for (i = 0; i < 4; i++)
-+		set_bit(PG_arch_1, &page[i].flags);
-+	page = virt_to_page(&invalid_pg_dir);
-+	for (i = 0; i < 4; i++)
-+		set_bit(PG_arch_1, &page[i].flags);
- 
- 	/* Set all kernel pages not used for page tables to stable/no-dat */
- 	for_each_mem_pfn_range(i, MAX_NUMNODES, &start, &end, NULL) {
 --- a/arch/s390/mm/pgalloc.c
 +++ b/arch/s390/mm/pgalloc.c
 @@ -146,6 +146,7 @@ struct page *page_table_alloc_pgste(stru
@@ -17230,39 +17158,6 @@
  	handle->cur++;
  
  	/* Zero pages were not included in the image, memset it and move on. */
---- a/kernel/rcu/rcu.h
-+++ b/kernel/rcu/rcu.h
-@@ -10,6 +10,7 @@
- #ifndef __LINUX_RCU_H
- #define __LINUX_RCU_H
- 
-+#include <linux/slab.h>
- #include <trace/events/rcu.h>
- 
- /*
-@@ -248,6 +249,12 @@ static inline void debug_rcu_head_unqueu
- }
- #endif	/* #else !CONFIG_DEBUG_OBJECTS_RCU_HEAD */
- 
-+static inline void debug_rcu_head_callback(struct rcu_head *rhp)
-+{
-+	if (unlikely(!rhp->func))
-+		kmem_dump_obj(rhp);
-+}
-+
- extern int rcu_cpu_stall_suppress_at_boot;
- 
- static inline bool rcu_stall_is_suppressed_at_boot(void)
---- a/kernel/rcu/srcutiny.c
-+++ b/kernel/rcu/srcutiny.c
-@@ -138,6 +138,7 @@ void srcu_drive_gp(struct work_struct *w
- 	while (lh) {
- 		rhp = lh;
- 		lh = lh->next;
-+		debug_rcu_head_callback(rhp);
- 		local_bh_disable();
- 		rhp->func(rhp);
- 		local_bh_enable();
 --- a/kernel/rcu/srcutree.c
 +++ b/kernel/rcu/srcutree.c
 @@ -223,7 +223,7 @@ static bool init_srcu_struct_nodes(struc
@@ -17301,15 +17196,7 @@
  	rcu_segcblist_advance(&sdp->srcu_cblist,
  			      rcu_seq_current(&ssp->srcu_sup->srcu_gp_seq));
  	if (sdp->srcu_cblist_invoking ||
-@@ -1735,6 +1735,7 @@ static void srcu_invoke_callbacks(struct
- 	rhp = rcu_cblist_dequeue(&ready_cbs);
- 	for (; rhp != NULL; rhp = rcu_cblist_dequeue(&ready_cbs)) {
- 		debug_rcu_head_unqueue(rhp);
-+		debug_rcu_head_callback(rhp);
- 		local_bh_disable();
- 		rhp->func(rhp);
- 		local_bh_enable();
-@@ -1747,8 +1748,6 @@ static void srcu_invoke_callbacks(struct
+@@ -1747,8 +1747,6 @@ static void srcu_invoke_callbacks(struct
  	 */
  	spin_lock_irq_rcu_node(sdp);
  	rcu_segcblist_add_len(&sdp->srcu_cblist, -len);
@@ -17318,26 +17205,6 @@
  	sdp->srcu_cblist_invoking = false;
  	more = rcu_segcblist_ready_cbs(&sdp->srcu_cblist);
  	spin_unlock_irq_rcu_node(sdp);
---- a/kernel/rcu/tasks.h
-+++ b/kernel/rcu/tasks.h
-@@ -538,6 +538,7 @@ static void rcu_tasks_invoke_cbs(struct
- 	raw_spin_unlock_irqrestore_rcu_node(rtpcp, flags);
- 	len = rcl.len;
- 	for (rhp = rcu_cblist_dequeue(&rcl); rhp; rhp = rcu_cblist_dequeue(&rcl)) {
-+		debug_rcu_head_callback(rhp);
- 		local_bh_disable();
- 		rhp->func(rhp);
- 		local_bh_enable();
---- a/kernel/rcu/tiny.c
-+++ b/kernel/rcu/tiny.c
-@@ -97,6 +97,7 @@ static inline bool rcu_reclaim_tiny(stru
- 
- 	trace_rcu_invoke_callback("", head);
- 	f = head->func;
-+	debug_rcu_head_callback(head);
- 	WRITE_ONCE(head->func, (rcu_callback_t)0L);
- 	f(head);
- 	rcu_lock_release(&rcu_callback_map);
 --- a/kernel/rcu/tree.c
 +++ b/kernel/rcu/tree.c
 @@ -31,6 +31,7 @@
@@ -17371,15 +17238,7 @@
  	if (first_time) {
  		/* Collect dyntick-idle snapshots. */
  		force_qs_rnp(dyntick_save_progress_counter);
-@@ -2135,6 +2148,7 @@ static void rcu_do_batch(struct rcu_data
- 		trace_rcu_invoke_callback(rcu_state.name, rhp);
- 
- 		f = rhp->func;
-+		debug_rcu_head_callback(rhp);
- 		WRITE_ONCE(rhp->func, (rcu_callback_t)0L);
- 		f(rhp);
- 
-@@ -3388,6 +3402,14 @@ void kvfree_call_rcu(struct rcu_head *he
+@@ -3388,6 +3401,14 @@ void kvfree_call_rcu(struct rcu_head *he
  		success = true;
  	}
  
@@ -22524,174 +22383,6 @@
 +		pm_runtime_get_sync(mcbsp->dev);
  
  	clk_put(fck_src);
- 
---- a/sound/usb/mixer_scarlett_gen2.c
-+++ b/sound/usb/mixer_scarlett_gen2.c
-@@ -317,8 +317,6 @@ struct scarlett2_mux_entry {
- };
- 
- struct scarlett2_device_info {
--	u32 usb_id; /* USB device identifier */
--
- 	/* Gen 3 devices have an internal MSD mode switch that needs
- 	 * to be disabled in order to access the full functionality of
- 	 * the device.
-@@ -440,8 +438,6 @@ struct scarlett2_data {
- /*** Model-specific data ***/
- 
- static const struct scarlett2_device_info s6i6_gen2_info = {
--	.usb_id = USB_ID(0x1235, 0x8203),
--
- 	.config_set = SCARLETT2_CONFIG_SET_GEN_2,
- 	.level_input_count = 2,
- 	.pad_input_count = 2,
-@@ -486,8 +482,6 @@ static const struct scarlett2_device_inf
- };
- 
- static const struct scarlett2_device_info s18i8_gen2_info = {
--	.usb_id = USB_ID(0x1235, 0x8204),
--
- 	.config_set = SCARLETT2_CONFIG_SET_GEN_2,
- 	.level_input_count = 2,
- 	.pad_input_count = 4,
-@@ -535,8 +529,6 @@ static const struct scarlett2_device_inf
- };
- 
- static const struct scarlett2_device_info s18i20_gen2_info = {
--	.usb_id = USB_ID(0x1235, 0x8201),
--
- 	.config_set = SCARLETT2_CONFIG_SET_GEN_2,
- 	.line_out_hw_vol = 1,
- 
-@@ -589,8 +581,6 @@ static const struct scarlett2_device_inf
- };
- 
- static const struct scarlett2_device_info solo_gen3_info = {
--	.usb_id = USB_ID(0x1235, 0x8211),
--
- 	.has_msd_mode = 1,
- 	.config_set = SCARLETT2_CONFIG_SET_NO_MIXER,
- 	.level_input_count = 1,
-@@ -602,8 +592,6 @@ static const struct scarlett2_device_inf
- };
- 
- static const struct scarlett2_device_info s2i2_gen3_info = {
--	.usb_id = USB_ID(0x1235, 0x8210),
--
- 	.has_msd_mode = 1,
- 	.config_set = SCARLETT2_CONFIG_SET_NO_MIXER,
- 	.level_input_count = 2,
-@@ -614,8 +602,6 @@ static const struct scarlett2_device_inf
- };
- 
- static const struct scarlett2_device_info s4i4_gen3_info = {
--	.usb_id = USB_ID(0x1235, 0x8212),
--
- 	.has_msd_mode = 1,
- 	.config_set = SCARLETT2_CONFIG_SET_GEN_3,
- 	.level_input_count = 2,
-@@ -660,8 +646,6 @@ static const struct scarlett2_device_inf
- };
- 
- static const struct scarlett2_device_info s8i6_gen3_info = {
--	.usb_id = USB_ID(0x1235, 0x8213),
--
- 	.has_msd_mode = 1,
- 	.config_set = SCARLETT2_CONFIG_SET_GEN_3,
- 	.level_input_count = 2,
-@@ -713,8 +697,6 @@ static const struct scarlett2_device_inf
- };
- 
- static const struct scarlett2_device_info s18i8_gen3_info = {
--	.usb_id = USB_ID(0x1235, 0x8214),
--
- 	.has_msd_mode = 1,
- 	.config_set = SCARLETT2_CONFIG_SET_GEN_3,
- 	.line_out_hw_vol = 1,
-@@ -783,8 +765,6 @@ static const struct scarlett2_device_inf
- };
- 
- static const struct scarlett2_device_info s18i20_gen3_info = {
--	.usb_id = USB_ID(0x1235, 0x8215),
--
- 	.has_msd_mode = 1,
- 	.config_set = SCARLETT2_CONFIG_SET_GEN_3,
- 	.line_out_hw_vol = 1,
-@@ -848,8 +828,6 @@ static const struct scarlett2_device_inf
- };
- 
- static const struct scarlett2_device_info clarett_8pre_info = {
--	.usb_id = USB_ID(0x1235, 0x820c),
--
- 	.config_set = SCARLETT2_CONFIG_SET_CLARETT,
- 	.line_out_hw_vol = 1,
- 	.level_input_count = 2,
-@@ -902,25 +880,30 @@ static const struct scarlett2_device_inf
- 	} },
- };
- 
--static const struct scarlett2_device_info *scarlett2_devices[] = {
-+struct scarlett2_device_entry {
-+	const u32 usb_id; /* USB device identifier */
-+	const struct scarlett2_device_info *info;
-+};
-+
-+static const struct scarlett2_device_entry scarlett2_devices[] = {
- 	/* Supported Gen 2 devices */
--	&s6i6_gen2_info,
--	&s18i8_gen2_info,
--	&s18i20_gen2_info,
-+	{ USB_ID(0x1235, 0x8203), &s6i6_gen2_info },
-+	{ USB_ID(0x1235, 0x8204), &s18i8_gen2_info },
-+	{ USB_ID(0x1235, 0x8201), &s18i20_gen2_info },
- 
- 	/* Supported Gen 3 devices */
--	&solo_gen3_info,
--	&s2i2_gen3_info,
--	&s4i4_gen3_info,
--	&s8i6_gen3_info,
--	&s18i8_gen3_info,
--	&s18i20_gen3_info,
-+	{ USB_ID(0x1235, 0x8211), &solo_gen3_info },
-+	{ USB_ID(0x1235, 0x8210), &s2i2_gen3_info },
-+	{ USB_ID(0x1235, 0x8212), &s4i4_gen3_info },
-+	{ USB_ID(0x1235, 0x8213), &s8i6_gen3_info },
-+	{ USB_ID(0x1235, 0x8214), &s18i8_gen3_info },
-+	{ USB_ID(0x1235, 0x8215), &s18i20_gen3_info },
- 
- 	/* Supported Clarett+ devices */
--	&clarett_8pre_info,
-+	{ USB_ID(0x1235, 0x820c), &clarett_8pre_info },
- 
- 	/* End of list */
--	NULL
-+	{ 0, NULL },
- };
- 
- /* get the starting port index number for a given port type/direction */
-@@ -4072,17 +4055,17 @@ static int scarlett2_init_notify(struct
- 
- static int snd_scarlett_gen2_controls_create(struct usb_mixer_interface *mixer)
- {
--	const struct scarlett2_device_info **info = scarlett2_devices;
-+	const struct scarlett2_device_entry *entry = scarlett2_devices;
- 	int err;
- 
--	/* Find device in scarlett2_devices */
--	while (*info && (*info)->usb_id != mixer->chip->usb_id)
--		info++;
--	if (!*info)
-+	/* Find entry in scarlett2_devices */
-+	while (entry->usb_id && entry->usb_id != mixer->chip->usb_id)
-+		entry++;
-+	if (!entry->usb_id)
- 		return -EINVAL;
- 
- 	/* Initialise private data */
--	err = scarlett2_init_private(mixer, *info);
-+	err = scarlett2_init_private(mixer, entry->info);
- 	if (err < 0)
- 		return err;
  
 --- a/tools/include/uapi/linux/prctl.h
 +++ b/tools/include/uapi/linux/prctl.h
