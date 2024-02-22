@@ -277,7 +277,7 @@
 -SUBLEVEL = 5
 -EXTRAVERSION =
 +SUBLEVEL = 6
-+EXTRAVERSION = -rc1
++EXTRAVERSION = -rc2
  NAME = Hurr durr I'ma ninja sloth
  
  # *DOCUMENTATION*
@@ -1423,6 +1423,31 @@
  	default "5" if X86_32 && X86_CMPXCHG64
  	default "4"
  
+--- a/arch/x86/include/asm/barrier.h
++++ b/arch/x86/include/asm/barrier.h
+@@ -81,22 +81,4 @@ do {									\
+ 
+ #include <asm-generic/barrier.h>
+ 
+-/*
+- * Make previous memory operations globally visible before
+- * a WRMSR.
+- *
+- * MFENCE makes writes visible, but only affects load/store
+- * instructions.  WRMSR is unfortunately not a load/store
+- * instruction and is unaffected by MFENCE.  The LFENCE ensures
+- * that the WRMSR is not reordered.
+- *
+- * Most WRMSRs are full serializing instructions themselves and
+- * do not require this barrier.  This is only required for the
+- * IA32_TSC_DEADLINE and X2APIC MSRs.
+- */
+-static inline void weak_wrmsr_fence(void)
+-{
+-	asm volatile("mfence; lfence" : : : "memory");
+-}
+-
+ #endif /* _ASM_X86_BARRIER_H */
 --- a/arch/x86/include/asm/cpufeature.h
 +++ b/arch/x86/include/asm/cpufeature.h
 @@ -168,7 +168,7 @@ extern void clear_cpu_cap(struct cpuinfo
@@ -1434,6 +1459,20 @@
  		ALTERNATIVE_TERNARY("jmp 6f", %P[feature], "", "jmp %l[t_no]")
  		".pushsection .altinstr_aux,\"ax\"\n"
  		"6:\n"
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -308,10 +308,10 @@
+ #define X86_FEATURE_SMBA		(11*32+21) /* "" Slow Memory Bandwidth Allocation */
+ #define X86_FEATURE_BMEC		(11*32+22) /* "" Bandwidth Monitoring Event Configuration */
+ #define X86_FEATURE_USER_SHSTK		(11*32+23) /* Shadow stack support for user mode applications */
+-
+ #define X86_FEATURE_SRSO		(11*32+24) /* "" AMD BTB untrain RETs */
+ #define X86_FEATURE_SRSO_ALIAS		(11*32+25) /* "" AMD BTB untrain RETs through aliasing */
+ #define X86_FEATURE_IBPB_ON_VMEXIT	(11*32+26) /* "" Issue an IBPB only on VMEXIT */
++#define X86_FEATURE_APIC_MSRS_FENCE	(11*32+27) /* "" IA32_TSC_DEADLINE and X2APIC MSRs need fencing */
+ 
+ /* Intel-defined CPU features, CPUID level 0x00000007:1 (EAX), word 12 */
+ #define X86_FEATURE_AVX_VNNI		(12*32+ 4) /* AVX VNNI instructions */
 --- a/arch/x86/include/asm/jump_label.h
 +++ b/arch/x86/include/asm/jump_label.h
 @@ -24,7 +24,7 @@
@@ -1463,6 +1502,31 @@
  		"jmp %l[l_yes]\n\t"
  		JUMP_TABLE_ENTRY
  		: :  "i" (key), "i" (branch) : : l_yes);
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -749,4 +749,22 @@ enum mds_mitigations {
+ 
+ extern bool gds_ucode_mitigated(void);
+ 
++/*
++ * Make previous memory operations globally visible before
++ * a WRMSR.
++ *
++ * MFENCE makes writes visible, but only affects load/store
++ * instructions.  WRMSR is unfortunately not a load/store
++ * instruction and is unaffected by MFENCE.  The LFENCE ensures
++ * that the WRMSR is not reordered.
++ *
++ * Most WRMSRs are full serializing instructions themselves and
++ * do not require this barrier.  This is only required for the
++ * IA32_TSC_DEADLINE and X2APIC MSRs.
++ */
++static inline void weak_wrmsr_fence(void)
++{
++	alternative("mfence; lfence", "", ALT_NOT(X86_FEATURE_APIC_MSRS_FENCE));
++}
++
+ #endif /* _ASM_X86_PROCESSOR_H */
 --- a/arch/x86/include/asm/rmwcc.h
 +++ b/arch/x86/include/asm/rmwcc.h
 @@ -13,7 +13,7 @@
@@ -1532,6 +1596,46 @@
  		"1:	mov"itype" %0,%1\n"				\
  		_ASM_EXTABLE_UA(1b, %l2)				\
  		: : ltype(x), "m" (__m(addr))				\
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -1162,6 +1162,9 @@ static void init_amd(struct cpuinfo_x86
+ 	if (!cpu_has(c, X86_FEATURE_HYPERVISOR) &&
+ 	     cpu_has_amd_erratum(c, amd_erratum_1485))
+ 		msr_set_bit(MSR_ZEN4_BP_CFG, MSR_ZEN4_BP_CFG_SHARED_BTB_FIX_BIT);
++
++	/* AMD CPUs don't need fencing after x2APIC/TSC_DEADLINE MSR writes. */
++	clear_cpu_cap(c, X86_FEATURE_APIC_MSRS_FENCE);
+ }
+ 
+ #ifdef CONFIG_X86_32
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -1856,6 +1856,13 @@ static void identify_cpu(struct cpuinfo_
+ 	c->topo.apicid = apic->phys_pkg_id(c->topo.initial_apicid, 0);
+ #endif
+ 
++
++	/*
++	 * Set default APIC and TSC_DEADLINE MSR fencing flag. AMD and
++	 * Hygon will clear it in ->c_init() below.
++	 */
++	set_cpu_cap(c, X86_FEATURE_APIC_MSRS_FENCE);
++
+ 	/*
+ 	 * Vendor-specific initialization.  In this section we
+ 	 * canonicalize the feature flags, meaning if there are
+--- a/arch/x86/kernel/cpu/hygon.c
++++ b/arch/x86/kernel/cpu/hygon.c
+@@ -354,6 +354,9 @@ static void init_hygon(struct cpuinfo_x8
+ 		set_cpu_bug(c, X86_BUG_SYSRET_SS_ATTRS);
+ 
+ 	check_null_seg_clears_base(c);
++
++	/* Hygon CPUs don't need fencing after x2APIC/TSC_DEADLINE MSR writes. */
++	clear_cpu_cap(c, X86_FEATURE_APIC_MSRS_FENCE);
+ }
+ 
+ static void cpu_detect_tlb_hygon(struct cpuinfo_x86 *c)
 --- a/arch/x86/kernel/fpu/signal.c
 +++ b/arch/x86/kernel/fpu/signal.c
 @@ -274,12 +274,13 @@ static int __restore_fpregs_from_user(vo
@@ -3637,6 +3741,17 @@
  
  	ret = irq_domain_translate_onecell(domain, arg, &hwirq, &type);
  	if (ret)
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@ -22,6 +22,8 @@
+ #include "dm-ima.h"
+ 
+ #define DM_RESERVED_MAX_IOS		1024
++#define DM_MAX_TARGETS			1048576
++#define DM_MAX_TARGET_PARAMS		1024
+ 
+ struct dm_io;
+ 
 --- a/drivers/md/dm-crypt.c
 +++ b/drivers/md/dm-crypt.c
 @@ -73,10 +73,8 @@ struct dm_crypt_io {
@@ -3723,6 +3838,43 @@
  	}
  
  	INIT_WORK(&io->work, kcryptd_crypt);
+--- a/drivers/md/dm-ioctl.c
++++ b/drivers/md/dm-ioctl.c
+@@ -1941,7 +1941,8 @@ static int copy_params(struct dm_ioctl _
+ 			   minimum_data_size - sizeof(param_kernel->version)))
+ 		return -EFAULT;
+ 
+-	if (param_kernel->data_size < minimum_data_size) {
++	if (unlikely(param_kernel->data_size < minimum_data_size) ||
++	    unlikely(param_kernel->data_size > DM_MAX_TARGETS * DM_MAX_TARGET_PARAMS)) {
+ 		DMERR("Invalid data size in the ioctl structure: %u",
+ 		      param_kernel->data_size);
+ 		return -EINVAL;
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -129,7 +129,12 @@ static int alloc_targets(struct dm_table
+ int dm_table_create(struct dm_table **result, blk_mode_t mode,
+ 		    unsigned int num_targets, struct mapped_device *md)
+ {
+-	struct dm_table *t = kzalloc(sizeof(*t), GFP_KERNEL);
++	struct dm_table *t;
++
++	if (num_targets > DM_MAX_TARGETS)
++		return -EOVERFLOW;
++
++	t = kzalloc(sizeof(*t), GFP_KERNEL);
+ 
+ 	if (!t)
+ 		return -ENOMEM;
+@@ -144,7 +149,7 @@ int dm_table_create(struct dm_table **re
+ 
+ 	if (!num_targets) {
+ 		kfree(t);
+-		return -ENOMEM;
++		return -EOVERFLOW;
+ 	}
+ 
+ 	if (alloc_targets(t, num_targets)) {
 --- a/drivers/md/dm-verity-target.c
 +++ b/drivers/md/dm-verity-target.c
 @@ -645,23 +645,6 @@ static void verity_work(struct work_stru
@@ -5400,7 +5552,18 @@
  static void xenvif_idx_unmap(struct xenvif_queue *queue, u16 pending_idx)
 --- a/drivers/of/property.c
 +++ b/drivers/of/property.c
-@@ -1062,36 +1062,6 @@ of_fwnode_device_get_match_data(const st
+@@ -762,7 +762,9 @@ struct device_node *of_graph_get_port_pa
+ 	/* Walk 3 levels up only if there is 'ports' node. */
+ 	for (depth = 3; depth && node; depth--) {
+ 		node = of_get_next_parent(node);
+-		if (depth == 2 && !of_node_name_eq(node, "ports"))
++		if (depth == 2 && !of_node_name_eq(node, "ports") &&
++		    !of_node_name_eq(node, "in-ports") &&
++		    !of_node_name_eq(node, "out-ports"))
+ 			break;
+ 	}
+ 	return node;
+@@ -1062,36 +1064,6 @@ of_fwnode_device_get_match_data(const st
  	return of_device_get_match_data(dev);
  }
  
@@ -5437,7 +5600,7 @@
  static void of_link_to_phandle(struct device_node *con_np,
  			      struct device_node *sup_np)
  {
-@@ -1221,10 +1191,10 @@ static struct device_node *parse_##fname
+@@ -1221,10 +1193,10 @@ static struct device_node *parse_##fname
   * @parse_prop.prop_name: Name of property holding a phandle value
   * @parse_prop.index: For properties holding a list of phandles, this is the
   *		      index into the list
@@ -5451,7 +5614,7 @@
   *
   * Returns:
   * parse_prop() return values are
-@@ -1235,15 +1205,15 @@ static struct device_node *parse_##fname
+@@ -1235,15 +1207,15 @@ static struct device_node *parse_##fname
  struct supplier_bindings {
  	struct device_node *(*parse_prop)(struct device_node *np,
  					  const char *prop_name, int index);
@@ -5469,7 +5632,7 @@
  DEFINE_SIMPLE_PROP(interrupt_parent, "interrupt-parent", NULL)
  DEFINE_SIMPLE_PROP(dmas, "dmas", "#dma-cells")
  DEFINE_SIMPLE_PROP(power_domains, "power-domains", "#power-domain-cells")
-@@ -1261,7 +1231,6 @@ DEFINE_SIMPLE_PROP(pinctrl5, "pinctrl-5"
+@@ -1261,7 +1233,6 @@ DEFINE_SIMPLE_PROP(pinctrl5, "pinctrl-5"
  DEFINE_SIMPLE_PROP(pinctrl6, "pinctrl-6", NULL)
  DEFINE_SIMPLE_PROP(pinctrl7, "pinctrl-7", NULL)
  DEFINE_SIMPLE_PROP(pinctrl8, "pinctrl-8", NULL)
@@ -5477,7 +5640,7 @@
  DEFINE_SIMPLE_PROP(pwms, "pwms", "#pwm-cells")
  DEFINE_SIMPLE_PROP(resets, "resets", "#reset-cells")
  DEFINE_SIMPLE_PROP(leds, "leds", NULL)
-@@ -1327,6 +1296,17 @@ static struct device_node *parse_interru
+@@ -1327,6 +1298,17 @@ static struct device_node *parse_interru
  	return of_irq_parse_one(np, index, &sup_args) ? NULL : sup_args.np;
  }
  
@@ -5495,7 +5658,7 @@
  static const struct supplier_bindings of_supplier_bindings[] = {
  	{ .parse_prop = parse_clocks, },
  	{ .parse_prop = parse_interconnects, },
-@@ -1351,7 +1331,10 @@ static const struct supplier_bindings of
+@@ -1351,7 +1333,10 @@ static const struct supplier_bindings of
  	{ .parse_prop = parse_pinctrl6, },
  	{ .parse_prop = parse_pinctrl7, },
  	{ .parse_prop = parse_pinctrl8, },
@@ -5507,7 +5670,7 @@
  	{ .parse_prop = parse_pwms, },
  	{ .parse_prop = parse_resets, },
  	{ .parse_prop = parse_leds, },
-@@ -1402,8 +1385,8 @@ static int of_link_property(struct devic
+@@ -1402,8 +1387,8 @@ static int of_link_property(struct devic
  		while ((phandle = s->parse_prop(con_np, prop_name, i))) {
  			struct device_node *con_dev_np;
  
@@ -7308,6 +7471,59 @@
  		if (unlikely(err))
  			goto failed_page;
  
+--- a/fs/nilfs2/segment.c
++++ b/fs/nilfs2/segment.c
+@@ -1703,7 +1703,6 @@ static void nilfs_segctor_prepare_write(
+ 
+ 		list_for_each_entry(bh, &segbuf->sb_payload_buffers,
+ 				    b_assoc_buffers) {
+-			set_buffer_async_write(bh);
+ 			if (bh == segbuf->sb_super_root) {
+ 				if (bh->b_page != bd_page) {
+ 					lock_page(bd_page);
+@@ -1714,6 +1713,7 @@ static void nilfs_segctor_prepare_write(
+ 				}
+ 				break;
+ 			}
++			set_buffer_async_write(bh);
+ 			if (bh->b_page != fs_page) {
+ 				nilfs_begin_page_io(fs_page);
+ 				fs_page = bh->b_page;
+@@ -1799,7 +1799,6 @@ static void nilfs_abort_logs(struct list
+ 
+ 		list_for_each_entry(bh, &segbuf->sb_payload_buffers,
+ 				    b_assoc_buffers) {
+-			clear_buffer_async_write(bh);
+ 			if (bh == segbuf->sb_super_root) {
+ 				clear_buffer_uptodate(bh);
+ 				if (bh->b_page != bd_page) {
+@@ -1808,6 +1807,7 @@ static void nilfs_abort_logs(struct list
+ 				}
+ 				break;
+ 			}
++			clear_buffer_async_write(bh);
+ 			if (bh->b_page != fs_page) {
+ 				nilfs_end_page_io(fs_page, err);
+ 				fs_page = bh->b_page;
+@@ -1895,8 +1895,9 @@ static void nilfs_segctor_complete_write
+ 				 BIT(BH_Delay) | BIT(BH_NILFS_Volatile) |
+ 				 BIT(BH_NILFS_Redirected));
+ 
+-			set_mask_bits(&bh->b_state, clear_bits, set_bits);
+ 			if (bh == segbuf->sb_super_root) {
++				set_buffer_uptodate(bh);
++				clear_buffer_dirty(bh);
+ 				if (bh->b_page != bd_page) {
+ 					end_page_writeback(bd_page);
+ 					bd_page = bh->b_page;
+@@ -1904,6 +1905,7 @@ static void nilfs_segctor_complete_write
+ 				update_sr = true;
+ 				break;
+ 			}
++			set_mask_bits(&bh->b_state, clear_bits, set_bits);
+ 			if (bh->b_page != fs_page) {
+ 				nilfs_end_page_io(fs_page, 0);
+ 				fs_page = bh->b_page;
 --- a/fs/proc/array.c
 +++ b/fs/proc/array.c
 @@ -477,13 +477,13 @@ static int do_task_stat(struct seq_file
@@ -9411,6 +9627,42 @@
  }
  
  int io_socket_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+--- a/kernel/sched/membarrier.c
++++ b/kernel/sched/membarrier.c
+@@ -162,6 +162,9 @@
+ 	| MEMBARRIER_PRIVATE_EXPEDITED_RSEQ_BITMASK			\
+ 	| MEMBARRIER_CMD_GET_REGISTRATIONS)
+ 
++static DEFINE_MUTEX(membarrier_ipi_mutex);
++#define SERIALIZE_IPI() guard(mutex)(&membarrier_ipi_mutex)
++
+ static void ipi_mb(void *info)
+ {
+ 	smp_mb();	/* IPIs should be serializing but paranoid. */
+@@ -259,6 +262,7 @@ static int membarrier_global_expedited(v
+ 	if (!zalloc_cpumask_var(&tmpmask, GFP_KERNEL))
+ 		return -ENOMEM;
+ 
++	SERIALIZE_IPI();
+ 	cpus_read_lock();
+ 	rcu_read_lock();
+ 	for_each_online_cpu(cpu) {
+@@ -347,6 +351,7 @@ static int membarrier_private_expedited(
+ 	if (cpu_id < 0 && !zalloc_cpumask_var(&tmpmask, GFP_KERNEL))
+ 		return -ENOMEM;
+ 
++	SERIALIZE_IPI();
+ 	cpus_read_lock();
+ 
+ 	if (cpu_id >= 0) {
+@@ -460,6 +465,7 @@ static int sync_runqueues_membarrier_sta
+ 	 * between threads which are users of @mm has its membarrier state
+ 	 * updated.
+ 	 */
++	SERIALIZE_IPI();
+ 	cpus_read_lock();
+ 	rcu_read_lock();
+ 	for_each_online_cpu(cpu) {
 --- a/kernel/sys.c
 +++ b/kernel/sys.c
 @@ -1785,21 +1785,24 @@ void getrusage(struct task_struct *p, in
@@ -10021,26 +10273,6 @@
  		io_schedule_timeout(pause);
  
  		current->dirty_paused_when = now + pause;
---- a/mm/readahead.c
-+++ b/mm/readahead.c
-@@ -469,7 +469,7 @@ static inline int ra_alloc_folio(struct
- 
- 	if (!folio)
- 		return -ENOMEM;
--	mark = round_up(mark, 1UL << order);
-+	mark = round_down(mark, 1UL << order);
- 	if (index == mark)
- 		folio_set_readahead(folio);
- 	err = filemap_add_folio(ractl->mapping, folio, index, gfp);
-@@ -577,7 +577,7 @@ static void ondemand_readahead(struct re
- 	 * It's the expected callback index, assume sequential access.
- 	 * Ramp up sizes, and push forward the readahead window.
- 	 */
--	expected = round_up(ra->start + ra->size - ra->async_size,
-+	expected = round_down(ra->start + ra->size - ra->async_size,
- 			1UL << order);
- 	if (index == expected || index == (ra->start + ra->size)) {
- 		ra->start += ra->size;
 --- a/mm/userfaultfd.c
 +++ b/mm/userfaultfd.c
 @@ -357,6 +357,7 @@ static __always_inline ssize_t mfill_ato
