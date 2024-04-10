@@ -1,21 +1,21 @@
-From a342ef429ded0fc18ab1e207fddc0a67a1876283 Mon Sep 17 00:00:00 2001
+From dd31947aecf3fd63ebde0e73eadeb049b02a567f Mon Sep 17 00:00:00 2001
 From: Bitterblue Smith <rtl8821cerfe2@gmail.com>
-Date: Wed, 20 Mar 2024 21:37:49 +0200
-Subject: [PATCH 14/21] wifi: rtlwifi: Add rtl8192du/hw.{c,h}
+Date: Tue, 9 Apr 2024 22:56:11 +0300
+Subject: [PATCH 15/23] wifi: rtlwifi: Add rtl8192du/hw.{c,h}
 
 These contain mostly hardware init/deinit routines for RTL8192DU.
 
 Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 ---
- .../wireless/realtek/rtlwifi/rtl8192du/hw.c   | 1244 +++++++++++++++++
+ .../wireless/realtek/rtlwifi/rtl8192du/hw.c   | 1232 +++++++++++++++++
  .../wireless/realtek/rtlwifi/rtl8192du/hw.h   |   24 +
- 2 files changed, 1268 insertions(+)
+ 2 files changed, 1256 insertions(+)
  create mode 100644 drivers/net/wireless/realtek/rtlwifi/rtl8192du/hw.c
  create mode 100644 drivers/net/wireless/realtek/rtlwifi/rtl8192du/hw.h
 
 --- /dev/null
 +++ b/drivers/net/wireless/realtek/rtlwifi/rtl8192du/hw.c
-@@ -0,0 +1,1244 @@
+@@ -0,0 +1,1232 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/* Copyright(c) 2009-2012  Realtek Corporation.*/
 +
@@ -37,7 +37,6 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +#include "dm.h"
 +#include "fw.h"
 +#include "led.h"
-+#include "sw.h"
 +#include "hw.h"
 +#include "trx.h"
 +
@@ -147,27 +146,27 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +						      HW_VAR_AID, NULL);
 +			tmp_regcr = rtl_read_byte(rtlpriv, REG_CR + 1);
 +			rtl_write_byte(rtlpriv, REG_CR + 1,
-+				       (tmp_regcr | BIT(0)));
-+			_rtl92de_set_bcn_ctrl_reg(hw, 0, BIT(3));
-+			_rtl92de_set_bcn_ctrl_reg(hw, BIT(4), 0);
++				       tmp_regcr | ENSWBCN);
++			_rtl92de_set_bcn_ctrl_reg(hw, 0, EN_BCN_FUNCTION);
++			_rtl92de_set_bcn_ctrl_reg(hw, DIS_TSF_UDT, 0);
 +			tmp_reg422 = rtl_read_byte(rtlpriv,
 +						   REG_FWHW_TXQ_CTRL + 2);
-+			if (tmp_reg422 & BIT(6))
++			if (tmp_reg422 & (EN_BCNQ_DL >> 16))
 +				recover = true;
 +			rtl_write_byte(rtlpriv, REG_FWHW_TXQ_CTRL + 2,
-+				       tmp_reg422 & (~BIT(6)));
++				       tmp_reg422 & ~(EN_BCNQ_DL >> 16));
 +
 +			/* We don't implement FW LPS so this is not needed. */
 +			/* rtl92d_set_fw_rsvdpagepkt(hw, 0); */
 +
-+			_rtl92de_set_bcn_ctrl_reg(hw, BIT(3), 0);
-+			_rtl92de_set_bcn_ctrl_reg(hw, 0, BIT(4));
++			_rtl92de_set_bcn_ctrl_reg(hw, EN_BCN_FUNCTION, 0);
++			_rtl92de_set_bcn_ctrl_reg(hw, 0, DIS_TSF_UDT);
 +			if (recover)
 +				rtl_write_byte(rtlpriv,
 +					       REG_FWHW_TXQ_CTRL + 2,
 +					       tmp_reg422);
 +			rtl_write_byte(rtlpriv, REG_CR + 1,
-+				       (tmp_regcr & ~(BIT(0))));
++				       tmp_regcr & ~ENSWBCN);
 +		}
 +		rtl92d_set_fw_joinbss_report_cmd(hw, (*val));
 +		break;
@@ -177,12 +176,12 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +
 +		if (btype_ibss)
 +			rtl92de_stop_tx_beacon(hw);
-+		_rtl92de_set_bcn_ctrl_reg(hw, 0, BIT(3));
++		_rtl92de_set_bcn_ctrl_reg(hw, 0, EN_BCN_FUNCTION);
 +		rtl_write_dword(rtlpriv, REG_TSFTR,
 +				(u32)(mac->tsf & 0xffffffff));
 +		rtl_write_dword(rtlpriv, REG_TSFTR + 4,
 +				(u32)((mac->tsf >> 32) & 0xffffffff));
-+		_rtl92de_set_bcn_ctrl_reg(hw, BIT(3), 0);
++		_rtl92de_set_bcn_ctrl_reg(hw, EN_BCN_FUNCTION, 0);
 +		if (btype_ibss)
 +			rtl92de_resume_tx_beacon(hw);
 +
@@ -300,7 +299,7 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +	/* config this MAC as two MAC transfer. */
 +	/* Otherwise used as local loopback buffer.  */
 +	for (i = txpktbuf_bndy; i < maxpage; i++) {
-+		status = rtl92de_llt_write(hw, i, (i + 1));
++		status = rtl92de_llt_write(hw, i, i + 1);
 +		if (!status)
 +			return status;
 +	}
@@ -568,9 +567,8 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +	struct rtl_priv *rtlpriv = rtl_priv(hw);
 +	unsigned short wordtmp;
 +	unsigned char bytetmp;
-+	u16 retry;
++	u16 retry = 0;
 +
-+	retry = 0;
 +	do {
 +		if (rtl_read_byte(rtlpriv, REG_APS_FSMCO) & PFM_ALDN)
 +			break;
@@ -678,22 +676,14 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +	local_save_flags(flags);
 +	local_irq_enable();
 +
-+	/* Let the first starting mac load RF parameters and do LCK */
-+	if (rtlhal->macphymode == DUALMAC_DUALPHY &&
-+	    ((rtlhal->interfaceindex == 0 && rtlhal->bandset == BAND_ON_2_4G) ||
-+	     (rtlhal->interfaceindex == 1 && rtlhal->bandset == BAND_ON_5G)))
-+		mutex_lock(&globalmutex_for_mac0_2g_mac1_5g);
-+
-+	mutex_lock(&globalmutex_for_power_and_efuse);
++	mutex_lock(rtlpriv->mutex_for_hw_init);
 +
 +	/* we should do iqk after disable/enable */
 +	rtl92d_phy_reset_iqk_result(hw);
 +
 +	if (!_rtl92de_init_mac(hw)) {
 +		pr_err("Init MAC failed\n");
-+		mutex_unlock(&globalmutex_for_power_and_efuse);
-+		if (mutex_is_locked(&globalmutex_for_mac0_2g_mac1_5g))
-+			mutex_unlock(&globalmutex_for_mac0_2g_mac1_5g);
++		mutex_unlock(rtlpriv->mutex_for_hw_init);
 +		return 1;
 +	}
 +
@@ -704,21 +694,17 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +
 +	if (!_rtl92de_llt_table_init(hw, txpktbuf_bndy)) {
 +		pr_err("Init LLT failed\n");
-+		mutex_unlock(&globalmutex_for_power_and_efuse);
-+		if (mutex_is_locked(&globalmutex_for_mac0_2g_mac1_5g))
-+			mutex_unlock(&globalmutex_for_mac0_2g_mac1_5g);
++		mutex_unlock(rtlpriv->mutex_for_hw_init);
 +		return 1;
 +	}
 +
 +	err = rtl92d_download_fw(hw);
-+	mutex_unlock(&globalmutex_for_power_and_efuse);
 +
 +	/* return fail only when part number check fail */
 +	if (err && rtl_read_byte(rtlpriv, 0x1c5) == 0xe0) {
 +		rtl_dbg(rtlpriv, COMP_ERR, DBG_WARNING,
 +			"Failed to download FW. Init HW without FW..\n");
-+		if (mutex_is_locked(&globalmutex_for_mac0_2g_mac1_5g))
-+			mutex_unlock(&globalmutex_for_mac0_2g_mac1_5g);
++		mutex_unlock(rtlpriv->mutex_for_hw_init);
 +		return 1;
 +	}
 +	rtlhal->last_hmeboxnum = 0;
@@ -854,12 +840,10 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +	/* After load BB, RF params, we need to do more for 92D. */
 +	rtl92d_update_bbrf_configuration(hw);
 +
-+	rtlphy->rfreg_chnlval[0] = rtl_get_rfreg(hw, RF90_PATH_A,
-+						 RF_CHNLBW,
-+						 RFREG_OFFSET_MASK);
-+	rtlphy->rfreg_chnlval[1] = rtl_get_rfreg(hw, RF90_PATH_B,
-+						 RF_CHNLBW,
-+						 RFREG_OFFSET_MASK);
++	rtlphy->rfreg_chnlval[0] =
++		rtl_get_rfreg(hw, RF90_PATH_A, RF_CHNLBW, RFREG_OFFSET_MASK);
++	rtlphy->rfreg_chnlval[1] =
++		rtl_get_rfreg(hw, RF90_PATH_B, RF_CHNLBW, RFREG_OFFSET_MASK);
 +
 +	/*---- Set CCK and OFDM Block "ON"----*/
 +	if (rtlhal->current_bandtype == BAND_ON_2_4G)
@@ -897,10 +881,9 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +
 +	rtl92d_phy_lc_calibrate(hw, IS_92D_SINGLEPHY(rtlhal->version));
 +
-+	if (mutex_is_locked(&globalmutex_for_mac0_2g_mac1_5g))
-+		mutex_unlock(&globalmutex_for_mac0_2g_mac1_5g);
-+
 +	rtl92du_phy_init_pa_bias(hw);
++
++	mutex_unlock(rtlpriv->mutex_for_hw_init);
 +
 +	rtl92du_dm_init(hw);
 +
@@ -944,7 +927,7 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +		rtl92de_stop_tx_beacon(hw);
 +		_rtl92de_enable_bcn_sub_func(hw);
 +	} else if (type == NL80211_IFTYPE_ADHOC ||
-+		type == NL80211_IFTYPE_AP) {
++		   type == NL80211_IFTYPE_AP) {
 +		rtl92de_resume_tx_beacon(hw);
 +		_rtl92de_disable_bcn_sub_func(hw);
 +	} else {
@@ -952,6 +935,7 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +			"Set HW_VAR_MEDIA_STATUS: No such media status(%x)\n",
 +			type);
 +	}
++
 +	switch (type) {
 +	case NL80211_IFTYPE_UNSPECIFIED:
 +		bt_msr |= MSR_NOLINK;
@@ -980,11 +964,14 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +		return 1;
 +	}
 +	rtl_write_byte(rtlpriv, MSR, bt_msr);
++
 +	rtlpriv->cfg->ops->led_control(hw, ledaction);
++
 +	if ((bt_msr & MSR_MASK) == MSR_AP)
 +		rtl_write_byte(rtlpriv, REG_BCNTCFG + 1, 0x00);
 +	else
 +		rtl_write_byte(rtlpriv, REG_BCNTCFG + 1, 0x66);
++
 +	return 0;
 +}
 +
@@ -999,13 +986,13 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +	rtlpriv->cfg->ops->get_hw_reg(hw, HW_VAR_RCR, (u8 *)(&reg_rcr));
 +
 +	if (check_bssid) {
-+		reg_rcr |= (RCR_CBSSID_DATA | RCR_CBSSID_BCN);
-+		rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_RCR, (u8 *)(&reg_rcr));
-+		_rtl92de_set_bcn_ctrl_reg(hw, 0, BIT(4));
++		reg_rcr |= RCR_CBSSID_DATA | RCR_CBSSID_BCN;
++		rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_RCR, (u8 *)&reg_rcr);
++		_rtl92de_set_bcn_ctrl_reg(hw, 0, DIS_TSF_UDT);
 +	} else if (!check_bssid) {
-+		reg_rcr &= (~(RCR_CBSSID_DATA | RCR_CBSSID_BCN));
-+		_rtl92de_set_bcn_ctrl_reg(hw, BIT(4), 0);
-+		rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_RCR, (u8 *)(&reg_rcr));
++		reg_rcr &= ~(RCR_CBSSID_DATA | RCR_CBSSID_BCN);
++		_rtl92de_set_bcn_ctrl_reg(hw, DIS_TSF_UDT, 0);
++		rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_RCR, (u8 *)&reg_rcr);
 +	}
 +}
 +
@@ -1023,6 +1010,7 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +	} else {
 +		rtl92de_set_check_bssid(hw, false);
 +	}
++
 +	return 0;
 +}
 +
@@ -1059,7 +1047,7 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +static void _rtl92du_poweroff_adapter(struct ieee80211_hw *hw)
 +{
 +	struct rtl_priv *rtlpriv = rtl_priv(hw);
-+	u8 delay = 100;
++	u8 retry = 100;
 +	u8 u1b_tmp;
 +	u16 val16;
 +	u32 val32;
@@ -1084,14 +1072,14 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +		rtl_write_byte(rtlpriv, REG_HMETFR + 3, 0x20);
 +		val16 = rtl_read_word(rtlpriv, REG_SYS_FUNC_EN);
 +		while (val16 & FEN_CPUEN) {
-+			delay--;
-+			if (delay == 0)
++			retry--;
++			if (retry == 0)
 +				break;
 +			udelay(50);
 +			val16 = rtl_read_word(rtlpriv, REG_SYS_FUNC_EN);
 +		}
 +
-+		if (delay == 0) {
++		if (retry == 0) {
 +			rtl_write_byte(rtlpriv, REG_FWIMR, 0);
 +
 +			/* if 8051 reset fail, reset MAC directly. */
@@ -1144,11 +1132,11 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +
 +	/* 0x17[7] 1b': power off in process  0b' : power off over */
 +	if (rtlpriv->rtlhal.macphymode != SINGLEMAC_SINGLEPHY) {
-+		mutex_lock(&globalmutex_power);
++		mutex_lock(rtlpriv->mutex_for_power_on_off);
 +		u1b_tmp = rtl_read_byte(rtlpriv, REG_POWER_OFF_IN_PROCESS);
-+		u1b_tmp &= (~BIT(7));
++		u1b_tmp &= ~BIT(7);
 +		rtl_write_byte(rtlpriv, REG_POWER_OFF_IN_PROCESS, u1b_tmp);
-+		mutex_unlock(&globalmutex_power);
++		mutex_unlock(rtlpriv->mutex_for_power_on_off);
 +	}
 +
 +	rtl_dbg(rtlpriv, COMP_INIT, DBG_LOUD, "<=======\n");
@@ -1266,8 +1254,8 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/* Copyright(c) 2009-2012  Realtek Corporation.*/
 +
-+#ifndef __RTL92DE_HW_H__
-+#define __RTL92DE_HW_H__
++#ifndef __RTL92DU_HW_H__
++#define __RTL92DU_HW_H__
 +
 +void rtl92du_get_hw_reg(struct ieee80211_hw *hw, u8 variable, u8 *val);
 +void rtl92du_set_hw_reg(struct ieee80211_hw *hw, u8 variable, u8 *val);

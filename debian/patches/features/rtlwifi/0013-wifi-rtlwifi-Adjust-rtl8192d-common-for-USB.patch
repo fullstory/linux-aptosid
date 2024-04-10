@@ -1,12 +1,17 @@
-From 48c20201503fb874bdf6f040e17bb26f90db340e Mon Sep 17 00:00:00 2001
+From 4760b268360e5606bc98d4d4eef89249d9c10dbf Mon Sep 17 00:00:00 2001
 From: Bitterblue Smith <rtl8821cerfe2@gmail.com>
-Date: Wed, 20 Mar 2024 21:35:47 +0200
-Subject: [PATCH 12/21] wifi: rtlwifi: Adjust rtl8192d-common for USB
+Date: Tue, 9 Apr 2024 22:54:07 +0300
+Subject: [PATCH 13/23] wifi: rtlwifi: Adjust rtl8192d-common for USB
 
-A few of the shared functions need small changes for the USB driver.
+A few of the shared functions need small changes for the USB driver:
+ - firmware loading
+ - efuse reading
+ - rate mask updating
+ - rf register reading
+ - initial gain for scanning
 
-Also, add a few macros to wifi.h and initialise rtlhal.interfaceindex
-for USB devices.
+Also, add a few macros to wifi.h, add some new members to struct
+rtl_priv, and initialise rtlhal.interfaceindex for USB devices.
 
 Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 ---
@@ -15,12 +20,12 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
  .../realtek/rtlwifi/rtl8192d/fw_common.c      |  23 ++-
  .../realtek/rtlwifi/rtl8192d/fw_common.h      |  10 ++
  .../realtek/rtlwifi/rtl8192d/hw_common.c      |  53 ++++--
- .../realtek/rtlwifi/rtl8192d/phy_common.c     |  40 ++++-
- .../realtek/rtlwifi/rtl8192d/phy_common.h     |   6 +
- .../wireless/realtek/rtlwifi/rtl8192d/reg.h   | 155 +++++++++++++++---
+ .../realtek/rtlwifi/rtl8192d/phy_common.c     |  22 ++-
+ .../realtek/rtlwifi/rtl8192d/phy_common.h     |  24 +++
+ .../wireless/realtek/rtlwifi/rtl8192d/reg.h   | 160 +++++++++++++++---
  drivers/net/wireless/realtek/rtlwifi/usb.c    |   3 +
- drivers/net/wireless/realtek/rtlwifi/wifi.h   |   5 +
- 10 files changed, 255 insertions(+), 44 deletions(-)
+ drivers/net/wireless/realtek/rtlwifi/wifi.h   |  11 ++
+ 10 files changed, 266 insertions(+), 44 deletions(-)
 
 --- a/drivers/net/wireless/realtek/rtlwifi/efuse.c
 +++ b/drivers/net/wireless/realtek/rtlwifi/efuse.c
@@ -171,12 +176,19 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
  	hwinfo = kzalloc(HWSET_MAX_SIZE, GFP_KERNEL);
  	if (!hwinfo)
  		return;
-@@ -858,7 +876,7 @@ static void rtl92de_update_hal_rate_mask
+@@ -849,6 +867,7 @@ static void rtl92de_update_hal_rate_mask
+ 	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
+ 	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
+ 	struct rtl_sta_info *sta_entry = NULL;
++	struct rtl92d_rate_mask_h2c rate_mask;
+ 	u32 ratr_bitmap;
+ 	u8 ratr_index;
+ 	u8 curtxbw_40mhz = (sta->deflink.bandwidth >= IEEE80211_STA_RX_BW_40) ? 1 : 0;
+@@ -858,7 +877,6 @@ static void rtl92de_update_hal_rate_mask
  							1 : 0;
  	enum wireless_mode wirelessmode = 0;
  	bool shortgi = false;
 -	u32 value[2];
-+	struct rtl92d_rate_mask_h2c rate_mask;
  	u8 macid = 0;
  	u8 mimo_ps = IEEE80211_SMPS_OFF;
  
@@ -195,8 +207,8 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
  	rtl_dbg(rtlpriv, COMP_RATR, DBG_DMESG,
 -		"ratr_bitmap :%x value0:%x value1:%x\n",
 -		ratr_bitmap, value[0], value[1]);
--	rtl92d_fill_h2c_cmd(hw, H2C_RA_MASK, 5, (u8 *) value);
-+	"Rate_index:%x, ratr_val:%x, %5phC\n",
+-	rtl92d_fill_h2c_cmd(hw, H2C_RA_MASK, 5, (u8 *)value);
++		"Rate_index:%x, ratr_val:%x, %5phC\n",
 +		ratr_index, ratr_bitmap, &rate_mask);
 +	memcpy(rtlpriv->rate_mask, &rate_mask, sizeof(rtlpriv->rate_mask));
 +	/* rtl92d_fill_h2c_cmd() does USB I/O and will result in a
@@ -218,64 +230,39 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
  		return false;
 --- a/drivers/net/wireless/realtek/rtlwifi/rtl8192d/phy_common.c
 +++ b/drivers/net/wireless/realtek/rtlwifi/rtl8192d/phy_common.c
-@@ -81,6 +81,24 @@ static void _rtl92d_phy_rf_serial_write(
- 		rfpath, pphyreg->rf3wire_offset, data_and_addr);
- }
- 
-+/* Without these helpers and the declarations sparse warns about
-+ * context imbalance.
-+ */
-+static inline void _rtl92d_pci_lock(struct rtl_priv *rtlpriv)
-+{
-+	if (rtlpriv->rtlhal.interface == INTF_PCI)
-+		spin_lock(&rtlpriv->locks.rf_lock);
-+}
-+
-+static inline void _rtl92d_pci_unlock(struct rtl_priv *rtlpriv)
-+{
-+	if (rtlpriv->rtlhal.interface == INTF_PCI)
-+		spin_unlock(&rtlpriv->locks.rf_lock);
-+}
-+
-+void _rtl92d_pci_lock(struct rtl_priv *rtlpriv);
-+void _rtl92d_pci_unlock(struct rtl_priv *rtlpriv);
-+
- u32 rtl92d_phy_query_rf_reg(struct ieee80211_hw *hw, enum radio_path rfpath,
- 			    u32 regaddr, u32 bitmask)
- {
-@@ -90,11 +108,11 @@ u32 rtl92d_phy_query_rf_reg(struct ieee8
+@@ -90,11 +90,11 @@ u32 rtl92d_phy_query_rf_reg(struct ieee8
  	rtl_dbg(rtlpriv, COMP_RF, DBG_TRACE,
  		"regaddr(%#x), rfpath(%#x), bitmask(%#x)\n",
  		regaddr, rfpath, bitmask);
 -	spin_lock(&rtlpriv->locks.rf_lock);
-+	_rtl92d_pci_lock(rtlpriv);
++	rtl92d_pci_lock(rtlpriv);
  	original_value = _rtl92d_phy_rf_serial_read(hw, rfpath, regaddr);
  	bitshift = calculate_bit_shift(bitmask);
  	readback_value = (original_value & bitmask) >> bitshift;
 -	spin_unlock(&rtlpriv->locks.rf_lock);
-+	_rtl92d_pci_unlock(rtlpriv);
++	rtl92d_pci_unlock(rtlpriv);
  	rtl_dbg(rtlpriv, COMP_RF, DBG_TRACE,
  		"regaddr(%#x), rfpath(%#x), bitmask(%#x), original_value(%#x)\n",
  		regaddr, rfpath, bitmask, original_value);
-@@ -114,7 +132,7 @@ void rtl92d_phy_set_rf_reg(struct ieee80
+@@ -114,7 +114,7 @@ void rtl92d_phy_set_rf_reg(struct ieee80
  		regaddr, bitmask, data, rfpath);
  	if (bitmask == 0)
  		return;
 -	spin_lock(&rtlpriv->locks.rf_lock);
-+	_rtl92d_pci_lock(rtlpriv);
++	rtl92d_pci_lock(rtlpriv);
  	if (rtlphy->rf_mode != RF_OP_BY_FW) {
  		if (bitmask != RFREG_OFFSET_MASK) {
  			original_value = _rtl92d_phy_rf_serial_read(hw,
-@@ -126,7 +144,7 @@ void rtl92d_phy_set_rf_reg(struct ieee80
+@@ -126,7 +126,7 @@ void rtl92d_phy_set_rf_reg(struct ieee80
  		}
  		_rtl92d_phy_rf_serial_write(hw, rfpath, regaddr, data);
  	}
 -	spin_unlock(&rtlpriv->locks.rf_lock);
-+	_rtl92d_pci_unlock(rtlpriv);
++	rtl92d_pci_unlock(rtlpriv);
  	rtl_dbg(rtlpriv, COMP_RF, DBG_TRACE,
  		"regaddr(%#x), bitmask(%#x), data(%#x), rfpath(%#x)\n",
  		regaddr, bitmask, data, rfpath);
-@@ -652,6 +670,8 @@ static void rtl92d_phy_set_io(struct iee
+@@ -652,6 +652,8 @@ static void rtl92d_phy_set_io(struct iee
  	case IO_CMD_PAUSE_DM_BY_SCAN:
  		rtlphy->initgain_backup.xaagccore1 = de_digtable->cur_igvalue;
  		de_digtable->cur_igvalue = 0x37;
@@ -284,7 +271,7 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
  		rtl92d_dm_write_dig(hw);
  		break;
  	default:
-@@ -708,22 +728,28 @@ void rtl92d_phy_config_macphymode(struct
+@@ -708,22 +710,28 @@ void rtl92d_phy_config_macphymode(struct
  	struct rtl_priv *rtlpriv = rtl_priv(hw);
  	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
  	u8 offset = REG_MAC_PHY_CTRL_NORMAL;
@@ -338,6 +325,29 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
  	if (rtlpriv->rtlhal.interfaceindex == 1)
  		spin_unlock_irqrestore(&rtlpriv->locks.cck_and_rw_pagea_lock,
  				       *flag);
+@@ -84,4 +90,22 @@ void rtl92d_acquire_cckandrw_pagea_ctl(s
+ void rtl92d_release_cckandrw_pagea_ctl(struct ieee80211_hw *hw,
+ 				       unsigned long *flag);
+ 
++/* Without these helpers and the declarations sparse warns about
++ * context imbalance.
++ */
++static inline void rtl92d_pci_lock(struct rtl_priv *rtlpriv)
++{
++	if (rtlpriv->rtlhal.interface == INTF_PCI)
++		spin_lock(&rtlpriv->locks.rf_lock);
++}
++
++static inline void rtl92d_pci_unlock(struct rtl_priv *rtlpriv)
++{
++	if (rtlpriv->rtlhal.interface == INTF_PCI)
++		spin_unlock(&rtlpriv->locks.rf_lock);
++}
++
++void rtl92d_pci_lock(struct rtl_priv *rtlpriv);
++void rtl92d_pci_unlock(struct rtl_priv *rtlpriv);
++
+ #endif
 --- a/drivers/net/wireless/realtek/rtlwifi/rtl8192d/reg.h
 +++ b/drivers/net/wireless/realtek/rtlwifi/rtl8192d/reg.h
 @@ -51,6 +51,8 @@
@@ -487,27 +497,32 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
  /* LLT_INIT */
  #define _LLT_NO_ACTIVE				0x0
  #define _LLT_WRITE_ACCESS			0x1
-@@ -929,6 +977,9 @@
+@@ -929,6 +977,10 @@
  /* ----------------------------------------------------- */
  /*	0x0400h ~ 0x047Fh	Protocol Configuration	 */
  /* ----------------------------------------------------- */
 +/* FWHW_TXQ_CTRL */
 +#define EN_AMPDU_RTY_NEW			BIT(7)
++#define EN_BCNQ_DL				BIT(22)
 +
  #define	RETRY_LIMIT_SHORT_SHIFT			8
  #define	RETRY_LIMIT_LONG_SHIFT			0
  
-@@ -942,6 +993,9 @@
+@@ -942,6 +994,13 @@
  #define AC_PARAM_ECW_MIN_OFFSET			8
  #define AC_PARAM_AIFS_OFFSET			0
  
 +/* REG_RD_CTRL */
 +#define DIS_EDCA_CNT_DWN			BIT(11)
 +
++/* REG_BCN_CTRL */
++#define EN_BCN_FUNCTION				BIT(3)
++#define DIS_TSF_UDT				BIT(4)
++
  /* ACMHWCTRL */
  #define	ACMHW_HWEN				BIT(0)
  #define	ACMHW_BEQEN				BIT(1)
-@@ -1073,6 +1127,11 @@
+@@ -1073,6 +1132,11 @@
  #define	RCCK0_FACOUNTERLOWER			0xa5c
  #define	RCCK0_FACOUNTERUPPER			0xa58
  
@@ -519,7 +534,7 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
  /* 6. PageC(0xC00) */
  #define	ROFDM0_LSTF				0xc00
  
-@@ -1126,6 +1185,7 @@
+@@ -1126,6 +1190,7 @@
  #define	ROFDM0_TXPSEUDONOISEWGT			0xce4
  #define	ROFDM0_FRAMESYNC			0xcf0
  #define	ROFDM0_DFSREPORT			0xcf4
@@ -527,7 +542,7 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
  #define	ROFDM0_TXCOEFF1				0xca4
  #define	ROFDM0_TXCOEFF2				0xca8
  #define	ROFDM0_TXCOEFF3				0xcac
-@@ -1184,17 +1244,70 @@
+@@ -1184,17 +1249,70 @@
  #define	RTXAGC_B_MCS15_MCS12			0x868
  #define	RTXAGC_B_CCK11_A_CCK2_11		0x86c
  
@@ -631,3 +646,16 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
  #define RF_CHANGE_BY_INIT			0
  #define RF_CHANGE_BY_IPS			BIT(28)
  #define RF_CHANGE_BY_PS				BIT(29)
+@@ -2768,6 +2773,12 @@ struct rtl_priv {
+ 	 */
+ 	bool use_new_trx_flow;
+ 
++	/* For dual MAC RTL8192DU, things shared by the 2 USB interfaces */
++	u32 *curveindex_2g;
++	u32 *curveindex_5g;
++	struct mutex *mutex_for_power_on_off; /* for power on/off */
++	struct mutex *mutex_for_hw_init; /* for hardware init */
++
+ #ifdef CONFIG_PM
+ 	struct wiphy_wowlan_support wowlan;
+ #endif

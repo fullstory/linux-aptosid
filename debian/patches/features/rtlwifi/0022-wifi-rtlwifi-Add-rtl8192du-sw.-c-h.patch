@@ -1,21 +1,19 @@
-From b79e8c9a0dff9ec94dc28f479df8ae0bd0a74513 Mon Sep 17 00:00:00 2001
+From 03615a4bf2641775a3090a7b8cdfb27950c05d6b Mon Sep 17 00:00:00 2001
 From: Bitterblue Smith <rtl8821cerfe2@gmail.com>
-Date: Wed, 20 Mar 2024 21:43:29 +0200
-Subject: [PATCH 20/21] wifi: rtlwifi: Add rtl8192du/sw.{c,h}
+Date: Tue, 9 Apr 2024 23:01:25 +0300
+Subject: [PATCH 22/23] wifi: rtlwifi: Add rtl8192du/sw.{c,h}
 
 These contain the new module's entry point.
 
 Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 ---
- .../wireless/realtek/rtlwifi/rtl8192du/sw.c   | 312 ++++++++++++++++++
- .../wireless/realtek/rtlwifi/rtl8192du/sw.h   |  12 +
- 2 files changed, 324 insertions(+)
+ .../wireless/realtek/rtlwifi/rtl8192du/sw.c   | 397 ++++++++++++++++++
+ 1 file changed, 397 insertions(+)
  create mode 100644 drivers/net/wireless/realtek/rtlwifi/rtl8192du/sw.c
- create mode 100644 drivers/net/wireless/realtek/rtlwifi/rtl8192du/sw.h
 
 --- /dev/null
 +++ b/drivers/net/wireless/realtek/rtlwifi/rtl8192du/sw.c
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,397 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/* Copyright(c) 2009-2012  Realtek Corporation.*/
 +
@@ -33,17 +31,112 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +#include "dm.h"
 +#include "fw.h"
 +#include "hw.h"
-+#include "sw.h"
 +#include "trx.h"
 +#include "led.h"
 +
 +#include <linux/module.h>
++
++static struct usb_interface *rtl92du_get_other_intf(struct ieee80211_hw *hw)
++{
++	struct usb_interface *intf;
++	struct usb_device *udev;
++	u8 other_interfaceindex;
++
++	/* See SET_IEEE80211_DEV(hw, &intf->dev); in usb.c */
++	intf = container_of_const(wiphy_dev(hw->wiphy), struct usb_interface, dev);
++
++	if (intf->altsetting[0].desc.bInterfaceNumber == 0)
++		other_interfaceindex = 1;
++	else
++		other_interfaceindex = 0;
++
++	udev = interface_to_usbdev(intf);
++
++	return usb_ifnum_to_if(udev, other_interfaceindex);
++}
++
++static int rtl92du_init_shared_data(struct ieee80211_hw *hw)
++{
++	struct usb_interface *other_intf = rtl92du_get_other_intf(hw);
++	struct rtl_priv *rtlpriv = rtl_priv(hw);
++	struct rtl_priv *other_rtlpriv = NULL;
++	struct ieee80211_hw *other_hw = NULL;
++
++	if (other_intf)
++		other_hw = usb_get_intfdata(other_intf);
++
++	if (other_hw) {
++		/* The other interface was already probed. */
++		other_rtlpriv = rtl_priv(other_hw);
++		rtlpriv->curveindex_2g = other_rtlpriv->curveindex_2g;
++		rtlpriv->curveindex_5g = other_rtlpriv->curveindex_5g;
++		rtlpriv->mutex_for_power_on_off = other_rtlpriv->mutex_for_power_on_off;
++		rtlpriv->mutex_for_hw_init = other_rtlpriv->mutex_for_hw_init;
++
++		if (!rtlpriv->curveindex_2g || !rtlpriv->curveindex_5g ||
++		    !rtlpriv->mutex_for_power_on_off || !rtlpriv->mutex_for_hw_init)
++			return 1;
++
++		return 0;
++	}
++
++	/* The other interface doesn't exist or was not probed yet. */
++	rtlpriv->curveindex_2g = kcalloc(TARGET_CHNL_NUM_2G,
++					 sizeof(*rtlpriv->curveindex_2g),
++					 GFP_KERNEL);
++	rtlpriv->curveindex_5g = kcalloc(TARGET_CHNL_NUM_5G,
++					 sizeof(*rtlpriv->curveindex_5g),
++					 GFP_KERNEL);
++	rtlpriv->mutex_for_power_on_off =
++		kzalloc(sizeof(*rtlpriv->mutex_for_power_on_off), GFP_KERNEL);
++	rtlpriv->mutex_for_hw_init =
++		kzalloc(sizeof(*rtlpriv->mutex_for_hw_init), GFP_KERNEL);
++
++	if (!rtlpriv->curveindex_2g || !rtlpriv->curveindex_5g ||
++	    !rtlpriv->mutex_for_power_on_off || !rtlpriv->mutex_for_hw_init) {
++		kfree(rtlpriv->curveindex_2g);
++		kfree(rtlpriv->curveindex_5g);
++		kfree(rtlpriv->mutex_for_power_on_off);
++		kfree(rtlpriv->mutex_for_hw_init);
++		rtlpriv->curveindex_2g = NULL;
++		rtlpriv->curveindex_5g = NULL;
++		rtlpriv->mutex_for_power_on_off = NULL;
++		rtlpriv->mutex_for_hw_init = NULL;
++		return 1;
++	}
++
++	mutex_init(rtlpriv->mutex_for_power_on_off);
++	mutex_init(rtlpriv->mutex_for_hw_init);
++
++	return 0;
++}
++
++static void rtl92du_deinit_shared_data(struct ieee80211_hw *hw)
++{
++	struct usb_interface *other_intf = rtl92du_get_other_intf(hw);
++	struct rtl_priv *rtlpriv = rtl_priv(hw);
++
++	if (!other_intf || !usb_get_intfdata(other_intf)) {
++		/* The other interface doesn't exist or was already disconnected. */
++		kfree(rtlpriv->curveindex_2g);
++		kfree(rtlpriv->curveindex_5g);
++		if (rtlpriv->mutex_for_power_on_off)
++			mutex_destroy(rtlpriv->mutex_for_power_on_off);
++		if (rtlpriv->mutex_for_hw_init)
++			mutex_destroy(rtlpriv->mutex_for_hw_init);
++		kfree(rtlpriv->mutex_for_power_on_off);
++		kfree(rtlpriv->mutex_for_hw_init);
++	}
++}
 +
 +static int rtl92du_init_sw_vars(struct ieee80211_hw *hw)
 +{
 +	const char *fw_name = "rtlwifi/rtl8192dufw.bin";
 +	struct rtl_priv *rtlpriv = rtl_priv(hw);
 +	int err;
++
++	if (rtl92du_init_shared_data(hw))
++		return 1;
 +
 +	rtlpriv->dm.dm_initialgain_enable = true;
 +	rtlpriv->dm.dm_flag = 0;
@@ -72,10 +165,8 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +
 +	/* for firmware buf */
 +	rtlpriv->rtlhal.pfirmware = kmalloc(0x8000, GFP_KERNEL);
-+	if (!rtlpriv->rtlhal.pfirmware) {
-+		pr_err("Can't alloc buffer for fw\n");
++	if (!rtlpriv->rtlhal.pfirmware)
 +		return 1;
-+	}
 +
 +	rtlpriv->max_fw_size = 0x8000;
 +	pr_info("Driver for Realtek RTL8192DU WLAN interface\n");
@@ -101,9 +192,11 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +
 +	kfree(rtlpriv->rtlhal.pfirmware);
 +	rtlpriv->rtlhal.pfirmware = NULL;
++
++	rtl92du_deinit_shared_data(hw);
 +}
 +
-+static struct rtl_hal_ops rtl8192du_hal_ops = {
++static const struct rtl_hal_ops rtl8192du_hal_ops = {
 +	.init_sw_vars = rtl92du_init_sw_vars,
 +	.deinit_sw_vars = rtl92du_deinit_sw_vars,
 +	.read_chip_version = rtl92du_read_chip_version,
@@ -154,7 +247,7 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +	.debug_mask = 0,
 +};
 +
-+static struct rtl_hal_usbint_cfg rtl92du_interface_cfg = {
++static const struct rtl_hal_usbint_cfg rtl92du_interface_cfg = {
 +	/* rx */
 +	.rx_urb_num = 8,
 +	.rx_max_size = 15360,
@@ -168,7 +261,7 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +	.usb_mq_to_hwq = rtl92du_mq_to_hwq,
 +};
 +
-+static struct rtl_hal_cfg rtl92du_hal_cfg = {
++static const struct rtl_hal_cfg rtl92du_hal_cfg = {
 +	.name = "rtl8192du",
 +	.ops = &rtl8192du_hal_ops,
 +	.mod_params = &rtl92du_mod_params,
@@ -259,13 +352,6 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +	.maps[RTL_RC_HT_RATEMCS15] = DESC_RATEMCS15,
 +};
 +
-+MODULE_AUTHOR("lizhaoming	<chaoming_li@realsil.com.cn>");
-+MODULE_AUTHOR("Realtek WlanFAE	<wlanfae@realtek.com>");
-+MODULE_AUTHOR("Larry Finger	<Larry.Finger@lwfinger.net>");
-+MODULE_LICENSE("GPL");
-+MODULE_DESCRIPTION("Realtek 8192DU 802.11an Dual Mac USB wireless");
-+MODULE_FIRMWARE("rtlwifi/rtl8192dufw.bin");
-+
 +module_param_named(swenc, rtl92du_mod_params.sw_crypto, bool, 0444);
 +module_param_named(debug_level, rtl92du_mod_params.debug_level, int, 0644);
 +module_param_named(ips, rtl92du_mod_params.inactiveps, bool, 0444);
@@ -276,14 +362,6 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +MODULE_PARM_DESC(swlps, "Set to 1 to use SW control power save (default 0)\n");
 +MODULE_PARM_DESC(debug_level, "Set debug level (0-5) (default 0)");
 +MODULE_PARM_DESC(debug_mask, "Set debug mask (default 0)");
-+
-+/* Add global mutex to solve the problem that
-+ * dual mac register operation on the same time
-+ */
-+DEFINE_MUTEX(globalmutex_power);
-+DEFINE_MUTEX(globalmutex_for_fwdownload);
-+DEFINE_MUTEX(globalmutex_for_power_and_efuse);
-+DEFINE_MUTEX(globalmutex_for_mac0_2g_mac1_5g);
 +
 +#define USB_VENDOR_ID_REALTEK		0x0bda
 +
@@ -328,18 +406,8 @@ Signed-off-by: Bitterblue Smith <rtl8821cerfe2@gmail.com>
 +};
 +
 +module_usb_driver(rtl8192du_driver);
---- /dev/null
-+++ b/drivers/net/wireless/realtek/rtlwifi/rtl8192du/sw.h
-@@ -0,0 +1,12 @@
-+/* SPDX-License-Identifier: GPL-2.0 */
-+/* Copyright(c) 2009-2012  Realtek Corporation.*/
 +
-+#ifndef __RTL92DE_SW_H__
-+#define __RTL92DE_SW_H__
-+
-+extern struct mutex globalmutex_power;
-+extern struct mutex globalmutex_for_fwdownload;
-+extern struct mutex globalmutex_for_power_and_efuse;
-+extern struct mutex globalmutex_for_mac0_2g_mac1_5g;
-+
-+#endif
++MODULE_AUTHOR("Bitterblue Smith	<rtl8821cerfe2@gmail.com>");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Realtek 8192DU 802.11an Dual Mac USB wireless");
++MODULE_FIRMWARE("rtlwifi/rtl8192dufw.bin");
