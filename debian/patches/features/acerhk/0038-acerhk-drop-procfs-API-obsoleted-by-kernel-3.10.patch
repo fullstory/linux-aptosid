@@ -1,0 +1,434 @@
+From 17cd78e2d9ffe8b333128fbf7a42ad34668fbfb8 Mon Sep 17 00:00:00 2001
+From: Stefan Lippers-Hollmann <s.l-h@gmx.de>
+Date: Thu, 8 Aug 2013 20:54:20 +0200
+Subject: [PATCH 38/65] acerhk: drop procfs API, obsoleted by kernel 3.10
+
+* the wireless button is now active by default and its state gets cleaned up
+  on module unload.
+* the bluetooth button is now active by default and its state gets cleaned up
+  on module unload. Blinking is no longer supported.
+* the mail LED is now enabled by default and its state gets cleaned up
+  on module unload.
+
+Signed-off-by: Stefan Lippers-Hollmann <s.l-h@gmx.de>
+---
+ drivers/platform/x86/acerhk.c | 326 +++++-------------------------------------
+ 1 file changed, 38 insertions(+), 288 deletions(-)
+
+--- a/drivers/platform/x86/acerhk.c
++++ b/drivers/platform/x86/acerhk.c
+@@ -53,7 +53,6 @@
+ #include <linux/mc146818rtc.h>
+ #include <linux/input.h>
+ #include <linux/interrupt.h>
+-#include <linux/proc_fs.h>
+ #include <linux/uaccess.h>
+ #include <linux/delay.h>
+ #include <linux/efi.h>
+@@ -67,7 +66,7 @@
+ #define ACERHK_DISCONNECT        _IO('p', 0x04)	/* ? */
+ #define ACERHK_GET_THERMAL_EVENT _IOR('p', 0x05, short)	/* ? */
+ #define ACERHK_MAIL_LED_OFF      _IO('p', 0x10)	/* switch mail LED off */
+-#define ACERHK_MAIL_LED_ON       _IO('p', 0x11)	/* switch mail LED on (blinking) */
++#define ACERHK_MAIL_LED_ON       _IO('p', 0x11)	/* switch mail LED on */
+ #define ACERHK_START_POLLING     _IO('p', 0x12)	/* poll keys in kernel, send real key events */
+ #define ACERHK_STOP_POLLING      _IO('p', 0x13)	/* stop key polling in kernel */
+ #define ACERHK_GET_KEY_MAP       _IOR('p', 0x20, int)	/* Get mapping of key names to key events, */
+@@ -212,29 +211,10 @@ static int acerhk_wlan_state;
+ /* bluetooth hardware toggle */
+ static int acerhk_bluetooth_state;
+ 
+-/*
+- * bluetooth blinking state; added by Antonio Cuni
+- * possible values:
+- *    -1: blinking disabled (default)
+- *      0: blinking enabled, led currently off
+- *      1: blinking enabled, led currently on
+- */
+-static int acerhk_blueled_blinking = -1;
+-
+-/* delay between two changes of state, in jiffies */
+-static unsigned acerhk_blueled_blinking_delay;
+-
+-/* timer for blinking */
+-static struct timer_list acerhk_timer_blinking;
+-
+ /* function prototypes */
+ static void start_polling(void);
+ static void stop_polling(void);
+ 
+-/* Added by Antonio Cuni */
+-static void start_blinking(void);
+-static void stop_blinking(void);
+-
+ /* {{{ Experimental use of dritek keyboard extension */
+ 
+ #define EC_STATUS_REG		0x66 /* Status register of EC (R) */
+@@ -617,7 +597,7 @@ static int get_nr_events(void)
+  * change state of mail led
+  *
+  * val: 0 - switch led off
+- *		1 - switch led on (blinking)
++ *		1 - switch led on
+  *
+  * return value: 1 - action succesfull (val valid)
+  *				 0 - no action taken (val invalid)
+@@ -694,8 +674,6 @@ static int launch_connect(int val)
+ 
+ /* {{{ hardware probing */
+ 
+-static struct proc_dir_entry *proc_acer_dir;
+-
+ #ifndef __x86_64__
+ static unsigned long __init find_hk_area(void)
+ {
+@@ -1150,21 +1128,6 @@ static void acerhk_poll_event(unsigned l
+ 	add_timer(&acerhk_timer_poll);
+ }
+ 
+-/* blinking timer handler; added by Antonio Cuni */
+-static void acerhk_blink_event(unsigned long not_used)
+-{
+-	if (acerhk_blueled_blinking != -1) {
+-		acerhk_blueled_blinking = !acerhk_blueled_blinking;
+-#ifndef __x86_64__
+-		wbutton_fct_1(acerhk_blueled_blinking);
+-#endif
+-		acerhk_timer_blinking.expires =
+-		    jiffies + acerhk_blueled_blinking_delay;
+-		add_timer(&acerhk_timer_blinking);
+-	} else
+-		pr_warn("blinking event called, but blinking not active\n");
+-}
+-
+ static void init_input(void)
+ {
+ 	int i;
+@@ -1236,36 +1199,6 @@ static void start_polling(void)
+ 		pr_info("key polling already active\n");
+ }
+ 
+-/* addedd by Antonio Cuni */
+-static void start_blinking(void)
+-{
+-	if (acerhk_blueled_blinking == -1) {
+-		/* blinking was disabled... enable it! */
+-		acerhk_timer_blinking.function = acerhk_blink_event;
+-		acerhk_timer_blinking.expires =
+-		    jiffies + acerhk_blueled_blinking_delay;
+-		acerhk_timer_blinking.data = 0;	/* not used */
+-		add_timer(&acerhk_timer_blinking);
+-		acerhk_blueled_blinking = 0;
+-
+-		if (verbose)
+-			pr_info("starting blueled blinking\n");
+-	} else if (verbose)
+-		pr_info("blueled already blinking\n");
+-}
+-
+-/* Added by Antonio Cuni */
+-static void stop_blinking(void)
+-{
+-	if (acerhk_blueled_blinking != -1) {
+-		del_timer(&acerhk_timer_blinking);
+-
+-		if (verbose)
+-			pr_info("blueled blinking stopped\n");
+-
+-		acerhk_blueled_blinking = -1;
+-	}
+-}
+ 
+ static void release_input(void)
+ {
+@@ -1275,214 +1208,6 @@ static void release_input(void)
+ 
+ /* }}} */
+ 
+-/* {{{ procfs functions */
+-
+-#ifndef CONFIG_PROC_FS
+-static int acerhk_proc_init(void)
+-{
+-	return 1;
+-}
+-#else
+-
+-/* This macro frees the machine specific function from bounds checking and
+- * things like that... */
+-#define	PRINT_PROC(fmt, args...)				\
+-	do {							\
+-		*len += sprintf(buffer + *len, fmt, ##args);	\
+-		if (*begin + *len > offset + size)		\
+-			return 0;				\
+-		if (*begin + *len < offset) {			\
+-			*begin += *len;				\
+-			*len = 0;				\
+-		}						\
+-	} while (0)
+-
+-static int acerhk_proc_led(struct file *file, const char *buffer,
+-			   unsigned long count, void *data)
+-{
+-	char str[2];
+-	int len;
+-
+-	if (count > 2)
+-		len = 2;
+-	else
+-		len = count;
+-
+-	if (copy_from_user(str, buffer, len))
+-		return -EFAULT;
+-
+-	str[1] = '\0';
+-	if (str[0] == '1')
+-		set_mail_led(1);
+-	else
+-		set_mail_led(0);
+-
+-	return len;
+-}
+-
+-static int acerhk_proc_wirelessled(struct file *file, const char *buffer,
+-				   unsigned long count, void *data)
+-{
+-	char str[2];
+-	int len;
+-
+-	if (count > 2)
+-		len = 2;
+-	else
+-		len = count;
+-
+-	if (copy_from_user(str, buffer, len))
+-		return -EFAULT;
+-
+-	str[1] = '\0';
+-	if (str[0] == '1') {
+-		if (acerhk_model_features & TM_F_WLAN_EC1)
+-			enable_wlan_ec_1();
+-		else if (acerhk_model_features & TM_F_WLAN_EC2)
+-			enable_wlan_ec_2();
+-		else
+-			wbutton_fct_2(1);
+-	} else {
+-		if (acerhk_model_features & TM_F_WLAN_EC1)
+-			disable_wlan_ec_1();
+-		else if (acerhk_model_features & TM_F_WLAN_EC2)
+-			disable_wlan_ec_2();
+-		else
+-			wbutton_fct_2(0);
+-	}
+-
+-	return len;
+-}
+-
+-/* Modified by Antonio Cuni: added support for blinking
+-   possible values:
+-   - 0: led always off
+-   - 1: led alway on
+-   - n (a number): led blinking; n is the delay between
+-   two changes of state, in jiffies; n must
+-   be > 50, to prevent the user from overloading
+-   the kernel.
+-
+- */
+-static int acerhk_proc_blueled(struct file *file, const char *buffer,
+-			       unsigned long count, void *data)
+-{
+-	const int MAXLEN = 11;
+-	char str[MAXLEN];
+-	int len;
+-	int isNumber;
+-
+-	if (count > MAXLEN)
+-		len = MAXLEN;
+-	else
+-		len = count;
+-
+-	if (copy_from_user(str, buffer, len))
+-		return -EFAULT;
+-	str[MAXLEN - 1] = '\0';
+-
+-	/* try to parse a number */
+-	isNumber = sscanf(str, "%u", &acerhk_blueled_blinking_delay);
+-
+-	/* if the delay is 0, turn off the led */
+-	if (isNumber && acerhk_blueled_blinking_delay != 0
+-	    && acerhk_blueled_blinking_delay != 1) {
+-		if (acerhk_blueled_blinking_delay < 50)
+-			pr_info("blinking request rejected. The delay must be > 50.\n");
+-		else {
+-			if (verbose)
+-				pr_info("blinking delay set to %u.\n",
+-					acerhk_blueled_blinking_delay);
+-
+-			start_blinking();
+-		}
+-	} else if (acerhk_blueled_blinking_delay == 1) {
+-		stop_blinking();
+-
+-		if (acerhk_model_features & TM_F_BLUE_EC1)
+-			enable_bluetooth_ec_1();
+-		else if (acerhk_model_features & TM_F_BLUE_EC2)
+-			enable_bluetooth_ec_2();
+-		else
+-			wbutton_fct_1(1);
+-	} else {
+-		/* it's 0 or everything else */
+-		stop_blinking();
+-		if (acerhk_model_features & TM_F_BLUE_EC1)
+-			disable_bluetooth_ec_1();
+-		else if (acerhk_model_features & TM_F_BLUE_EC2)
+-			disable_bluetooth_ec_2();
+-		else
+-			wbutton_fct_1(0);
+-	}
+-
+-	return len;
+-}
+-
+-
+-static int acerhk_proc_init(void)
+-{
+-	struct proc_dir_entry *entry;
+-
+-	/* create own directory */
+-	proc_acer_dir = proc_mkdir("driver/acerhk", NULL);
+-	if (proc_acer_dir == NULL) {
+-		pr_info("could not create /proc/driver/acerhk\n");
+-
+-		return 0;
+-	}
+-
+-	/* ... and led control file */
+-	entry = create_proc_entry("led", 0220, proc_acer_dir);
+-	if (entry == NULL) {
+-		pr_info("cannot create LED file\n");
+-		remove_proc_entry("driver/acerhk", NULL);
+-
+-		return 0;
+-	}
+-
+-	entry->write_proc = acerhk_proc_led;
+-	/* ... and wireless led controll file */
+-	entry = create_proc_entry("wirelessled", 0220, proc_acer_dir);
+-	if (entry == NULL) {
+-		pr_info("cannot create wirelessled file\n");
+-		remove_proc_entry("led", proc_acer_dir);
+-		remove_proc_entry("driver/acerhk", NULL);
+-
+-		return 0;
+-	}
+-	entry->write_proc = acerhk_proc_wirelessled;
+-
+-	/* ... and bluetooth led control file */
+-	entry = create_proc_entry("blueled", 0220, proc_acer_dir);
+-	if (entry == NULL) {
+-		pr_info("cannot create blueled file\n");
+-		remove_proc_entry("led", proc_acer_dir);
+-		remove_proc_entry("wirelessled", proc_acer_dir);
+-		remove_proc_entry("driver/acerhk", NULL);
+-
+-		return 0;
+-	}
+-	entry->write_proc = acerhk_proc_blueled;
+-
+-	return 1;
+-}
+-
+-static void acerhk_proc_cleanup(void)
+-{
+-	if (proc_acer_dir) {
+-		remove_proc_entry("led", proc_acer_dir);
+-		remove_proc_entry("wirelessled", proc_acer_dir);
+-		remove_proc_entry("blueled", proc_acer_dir);
+-		remove_proc_entry("driver/acerhk", NULL);
+-
+-		proc_acer_dir = NULL;
+-	}
+-}
+-
+-#endif /* CONFIG_PROC_FS */
+-
+-/* }}} */
+ 
+ /* {{{ file operations */
+ 
+@@ -1629,9 +1354,6 @@ static void model_init(void)
+ 		launch_connect(1);
+ 	}
+ 	enable_dritek_keyboard();
+-
+-	/* added by Antonio Cuni */
+-	init_timer(&acerhk_timer_blinking);
+ }
+ #endif
+ 
+@@ -1645,10 +1367,6 @@ static int acerhk_probe(struct platform_
+ 	if (ret) {
+ 		pr_err("can't misc_register on minor=%d\n", ACERHK_MINOR);
+ 		ret = -EAGAIN;
+-	} else if (!acerhk_proc_init()) {
+-		pr_err("can't create procfs entries\n");
+-		ret = -ENOMEM;
+-		misc_deregister(&acerhk_misc_dev);
+ 	} else {
+ 		reg1 = ioremap(0xf0000, 0xffff);
+ 		if (verbose > 1)
+@@ -1696,9 +1414,25 @@ static int acerhk_probe(struct platform_
+ 
+ 		if (poll)
+ 			start_polling();
+-
+-		init_timer(&acerhk_timer_blinking);
+ #endif
++		/* enable wlan LED */
++		if (acerhk_model_features & TM_F_WLAN_EC1)
++			enable_wlan_ec_1();
++		else if (acerhk_model_features & TM_F_WLAN_EC2)
++			enable_wlan_ec_2();
++		else
++			wbutton_fct_2(1);
++
++		/* enable bluetooth LED */
++		if (acerhk_model_features & TM_F_BLUE_EC1)
++			enable_bluetooth_ec_1();
++		else if (acerhk_model_features & TM_F_BLUE_EC2)
++			enable_bluetooth_ec_2();
++		else
++			wbutton_fct_1(1);
++
++		/* enable mail LED */
++		set_mail_led(1);
+ 	}
+ 
+ 	return ret;
+@@ -1706,8 +1440,24 @@ static int acerhk_probe(struct platform_
+ 
+ static int acerhk_remove(struct platform_device *dev)
+ {
+-	acerhk_proc_cleanup();
+-	stop_blinking();
++	/* disable wireless LED */
++	if (acerhk_model_features & TM_F_WLAN_EC1)
++		disable_wlan_ec_1();
++	else if (acerhk_model_features & TM_F_WLAN_EC2)
++		disable_wlan_ec_2();
++	else
++		wbutton_fct_2(0);
++
++	/* disable bluetooth LED */
++	if (acerhk_model_features & TM_F_BLUE_EC1)
++		disable_bluetooth_ec_1();
++	else if (acerhk_model_features & TM_F_BLUE_EC2)
++		disable_bluetooth_ec_2();
++	else
++		wbutton_fct_1(0);
++
++	/* disable mail LED */
++	set_mail_led(0);
+ 
+ 	if (reg1)
+ 		iounmap(reg1);

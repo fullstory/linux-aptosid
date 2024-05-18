@@ -1,0 +1,789 @@
+From d4772aa5025e3f7169459cda7f13f9834eac4b9c Mon Sep 17 00:00:00 2001
+From: Stefan Lippers-Hollmann <s.l-h@gmx.de>
+Date: Wed, 14 Aug 2013 03:28:25 +0200
+Subject: [PATCH 46/65] acerhk: add DMI based autoloading
+
+acerhk can now detect the feature set automatically, which obsoletes
+the force_series kernel parameter.
+
+Signed-off-by: Stefan Lippers-Hollmann <s.l-h@gmx.de>
+---
+ drivers/platform/x86/acerhk.c | 677 ++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 558 insertions(+), 119 deletions(-)
+
+--- a/drivers/platform/x86/acerhk.c
++++ b/drivers/platform/x86/acerhk.c
+@@ -31,6 +31,7 @@
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
++#include <linux/dmi.h>
+ #include <linux/kmod.h>
+ #include <linux/miscdevice.h>
+ #include <linux/platform_device.h>
+@@ -132,20 +133,17 @@ static int poll;
+ static int wlan_state = -1;
+ static int bluetooth_state = -1;
+ static int verbose = 1;
+-static unsigned int force_series;
+ 
+ module_param(poll, int, 0444);
+ module_param(verbose, int, 0444);
+ module_param(wlan_state, int, 0444);
+ module_param(bluetooth_state, int, 0444);
+-module_param(force_series, uint, 0444);
+ 
+ MODULE_PARM_DESC(poll, "start polling timer");
+ MODULE_PARM_DESC(wlan_state, "(assumed) initial state of WLAN LED/hardware");
+ MODULE_PARM_DESC(bluetooth_state,
+ 		 "(assumed) initial state of Bluetooth LED/hardware");
+ MODULE_PARM_DESC(verbose, "output additional information");
+-MODULE_PARM_DESC(force_series, "force laptop series, skip autodetection");
+ 
+ /* input device */
+ static struct input_dev *acerhk_input_dev_ptr;
+@@ -170,9 +168,6 @@ static unsigned int cmos_index;
+ /* function for bios call */
+ static bios_call call_bios;
+ 
+-/* travelmate series  */
+-static unsigned int acerhk_series;
+-
+ /* supported features for this model */
+ static unsigned int acerhk_model_features;
+ 
+@@ -856,96 +851,8 @@ static void __init setup_keymap_model(vo
+ 	acerhk_key2name[2] = k_none;
+ }
+ 
+-static void __init setup_model_features(unsigned int series)
++static void __init setup_model_features(void)
+ {
+-	switch (series) {
+-	case 2350:
+-	case 4050:
+-		/* Default state is on */
+-		acerhk_wlan_state = 1;
+-	case 290:
+-		/* no special functions, wireless hardware controlled by EC */
+-		acerhk_model_features = TM_F_WLAN_EC2 | TM_F_BLUE_EC2;
+-		break;
+-	case 650:
+-	case 1300:
+-	case 1310:
+-	case 1400:
+-	case 1700:
+-		/* all special functions, wireless hardware can be controlled */
+-		acerhk_model_features = 0x00f00000;
+-		break;
+-	case 660:
+-	case 800:
+-		/* all special functions, mail led */
+-		acerhk_model_features = TM_F_MAIL_LED | 0x00f00000;
+-		break;
+-	case 1350:
+-	case 1360:
+-		/* mail led, handled by EC, wireless HW is not (yet)
+-		 * controllable? */
+-		acerhk_model_features = TM_F_MAIL_LED_EC | TM_F_WLAN_EC1;
+-		break;
+-	case 1450:
+-		/* Bluetooth/Wlan led, Mail led handled by EC (variant 3) */
+-		acerhk_model_features = TM_F_MAIL_LED_EC3 | TM_F_WBUTTON;
+-		break;
+-	case 420:
+-	case 430:
+-		/* all functions and dritek EC, mail LED is handled by EC,
+-		 * second variant. An additional led is available, mute.
+-		 * (really?)
+-		 */
+-		acerhk_model_features = TM_F_MUTE_LED_EC | TM_F_MAIL_LED_EC2;
+-		break;
+-	case 2300:
+-	case 4000:
+-	case 4500:
+-		/* wireless hardware, hopefully under control of my driver */
+-		acerhk_model_features = TM_F_BLUE_EC1 | TM_F_WLAN_EC1;
+-		break;
+-	case 3200:
+-		/* test, if this model uses old style wlan control */
+-		acerhk_model_features = TM_F_WBUTTON;
+-		break;
+-	case 6000:
+-	case 8000:
+-		/* 6000 and 8000 have wireless hardware, but I don't know how
+-		 * to handle, so I choose no features */
+-		break;
+-	case 530:
+-	case 540:
+-	case 2000:
+-		/* No features (?) dritek EC, mail LED is handled by EC but
+-		   different from other Aspire series */
+-		acerhk_model_features = TM_F_MAIL_LED_EC2;
+-		break;
+-	case 4150:
+-	case 4650:
+-		/* Dritek EC, bluetooth, wifi, mail */
+-		/* According to Andreas Stumpfl his TM 4652LMi does also work
+-		 * as series 3200, which might mean that the BIOS function
+-		 * accesses the EC */
+-		acerhk_model_features =
+-		    TM_F_MAIL_LED_EC2 | TM_F_WLAN_EC2 | TM_F_BLUE_EC2;
+-		break;
+-	case 1800:
+-	case 2010:
+-	case 2020:
+-	case 5100:
+-		/* Dritek EC, bluetooth, wifi, mail */
+-		acerhk_model_features =
+-		    TM_F_MAIL_LED_EC2 | TM_F_WLAN_EC2 | TM_F_BLUE_EC2;
+-
+-		/* Default state is on */
+-		acerhk_wlan_state = 1;
+-		break;
+-	default:
+-		/* nothing special */
+-		acerhk_model_features = 0;
+-		break;
+-	}
+-
+ 	/* set the correct bios call function according to type */
+ 	call_bios = call_bios_6xx;
+ 
+@@ -959,18 +866,6 @@ static void __init setup_model_features(
+ 		print_features();
+ }
+ 
+-#ifndef __x86_64__
+-static void __init probe_model(void)
+-{
+-	/* XXX: replace with proper DMI parsing */
+-	/* set 290 series as default */
+-	acerhk_series = 290;
+-
+-	if (verbose)
+-		pr_info("detected laptop series: %d\n", acerhk_series);
+-}
+-#endif
+-
+ /* }}} */
+ 
+ /* {{{ key polling and translation */
+@@ -1343,7 +1238,7 @@ static struct miscdevice acerhk_misc_dev
+ static void model_init(void)
+ {
+ 	/* set callroutine, features and keymap for model */
+-	setup_model_features(acerhk_series);
++	setup_model_features();
+ 
+ 	/* override initial state of wireless hardware if specified by module
+ 	 * options */
+@@ -1364,11 +1259,558 @@ static void model_init(void)
+ }
+ #endif
+ 
++static int __init dmi_check_cb_aspire_1300(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* all special functions, wireless hardware can be controlled */
++	acerhk_model_features = 0x00f00000;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_aspire_1310(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* all special functions, wireless hardware can be controlled */
++	acerhk_model_features = 0x00f00000;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_aspire_1350(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* mail led, handled by EC, wireless HW is not (yet) controllable? */
++	acerhk_model_features = TM_F_MAIL_LED_EC | TM_F_WLAN_EC1;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_aspire_1360(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* mail led, handled by EC, wireless HW is not (yet) controllable? */
++	acerhk_model_features = TM_F_MAIL_LED_EC | TM_F_WLAN_EC1;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_aspire_1400(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* all special functions, wireless hardware can be controlled */
++	acerhk_model_features = 0x00f00000;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_aspire_1450(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* Bluetooth/Wlan led, Mail led handled by EC (variant 3) */
++	acerhk_model_features = TM_F_MAIL_LED_EC3 | TM_F_WBUTTON;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_aspire_1800(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* Dritek EC, bluetooth, wifi, mail */
++	acerhk_model_features = TM_F_MAIL_LED_EC2 | TM_F_WLAN_EC2 | TM_F_BLUE_EC2;
++
++	/* Default state is on */
++	acerhk_wlan_state = 1;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_aspire_2000(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* No features (?) dritek EC, mail LED is handled by EC but
++	   different from other Aspire series */
++	acerhk_model_features = TM_F_MAIL_LED_EC2;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_aspire_2010(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* Dritek EC, bluetooth, wifi, mail */
++	acerhk_model_features = TM_F_MAIL_LED_EC2 | TM_F_WLAN_EC2 | TM_F_BLUE_EC2;
++
++	/* Default state is on */
++	acerhk_wlan_state = 1;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_aspire_2020(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* Dritek EC, bluetooth, wifi, mail */
++	acerhk_model_features = TM_F_MAIL_LED_EC2 | TM_F_WLAN_EC2 | TM_F_BLUE_EC2;
++
++	/* Default state is on */
++	acerhk_wlan_state = 1;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_aspire_4150(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* Dritek EC, bluetooth, wifi, mail */
++	acerhk_model_features = TM_F_MAIL_LED_EC2 | TM_F_WLAN_EC2 | TM_F_BLUE_EC2;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_aspire_4650(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* Dritek EC, bluetooth, wifi, mail */
++	/* According to Andreas Stumpfl his TM 4652LMi does also work
++	 * as series 3200, which might mean that the BIOS function
++	 * accesses the EC */
++	acerhk_model_features = TM_F_MAIL_LED_EC2 | TM_F_WLAN_EC2 | TM_F_BLUE_EC2;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_290(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++
++	/* no special functions, wireless hardware controlled by EC */
++	acerhk_model_features = TM_F_WLAN_EC2 | TM_F_BLUE_EC2;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_420(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* all functions and dritek EC, mail LED is handled by EC,
++	 * second variant. An additional led is available, mute.
++	 * (really?)
++	 */
++	acerhk_model_features = TM_F_MUTE_LED_EC | TM_F_MAIL_LED_EC2;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_430(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* all functions and dritek EC, mail LED is handled by EC,
++	 * second variant. An additional led is available, mute.
++	 * (really?)
++	 */
++	acerhk_model_features = TM_F_MUTE_LED_EC | TM_F_MAIL_LED_EC2;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_530(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* No features(?) dritek EC, mail LED is handled by EC but
++	   different from other Aspire series */
++	acerhk_model_features = TM_F_MAIL_LED_EC2;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_540(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* No features(?) dritek EC, mail LED is handled by EC but
++	   different from other Aspire series */
++	acerhk_model_features = TM_F_MAIL_LED_EC2;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_650(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* all special functions, wireless hardware can be controlled */
++	acerhk_model_features = 0x00f00000;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_660(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* all special functions, mail led */
++	acerhk_model_features = TM_F_MAIL_LED | 0x00f00000;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_800(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* all special functions, mail led */
++	acerhk_model_features = TM_F_MAIL_LED | 0x00f00000;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_1700(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* all special functions, wireless hardware can be controlled */
++	acerhk_model_features = 0x00f00000;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_2300(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* wireless hardware, hopefully under control of my driver */
++	acerhk_model_features = TM_F_BLUE_EC1 | TM_F_WLAN_EC1;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_2350(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* no special functions, wireless hardware controlled by EC */
++	acerhk_model_features = TM_F_WLAN_EC2 | TM_F_BLUE_EC2;
++
++	/* Default state is on */
++	acerhk_wlan_state = 1;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_3200(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* test, if this model uses old style wlan control */
++	acerhk_model_features = TM_F_WBUTTON;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_4000(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* wireless hardware, hopefully under control of my driver */
++	acerhk_model_features = TM_F_BLUE_EC1 | TM_F_WLAN_EC1;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_4050(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* no special functions, wireless hardware controlled by EC */
++	acerhk_model_features = TM_F_WLAN_EC2 | TM_F_BLUE_EC2;
++
++	/* Default state is on */
++	acerhk_wlan_state = 1;
++
++	return 1;
++}
++
++static int __init dmi_check_cb_travelmate_4500(const struct dmi_system_id *id)
++{
++	pr_info("Identified notebook model: '%s'\n", id->ident);
++	pr_warn("Untested device, please report success or failure to the module maintainer.\n");
++
++	/* wireless hardware, hopefully under control of my driver */
++	acerhk_model_features = TM_F_BLUE_EC1 | TM_F_WLAN_EC1;
++
++	return 1;
++}
++
++static const struct dmi_system_id acerhk_id_table[] = {
++	{
++		.ident = "Acer Aspire 1300",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 1300"),
++		},
++		.callback = dmi_check_cb_aspire_1300
++	},
++	{
++		.ident = "Acer Aspire 1310",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 1310"),
++		},
++		.callback = dmi_check_cb_aspire_1310
++	},
++	{
++		.ident = "Acer Aspire 1350",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 1350"),
++		},
++		.callback = dmi_check_cb_aspire_1350
++	},
++	{
++		.ident = "Acer Aspire 1360",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 1360"),
++		},
++		.callback = dmi_check_cb_aspire_1360
++	},
++	{
++		.ident = "Acer Aspire 1400",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 1400"),
++		},
++		.callback = dmi_check_cb_aspire_1400
++	},
++	{
++		.ident = "Acer Aspire 1450",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 1450"),
++		},
++		.callback = dmi_check_cb_aspire_1450
++	},
++	{
++		.ident = "Acer Aspire 1800",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 1800"),
++		},
++		.callback = dmi_check_cb_aspire_1800
++	},
++	{
++		.ident = "Acer Aspire 2000",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 2000"),
++		},
++		.callback = dmi_check_cb_aspire_2000
++	},
++	{
++		.ident = "Acer Aspire 2010",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 2010"),
++		},
++		.callback = dmi_check_cb_aspire_2010
++	},
++	{
++		.ident = "Acer Aspire 2020",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 2020"),
++		},
++		.callback = dmi_check_cb_aspire_2020
++	},
++	{
++		.ident = "Acer Aspire 4150",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 4150"),
++		},
++		.callback = dmi_check_cb_aspire_4150
++	},
++	{
++		.ident = "Acer Aspire 4650",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 4650"),
++		},
++		.callback = dmi_check_cb_aspire_4650
++	},
++	{
++		.callback = dmi_check_cb_travelmate_290,
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 290"),
++		},
++		.ident = "Acer TravelMate 290"
++	},
++	{
++		.ident = "Acer TravelMate 420",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 420"),
++		},
++		.callback = dmi_check_cb_travelmate_420
++	},
++	{
++		.ident = "Acer TravelMate 430",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 430"),
++		},
++		.callback = dmi_check_cb_travelmate_430
++	},
++	{
++		.ident = "Acer TravelMate 530",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 530"),
++		},
++		.callback = dmi_check_cb_travelmate_530
++	},
++	{
++		.ident = "Acer TravelMate 540",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 540"),
++		},
++		.callback = dmi_check_cb_travelmate_540
++	},
++	{
++		.ident = "Acer TravelMate 650",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 650"),
++		},
++		.callback = dmi_check_cb_travelmate_650
++	},
++	{
++		.ident = "Acer TravelMate 660",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 660"),
++		},
++		.callback = dmi_check_cb_travelmate_660
++	},
++	{
++		.ident = "Acer TravelMate 800",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 800"),
++		},
++		.callback = dmi_check_cb_travelmate_800
++	},
++	{
++		.ident = "Acer TravelMate 1700",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 1700"),
++		},
++		.callback = dmi_check_cb_travelmate_1700
++	},
++	{
++		.ident = "Acer TravelMate 2300",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 2300"),
++		},
++		.callback = dmi_check_cb_travelmate_2300
++	},
++	{
++		.ident = "Acer TravelMate 2350",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 2350"),
++		},
++		.callback = dmi_check_cb_travelmate_2350
++	},
++	{
++		.ident = "Acer TravelMate 3200",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 3200"),
++		},
++		.callback = dmi_check_cb_travelmate_3200
++	},
++	{
++		.ident = "Acer TravelMate 4000",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 4000"),
++		},
++		.callback = dmi_check_cb_travelmate_4000
++	},
++	{
++		.ident = "Acer TravelMate 4050",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 4050"),
++		},
++		.callback = dmi_check_cb_travelmate_4050
++	},
++	{
++		.ident = "Acer TravelMate 4500",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 4500"),
++		},
++		.callback = dmi_check_cb_travelmate_4500
++	},
++	{ NULL, }
++};
++
+ static int acerhk_remove(struct platform_device *dev);
+ 
+ static int acerhk_probe(struct platform_device *dev)
+ {
+ 	int ret;
++	const struct dmi_system_id *system_id = dmi_first_match(acerhk_id_table);
++
++	if (!system_id)
++		return -ENXIO;
+ 
+ 	ret = misc_register(&acerhk_misc_dev);
+ 	if (ret) {
+@@ -1389,8 +1831,6 @@ static int acerhk_probe(struct platform_
+ 		init_input();
+ #ifndef __x86_64__
+ 		bios_routine = find_hk_area();
+-		if (!force_series)
+-			probe_model();
+ 
+ 		/* do model specific initialization */
+ 		model_init();
+@@ -1401,21 +1841,14 @@ static int acerhk_probe(struct platform_
+ 		if (verbose && bios_routine)
+ 			pr_info("bios routine found at 0x%x\n", bios_routine);
+ 
+-		pr_info("Acer Travelmate hotkey driver loaded, configured laptop series: %d\n",
+-			acerhk_series);
++		pr_info("Acer Travelmate hotkey driver successfully loaded.\n");
+ 
+ 		/* start automatic polling of key presses if wanted and bios
+ 		 * routine found */
+ 		if (poll && bios_routine)
+ 			start_polling();
+ #else
+-		/* set callroutine for model */
+-		if (force_series)
+-			acerhk_series = force_series;
+-		else
+-			acerhk_series = 2000;
+-
+-		setup_model_features(acerhk_series);
++		setup_model_features();
+ 		pr_info("Acer Travelmate hotkey driver dummy\n");
+ 		enable_dritek_keyboard();
+ 
+@@ -1503,6 +1936,11 @@ static int __init acerhk_init(void)
+ 	if (efi_enabled(EFI_BOOT))
+ 		return -ENODEV;
+ 
++	if (!dmi_check_system(acerhk_id_table)) {
++		pr_err("notebook not recognized, refusing to load module.\n");
++		return -ENODEV;
++	}
++
+ 	error = platform_driver_register(&acerhk_driver);
+ 	if (error)
+ 		return error;
+@@ -1541,3 +1979,4 @@ MODULE_AUTHOR("Olaf Tauber");
+ MODULE_AUTHOR("Stefan Lippers-Hollmann <s.l-h@gmx.de>");
+ MODULE_DESCRIPTION("AcerHotkeys extra buttons keyboard driver");
+ MODULE_LICENSE("GPL");
++MODULE_DEVICE_TABLE(dmi, acerhk_id_table);

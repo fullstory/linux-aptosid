@@ -1,0 +1,514 @@
+From 47f6d03f6779a3e51c650bd2089ca1a7fbef69eb Mon Sep 17 00:00:00 2001
+From: Stefan Lippers-Hollmann <s.l-h@gmx.de>
+Date: Thu, 15 Aug 2013 03:42:20 +0200
+Subject: [PATCH 60/65] acerhk: move debugging to debugfs
+
+Signed-off-by: Stefan Lippers-Hollmann <s.l-h@gmx.de>
+---
+ drivers/platform/x86/acerhk.c | 388 ++++++++++++++++++++++++++----------------
+ 1 file changed, 243 insertions(+), 145 deletions(-)
+
+--- a/drivers/platform/x86/acerhk.c
++++ b/drivers/platform/x86/acerhk.c
+@@ -42,6 +42,8 @@
+ #include <linux/efi.h>
+ #include <linux/ioctl.h>
+ #include <linux/preempt.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
+ 
+ #define ACERHK_MINOR MISC_DYNAMIC_MINOR
+ 
+@@ -647,206 +649,304 @@ static unsigned long __init find_hk_area
+ }
+ #endif
+ 
+-static void print_features(void)
++static void __init setup_keymap_model(void)
++{
++	/* clear mapping keycode -> keyname, */
++	memset(&acerhk_key2name[0], k_none, sizeof(acerhk_key2name));
++
++	/*
++	 * keys are handled by dritek EC
++	 *
++	 * Aspire 13xx series laptops use dritek hardware, no
++	 * acerhk-mapping needed
++	 * VolUp and VolDown are managed as normal keys
++	 * 1300/1310 series should have P1, P2, Mail, WWW, Mute buttons
++	 * 1353 has bluetooth, wifi, p1, p2, www, mail, help, setup, power
++	 * and mute
++	 * Aspire 1400/1450/Ferrari use dritek EC, too
++	 * 1450 should have bluetooth, wifi, p1, p2, www, mail, help,
++	 * setup, power and mute
++	 * Aspire 1700 uses dritek EC, too
++	 * 1700 should have bluetooth, wifi, p1, p2, www, mail, help,
++	 * setup, power and mute
++	 * need the MM-buttons Activation? (forward, shuffle, ...)
++	 * 2000 hast lots of MM buttons
++	 * 2010 should have bluetooth, wifi, p1, p2, www, mail, help,
++	 * setup, power and mute
++	 */
++	acerhk_key2name[1] = k_none;
++	acerhk_key2name[2] = k_none;
++}
++
++static void __init setup_model_features(void)
++{
++	/* set the correct bios call function according to type */
++	call_bios = call_bios_6xx;
++
++	if (verbose >= 3)
++		pr_info("using call_bios_6xx mode\n");
++
++	/* setup available keys */
++	setup_keymap_model();
++}
++/* hardware probing }}} */
++
++/* {{{ key polling and translation */
++#ifdef CONFIG_DEBUG_FS
++static int acerhk_status_show(struct seq_file *m, void *v)
++{
++#ifndef __x86_64__
++	if (bios_routine != 0) {
++		seq_printf(m, "request handler:\t 0x%x\n", bios_routine);
++		if (cmos_index) {
++			seq_printf(m, "CMOS index:\t 0x%x\n", cmos_index);
++			seq_printf(m, "events pending:\t %u\n", get_nr_events());
++		} else {
++			seq_printf(m, "CMOS index:\t not available\n");
++		}
++
++		if (acerhk_polling_state == 1)
++			seq_printf(m, "kernel polling:\t active\n");
++		else
++			seq_printf(m, "kernel polling:\t inactive\n");
++	} else {
++		seq_printf(m, "request handler:\t not found\n");
++		seq_printf(m, "kernel polling:\t not possible\n");
++	}
++#else
++	seq_printf(m, "Acer Travelmate hotkey driver dummy (x86_64).\n");
++#endif
++
++	return 0;
++}
++
++static int acerhk_status_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, acerhk_status_show, &inode->i_private);
++}
++
++static const struct file_operations acerhk_status_fops = {
++	.open		= acerhk_status_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= seq_release,
++};
++
++static int acerhk_features_show(struct seq_file *m, void *v)
++{
++	if (acerhk_model_features & TM_F_MUTE_LED_EC)
++		seq_printf(m, "mute led is supported\n");
++
++	if (acerhk_model_features & TM_F_MAIL_LED)
++		seq_printf(m, "mail led is supported\n");
++	else if (acerhk_model_features & TM_F_MAIL_LED_EC)
++		seq_printf(m, "mail led (EC) is supported\n");
++	else if (acerhk_model_features & TM_F_MAIL_LED_EC2)
++		seq_printf(m, "mail led (EC2) is supported\n");
++	else if (acerhk_model_features & TM_F_MAIL_LED_EC3)
++		seq_printf(m, "mail led (EC3) is supported\n");
++
++	if (acerhk_model_features & TM_F_WLAN_EC1)
++		seq_printf(m, "wlan control (EC1) is supported\n");
++	else if (acerhk_model_features & TM_F_WLAN_EC2)
++		seq_printf(m, "wlan control (EC2) is supported\n");
++
++	if (acerhk_model_features & TM_F_BLUE_EC1)
++		seq_printf(m, "bluetooth control (EC1) is supported\n");
++	else if (acerhk_model_features & TM_F_BLUE_EC2)
++		seq_printf(m, "bluetooth control (EC2) is supported\n");
++
++	if (acerhk_model_features & TM_F_CONNECT)
++		seq_printf(m, "supported function: connect");
++
++	if (acerhk_model_features & TM_F_THERMAL)
++		seq_printf(m, "supported function: thermal");
++
++	if (acerhk_model_features & TM_F_PBUTTON)
++		seq_printf(m, "supported function: pbutton");
++
++	if (acerhk_model_features & TM_F_WBUTTON)
++		seq_printf(m, "supported function: wbutton");
++
++	return 0;
++}
++
++static int acerhk_features_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, acerhk_features_show, &inode->i_private);
++}
++
++static const struct file_operations acerhk_features_fops = {
++	.open		= acerhk_features_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= seq_release,
++};
++
++static int acerhk_supported_keys_show(struct seq_file *m, void *v)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < 255; i++) {
+ 		switch (acerhk_key2name[i]) {
+ 		case k_help:
+-			pr_info("supported key: help, mapped to 0x%x\n",
+-				acerhk_name2event[k_help]);
++			seq_printf(m, "help\n");
+ 			break;
+ 		case k_setup:
+-			pr_info("supported key: setup, mapped to 0x%x\n",
+-				acerhk_name2event[k_setup]);
++			seq_printf(m, "setup\n");
+ 			break;
+ 		case k_p1:
+-			pr_info("supported key: p1, mapped to 0x%x\n",
+-				acerhk_name2event[k_p1]);
++			seq_printf(m, "p1\n");
+ 			break;
+ 		case k_p2:
+-			pr_info("supported key: p2, mapped to 0x%x\n",
+-				acerhk_name2event[k_p2]);
++			seq_printf(m, "p2\n");
+ 			break;
+ 		case k_p3:
+-			pr_info("supported key: p3, mapped to 0x%x\n",
+-				acerhk_name2event[k_p3]);
++			seq_printf(m, "p3\n");
+ 			break;
+ 		case k_www:
+-			pr_info("supported key: www, mapped to 0x%x\n",
+-				acerhk_name2event[k_www]);
++			seq_printf(m, "www\n");
+ 			break;
+ 		case k_mail:
+-			pr_info("supported key: mail, mapped to 0x%x\n",
+-				acerhk_name2event[k_mail]);
++			seq_printf(m, "mail\n");
+ 			break;
+ 		case k_wireless:
+-			pr_info("supported key: wireless, mapped to 0x%x\n",
+-				acerhk_name2event[k_wireless]);
++			seq_printf(m, "wireless\n");
+ 			break;
+ 		case k_power:
+-			pr_info("supported key: power, mapped to 0x%x\n",
+-				acerhk_name2event[k_power]);
++			seq_printf(m, "power\n");
+ 			break;
+ 		case k_mute:
+-			pr_info("supported key: mute, mapped to 0x%x\n",
+-				acerhk_name2event[k_mute]);
++			seq_printf(m, "mute\n");
+ 			break;
+ 		case k_volup:
+-			pr_info("supported key: volup, mapped to 0x%x\n",
+-				acerhk_name2event[k_volup]);
++			seq_printf(m, "volup\n");
+ 			break;
+ 		case k_voldn:
+-			pr_info("supported key: voldn, mapped to 0x%x\n",
+-				acerhk_name2event[k_voldn]);
++			seq_printf(m, "voldn\n");
+ 			break;
+ 		case k_res:
+-			pr_info("supported key: res, mapped to 0x%x\n",
+-				acerhk_name2event[k_res]);
++			seq_printf(m, "res\n");
+ 			break;
+ 		case k_close:
+-			pr_info("supported key: close, mapped to 0x%x\n",
+-				acerhk_name2event[k_close]);
++			seq_printf(m, "close\n");
+ 			break;
+ 		case k_open:
+-			pr_info("supported key: open, mapped to 0x%x\n",
+-				acerhk_name2event[k_open]);
++			seq_printf(m, "open\n");
+ 			break;
+ 		case k_wireless2:
+-			pr_info("supported key: wireless2, mapped to 0x%x\n",
+-				acerhk_name2event[k_wireless2]);
++			seq_printf(m, "wireless2\n");
+ 			break;
+ 		case k_play:
+-			pr_info("supported key: play, mapped to 0x%x\n",
+-				acerhk_name2event[k_play]);
++			seq_printf(m, "play\n");
+ 			break;
+ 		case k_stop:
+-			pr_info("supported key: stop, mapped to 0x%x\n",
+-				acerhk_name2event[k_stop]);
++			seq_printf(m, "stop\n");
+ 			break;
+ 		case k_prev:
+-			pr_info("supported key: prev, mapped to 0x%x\n",
+-				acerhk_name2event[k_prev]);
++			seq_printf(m, "prev\n");
+ 			break;
+ 		case k_next:
+-			pr_info("supported key: next, mapped to 0x%x\n",
+-				acerhk_name2event[k_next]);
++			seq_printf(m, "next\n");
+ 			break;
+ 		case k_display:
+-			pr_info("supported key: display, mapped to 0x%x\n",
+-				acerhk_name2event[k_display]);
++			seq_printf(m, "display\n");
+ 			break;
+ 		default:
+ 			break;
+ 		}
+ 	}
+ 
+-	if (acerhk_model_features & TM_F_MUTE_LED_EC)
+-		pr_info("mute led is supported\n");
+-
+-	if (acerhk_model_features & TM_F_MAIL_LED)
+-		pr_info("mail led is supported\n");
+-	else if (acerhk_model_features & TM_F_MAIL_LED_EC)
+-		pr_info("mail led (EC) is supported\n");
+-	else if (acerhk_model_features & TM_F_MAIL_LED_EC2)
+-		pr_info("mail led (EC2) is supported\n");
+-	else if (acerhk_model_features & TM_F_MAIL_LED_EC3)
+-		pr_info("mail led (EC3) is supported\n");
+-
+-	if (acerhk_model_features & TM_F_WLAN_EC1)
+-		pr_info("wlan control (EC1) is supported\n");
+-	else if (acerhk_model_features & TM_F_WLAN_EC2)
+-		pr_info("wlan control (EC2) is supported\n");
+-
+-	if (acerhk_model_features & TM_F_BLUE_EC1)
+-		pr_info("bluetooth control (EC1) is supported\n");
+-	else if (acerhk_model_features & TM_F_BLUE_EC2)
+-		pr_info("bluetooth control (EC2) is supported\n");
+-
+-	if (acerhk_model_features & TM_F_CONNECT)
+-		pr_info("supported function: connect");
+-
+-	if (acerhk_model_features & TM_F_THERMAL)
+-		pr_info("supported function: thermal");
+-
+-	if (acerhk_model_features & TM_F_PBUTTON)
+-		pr_info("supported function: pbutton");
++	return 0;
++}
+ 
+-	if (acerhk_model_features & TM_F_WBUTTON)
+-		pr_info("supported function: wbutton");
++static int acerhk_supported_keys_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, acerhk_supported_keys_show, &inode->i_private);
+ }
+ 
+-static void __init setup_keymap_model(void)
++static const struct file_operations acerhk_supported_keys_fops = {
++	.open		= acerhk_supported_keys_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= seq_release,
++};
++
++static int acerhk_keymap_show(struct seq_file *m, void *v)
+ {
+-	/* clear mapping keycode -> keyname, */
+-	memset(&acerhk_key2name[0], k_none, sizeof(acerhk_key2name));
++	seq_printf(m,
++		   "help:      0x%x\n"
++		   "setup:     0x%x\n"
++		   "p1:        0x%x\n"
++		   "p2:        0x%x\n"
++		   "p3:        0x%x\n"
++		   "www:       0x%x\n"
++		   "mail:      0x%x\n"
++		   "wireless:  0x%x\n"
++		   "power:     0x%x\n"
++		   "mute:      0x%x\n"
++		   "volup:     0x%x\n"
++		   "voldn:     0x%x\n"
++		   "res:       0x%x\n"
++		   "close:     0x%x\n"
++		   "open:      0x%x\n"
++		   "wireless2: 0x%x\n"
++		   "play:      0x%x\n"
++		   "stop:      0x%x\n"
++		   "prev:      0x%x\n"
++		   "next:      0x%x\n"
++		   "display:   0x%x\n",
++		   acerhk_name2event[k_help],
++		   acerhk_name2event[k_setup],
++		   acerhk_name2event[k_p1],
++		   acerhk_name2event[k_p2],
++		   acerhk_name2event[k_p3],
++		   acerhk_name2event[k_www],
++		   acerhk_name2event[k_mail],
++		   acerhk_name2event[k_wireless],
++		   acerhk_name2event[k_power],
++		   acerhk_name2event[k_mute],
++		   acerhk_name2event[k_volup],
++		   acerhk_name2event[k_voldn],
++		   acerhk_name2event[k_res],
++		   acerhk_name2event[k_close],
++		   acerhk_name2event[k_open],
++		   acerhk_name2event[k_wireless2],
++		   acerhk_name2event[k_play],
++		   acerhk_name2event[k_stop],
++		   acerhk_name2event[k_prev],
++		   acerhk_name2event[k_next],
++		   acerhk_name2event[k_display]);
+ 
+-	/*
+-	 * keys are handled by dritek EC
+-	 *
+-	 * Aspire 13xx series laptops use dritek hardware, no
+-	 * acerhk-mapping needed
+-	 * VolUp and VolDown are managed as normal keys
+-	 * 1300/1310 series should have P1, P2, Mail, WWW, Mute buttons
+-	 * 1353 has bluetooth, wifi, p1, p2, www, mail, help, setup, power
+-	 * and mute
+-	 * Aspire 1400/1450/Ferrari use dritek EC, too
+-	 * 1450 should have bluetooth, wifi, p1, p2, www, mail, help,
+-	 * setup, power and mute
+-	 * Aspire 1700 uses dritek EC, too
+-	 * 1700 should have bluetooth, wifi, p1, p2, www, mail, help,
+-	 * setup, power and mute
+-	 * need the MM-buttons Activation? (forward, shuffle, ...)
+-	 * 2000 hast lots of MM buttons
+-	 * 2010 should have bluetooth, wifi, p1, p2, www, mail, help,
+-	 * setup, power and mute
+-	 */
+-	acerhk_key2name[1] = k_none;
+-	acerhk_key2name[2] = k_none;
++	return 0;
+ }
+ 
+-static void __init setup_model_features(void)
++static int acerhk_keymap_open(struct inode *inode, struct file *file)
+ {
+-	/* set the correct bios call function according to type */
+-	call_bios = call_bios_6xx;
++	return single_open(file, acerhk_keymap_show, &inode->i_private);
++}
+ 
+-	if (verbose >= 3)
+-		pr_info("using call_bios_6xx mode\n");
++static const struct file_operations acerhk_keymap_fops = {
++	.open		= acerhk_keymap_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= seq_release,
++};
+ 
+-	/* setup available keys */
+-	setup_keymap_model();
++static void acerhk_init_debugfs(void)
++{
++	struct dentry *d;
+ 
+-	if (verbose >= 2)
+-		print_features();
+-}
+-/* hardware probing }}} */
++	d = debugfs_create_dir("acerhk", NULL);
++	if (!d)
++		return;
+ 
+-/* {{{ key polling and translation */
+-static void print_mapping(void)
+-{
+-	pr_info("key mapping help      0x%x\n", acerhk_name2event[k_help]);
+-	pr_info("key mapping setup     0x%x\n", acerhk_name2event[k_setup]);
+-	pr_info("key mapping p1        0x%x\n", acerhk_name2event[k_p1]);
+-	pr_info("key mapping p2        0x%x\n", acerhk_name2event[k_p2]);
+-	pr_info("key mapping p3        0x%x\n", acerhk_name2event[k_p3]);
+-	pr_info("key mapping www       0x%x\n", acerhk_name2event[k_www]);
+-	pr_info("key mapping mail      0x%x\n", acerhk_name2event[k_mail]);
+-	pr_info("key mapping wireless  0x%x\n", acerhk_name2event[k_wireless]);
+-	pr_info("key mapping power     0x%x\n", acerhk_name2event[k_power]);
+-	pr_info("key mapping mute      0x%x\n", acerhk_name2event[k_mute]);
+-	pr_info("key mapping volup     0x%x\n", acerhk_name2event[k_volup]);
+-	pr_info("key mapping voldn     0x%x\n", acerhk_name2event[k_voldn]);
+-	pr_info("key mapping res       0x%x\n", acerhk_name2event[k_res]);
+-	pr_info("key mapping close     0x%x\n", acerhk_name2event[k_close]);
+-	pr_info("key mapping open      0x%x\n", acerhk_name2event[k_open]);
+-	pr_info("key mapping wireless2 0x%x\n", acerhk_name2event[k_wireless2]);
+-	pr_info("key mapping play      0x%x\n", acerhk_name2event[k_play]);
+-	pr_info("key mapping stop      0x%x\n", acerhk_name2event[k_stop]);
+-	pr_info("key mapping prev      0x%x\n", acerhk_name2event[k_prev]);
+-	pr_info("key mapping next      0x%x\n", acerhk_name2event[k_next]);
+-	pr_info("key mapping display   0x%x\n", acerhk_name2event[k_display]);
++	(void) debugfs_create_file("status", 0444, d, NULL, &acerhk_status_fops);
++	(void) debugfs_create_file("features", 0444, d, NULL, &acerhk_features_fops);
++	(void) debugfs_create_file("supported_keys", 0444, d, NULL, &acerhk_supported_keys_fops);
++	(void) debugfs_create_file("keymap", 0444, d, NULL, &acerhk_keymap_fops);
+ }
++#endif /* CONFIG_DEBUG_FS */
+ 
+ static void set_keymap_name(t_key_names name, unsigned int key)
+ {
+@@ -881,9 +981,6 @@ static void init_keymap_input(void)
+ 	set_keymap_name(k_prev, KEY_PREVIOUSSONG);
+ 	set_keymap_name(k_next, KEY_NEXTSONG);
+ 	set_keymap_name(k_display, KEY_MEDIA);	/* also not happy with this */
+-
+-	if (verbose >= 2)
+-		print_mapping();
+ }
+ 
+ #ifndef __x86_64__
+@@ -1126,10 +1223,9 @@ static long acerhk_unlocked_ioctl(struct
+ 		     sizeof(acerhk_name2event)))
+ 			retval = -EFAULT;
+ 		else {
+-			if (verbose) {
+-				pr_info("changed key mapping\n");
+-				print_mapping();
+-			}
++			if (verbose)
++				pr_info("changed key mapping, check /sys/kernel/debug/acerhk/keymap.\n");
++
+ 			retval = 0;
+ 		}
+ 		break;
+@@ -1201,8 +1297,6 @@ static void __init dmi_check_cb_common(c
+ 
+ 	if (untested)
+ 		pr_warn("Untested device, please report success or failure to the module maintainer.\n");
+-
+-	print_features();
+ }
+ 
+ static int __init dmi_check_cb_aspire_1300(const struct dmi_system_id *id)
+@@ -1765,6 +1859,11 @@ static int acerhk_probe(struct platform_
+ 		pr_info("Acer Travelmate hotkey driver dummy\n");
+ 		enable_dritek_keyboard();
+ #endif
++
++#ifdef CONFIG_DEBUG_FS
++		acerhk_init_debugfs();
++#endif
++
+ 		/* enable wlan LED */
+ 		if (acerhk_model_features & TM_F_WLAN_EC1)
+ 			enable_wlan_ec_1();
+@@ -1783,7 +1882,6 @@ static int acerhk_probe(struct platform_
+ 
+ 		/* enable mail LED */
+ 		set_mail_led(1);
+-		print_features();
+ 	}
+ 
+ 	return ret;
