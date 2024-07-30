@@ -1,16 +1,14 @@
 --- a/Makefile
 +++ b/Makefile
-@@ -1,8 +1,8 @@
+@@ -1,7 +1,7 @@
  # SPDX-License-Identifier: GPL-2.0
  VERSION = 6
  PATCHLEVEL = 10
--SUBLEVEL = 1
--EXTRAVERSION =
+-SUBLEVEL = 0
 +SUBLEVEL = 2
-+EXTRAVERSION = -rc1
+ EXTRAVERSION =
  NAME = Baby Opossum Posse
  
- # *DOCUMENTATION*
 --- a/arch/arm64/boot/dts/qcom/ipq6018.dtsi
 +++ b/arch/arm64/boot/dts/qcom/ipq6018.dtsi
 @@ -685,6 +685,7 @@
@@ -338,6 +336,27 @@
  		BUG();
  	}
  }
+--- a/drivers/char/tpm/tpm2-sessions.c
++++ b/drivers/char/tpm/tpm2-sessions.c
+@@ -746,15 +746,16 @@ int tpm_buf_check_hmac_response(struct t
+ 	struct tpm2_auth *auth = chip->auth;
+ 	off_t offset_s, offset_p;
+ 	u8 rphash[SHA256_DIGEST_SIZE];
+-	u32 attrs;
++	u32 attrs, cc;
+ 	struct sha256_state sctx;
+ 	u16 tag = be16_to_cpu(head->tag);
+-	u32 cc = be32_to_cpu(auth->ordinal);
+ 	int parm_len, len, i, handles;
+ 
+ 	if (!auth)
+ 		return rc;
+ 
++	cc = be32_to_cpu(auth->ordinal);
++
+ 	if (auth->session >= TPM_HEADER_SIZE) {
+ 		WARN(1, "tpm session not filled correctly\n");
+ 		goto out;
 --- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
 +++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c
 @@ -2017,7 +2017,7 @@ static int sdma_v4_0_process_trap_irq(st
@@ -349,6 +368,168 @@
  
  	DRM_DEBUG("IH: SDMA trap\n");
  	instance = sdma_v4_0_irq_id_to_seq(entry->client_id);
+--- a/drivers/net/tap.c
++++ b/drivers/net/tap.c
+@@ -1177,6 +1177,11 @@ static int tap_get_user_xdp(struct tap_q
+ 	struct sk_buff *skb;
+ 	int err, depth;
+ 
++	if (unlikely(xdp->data_end - xdp->data < ETH_HLEN)) {
++		err = -EINVAL;
++		goto err;
++	}
++
+ 	if (q->flags & IFF_VNET_HDR)
+ 		vnet_hdr_len = READ_ONCE(q->vnet_hdr_sz);
+ 
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@ -2451,6 +2451,9 @@ static int tun_xdp_one(struct tun_struct
+ 	bool skb_xdp = false;
+ 	struct page *page;
+ 
++	if (unlikely(datasize < ETH_HLEN))
++		return -EINVAL;
++
+ 	xdp_prog = rcu_dereference(tun->xdp_prog);
+ 	if (xdp_prog) {
+ 		if (gso->gso_type) {
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/tt.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/tt.c
+@@ -622,7 +622,12 @@ static int iwl_mvm_tzone_get_temp(struct
+ 
+ 	if (!iwl_mvm_firmware_running(mvm) ||
+ 	    mvm->fwrt.cur_fw_img != IWL_UCODE_REGULAR) {
+-		ret = -ENODATA;
++		/*
++		 * Tell the core that there is no valid temperature value to
++		 * return, but it need not worry about this.
++		 */
++		*temperature = THERMAL_TEMP_INVALID;
++		ret = 0;
+ 		goto out;
+ 	}
+ 
+--- a/drivers/thermal/thermal_core.c
++++ b/drivers/thermal/thermal_core.c
+@@ -300,8 +300,6 @@ static void monitor_thermal_zone(struct
+ 		thermal_zone_device_set_polling(tz, tz->passive_delay_jiffies);
+ 	else if (tz->polling_delay_jiffies)
+ 		thermal_zone_device_set_polling(tz, tz->polling_delay_jiffies);
+-	else if (tz->temperature == THERMAL_TEMP_INVALID)
+-		thermal_zone_device_set_polling(tz, msecs_to_jiffies(THERMAL_RECHECK_DELAY_MS));
+ }
+ 
+ static struct thermal_governor *thermal_get_tz_governor(struct thermal_zone_device *tz)
+@@ -382,7 +380,7 @@ static void handle_thermal_trip(struct t
+ 	td->threshold = trip->temperature;
+ 
+ 	if (tz->last_temperature >= old_threshold &&
+-	    tz->last_temperature != THERMAL_TEMP_INVALID) {
++	    tz->last_temperature != THERMAL_TEMP_INIT) {
+ 		/*
+ 		 * Mitigation is under way, so it needs to stop if the zone
+ 		 * temperature falls below the low temperature of the trip.
+@@ -417,27 +415,6 @@ static void handle_thermal_trip(struct t
+ 	}
+ }
+ 
+-static void update_temperature(struct thermal_zone_device *tz)
+-{
+-	int temp, ret;
+-
+-	ret = __thermal_zone_get_temp(tz, &temp);
+-	if (ret) {
+-		if (ret != -EAGAIN)
+-			dev_warn(&tz->device,
+-				 "failed to read out thermal zone (%d)\n",
+-				 ret);
+-		return;
+-	}
+-
+-	tz->last_temperature = tz->temperature;
+-	tz->temperature = temp;
+-
+-	trace_thermal_temperature(tz);
+-
+-	thermal_genl_sampling_temp(tz->id, temp);
+-}
+-
+ static void thermal_zone_device_check(struct work_struct *work)
+ {
+ 	struct thermal_zone_device *tz = container_of(work, struct
+@@ -452,7 +429,7 @@ static void thermal_zone_device_init(str
+ 
+ 	INIT_DELAYED_WORK(&tz->poll_queue, thermal_zone_device_check);
+ 
+-	tz->temperature = THERMAL_TEMP_INVALID;
++	tz->temperature = THERMAL_TEMP_INIT;
+ 	tz->passive = 0;
+ 	tz->prev_low_trip = -INT_MAX;
+ 	tz->prev_high_trip = INT_MAX;
+@@ -501,6 +478,7 @@ void __thermal_zone_device_update(struct
+ 	struct thermal_trip_desc *td;
+ 	LIST_HEAD(way_down_list);
+ 	LIST_HEAD(way_up_list);
++	int temp, ret;
+ 
+ 	if (tz->suspended)
+ 		return;
+@@ -508,10 +486,29 @@ void __thermal_zone_device_update(struct
+ 	if (!thermal_zone_device_is_enabled(tz))
+ 		return;
+ 
+-	update_temperature(tz);
++	ret = __thermal_zone_get_temp(tz, &temp);
++	if (ret) {
++		if (ret != -EAGAIN)
++			dev_info(&tz->device, "Temperature check failed (%d)\n", ret);
+ 
+-	if (tz->temperature == THERMAL_TEMP_INVALID)
++		thermal_zone_device_set_polling(tz, msecs_to_jiffies(THERMAL_RECHECK_DELAY_MS));
++		return;
++	} else if (temp <= THERMAL_TEMP_INVALID) {
++		/*
++		 * Special case: No valid temperature value is available, but
++		 * the zone owner does not want the core to do anything about
++		 * it.  Continue regular zone polling if needed, so that this
++		 * function can be called again, but skip everything else.
++		 */
+ 		goto monitor;
++	}
++
++	tz->last_temperature = tz->temperature;
++	tz->temperature = temp;
++
++	trace_thermal_temperature(tz);
++
++	thermal_genl_sampling_temp(tz->id, temp);
+ 
+ 	__thermal_zone_set_trips(tz);
+ 
+--- a/drivers/thermal/thermal_core.h
++++ b/drivers/thermal/thermal_core.h
+@@ -133,6 +133,9 @@ struct thermal_zone_device {
+ 	struct thermal_trip_desc trips[] __counted_by(num_trips);
+ };
+ 
++/* Initial thermal zone temperature. */
++#define THERMAL_TEMP_INIT	INT_MIN
++
+ /*
+  * Default delay after a failing thermal zone temperature check before
+  * attempting to check it again.
+--- a/drivers/thermal/thermal_helpers.c
++++ b/drivers/thermal/thermal_helpers.c
+@@ -140,6 +140,8 @@ int thermal_zone_get_temp(struct thermal
+ 	}
+ 
+ 	ret = __thermal_zone_get_temp(tz, temp);
++	if (!ret && *temp <= THERMAL_TEMP_INVALID)
++		ret = -ENODATA;
+ 
+ unlock:
+ 	mutex_unlock(&tz->lock);
 --- a/drivers/usb/gadget/function/f_midi2.c
 +++ b/drivers/usb/gadget/function/f_midi2.c
 @@ -150,6 +150,9 @@ struct f_midi2 {
@@ -416,6 +597,28 @@
  		ump->info.version = 0x0101;
  		ump->info.family_id = ep->info.family;
  		ump->info.model_id = ep->info.model;
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -1347,7 +1347,7 @@ struct ext4_super_block {
+ /*60*/	__le32	s_feature_incompat;	/* incompatible feature set */
+ 	__le32	s_feature_ro_compat;	/* readonly-compatible feature set */
+ /*68*/	__u8	s_uuid[16];		/* 128-bit uuid for volume */
+-/*78*/	char	s_volume_name[EXT4_LABEL_MAX];	/* volume name */
++/*78*/	char	s_volume_name[EXT4_LABEL_MAX] __nonstring; /* volume name */
+ /*88*/	char	s_last_mounted[64] __nonstring;	/* directory where last mounted */
+ /*C8*/	__le32	s_algorithm_usage_bitmap; /* For compression */
+ 	/*
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -1151,7 +1151,7 @@ static int ext4_ioctl_getlabel(struct ex
+ 	BUILD_BUG_ON(EXT4_LABEL_MAX >= FSLABEL_MAX);
+ 
+ 	lock_buffer(sbi->s_sbh);
+-	strscpy_pad(label, sbi->s_es->s_volume_name);
++	memtostr_pad(label, sbi->s_es->s_volume_name);
+ 	unlock_buffer(sbi->s_sbh);
+ 
+ 	if (copy_to_user(user_label, label, sizeof(label)))
 --- a/fs/jfs/xattr.c
 +++ b/fs/jfs/xattr.c
 @@ -797,7 +797,7 @@ ssize_t __jfs_getxattr(struct inode *ino
@@ -726,6 +929,115 @@
  			status = -ENOENT;
  			goto bail;
  		}
+--- a/fs/smb/client/cifsfs.c
++++ b/fs/smb/client/cifsfs.c
+@@ -1359,7 +1359,7 @@ ssize_t cifs_file_copychunk_range(unsign
+ 	target_tcon = tlink_tcon(smb_file_target->tlink);
+ 
+ 	if (src_tcon->ses != target_tcon->ses) {
+-		cifs_dbg(VFS, "source and target of copy not on same server\n");
++		cifs_dbg(FYI, "source and target of copy not on same server\n");
+ 		goto out;
+ 	}
+ 
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@ -123,6 +123,11 @@ fail:
+ 	goto out;
+ }
+ 
++static void cifs_netfs_invalidate_cache(struct netfs_io_request *wreq)
++{
++	cifs_invalidate_cache(wreq->inode, 0);
++}
++
+ /*
+  * Split the read up according to how many credits we can get for each piece.
+  * It's okay to sleep here if we need to wait for more credit to become
+@@ -307,6 +312,7 @@ const struct netfs_request_ops cifs_req_
+ 	.begin_writeback	= cifs_begin_writeback,
+ 	.prepare_write		= cifs_prepare_write,
+ 	.issue_write		= cifs_issue_write,
++	.invalidate_cache	= cifs_netfs_invalidate_cache,
+ };
+ 
+ /*
+@@ -2358,13 +2364,18 @@ void cifs_write_subrequest_terminated(st
+ 				      bool was_async)
+ {
+ 	struct netfs_io_request *wreq = wdata->rreq;
+-	loff_t new_server_eof;
++	struct netfs_inode *ictx = netfs_inode(wreq->inode);
++	loff_t wrend;
+ 
+ 	if (result > 0) {
+-		new_server_eof = wdata->subreq.start + wdata->subreq.transferred + result;
++		wrend = wdata->subreq.start + wdata->subreq.transferred + result;
+ 
+-		if (new_server_eof > netfs_inode(wreq->inode)->remote_i_size)
+-			netfs_resize_file(netfs_inode(wreq->inode), new_server_eof, true);
++		if (wrend > ictx->zero_point &&
++		    (wdata->rreq->origin == NETFS_UNBUFFERED_WRITE ||
++		     wdata->rreq->origin == NETFS_DIO_WRITE))
++			ictx->zero_point = wrend;
++		if (wrend > ictx->remote_i_size)
++			netfs_resize_file(ictx, wrend, true);
+ 	}
+ 
+ 	netfs_write_subrequest_terminated(&wdata->subreq, result, was_async);
+@@ -2877,6 +2888,7 @@ cifs_strict_readv(struct kiocb *iocb, st
+ 		rc = netfs_start_io_direct(inode);
+ 		if (rc < 0)
+ 			goto out;
++		rc = -EACCES;
+ 		down_read(&cinode->lock_sem);
+ 		if (!cifs_find_lock_conflict(
+ 			    cfile, iocb->ki_pos, iov_iter_count(to),
+@@ -2889,6 +2901,7 @@ cifs_strict_readv(struct kiocb *iocb, st
+ 		rc = netfs_start_io_read(inode);
+ 		if (rc < 0)
+ 			goto out;
++		rc = -EACCES;
+ 		down_read(&cinode->lock_sem);
+ 		if (!cifs_find_lock_conflict(
+ 			    cfile, iocb->ki_pos, iov_iter_count(to),
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@ -4859,9 +4859,6 @@ smb2_async_writev(struct cifs_io_subrequ
+ 	struct cifs_io_parms *io_parms = NULL;
+ 	int credit_request;
+ 
+-	if (!wdata->server || test_bit(NETFS_SREQ_RETRYING, &wdata->subreq.flags))
+-		server = wdata->server = cifs_pick_channel(tcon->ses);
+-
+ 	/*
+ 	 * in future we may get cifs_io_parms passed in from the caller,
+ 	 * but for now we construct it here...
+--- a/include/sound/cs35l56.h
++++ b/include/sound/cs35l56.h
+@@ -209,7 +209,7 @@
+ 
+ /* CS35L56_MAIN_RENDER_USER_VOLUME */
+ #define CS35L56_MAIN_RENDER_USER_VOLUME_MIN		-400
+-#define CS35L56_MAIN_RENDER_USER_VOLUME_MAX		400
++#define CS35L56_MAIN_RENDER_USER_VOLUME_MAX		48
+ #define CS35L56_MAIN_RENDER_USER_VOLUME_MASK		0x0000FFC0
+ #define CS35L56_MAIN_RENDER_USER_VOLUME_SHIFT		6
+ #define CS35L56_MAIN_RENDER_USER_VOLUME_SIGNBIT		9
+--- a/io_uring/kbuf.c
++++ b/io_uring/kbuf.c
+@@ -657,8 +657,10 @@ static int io_alloc_pbuf_ring(struct io_
+ 	ring_size = reg->ring_entries * sizeof(struct io_uring_buf_ring);
+ 
+ 	bl->buf_ring = io_pages_map(&bl->buf_pages, &bl->buf_nr_pages, ring_size);
+-	if (!bl->buf_ring)
++	if (IS_ERR(bl->buf_ring)) {
++		bl->buf_ring = NULL;
+ 		return -ENOMEM;
++	}
+ 
+ 	bl->is_buf_ring = 1;
+ 	bl->is_mmap = 1;
 --- a/sound/core/pcm_dmaengine.c
 +++ b/sound/core/pcm_dmaengine.c
 @@ -352,8 +352,12 @@ EXPORT_SYMBOL_GPL(snd_dmaengine_pcm_open
@@ -828,3 +1140,18 @@
  	SND_PCI_QUIRK(0x17aa, 0x30bb, "ThinkCentre AIO", ALC233_FIXUP_LENOVO_LINE2_MIC_HOTKEY),
  	SND_PCI_QUIRK(0x17aa, 0x30e2, "ThinkCentre AIO", ALC233_FIXUP_LENOVO_LINE2_MIC_HOTKEY),
  	SND_PCI_QUIRK(0x17aa, 0x310c, "ThinkCentre Station", ALC294_FIXUP_LENOVO_MIC_LOCATION),
+--- a/sound/soc/codecs/cs35l56.c
++++ b/sound/soc/codecs/cs35l56.c
+@@ -196,7 +196,11 @@ static const struct snd_kcontrol_new cs3
+ 		       cs35l56_dspwait_get_volsw, cs35l56_dspwait_put_volsw),
+ 	SOC_SINGLE_S_EXT_TLV("Speaker Volume",
+ 			     CS35L56_MAIN_RENDER_USER_VOLUME,
+-			     6, -400, 400, 9, 0,
++			     CS35L56_MAIN_RENDER_USER_VOLUME_SHIFT,
++			     CS35L56_MAIN_RENDER_USER_VOLUME_MIN,
++			     CS35L56_MAIN_RENDER_USER_VOLUME_MAX,
++			     CS35L56_MAIN_RENDER_USER_VOLUME_SIGNBIT,
++			     0,
+ 			     cs35l56_dspwait_get_volsw,
+ 			     cs35l56_dspwait_put_volsw,
+ 			     vol_tlv),
