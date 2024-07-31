@@ -111,7 +111,7 @@
 -SUBLEVEL = 2
 -EXTRAVERSION =
 +SUBLEVEL = 3
-+EXTRAVERSION = -rc1
++EXTRAVERSION = -rc3
  NAME = Baby Opossum Posse
  
  # *DOCUMENTATION*
@@ -2463,6 +2463,24 @@
  
  	help
  	  The PA-RISC microprocessor is designed by Hewlett-Packard and used
+--- a/arch/powerpc/configs/85xx-hw.config
++++ b/arch/powerpc/configs/85xx-hw.config
+@@ -24,6 +24,7 @@ CONFIG_FS_ENET=y
+ CONFIG_FSL_CORENET_CF=y
+ CONFIG_FSL_DMA=y
+ CONFIG_FSL_HV_MANAGER=y
++CONFIG_FSL_IFC=y
+ CONFIG_FSL_PQ_MDIO=y
+ CONFIG_FSL_RIO=y
+ CONFIG_FSL_XGMAC_MDIO=y
+@@ -58,6 +59,7 @@ CONFIG_INPUT_FF_MEMLESS=m
+ CONFIG_MARVELL_PHY=y
+ CONFIG_MDIO_BUS_MUX_GPIO=y
+ CONFIG_MDIO_BUS_MUX_MMIOREG=y
++CONFIG_MEMORY=y
+ CONFIG_MMC_SDHCI_OF_ESDHC=y
+ CONFIG_MMC_SDHCI_PLTFM=y
+ CONFIG_MMC_SDHCI=y
 --- a/arch/powerpc/include/asm/guest-state-buffer.h
 +++ b/arch/powerpc/include/asm/guest-state-buffer.h
 @@ -81,6 +81,7 @@
@@ -13763,141 +13781,7 @@
  	return err;
 --- a/drivers/net/virtio_net.c
 +++ b/drivers/net/virtio_net.c
-@@ -47,7 +47,8 @@ module_param(napi_tx, bool, 0644);
- #define VIRTIO_XDP_TX		BIT(0)
- #define VIRTIO_XDP_REDIR	BIT(1)
- 
--#define VIRTIO_XDP_FLAG	BIT(0)
-+#define VIRTIO_XDP_FLAG		BIT(0)
-+#define VIRTIO_ORPHAN_FLAG	BIT(1)
- 
- /* RX packet size EWMA. The average packet size is used to determine the packet
-  * buffer size when refilling RX rings. As the entire RX ring may be refilled
-@@ -85,6 +86,8 @@ struct virtnet_stat_desc {
- struct virtnet_sq_free_stats {
- 	u64 packets;
- 	u64 bytes;
-+	u64 napi_packets;
-+	u64 napi_bytes;
- };
- 
- struct virtnet_sq_stats {
-@@ -506,29 +509,50 @@ static struct xdp_frame *ptr_to_xdp(void
- 	return (struct xdp_frame *)((unsigned long)ptr & ~VIRTIO_XDP_FLAG);
- }
- 
--static void __free_old_xmit(struct send_queue *sq, bool in_napi,
--			    struct virtnet_sq_free_stats *stats)
-+static bool is_orphan_skb(void *ptr)
-+{
-+	return (unsigned long)ptr & VIRTIO_ORPHAN_FLAG;
-+}
-+
-+static void *skb_to_ptr(struct sk_buff *skb, bool orphan)
-+{
-+	return (void *)((unsigned long)skb | (orphan ? VIRTIO_ORPHAN_FLAG : 0));
-+}
-+
-+static struct sk_buff *ptr_to_skb(void *ptr)
-+{
-+	return (struct sk_buff *)((unsigned long)ptr & ~VIRTIO_ORPHAN_FLAG);
-+}
-+
-+static void __free_old_xmit(struct send_queue *sq, struct netdev_queue *txq,
-+			    bool in_napi, struct virtnet_sq_free_stats *stats)
- {
- 	unsigned int len;
- 	void *ptr;
- 
- 	while ((ptr = virtqueue_get_buf(sq->vq, &len)) != NULL) {
--		++stats->packets;
--
- 		if (!is_xdp_frame(ptr)) {
--			struct sk_buff *skb = ptr;
-+			struct sk_buff *skb = ptr_to_skb(ptr);
- 
- 			pr_debug("Sent skb %p\n", skb);
- 
--			stats->bytes += skb->len;
-+			if (is_orphan_skb(ptr)) {
-+				stats->packets++;
-+				stats->bytes += skb->len;
-+			} else {
-+				stats->napi_packets++;
-+				stats->napi_bytes += skb->len;
-+			}
- 			napi_consume_skb(skb, in_napi);
- 		} else {
- 			struct xdp_frame *frame = ptr_to_xdp(ptr);
- 
-+			stats->packets++;
- 			stats->bytes += xdp_get_frame_len(frame);
- 			xdp_return_frame(frame);
- 		}
- 	}
-+	netdev_tx_completed_queue(txq, stats->napi_packets, stats->napi_bytes);
- }
- 
- /* Converting between virtqueue no. and kernel tx/rx queue no.
-@@ -955,21 +979,22 @@ static void virtnet_rq_unmap_free_buf(st
- 	virtnet_rq_free_buf(vi, rq, buf);
- }
- 
--static void free_old_xmit(struct send_queue *sq, bool in_napi)
-+static void free_old_xmit(struct send_queue *sq, struct netdev_queue *txq,
-+			  bool in_napi)
- {
- 	struct virtnet_sq_free_stats stats = {0};
- 
--	__free_old_xmit(sq, in_napi, &stats);
-+	__free_old_xmit(sq, txq, in_napi, &stats);
- 
- 	/* Avoid overhead when no packets have been processed
- 	 * happens when called speculatively from start_xmit.
- 	 */
--	if (!stats.packets)
-+	if (!stats.packets && !stats.napi_packets)
- 		return;
- 
- 	u64_stats_update_begin(&sq->stats.syncp);
--	u64_stats_add(&sq->stats.bytes, stats.bytes);
--	u64_stats_add(&sq->stats.packets, stats.packets);
-+	u64_stats_add(&sq->stats.bytes, stats.bytes + stats.napi_bytes);
-+	u64_stats_add(&sq->stats.packets, stats.packets + stats.napi_packets);
- 	u64_stats_update_end(&sq->stats.syncp);
- }
- 
-@@ -1003,7 +1028,9 @@ static void check_sq_full_and_disable(st
- 	 * early means 16 slots are typically wasted.
- 	 */
- 	if (sq->vq->num_free < 2+MAX_SKB_FRAGS) {
--		netif_stop_subqueue(dev, qnum);
-+		struct netdev_queue *txq = netdev_get_tx_queue(dev, qnum);
-+
-+		netif_tx_stop_queue(txq);
- 		u64_stats_update_begin(&sq->stats.syncp);
- 		u64_stats_inc(&sq->stats.stop);
- 		u64_stats_update_end(&sq->stats.syncp);
-@@ -1012,7 +1039,7 @@ static void check_sq_full_and_disable(st
- 				virtqueue_napi_schedule(&sq->napi, sq->vq);
- 		} else if (unlikely(!virtqueue_enable_cb_delayed(sq->vq))) {
- 			/* More just got used, free them then recheck. */
--			free_old_xmit(sq, false);
-+			free_old_xmit(sq, txq, false);
- 			if (sq->vq->num_free >= 2+MAX_SKB_FRAGS) {
- 				netif_start_subqueue(dev, qnum);
- 				u64_stats_update_begin(&sq->stats.syncp);
-@@ -1138,7 +1165,8 @@ static int virtnet_xdp_xmit(struct net_d
- 	}
- 
- 	/* Free up any pending old buffers before queueing new ones. */
--	__free_old_xmit(sq, false, &stats);
-+	__free_old_xmit(sq, netdev_get_tx_queue(dev, sq - vi->sq),
-+			false, &stats);
- 
- 	for (i = 0; i < n; i++) {
- 		struct xdp_frame *xdpf = frames[i];
-@@ -2313,7 +2341,7 @@ static int virtnet_receive(struct receiv
+@@ -2313,7 +2313,7 @@ static int virtnet_receive(struct receiv
  	return packets;
  }
  
@@ -13906,16 +13790,16 @@
  {
  	struct virtnet_info *vi = rq->vq->vdev->priv;
  	unsigned int index = vq2rxq(rq->vq);
-@@ -2331,7 +2359,7 @@ static void virtnet_poll_cleantx(struct
+@@ -2331,7 +2331,7 @@ static void virtnet_poll_cleantx(struct
  
  		do {
  			virtqueue_disable_cb(sq->vq);
 -			free_old_xmit(sq, true);
-+			free_old_xmit(sq, txq, !!budget);
++			free_old_xmit(sq, !!budget);
  		} while (unlikely(!virtqueue_enable_cb_delayed(sq->vq)));
  
  		if (sq->vq->num_free >= 2 + MAX_SKB_FRAGS) {
-@@ -2375,7 +2403,7 @@ static int virtnet_poll(struct napi_stru
+@@ -2375,7 +2375,7 @@ static int virtnet_poll(struct napi_stru
  	unsigned int xdp_xmit = 0;
  	bool napi_complete;
  
@@ -13924,83 +13808,15 @@
  
  	received = virtnet_receive(rq, budget, &xdp_xmit);
  	rq->packets_in_napi += received;
-@@ -2430,6 +2458,7 @@ static int virtnet_enable_queue_pair(str
- 		goto err_xdp_reg_mem_model;
- 
- 	virtnet_napi_enable(vi->rq[qp_index].vq, &vi->rq[qp_index].napi);
-+	netdev_tx_reset_queue(netdev_get_tx_queue(vi->dev, qp_index));
- 	virtnet_napi_tx_enable(vi, vi->sq[qp_index].vq, &vi->sq[qp_index].napi);
- 
- 	return 0;
-@@ -2489,7 +2518,7 @@ static int virtnet_poll_tx(struct napi_s
+@@ -2489,7 +2489,7 @@ static int virtnet_poll_tx(struct napi_s
  	txq = netdev_get_tx_queue(vi->dev, index);
  	__netif_tx_lock(txq, raw_smp_processor_id());
  	virtqueue_disable_cb(sq->vq);
 -	free_old_xmit(sq, true);
-+	free_old_xmit(sq, txq, !!budget);
++	free_old_xmit(sq, !!budget);
  
  	if (sq->vq->num_free >= 2 + MAX_SKB_FRAGS) {
  		if (netif_tx_queue_stopped(txq)) {
-@@ -2523,7 +2552,7 @@ static int virtnet_poll_tx(struct napi_s
- 	return 0;
- }
- 
--static int xmit_skb(struct send_queue *sq, struct sk_buff *skb)
-+static int xmit_skb(struct send_queue *sq, struct sk_buff *skb, bool orphan)
- {
- 	struct virtio_net_hdr_mrg_rxbuf *hdr;
- 	const unsigned char *dest = ((struct ethhdr *)skb->data)->h_dest;
-@@ -2567,7 +2596,8 @@ static int xmit_skb(struct send_queue *s
- 			return num_sg;
- 		num_sg++;
- 	}
--	return virtqueue_add_outbuf(sq->vq, sq->sg, num_sg, skb, GFP_ATOMIC);
-+	return virtqueue_add_outbuf(sq->vq, sq->sg, num_sg,
-+				    skb_to_ptr(skb, orphan), GFP_ATOMIC);
- }
- 
- static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
-@@ -2577,24 +2607,25 @@ static netdev_tx_t start_xmit(struct sk_
- 	struct send_queue *sq = &vi->sq[qnum];
- 	int err;
- 	struct netdev_queue *txq = netdev_get_tx_queue(dev, qnum);
--	bool kick = !netdev_xmit_more();
-+	bool xmit_more = netdev_xmit_more();
- 	bool use_napi = sq->napi.weight;
-+	bool kick;
- 
- 	/* Free up any pending old buffers before queueing new ones. */
- 	do {
- 		if (use_napi)
- 			virtqueue_disable_cb(sq->vq);
- 
--		free_old_xmit(sq, false);
-+		free_old_xmit(sq, txq, false);
- 
--	} while (use_napi && kick &&
-+	} while (use_napi && !xmit_more &&
- 	       unlikely(!virtqueue_enable_cb_delayed(sq->vq)));
- 
- 	/* timestamp packet in software */
- 	skb_tx_timestamp(skb);
- 
- 	/* Try to transmit */
--	err = xmit_skb(sq, skb);
-+	err = xmit_skb(sq, skb, !use_napi);
- 
- 	/* This should not happen! */
- 	if (unlikely(err)) {
-@@ -2616,7 +2647,9 @@ static netdev_tx_t start_xmit(struct sk_
- 
- 	check_sq_full_and_disable(vi, dev, sq);
- 
--	if (kick || netif_xmit_stopped(txq)) {
-+	kick = use_napi ? __netdev_tx_sent_queue(txq, skb->len, xmit_more) :
-+			  !xmit_more || netif_xmit_stopped(txq);
-+	if (kick) {
- 		if (virtqueue_kick_prepare(sq->vq) && virtqueue_notify(sq->vq)) {
- 			u64_stats_update_begin(&sq->stats.syncp);
- 			u64_stats_inc(&sq->stats.kicks);
 --- a/drivers/net/wireless/ath/ath11k/ce.h
 +++ b/drivers/net/wireless/ath/ath11k/ce.h
 @@ -1,7 +1,7 @@
@@ -27081,7 +26897,25 @@
  
  	if (!selinux_initialized())
  		return (inode_owner_or_capable(idmap, inode) ? 0 : -EPERM);
-@@ -7175,6 +7186,7 @@ static struct security_hook_list selinux
+@@ -3345,15 +3356,9 @@ static int selinux_inode_listxattr(struc
+ static int selinux_inode_removexattr(struct mnt_idmap *idmap,
+ 				     struct dentry *dentry, const char *name)
+ {
+-	if (strcmp(name, XATTR_NAME_SELINUX)) {
+-		int rc = cap_inode_removexattr(idmap, dentry, name);
+-		if (rc)
+-			return rc;
+-
+-		/* Not an attribute we recognize, so just check the
+-		   ordinary setattr permission. */
++	/* if not a selinux xattr, only check the ordinary setattr perm */
++	if (strcmp(name, XATTR_NAME_SELINUX))
+ 		return dentry_has_perm(current_cred(), dentry, FILE__SETATTR);
+-	}
+ 
+ 	if (!selinux_initialized())
+ 		return 0;
+@@ -7175,6 +7180,7 @@ static struct security_hook_list selinux
  	LSM_HOOK_INIT(inode_permission, selinux_inode_permission),
  	LSM_HOOK_INIT(inode_setattr, selinux_inode_setattr),
  	LSM_HOOK_INIT(inode_getattr, selinux_inode_getattr),
@@ -27135,7 +26969,17 @@
  
  	if (check_priv && !smack_privileged(CAP_MAC_ADMIN))
  		rc = -EPERM;
-@@ -5053,6 +5079,7 @@ static struct security_hook_list smack_h
+@@ -1435,8 +1461,7 @@ static int smack_inode_removexattr(struc
+ 	    strcmp(name, XATTR_NAME_SMACKMMAP) == 0) {
+ 		if (!smack_privileged(CAP_MAC_ADMIN))
+ 			rc = -EPERM;
+-	} else
+-		rc = cap_inode_removexattr(idmap, dentry, name);
++	}
+ 
+ 	if (rc != 0)
+ 		return rc;
+@@ -5053,6 +5078,7 @@ static struct security_hook_list smack_h
  	LSM_HOOK_INIT(inode_permission, smack_inode_permission),
  	LSM_HOOK_INIT(inode_setattr, smack_inode_setattr),
  	LSM_HOOK_INIT(inode_getattr, smack_inode_getattr),
@@ -28091,203 +27935,6 @@
  
  		intel_pt_evsel->core.attr.aux_watermark = aux_watermark;
  	}
---- a/tools/perf/tests/pmu.c
-+++ b/tools/perf/tests/pmu.c
-@@ -3,6 +3,7 @@
- #include "evsel.h"
- #include "parse-events.h"
- #include "pmu.h"
-+#include "pmus.h"
- #include "tests.h"
- #include "debug.h"
- #include "fncache.h"
-@@ -340,10 +341,186 @@ static int test__pmu_event_names(struct
- 	return ret;
- }
- 
-+static const char * const uncore_chas[] = {
-+	"uncore_cha_0",
-+	"uncore_cha_1",
-+	"uncore_cha_2",
-+	"uncore_cha_3",
-+	"uncore_cha_4",
-+	"uncore_cha_5",
-+	"uncore_cha_6",
-+	"uncore_cha_7",
-+	"uncore_cha_8",
-+	"uncore_cha_9",
-+	"uncore_cha_10",
-+	"uncore_cha_11",
-+	"uncore_cha_12",
-+	"uncore_cha_13",
-+	"uncore_cha_14",
-+	"uncore_cha_15",
-+	"uncore_cha_16",
-+	"uncore_cha_17",
-+	"uncore_cha_18",
-+	"uncore_cha_19",
-+	"uncore_cha_20",
-+	"uncore_cha_21",
-+	"uncore_cha_22",
-+	"uncore_cha_23",
-+	"uncore_cha_24",
-+	"uncore_cha_25",
-+	"uncore_cha_26",
-+	"uncore_cha_27",
-+	"uncore_cha_28",
-+	"uncore_cha_29",
-+	"uncore_cha_30",
-+	"uncore_cha_31",
-+};
-+
-+static const char * const mrvl_ddrs[] = {
-+	"mrvl_ddr_pmu_87e1b0000000",
-+	"mrvl_ddr_pmu_87e1b1000000",
-+	"mrvl_ddr_pmu_87e1b2000000",
-+	"mrvl_ddr_pmu_87e1b3000000",
-+	"mrvl_ddr_pmu_87e1b4000000",
-+	"mrvl_ddr_pmu_87e1b5000000",
-+	"mrvl_ddr_pmu_87e1b6000000",
-+	"mrvl_ddr_pmu_87e1b7000000",
-+	"mrvl_ddr_pmu_87e1b8000000",
-+	"mrvl_ddr_pmu_87e1b9000000",
-+	"mrvl_ddr_pmu_87e1ba000000",
-+	"mrvl_ddr_pmu_87e1bb000000",
-+	"mrvl_ddr_pmu_87e1bc000000",
-+	"mrvl_ddr_pmu_87e1bd000000",
-+	"mrvl_ddr_pmu_87e1be000000",
-+	"mrvl_ddr_pmu_87e1bf000000",
-+};
-+
-+static int test__name_len(struct test_suite *test __maybe_unused, int subtest __maybe_unused)
-+{
-+	TEST_ASSERT_VAL("cpu", pmu_name_len_no_suffix("cpu") == strlen("cpu"));
-+	TEST_ASSERT_VAL("i915", pmu_name_len_no_suffix("i915") == strlen("i915"));
-+	TEST_ASSERT_VAL("cpum_cf", pmu_name_len_no_suffix("cpum_cf") == strlen("cpum_cf"));
-+	for (size_t i = 0; i < ARRAY_SIZE(uncore_chas); i++) {
-+		TEST_ASSERT_VAL("Strips uncore_cha suffix",
-+				pmu_name_len_no_suffix(uncore_chas[i]) ==
-+				strlen("uncore_cha"));
-+	}
-+	for (size_t i = 0; i < ARRAY_SIZE(mrvl_ddrs); i++) {
-+		TEST_ASSERT_VAL("Strips mrvl_ddr_pmu suffix",
-+				pmu_name_len_no_suffix(mrvl_ddrs[i]) ==
-+				strlen("mrvl_ddr_pmu"));
-+	}
-+	return TEST_OK;
-+}
-+
-+static int test__name_cmp(struct test_suite *test __maybe_unused, int subtest __maybe_unused)
-+{
-+	TEST_ASSERT_EQUAL("cpu", pmu_name_cmp("cpu", "cpu"), 0);
-+	TEST_ASSERT_EQUAL("i915", pmu_name_cmp("i915", "i915"), 0);
-+	TEST_ASSERT_EQUAL("cpum_cf", pmu_name_cmp("cpum_cf", "cpum_cf"), 0);
-+	TEST_ASSERT_VAL("i915", pmu_name_cmp("cpu", "i915") < 0);
-+	TEST_ASSERT_VAL("i915", pmu_name_cmp("i915", "cpu") > 0);
-+	TEST_ASSERT_VAL("cpum_cf", pmu_name_cmp("cpum_cf", "cpum_ce") > 0);
-+	TEST_ASSERT_VAL("cpum_cf", pmu_name_cmp("cpum_cf", "cpum_d0") < 0);
-+	for (size_t i = 1; i < ARRAY_SIZE(uncore_chas); i++) {
-+		TEST_ASSERT_VAL("uncore_cha suffixes ordered lt",
-+				pmu_name_cmp(uncore_chas[i-1], uncore_chas[i]) < 0);
-+		TEST_ASSERT_VAL("uncore_cha suffixes ordered gt",
-+				pmu_name_cmp(uncore_chas[i], uncore_chas[i-1]) > 0);
-+	}
-+	for (size_t i = 1; i < ARRAY_SIZE(mrvl_ddrs); i++) {
-+		TEST_ASSERT_VAL("mrvl_ddr_pmu suffixes ordered lt",
-+				pmu_name_cmp(mrvl_ddrs[i-1], mrvl_ddrs[i]) < 0);
-+		TEST_ASSERT_VAL("mrvl_ddr_pmu suffixes ordered gt",
-+				pmu_name_cmp(mrvl_ddrs[i], mrvl_ddrs[i-1]) > 0);
-+	}
-+	return TEST_OK;
-+}
-+
-+/**
-+ * Test perf_pmu__match() that's used to search for a PMU given a name passed
-+ * on the command line. The name that's passed may also be a filename type glob
-+ * match.
-+ */
-+static int test__pmu_match(struct test_suite *test __maybe_unused, int subtest __maybe_unused)
-+{
-+	struct perf_pmu test_pmu;
-+
-+	test_pmu.name = "pmuname";
-+	TEST_ASSERT_EQUAL("Exact match", perf_pmu__match(&test_pmu, "pmuname"),	     true);
-+	TEST_ASSERT_EQUAL("Longer token", perf_pmu__match(&test_pmu, "longertoken"), false);
-+	TEST_ASSERT_EQUAL("Shorter token", perf_pmu__match(&test_pmu, "pmu"),	     false);
-+
-+	test_pmu.name = "pmuname_10";
-+	TEST_ASSERT_EQUAL("Diff suffix_", perf_pmu__match(&test_pmu, "pmuname_2"),  false);
-+	TEST_ASSERT_EQUAL("Sub suffix_",  perf_pmu__match(&test_pmu, "pmuname_1"),  true);
-+	TEST_ASSERT_EQUAL("Same suffix_", perf_pmu__match(&test_pmu, "pmuname_10"), true);
-+	TEST_ASSERT_EQUAL("No suffix_",   perf_pmu__match(&test_pmu, "pmuname"),    true);
-+	TEST_ASSERT_EQUAL("Underscore_",  perf_pmu__match(&test_pmu, "pmuname_"),   true);
-+	TEST_ASSERT_EQUAL("Substring_",   perf_pmu__match(&test_pmu, "pmuna"),      false);
-+
-+	test_pmu.name = "pmuname_ab23";
-+	TEST_ASSERT_EQUAL("Diff suffix hex_", perf_pmu__match(&test_pmu, "pmuname_2"),    false);
-+	TEST_ASSERT_EQUAL("Sub suffix hex_",  perf_pmu__match(&test_pmu, "pmuname_ab"),   true);
-+	TEST_ASSERT_EQUAL("Same suffix hex_", perf_pmu__match(&test_pmu, "pmuname_ab23"), true);
-+	TEST_ASSERT_EQUAL("No suffix hex_",   perf_pmu__match(&test_pmu, "pmuname"),      true);
-+	TEST_ASSERT_EQUAL("Underscore hex_",  perf_pmu__match(&test_pmu, "pmuname_"),     true);
-+	TEST_ASSERT_EQUAL("Substring hex_",   perf_pmu__match(&test_pmu, "pmuna"),	 false);
-+
-+	test_pmu.name = "pmuname10";
-+	TEST_ASSERT_EQUAL("Diff suffix", perf_pmu__match(&test_pmu, "pmuname2"),  false);
-+	TEST_ASSERT_EQUAL("Sub suffix",  perf_pmu__match(&test_pmu, "pmuname1"),  true);
-+	TEST_ASSERT_EQUAL("Same suffix", perf_pmu__match(&test_pmu, "pmuname10"), true);
-+	TEST_ASSERT_EQUAL("No suffix",   perf_pmu__match(&test_pmu, "pmuname"),   true);
-+	TEST_ASSERT_EQUAL("Underscore",  perf_pmu__match(&test_pmu, "pmuname_"),  false);
-+	TEST_ASSERT_EQUAL("Substring",   perf_pmu__match(&test_pmu, "pmuna"),     false);
-+
-+	test_pmu.name = "pmunameab23";
-+	TEST_ASSERT_EQUAL("Diff suffix hex", perf_pmu__match(&test_pmu, "pmuname2"),    false);
-+	TEST_ASSERT_EQUAL("Sub suffix hex",  perf_pmu__match(&test_pmu, "pmunameab"),   true);
-+	TEST_ASSERT_EQUAL("Same suffix hex", perf_pmu__match(&test_pmu, "pmunameab23"), true);
-+	TEST_ASSERT_EQUAL("No suffix hex",   perf_pmu__match(&test_pmu, "pmuname"),     true);
-+	TEST_ASSERT_EQUAL("Underscore hex",  perf_pmu__match(&test_pmu, "pmuname_"),    false);
-+	TEST_ASSERT_EQUAL("Substring hex",   perf_pmu__match(&test_pmu, "pmuna"),	false);
-+
-+	/*
-+	 * 2 hex chars or less are not considered suffixes so it shouldn't be
-+	 * possible to wildcard by skipping the suffix. Therefore there are more
-+	 * false results here than above.
-+	 */
-+	test_pmu.name = "pmuname_a3";
-+	TEST_ASSERT_EQUAL("Diff suffix 2 hex_", perf_pmu__match(&test_pmu, "pmuname_2"),  false);
-+	/*
-+	 * This one should be false, but because pmuname_a3 ends in 3 which is
-+	 * decimal, it's not possible to determine if it's a short hex suffix or
-+	 * a normal decimal suffix following text. And we want to match on any
-+	 * length of decimal suffix. Run the test anyway and expect the wrong
-+	 * result. And slightly fuzzy matching shouldn't do too much harm.
-+	 */
-+	TEST_ASSERT_EQUAL("Sub suffix 2 hex_",  perf_pmu__match(&test_pmu, "pmuname_a"),  true);
-+	TEST_ASSERT_EQUAL("Same suffix 2 hex_", perf_pmu__match(&test_pmu, "pmuname_a3"), true);
-+	TEST_ASSERT_EQUAL("No suffix 2 hex_",   perf_pmu__match(&test_pmu, "pmuname"),    false);
-+	TEST_ASSERT_EQUAL("Underscore 2 hex_",  perf_pmu__match(&test_pmu, "pmuname_"),   false);
-+	TEST_ASSERT_EQUAL("Substring 2 hex_",   perf_pmu__match(&test_pmu, "pmuna"),	  false);
-+
-+	test_pmu.name = "pmuname_5";
-+	TEST_ASSERT_EQUAL("Glob 1", perf_pmu__match(&test_pmu, "pmu*"),		   true);
-+	TEST_ASSERT_EQUAL("Glob 2", perf_pmu__match(&test_pmu, "nomatch*"),	   false);
-+	TEST_ASSERT_EQUAL("Seq 1",  perf_pmu__match(&test_pmu, "pmuname_[12345]"), true);
-+	TEST_ASSERT_EQUAL("Seq 2",  perf_pmu__match(&test_pmu, "pmuname_[67890]"), false);
-+	TEST_ASSERT_EQUAL("? 1",    perf_pmu__match(&test_pmu, "pmuname_?"),	   true);
-+	TEST_ASSERT_EQUAL("? 2",    perf_pmu__match(&test_pmu, "pmuname_1?"),	   false);
-+
-+	return TEST_OK;
-+}
-+
- static struct test_case tests__pmu[] = {
- 	TEST_CASE("Parsing with PMU format directory", pmu_format),
- 	TEST_CASE("Parsing with PMU event", pmu_events),
- 	TEST_CASE("PMU event names", pmu_event_names),
-+	TEST_CASE("PMU name combining", name_len),
-+	TEST_CASE("PMU name comparison", name_cmp),
-+	TEST_CASE("PMU cmdline match", pmu_match),
- 	{	.name = NULL, }
- };
- 
 --- a/tools/perf/tests/shell/test_arm_callgraph_fp.sh
 +++ b/tools/perf/tests/shell/test_arm_callgraph_fp.sh
 @@ -28,28 +28,21 @@ cleanup_files()
@@ -28574,17 +28221,6 @@
  out_err:
  	return err;
  }
---- a/tools/perf/util/pmu.c
-+++ b/tools/perf/util/pmu.c
-@@ -2143,7 +2143,7 @@ void perf_pmu__warn_invalid_config(struc
- bool perf_pmu__match(const struct perf_pmu *pmu, const char *tok)
- {
- 	const char *name = pmu->name;
--	bool need_fnmatch = strchr(tok, '*') != NULL;
-+	bool need_fnmatch = strisglob(tok);
- 
- 	if (!strncmp(tok, "uncore_", 7))
- 		tok += 7;
 --- a/tools/perf/util/pmus.c
 +++ b/tools/perf/util/pmus.c
 @@ -477,8 +477,8 @@ void perf_pmus__print_pmu_events(const s
@@ -28857,15 +28493,6 @@
  
  		memset(&di, 0, sizeof(di));
  		if (dwarf_find_debug_frame(0, &di, ip, base, symfile, start, map__end(map)))
---- a/tools/testing/selftests/bpf/DENYLIST.aarch64
-+++ b/tools/testing/selftests/bpf/DENYLIST.aarch64
-@@ -1,6 +1,5 @@
- bpf_cookie/multi_kprobe_attach_api               # kprobe_multi_link_api_subtest:FAIL:fentry_raw_skel_load unexpected error: -3
- bpf_cookie/multi_kprobe_link_api                 # kprobe_multi_link_api_subtest:FAIL:fentry_raw_skel_load unexpected error: -3
--fexit_sleep                                      # The test never returns. The remaining tests cannot start.
- kprobe_multi_bench_attach                        # needs CONFIG_FPROBE
- kprobe_multi_test                                # needs CONFIG_FPROBE
- module_attach                                    # prog 'kprobe_multi': failed to auto-attach: -95
 --- a/tools/testing/selftests/bpf/bpf_kfuncs.h
 +++ b/tools/testing/selftests/bpf/bpf_kfuncs.h
 @@ -77,5 +77,5 @@ extern int bpf_verify_pkcs7_signature(st
