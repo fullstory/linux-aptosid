@@ -1833,17 +1833,15 @@
  F:	include/uapi/linux/xilinx-v4l2-controls.h
 --- a/Makefile
 +++ b/Makefile
-@@ -1,8 +1,8 @@
+@@ -1,7 +1,7 @@
  # SPDX-License-Identifier: GPL-2.0
  VERSION = 6
  PATCHLEVEL = 12
--SUBLEVEL = 1
--EXTRAVERSION =
-+SUBLEVEL = 2
-+EXTRAVERSION = -rc1
+-SUBLEVEL = 0
++SUBLEVEL = 3
+ EXTRAVERSION =
  NAME = Baby Opossum Posse
  
- # *DOCUMENTATION*
 --- a/arch/arc/kernel/devtree.c
 +++ b/arch/arc/kernel/devtree.c
 @@ -62,7 +62,7 @@ const struct machine_desc * __init setup
@@ -3840,302 +3838,6 @@
  	return 0;
  }
  #endif
---- a/arch/powerpc/crypto/Kconfig
-+++ b/arch/powerpc/crypto/Kconfig
-@@ -107,12 +107,12 @@ config CRYPTO_AES_PPC_SPE
- 
- config CRYPTO_AES_GCM_P10
- 	tristate "Stitched AES/GCM acceleration support on P10 or later CPU (PPC)"
--	depends on BROKEN
- 	depends on PPC64 && CPU_LITTLE_ENDIAN && VSX
- 	select CRYPTO_LIB_AES
- 	select CRYPTO_ALGAPI
- 	select CRYPTO_AEAD
- 	select CRYPTO_SKCIPHER
-+	select CRYPTO_SIMD
- 	help
- 	  AEAD cipher: AES cipher algorithms (FIPS-197)
- 	  GCM (Galois/Counter Mode) authenticated encryption mode (NIST SP800-38D)
---- a/arch/powerpc/crypto/aes-gcm-p10-glue.c
-+++ b/arch/powerpc/crypto/aes-gcm-p10-glue.c
-@@ -8,6 +8,7 @@
- #include <linux/unaligned.h>
- #include <asm/simd.h>
- #include <asm/switch_to.h>
-+#include <crypto/gcm.h>
- #include <crypto/aes.h>
- #include <crypto/algapi.h>
- #include <crypto/b128ops.h>
-@@ -24,6 +25,7 @@
- 
- #define	PPC_ALIGN		16
- #define GCM_IV_SIZE		12
-+#define RFC4106_NONCE_SIZE	4
- 
- MODULE_DESCRIPTION("PPC64le AES-GCM with Stitched implementation");
- MODULE_AUTHOR("Danny Tsen <dtsen@linux.ibm.com");
-@@ -31,7 +33,7 @@ MODULE_LICENSE("GPL v2");
- MODULE_ALIAS_CRYPTO("aes");
- 
- asmlinkage int aes_p10_set_encrypt_key(const u8 *userKey, const int bits,
--				      void *key);
-+				       void *key);
- asmlinkage void aes_p10_encrypt(const u8 *in, u8 *out, const void *key);
- asmlinkage void aes_p10_gcm_encrypt(u8 *in, u8 *out, size_t len,
- 				    void *rkey, u8 *iv, void *Xi);
-@@ -39,7 +41,8 @@ asmlinkage void aes_p10_gcm_decrypt(u8 *
- 				    void *rkey, u8 *iv, void *Xi);
- asmlinkage void gcm_init_htable(unsigned char htable[], unsigned char Xi[]);
- asmlinkage void gcm_ghash_p10(unsigned char *Xi, unsigned char *Htable,
--		unsigned char *aad, unsigned int alen);
-+			      unsigned char *aad, unsigned int alen);
-+asmlinkage void gcm_update(u8 *iv, void *Xi);
- 
- struct aes_key {
- 	u8 key[AES_MAX_KEYLENGTH];
-@@ -52,6 +55,7 @@ struct gcm_ctx {
- 	u8 aad_hash[16];
- 	u64 aadLen;
- 	u64 Plen;	/* offset 56 - used in aes_p10_gcm_{en/de}crypt */
-+	u8 pblock[16];
- };
- struct Hash_ctx {
- 	u8 H[16];	/* subkey */
-@@ -60,17 +64,20 @@ struct Hash_ctx {
- 
- struct p10_aes_gcm_ctx {
- 	struct aes_key enc_key;
-+	u8 nonce[RFC4106_NONCE_SIZE];
- };
- 
- static void vsx_begin(void)
- {
- 	preempt_disable();
-+	pagefault_disable();
- 	enable_kernel_vsx();
- }
- 
- static void vsx_end(void)
- {
- 	disable_kernel_vsx();
-+	pagefault_enable();
- 	preempt_enable();
- }
- 
-@@ -185,7 +192,7 @@ static int set_authsize(struct crypto_ae
- }
- 
- static int p10_aes_gcm_setkey(struct crypto_aead *aead, const u8 *key,
--			     unsigned int keylen)
-+			      unsigned int keylen)
- {
- 	struct crypto_tfm *tfm = crypto_aead_tfm(aead);
- 	struct p10_aes_gcm_ctx *ctx = crypto_tfm_ctx(tfm);
-@@ -198,7 +205,8 @@ static int p10_aes_gcm_setkey(struct cry
- 	return ret ? -EINVAL : 0;
- }
- 
--static int p10_aes_gcm_crypt(struct aead_request *req, int enc)
-+static int p10_aes_gcm_crypt(struct aead_request *req, u8 *riv,
-+			     int assoclen, int enc)
- {
- 	struct crypto_tfm *tfm = req->base.tfm;
- 	struct p10_aes_gcm_ctx *ctx = crypto_tfm_ctx(tfm);
-@@ -210,7 +218,6 @@ static int p10_aes_gcm_crypt(struct aead
- 	struct skcipher_walk walk;
- 	u8 *assocmem = NULL;
- 	u8 *assoc;
--	unsigned int assoclen = req->assoclen;
- 	unsigned int cryptlen = req->cryptlen;
- 	unsigned char ivbuf[AES_BLOCK_SIZE+PPC_ALIGN];
- 	unsigned char *iv = PTR_ALIGN((void *)ivbuf, PPC_ALIGN);
-@@ -218,11 +225,12 @@ static int p10_aes_gcm_crypt(struct aead
- 	unsigned long auth_tag_len = crypto_aead_authsize(__crypto_aead_cast(tfm));
- 	u8 otag[16];
- 	int total_processed = 0;
-+	int nbytes;
- 
- 	memset(databuf, 0, sizeof(databuf));
- 	memset(hashbuf, 0, sizeof(hashbuf));
- 	memset(ivbuf, 0, sizeof(ivbuf));
--	memcpy(iv, req->iv, GCM_IV_SIZE);
-+	memcpy(iv, riv, GCM_IV_SIZE);
- 
- 	/* Linearize assoc, if not already linear */
- 	if (req->src->length >= assoclen && req->src->length) {
-@@ -257,19 +265,25 @@ static int p10_aes_gcm_crypt(struct aead
- 	if (ret)
- 		return ret;
- 
--	while (walk.nbytes > 0 && ret == 0) {
-+	while ((nbytes = walk.nbytes) > 0 && ret == 0) {
-+		u8 *src = walk.src.virt.addr;
-+		u8 *dst = walk.dst.virt.addr;
-+		u8 buf[AES_BLOCK_SIZE];
-+
-+		if (unlikely(nbytes > 0 && nbytes < AES_BLOCK_SIZE))
-+			src = dst = memcpy(buf, src, nbytes);
- 
- 		vsx_begin();
- 		if (enc)
--			aes_p10_gcm_encrypt(walk.src.virt.addr,
--					    walk.dst.virt.addr,
--					    walk.nbytes,
-+			aes_p10_gcm_encrypt(src, dst, nbytes,
- 					    &ctx->enc_key, gctx->iv, hash->Htable);
- 		else
--			aes_p10_gcm_decrypt(walk.src.virt.addr,
--					    walk.dst.virt.addr,
--					    walk.nbytes,
-+			aes_p10_gcm_decrypt(src, dst, nbytes,
- 					    &ctx->enc_key, gctx->iv, hash->Htable);
-+
-+		if (unlikely(nbytes > 0 && nbytes < AES_BLOCK_SIZE))
-+			memcpy(walk.dst.virt.addr, buf, nbytes);
-+
- 		vsx_end();
- 
- 		total_processed += walk.nbytes;
-@@ -281,6 +295,7 @@ static int p10_aes_gcm_crypt(struct aead
- 
- 	/* Finalize hash */
- 	vsx_begin();
-+	gcm_update(gctx->iv, hash->Htable);
- 	finish_tag(gctx, hash, total_processed);
- 	vsx_end();
- 
-@@ -302,17 +317,63 @@ static int p10_aes_gcm_crypt(struct aead
- 	return 0;
- }
- 
-+static int rfc4106_setkey(struct crypto_aead *tfm, const u8 *inkey,
-+			  unsigned int keylen)
-+{
-+	struct p10_aes_gcm_ctx *ctx = crypto_aead_ctx(tfm);
-+	int err;
-+
-+	keylen -= RFC4106_NONCE_SIZE;
-+	err = p10_aes_gcm_setkey(tfm, inkey, keylen);
-+	if (err)
-+		return err;
-+
-+	memcpy(ctx->nonce, inkey + keylen, RFC4106_NONCE_SIZE);
-+	return 0;
-+}
-+
-+static int rfc4106_setauthsize(struct crypto_aead *tfm, unsigned int authsize)
-+{
-+	return crypto_rfc4106_check_authsize(authsize);
-+}
-+
-+static int rfc4106_encrypt(struct aead_request *req)
-+{
-+	struct crypto_aead *aead = crypto_aead_reqtfm(req);
-+	struct p10_aes_gcm_ctx *ctx = crypto_aead_ctx(aead);
-+	u8 iv[AES_BLOCK_SIZE];
-+
-+	memcpy(iv, ctx->nonce, RFC4106_NONCE_SIZE);
-+	memcpy(iv + RFC4106_NONCE_SIZE, req->iv, GCM_RFC4106_IV_SIZE);
-+
-+	return crypto_ipsec_check_assoclen(req->assoclen) ?:
-+	       p10_aes_gcm_crypt(req, iv, req->assoclen - GCM_RFC4106_IV_SIZE, 1);
-+}
-+
-+static int rfc4106_decrypt(struct aead_request *req)
-+{
-+	struct crypto_aead *aead = crypto_aead_reqtfm(req);
-+	struct p10_aes_gcm_ctx *ctx = crypto_aead_ctx(aead);
-+	u8 iv[AES_BLOCK_SIZE];
-+
-+	memcpy(iv, ctx->nonce, RFC4106_NONCE_SIZE);
-+	memcpy(iv + RFC4106_NONCE_SIZE, req->iv, GCM_RFC4106_IV_SIZE);
-+
-+	return crypto_ipsec_check_assoclen(req->assoclen) ?:
-+	       p10_aes_gcm_crypt(req, iv, req->assoclen - GCM_RFC4106_IV_SIZE, 0);
-+}
-+
- static int p10_aes_gcm_encrypt(struct aead_request *req)
- {
--	return p10_aes_gcm_crypt(req, 1);
-+	return p10_aes_gcm_crypt(req, req->iv, req->assoclen, 1);
- }
- 
- static int p10_aes_gcm_decrypt(struct aead_request *req)
- {
--	return p10_aes_gcm_crypt(req, 0);
-+	return p10_aes_gcm_crypt(req, req->iv, req->assoclen, 0);
- }
- 
--static struct aead_alg gcm_aes_alg = {
-+static struct aead_alg gcm_aes_algs[] = {{
- 	.ivsize			= GCM_IV_SIZE,
- 	.maxauthsize		= 16,
- 
-@@ -321,23 +382,57 @@ static struct aead_alg gcm_aes_alg = {
- 	.encrypt		= p10_aes_gcm_encrypt,
- 	.decrypt		= p10_aes_gcm_decrypt,
- 
--	.base.cra_name		= "gcm(aes)",
--	.base.cra_driver_name	= "aes_gcm_p10",
-+	.base.cra_name		= "__gcm(aes)",
-+	.base.cra_driver_name	= "__aes_gcm_p10",
- 	.base.cra_priority	= 2100,
- 	.base.cra_blocksize	= 1,
--	.base.cra_ctxsize	= sizeof(struct p10_aes_gcm_ctx),
-+	.base.cra_ctxsize	= sizeof(struct p10_aes_gcm_ctx)+
-+				  4 * sizeof(u64[2]),
- 	.base.cra_module	= THIS_MODULE,
--};
-+	.base.cra_flags		= CRYPTO_ALG_INTERNAL,
-+}, {
-+	.ivsize			= GCM_RFC4106_IV_SIZE,
-+	.maxauthsize		= 16,
-+	.setkey			= rfc4106_setkey,
-+	.setauthsize		= rfc4106_setauthsize,
-+	.encrypt		= rfc4106_encrypt,
-+	.decrypt		= rfc4106_decrypt,
-+
-+	.base.cra_name		= "__rfc4106(gcm(aes))",
-+	.base.cra_driver_name	= "__rfc4106_aes_gcm_p10",
-+	.base.cra_priority	= 2100,
-+	.base.cra_blocksize	= 1,
-+	.base.cra_ctxsize	= sizeof(struct p10_aes_gcm_ctx) +
-+				  4 * sizeof(u64[2]),
-+	.base.cra_module	= THIS_MODULE,
-+	.base.cra_flags		= CRYPTO_ALG_INTERNAL,
-+}};
-+
-+static struct simd_aead_alg *p10_simd_aeads[ARRAY_SIZE(gcm_aes_algs)];
- 
- static int __init p10_init(void)
- {
--	return crypto_register_aead(&gcm_aes_alg);
-+	int ret;
-+
-+	if (!cpu_has_feature(CPU_FTR_ARCH_31))
-+		return 0;
-+
-+	ret = simd_register_aeads_compat(gcm_aes_algs,
-+					 ARRAY_SIZE(gcm_aes_algs),
-+					 p10_simd_aeads);
-+	if (ret) {
-+		simd_unregister_aeads(gcm_aes_algs, ARRAY_SIZE(gcm_aes_algs),
-+				      p10_simd_aeads);
-+		return ret;
-+	}
-+	return 0;
- }
- 
- static void __exit p10_exit(void)
- {
--	crypto_unregister_aead(&gcm_aes_alg);
-+	simd_unregister_aeads(gcm_aes_algs, ARRAY_SIZE(gcm_aes_algs),
-+			      p10_simd_aeads);
- }
- 
--module_cpu_feature_match(PPC_MODULE_FEATURE_P10, p10_init);
-+module_init(p10_init);
- module_exit(p10_exit);
 --- a/arch/powerpc/include/asm/dtl.h
 +++ b/arch/powerpc/include/asm/dtl.h
 @@ -1,8 +1,8 @@
@@ -10991,248 +10693,6 @@
  	return 0;
  }
  
---- a/drivers/gpu/drm/imx/ipuv3/Kconfig
-+++ b/drivers/gpu/drm/imx/ipuv3/Kconfig
-@@ -11,8 +11,10 @@ config DRM_IMX
- 
- config DRM_IMX_PARALLEL_DISPLAY
- 	tristate "Support for parallel displays"
--	select DRM_PANEL
- 	depends on DRM_IMX
-+	select DRM_BRIDGE
-+	select DRM_BRIDGE_CONNECTOR
-+	select DRM_PANEL_BRIDGE
- 	select VIDEOMODE_HELPERS
- 
- config DRM_IMX_TVE
-@@ -26,9 +28,12 @@ config DRM_IMX_TVE
- 
- config DRM_IMX_LDB
- 	tristate "Support for LVDS displays"
--	depends on DRM_IMX && MFD_SYSCON
-+	depends on DRM_IMX
- 	depends on COMMON_CLK
--	select DRM_PANEL
-+	select MFD_SYSCON
-+	select DRM_BRIDGE
-+	select DRM_BRIDGE_CONNECTOR
-+	select DRM_PANEL_BRIDGE
- 	help
- 	  Choose this to enable the internal LVDS Display Bridge (LDB)
- 	  found on i.MX53 and i.MX6 processors.
---- a/drivers/gpu/drm/imx/ipuv3/imx-ldb.c
-+++ b/drivers/gpu/drm/imx/ipuv3/imx-ldb.c
-@@ -25,10 +25,8 @@
- #include <drm/drm_atomic.h>
- #include <drm/drm_atomic_helper.h>
- #include <drm/drm_bridge.h>
--#include <drm/drm_edid.h>
- #include <drm/drm_managed.h>
- #include <drm/drm_of.h>
--#include <drm/drm_panel.h>
- #include <drm/drm_print.h>
- #include <drm/drm_probe_helper.h>
- #include <drm/drm_simple_kms_helper.h>
-@@ -65,14 +63,10 @@ struct imx_ldb;
- struct imx_ldb_channel {
- 	struct imx_ldb *ldb;
- 
--	/* Defines what is connected to the ldb, only one at a time */
--	struct drm_panel *panel;
- 	struct drm_bridge *bridge;
- 
- 	struct device_node *child;
--	struct i2c_adapter *ddc;
- 	int chno;
--	const struct drm_edid *drm_edid;
- 	struct drm_display_mode mode;
- 	int mode_valid;
- 	u32 bus_format;
-@@ -138,19 +132,6 @@ static int imx_ldb_connector_get_modes(s
- 	struct imx_ldb_channel *imx_ldb_ch = con_to_imx_ldb_ch(connector);
- 	int num_modes;
- 
--	num_modes = drm_panel_get_modes(imx_ldb_ch->panel, connector);
--	if (num_modes > 0)
--		return num_modes;
--
--	if (!imx_ldb_ch->drm_edid && imx_ldb_ch->ddc) {
--		imx_ldb_ch->drm_edid = drm_edid_read_ddc(connector,
--							 imx_ldb_ch->ddc);
--		drm_edid_connector_update(connector, imx_ldb_ch->drm_edid);
--	}
--
--	if (imx_ldb_ch->drm_edid)
--		num_modes = drm_edid_connector_add_modes(connector);
--
- 	if (imx_ldb_ch->mode_valid) {
- 		struct drm_display_mode *mode;
- 
-@@ -205,8 +186,6 @@ static void imx_ldb_encoder_enable(struc
- 		return;
- 	}
- 
--	drm_panel_prepare(imx_ldb_ch->panel);
--
- 	if (dual) {
- 		clk_set_parent(ldb->clk_sel[mux], ldb->clk[0]);
- 		clk_set_parent(ldb->clk_sel[mux], ldb->clk[1]);
-@@ -245,8 +224,6 @@ static void imx_ldb_encoder_enable(struc
- 	}
- 
- 	regmap_write(ldb->regmap, IOMUXC_GPR2, ldb->ldb_ctrl);
--
--	drm_panel_enable(imx_ldb_ch->panel);
- }
- 
- static void
-@@ -323,8 +300,6 @@ static void imx_ldb_encoder_disable(stru
- 	int dual = ldb->ldb_ctrl & LDB_SPLIT_MODE_EN;
- 	int mux, ret;
- 
--	drm_panel_disable(imx_ldb_ch->panel);
--
- 	if (imx_ldb_ch == &ldb->channel[0] || dual)
- 		ldb->ldb_ctrl &= ~LDB_CH0_MODE_EN_MASK;
- 	if (imx_ldb_ch == &ldb->channel[1] || dual)
-@@ -358,8 +333,6 @@ static void imx_ldb_encoder_disable(stru
- 		dev_err(ldb->dev,
- 			"unable to set di%d parent clock to original parent\n",
- 			mux);
--
--	drm_panel_unprepare(imx_ldb_ch->panel);
- }
- 
- static int imx_ldb_encoder_atomic_check(struct drm_encoder *encoder,
-@@ -479,10 +452,9 @@ static int imx_ldb_register(struct drm_d
- 		 */
- 		drm_connector_helper_add(connector,
- 					 &imx_ldb_connector_helper_funcs);
--		drm_connector_init_with_ddc(drm, connector,
--					    &imx_ldb_connector_funcs,
--					    DRM_MODE_CONNECTOR_LVDS,
--					    imx_ldb_ch->ddc);
-+		drm_connector_init(drm, connector,
-+				   &imx_ldb_connector_funcs,
-+				   DRM_MODE_CONNECTOR_LVDS);
- 		drm_connector_attach_encoder(connector, encoder);
- 	}
- 
-@@ -549,47 +521,6 @@ static const struct of_device_id imx_ldb
- };
- MODULE_DEVICE_TABLE(of, imx_ldb_dt_ids);
- 
--static int imx_ldb_panel_ddc(struct device *dev,
--		struct imx_ldb_channel *channel, struct device_node *child)
--{
--	struct device_node *ddc_node;
--	int ret;
--
--	ddc_node = of_parse_phandle(child, "ddc-i2c-bus", 0);
--	if (ddc_node) {
--		channel->ddc = of_find_i2c_adapter_by_node(ddc_node);
--		of_node_put(ddc_node);
--		if (!channel->ddc) {
--			dev_warn(dev, "failed to get ddc i2c adapter\n");
--			return -EPROBE_DEFER;
--		}
--	}
--
--	if (!channel->ddc) {
--		const void *edidp;
--		int edid_len;
--
--		/* if no DDC available, fallback to hardcoded EDID */
--		dev_dbg(dev, "no ddc available\n");
--
--		edidp = of_get_property(child, "edid", &edid_len);
--		if (edidp) {
--			channel->drm_edid = drm_edid_alloc(edidp, edid_len);
--			if (!channel->drm_edid)
--				return -ENOMEM;
--		} else if (!channel->panel) {
--			/* fallback to display-timings node */
--			ret = of_get_drm_display_mode(child,
--						      &channel->mode,
--						      &channel->bus_flags,
--						      OF_USE_NATIVE_MODE);
--			if (!ret)
--				channel->mode_valid = 1;
--		}
--	}
--	return 0;
--}
--
- static int imx_ldb_bind(struct device *dev, struct device *master, void *data)
- {
- 	struct drm_device *drm = data;
-@@ -694,29 +625,32 @@ static int imx_ldb_probe(struct platform
- 		 * The output port is port@4 with an external 4-port mux or
- 		 * port@2 with the internal 2-port mux.
- 		 */
--		ret = drm_of_find_panel_or_bridge(child,
--						  imx_ldb->lvds_mux ? 4 : 2, 0,
--						  &channel->panel, &channel->bridge);
--		if (ret && ret != -ENODEV)
--			goto free_child;
-+		channel->bridge = devm_drm_of_get_bridge(dev, child,
-+						imx_ldb->lvds_mux ? 4 : 2, 0);
-+		if (IS_ERR(channel->bridge)) {
-+			ret = PTR_ERR(channel->bridge);
-+			if (ret != -ENODEV)
-+				goto free_child;
-+
-+			channel->bridge = NULL;
- 
--		/* panel ddc only if there is no bridge */
--		if (!channel->bridge) {
--			ret = imx_ldb_panel_ddc(dev, channel, child);
-+			ret = of_get_drm_display_mode(child,
-+						      &channel->mode,
-+						      &channel->bus_flags,
-+						      OF_USE_NATIVE_MODE);
- 			if (ret)
- 				goto free_child;
-+
-+			channel->mode_valid = 1;
- 		}
- 
- 		bus_format = of_get_bus_format(dev, child);
--		if (bus_format == -EINVAL) {
--			/*
--			 * If no bus format was specified in the device tree,
--			 * we can still get it from the connected panel later.
--			 */
--			if (channel->panel && channel->panel->funcs &&
--			    channel->panel->funcs->get_modes)
--				bus_format = 0;
--		}
-+		/*
-+		 * If no bus format was specified in the device tree,
-+		 * we can still get it from the connected panel later.
-+		 */
-+		if (bus_format == -EINVAL && channel->bridge)
-+			bus_format = 0;
- 		if (bus_format < 0) {
- 			dev_err(dev, "could not determine data mapping: %d\n",
- 				bus_format);
-@@ -738,16 +672,6 @@ free_child:
- 
- static void imx_ldb_remove(struct platform_device *pdev)
- {
--	struct imx_ldb *imx_ldb = platform_get_drvdata(pdev);
--	int i;
--
--	for (i = 0; i < 2; i++) {
--		struct imx_ldb_channel *channel = &imx_ldb->channel[i];
--
--		drm_edid_free(channel->drm_edid);
--		i2c_put_adapter(channel->ddc);
--	}
--
- 	component_del(&pdev->dev, &imx_ldb_ops);
- }
- 
 --- a/drivers/gpu/drm/imx/ipuv3/ipuv3-crtc.c
 +++ b/drivers/gpu/drm/imx/ipuv3/ipuv3-crtc.c
 @@ -410,14 +410,12 @@ static int ipu_drm_bind(struct device *d
@@ -11252,123 +10712,6 @@
  
  	return 0;
  }
---- a/drivers/gpu/drm/imx/ipuv3/parallel-display.c
-+++ b/drivers/gpu/drm/imx/ipuv3/parallel-display.c
-@@ -16,10 +16,8 @@
- 
- #include <drm/drm_atomic_helper.h>
- #include <drm/drm_bridge.h>
--#include <drm/drm_edid.h>
- #include <drm/drm_managed.h>
- #include <drm/drm_of.h>
--#include <drm/drm_panel.h>
- #include <drm/drm_probe_helper.h>
- #include <drm/drm_simple_kms_helper.h>
- 
-@@ -34,11 +32,9 @@ struct imx_parallel_display_encoder {
- 
- struct imx_parallel_display {
- 	struct device *dev;
--	const struct drm_edid *drm_edid;
- 	u32 bus_format;
- 	u32 bus_flags;
- 	struct drm_display_mode mode;
--	struct drm_panel *panel;
- 	struct drm_bridge *next_bridge;
- };
- 
-@@ -58,15 +54,6 @@ static int imx_pd_connector_get_modes(st
- 	struct device_node *np = imxpd->dev->of_node;
- 	int num_modes;
- 
--	num_modes = drm_panel_get_modes(imxpd->panel, connector);
--	if (num_modes > 0)
--		return num_modes;
--
--	if (imxpd->drm_edid) {
--		drm_edid_connector_update(connector, imxpd->drm_edid);
--		num_modes = drm_edid_connector_add_modes(connector);
--	}
--
- 	if (np) {
- 		struct drm_display_mode *mode = drm_mode_create(connector->dev);
- 		int ret;
-@@ -91,22 +78,6 @@ static int imx_pd_connector_get_modes(st
- 	return num_modes;
- }
- 
--static void imx_pd_bridge_enable(struct drm_bridge *bridge)
--{
--	struct imx_parallel_display *imxpd = bridge_to_imxpd(bridge);
--
--	drm_panel_prepare(imxpd->panel);
--	drm_panel_enable(imxpd->panel);
--}
--
--static void imx_pd_bridge_disable(struct drm_bridge *bridge)
--{
--	struct imx_parallel_display *imxpd = bridge_to_imxpd(bridge);
--
--	drm_panel_disable(imxpd->panel);
--	drm_panel_unprepare(imxpd->panel);
--}
--
- static const u32 imx_pd_bus_fmts[] = {
- 	MEDIA_BUS_FMT_RGB888_1X24,
- 	MEDIA_BUS_FMT_BGR888_1X24,
-@@ -244,8 +215,6 @@ static const struct drm_connector_helper
- };
- 
- static const struct drm_bridge_funcs imx_pd_bridge_funcs = {
--	.enable = imx_pd_bridge_enable,
--	.disable = imx_pd_bridge_disable,
- 	.atomic_reset = drm_atomic_helper_bridge_reset,
- 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
- 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
-@@ -312,9 +281,7 @@ static int imx_pd_probe(struct platform_
- {
- 	struct device *dev = &pdev->dev;
- 	struct device_node *np = dev->of_node;
--	const u8 *edidp;
- 	struct imx_parallel_display *imxpd;
--	int edid_len;
- 	int ret;
- 	u32 bus_format = 0;
- 	const char *fmt;
-@@ -324,14 +291,14 @@ static int imx_pd_probe(struct platform_
- 		return -ENOMEM;
- 
- 	/* port@1 is the output port */
--	ret = drm_of_find_panel_or_bridge(np, 1, 0, &imxpd->panel,
--					  &imxpd->next_bridge);
--	if (ret && ret != -ENODEV)
--		return ret;
-+	imxpd->next_bridge = devm_drm_of_get_bridge(dev, np, 1, 0);
-+	if (IS_ERR(imxpd->next_bridge)) {
-+		ret = PTR_ERR(imxpd->next_bridge);
-+		if (ret != -ENODEV)
-+			return ret;
- 
--	edidp = of_get_property(np, "edid", &edid_len);
--	if (edidp)
--		imxpd->drm_edid = drm_edid_alloc(edidp, edid_len);
-+		imxpd->next_bridge = NULL;
-+	}
- 
- 	ret = of_property_read_string(np, "interface-pix-fmt", &fmt);
- 	if (!ret) {
-@@ -355,11 +322,7 @@ static int imx_pd_probe(struct platform_
- 
- static void imx_pd_remove(struct platform_device *pdev)
- {
--	struct imx_parallel_display *imxpd = platform_get_drvdata(pdev);
--
- 	component_del(&pdev->dev, &imx_pd_ops);
--
--	drm_edid_free(imxpd->drm_edid);
- }
- 
- static const struct of_device_id imx_pd_dt_ids[] = {
 --- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
 +++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
 @@ -1522,15 +1522,13 @@ static int a6xx_gmu_get_irq(struct a6xx_
@@ -16701,72 +16044,6 @@
  	return 0;
  }
  
---- a/drivers/media/platform/qcom/venus/vdec.c
-+++ b/drivers/media/platform/qcom/venus/vdec.c
-@@ -1748,15 +1748,26 @@ static int vdec_close(struct file *file)
- 	vdec_pm_get(inst);
- 
- 	cancel_work_sync(&inst->delayed_process_work);
-+	/*
-+	 * First, remove the inst from the ->instances list, so that
-+	 * to_instance() will return NULL.
-+	 */
-+	hfi_session_destroy(inst);
-+	/*
-+	 * Second, make sure we don't have IRQ/IRQ-thread currently running
-+	 * or pending execution, which would race with the inst destruction.
-+	 */
-+	synchronize_irq(inst->core->irq);
-+
- 	v4l2_m2m_ctx_release(inst->m2m_ctx);
- 	v4l2_m2m_release(inst->m2m_dev);
--	vdec_ctrl_deinit(inst);
- 	ida_destroy(&inst->dpb_ids);
--	hfi_session_destroy(inst);
--	mutex_destroy(&inst->lock);
--	mutex_destroy(&inst->ctx_q_lock);
- 	v4l2_fh_del(&inst->fh);
- 	v4l2_fh_exit(&inst->fh);
-+	vdec_ctrl_deinit(inst);
-+
-+	mutex_destroy(&inst->lock);
-+	mutex_destroy(&inst->ctx_q_lock);
- 
- 	vdec_pm_put(inst, false);
- 
---- a/drivers/media/platform/qcom/venus/venc.c
-+++ b/drivers/media/platform/qcom/venus/venc.c
-@@ -1515,16 +1515,26 @@ static int venc_close(struct file *file)
- 
- 	venc_pm_get(inst);
- 
-+	/*
-+	 * First, remove the inst from the ->instances list, so that
-+	 * to_instance() will return NULL.
-+	 */
-+	hfi_session_destroy(inst);
-+	/*
-+	 * Second, make sure we don't have IRQ/IRQ-thread currently running
-+	 * or pending execution, which would race with the inst destruction.
-+	 */
-+	synchronize_irq(inst->core->irq);
-+
- 	v4l2_m2m_ctx_release(inst->m2m_ctx);
- 	v4l2_m2m_release(inst->m2m_dev);
--	venc_ctrl_deinit(inst);
--	hfi_session_destroy(inst);
--	mutex_destroy(&inst->lock);
--	mutex_destroy(&inst->ctx_q_lock);
- 	v4l2_fh_del(&inst->fh);
- 	v4l2_fh_exit(&inst->fh);
-+	venc_ctrl_deinit(inst);
- 
- 	inst->enc_state = VENUS_ENC_STATE_DEINIT;
-+	mutex_destroy(&inst->lock);
-+	mutex_destroy(&inst->ctx_q_lock);
- 
- 	venc_pm_put(inst, false);
- 
 --- a/drivers/media/radio/wl128x/fmdrv_common.c
 +++ b/drivers/media/radio/wl128x/fmdrv_common.c
 @@ -466,11 +466,12 @@ int fmc_send_cmd(struct fmdev *fmdev, u8
@@ -16820,6 +16097,17 @@
  	}
  	return false;
  }
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -371,7 +371,7 @@ static int uvc_parse_format(struct uvc_d
+ 	 * Parse the frame descriptors. Only uncompressed, MJPEG and frame
+ 	 * based formats have frame descriptors.
+ 	 */
+-	while (buflen > 2 && buffer[1] == USB_DT_CS_INTERFACE &&
++	while (ftype && buflen > 2 && buffer[1] == USB_DT_CS_INTERFACE &&
+ 	       buffer[2] == ftype) {
+ 		unsigned int maxIntervalIndex;
+ 
 --- a/drivers/media/v4l2-core/v4l2-dv-timings.c
 +++ b/drivers/media/v4l2-core/v4l2-dv-timings.c
 @@ -481,25 +481,28 @@ EXPORT_SYMBOL_GPL(v4l2_calc_timeperframe
@@ -39650,6 +38938,48 @@
  	} else if (READ_ONCE(rdp->nocb_cb_sleep)) {
  		WARN_ON(signal_pending(current));
  		trace_rcu_nocb_wake(rcu_state.name, rdp->cpu, TPS("WokeEmpty"));
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4424,7 +4424,8 @@ int wake_up_state(struct task_struct *p,
+  * Perform scheduler related setup for a newly forked process p.
+  * p is forked by current.
+  *
+- * __sched_fork() is basic setup used by init_idle() too:
++ * __sched_fork() is basic setup which is also used by sched_init() to
++ * initialize the boot CPU's idle task.
+  */
+ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ {
+@@ -7683,8 +7684,6 @@ void __init init_idle(struct task_struct
+ 	struct rq *rq = cpu_rq(cpu);
+ 	unsigned long flags;
+ 
+-	__sched_fork(0, idle);
+-
+ 	raw_spin_lock_irqsave(&idle->pi_lock, flags);
+ 	raw_spin_rq_lock(rq);
+ 
+@@ -7699,10 +7698,8 @@ void __init init_idle(struct task_struct
+ 
+ #ifdef CONFIG_SMP
+ 	/*
+-	 * It's possible that init_idle() gets called multiple times on a task,
+-	 * in that case do_set_cpus_allowed() will not do the right thing.
+-	 *
+-	 * And since this is boot we can forgo the serialization.
++	 * No validation and serialization required at boot time and for
++	 * setting up the idle tasks of not yet online CPUs.
+ 	 */
+ 	set_cpus_allowed_common(idle, &ac);
+ #endif
+@@ -8546,6 +8543,7 @@ void __init sched_init(void)
+ 	 * but because we are the idle thread, we just pick up running again
+ 	 * when this runqueue becomes "idle".
+ 	 */
++	__sched_fork(0, current);
+ 	init_idle(current, smp_processor_id());
+ 
+ 	calc_load_update = jiffies + LOAD_FREQ;
 --- a/kernel/sched/cpufreq_schedutil.c
 +++ b/kernel/sched/cpufreq_schedutil.c
 @@ -783,9 +783,8 @@ static int sugov_init(struct cpufreq_pol
@@ -39815,6 +39145,28 @@
  	int __ret_warn_once = !!(cond);					\
  									\
  	if (unlikely(!(gfp & __GFP_NOWARN) && __ret_warn_once && !__warned)) { \
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1491,7 +1491,18 @@ static unsigned long __mmap_region(struc
+ 				vm_flags = vma->vm_flags;
+ 				goto file_expanded;
+ 			}
+-			vma_iter_config(&vmi, addr, end);
++
++			/*
++			 * In the unlikely even that more memory was needed, but
++			 * not available for the vma merge, the vma iterator
++			 * will have no memory reserved for the write we told
++			 * the driver was happening.  To keep up the ruse,
++			 * ensure the allocation for the store succeeds.
++			 */
++			if (vmg_nomem(&vmg)) {
++				mas_preallocate(&vmi.mas, vma,
++						GFP_KERNEL|__GFP_NOFAIL);
++			}
+ 		}
+ 
+ 		vm_flags = vma->vm_flags;
 --- a/net/9p/trans_usbg.c
 +++ b/net/9p/trans_usbg.c
 @@ -909,9 +909,9 @@ static struct usb_function_instance *usb
@@ -41918,6 +41270,16 @@
  	}
  
  	rc = lower_transport->xprt_err;
+--- a/net/vmw_vsock/hyperv_transport.c
++++ b/net/vmw_vsock/hyperv_transport.c
+@@ -549,6 +549,7 @@ static void hvs_destruct(struct vsock_so
+ 		vmbus_hvsock_device_unregister(chan);
+ 
+ 	kfree(hvs);
++	vsk->trans = NULL;
+ }
+ 
+ static int hvs_dgram_bind(struct vsock_sock *vsk, struct sockaddr_vm *addr)
 --- a/net/wireless/core.c
 +++ b/net/wireless/core.c
 @@ -603,16 +603,20 @@ use_default_name:
@@ -45251,28 +44613,6 @@
  type=3
  config=66048
  optional=1
---- a/tools/perf/tests/shell/test_stat_intel_tpebs.sh
-+++ b/tools/perf/tests/shell/test_stat_intel_tpebs.sh
-@@ -8,12 +8,15 @@ grep -q GenuineIntel /proc/cpuinfo || {
- # Use this event for testing because it should exist in all platforms
- event=cache-misses:R
- 
-+# Hybrid platforms output like "cpu_atom/cache-misses/R", rather than as above
-+alt_name=/cache-misses/R
-+
- # Without this cmd option, default value or zero is returned
--echo "Testing without --record-tpebs"
--result=$(perf stat -e "$event" true 2>&1)
--[[ "$result" =~ $event ]] || exit 1
-+#echo "Testing without --record-tpebs"
-+#result=$(perf stat -e "$event" true 2>&1)
-+#[[ "$result" =~ $event || "$result" =~ $alt_name ]] || exit 1
- 
- # In platforms that do not support TPEBS, it should execute without error.
- echo "Testing with --record-tpebs"
- result=$(perf stat -e "$event" --record-tpebs -a sleep 0.01 2>&1)
--[[ "$result" =~ "perf record" && "$result" =~ $event ]] || exit 1
-+[[ "$result" =~ "perf record" && "$result" =~ $event || "$result" =~ $alt_name ]] || exit 1
 --- a/tools/perf/util/bpf-filter.c
 +++ b/tools/perf/util/bpf-filter.c
 @@ -375,7 +375,7 @@ static int create_idx_hash(struct evsel
@@ -45580,139 +44920,6 @@
  	Dwarf_CFI		*cfi_dbg;
  #endif
  	Dwarf_Op		*fb_ops;	/* Frame base attribute */
---- a/tools/perf/util/stat-display.c
-+++ b/tools/perf/util/stat-display.c
-@@ -871,38 +871,66 @@ static void printout(struct perf_stat_co
- 
- static void uniquify_event_name(struct evsel *counter)
- {
--	char *new_name;
--	char *config;
--	int ret = 0;
-+	const char *name, *pmu_name;
-+	char *new_name, *config;
-+	int ret;
- 
--	if (counter->uniquified_name || counter->use_config_name ||
--	    !counter->pmu_name || !strncmp(evsel__name(counter), counter->pmu_name,
--					   strlen(counter->pmu_name)))
-+	/* The evsel was already uniquified. */
-+	if (counter->uniquified_name)
- 		return;
- 
--	config = strchr(counter->name, '/');
-+	/* Avoid checking to uniquify twice. */
-+	counter->uniquified_name = true;
-+
-+	/* The evsel has a "name=" config term or is from libpfm. */
-+	if (counter->use_config_name || counter->is_libpfm_event)
-+		return;
-+
-+	/* Legacy no PMU event, don't uniquify. */
-+	if  (!counter->pmu ||
-+	     (counter->pmu->type < PERF_TYPE_MAX && counter->pmu->type != PERF_TYPE_RAW))
-+		return;
-+
-+	/* A sysfs or json event replacing a legacy event, don't uniquify. */
-+	if (counter->pmu->is_core && counter->alternate_hw_config != PERF_COUNT_HW_MAX)
-+		return;
-+
-+	name = evsel__name(counter);
-+	pmu_name = counter->pmu->name;
-+	/* Already prefixed by the PMU name. */
-+	if (!strncmp(name, pmu_name, strlen(pmu_name)))
-+		return;
-+
-+	config = strchr(name, '/');
- 	if (config) {
--		if (asprintf(&new_name,
--			     "%s%s", counter->pmu_name, config) > 0) {
--			free(counter->name);
--			counter->name = new_name;
--		}
--	} else {
--		if (evsel__is_hybrid(counter)) {
--			ret = asprintf(&new_name, "%s/%s/",
--				       counter->pmu_name, counter->name);
-+		int len = config - name;
-+
-+		if (config[1] == '/') {
-+			/* case: event// */
-+			ret = asprintf(&new_name, "%s/%.*s/%s", pmu_name, len, name, config + 2);
- 		} else {
--			ret = asprintf(&new_name, "%s [%s]",
--				       counter->name, counter->pmu_name);
-+			/* case: event/.../ */
-+			ret = asprintf(&new_name, "%s/%.*s,%s", pmu_name, len, name, config + 1);
- 		}
-+	} else {
-+		config = strchr(name, ':');
-+		if (config) {
-+			/* case: event:.. */
-+			int len = config - name;
- 
--		if (ret) {
--			free(counter->name);
--			counter->name = new_name;
-+			ret = asprintf(&new_name, "%s/%.*s/%s", pmu_name, len, name, config + 1);
-+		} else {
-+			/* case: event */
-+			ret = asprintf(&new_name, "%s/%s/", pmu_name, name);
- 		}
- 	}
--
--	counter->uniquified_name = true;
-+	if (ret > 0) {
-+		free(counter->name);
-+		counter->name = new_name;
-+	} else {
-+		/* ENOMEM from asprintf. */
-+		counter->uniquified_name = false;
-+	}
- }
- 
- static bool hybrid_uniquify(struct evsel *evsel, struct perf_stat_config *config)
-@@ -1559,6 +1587,31 @@ static void print_cgroup_counter(struct
- 		print_metric_end(config, os);
- }
- 
-+static void disable_uniquify(struct evlist *evlist)
-+{
-+	struct evsel *counter;
-+	struct perf_pmu *last_pmu = NULL;
-+	bool first = true;
-+
-+	evlist__for_each_entry(evlist, counter) {
-+		/* If PMUs vary then uniquify can be useful. */
-+		if (!first && counter->pmu != last_pmu)
-+			return;
-+		first = false;
-+		if (counter->pmu) {
-+			/* Allow uniquify for uncore PMUs. */
-+			if (!counter->pmu->is_core)
-+				return;
-+			/* Keep hybrid event names uniquified for clarity. */
-+			if (perf_pmus__num_core_pmus() > 1)
-+				return;
-+		}
-+	}
-+	evlist__for_each_entry_continue(evlist, counter) {
-+		counter->uniquified_name = true;
-+	}
-+}
-+
- void evlist__print_counters(struct evlist *evlist, struct perf_stat_config *config,
- 			    struct target *_target, struct timespec *ts,
- 			    int argc, const char **argv)
-@@ -1572,6 +1625,8 @@ void evlist__print_counters(struct evlis
- 		.first = true,
- 	};
- 
-+	disable_uniquify(evlist);
-+
- 	if (config->iostat_run)
- 		evlist->selected = evlist__first(evlist);
- 
 --- a/tools/power/x86/turbostat/turbostat.c
 +++ b/tools/power/x86/turbostat/turbostat.c
 @@ -5385,6 +5385,9 @@ static int parse_cpu_str(char *cpu_str,
