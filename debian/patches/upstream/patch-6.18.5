@@ -1108,7 +1108,7 @@
  VERSION = 6
  PATCHLEVEL = 18
 -SUBLEVEL = 0
-+SUBLEVEL = 4
++SUBLEVEL = 5
  EXTRAVERSION =
  NAME = Baby Opossum Posse
  
@@ -38409,6 +38409,62 @@
  	if (unlikely(len < nf_dio_offset_align))
  		return false;
  
+@@ -625,8 +623,6 @@ static void nfs_local_call_read(struct w
+ 	ssize_t status;
+ 	int n_iters;
+ 
+-	save_cred = override_creds(filp->f_cred);
+-
+ 	n_iters = atomic_read(&iocb->n_iters);
+ 	for (int i = 0; i < n_iters ; i++) {
+ 		if (iocb->iter_is_dio_aligned[i]) {
+@@ -639,7 +635,10 @@ static void nfs_local_call_read(struct w
+ 		} else
+ 			iocb->kiocb.ki_flags &= ~IOCB_DIRECT;
+ 
++		save_cred = override_creds(filp->f_cred);
+ 		status = filp->f_op->read_iter(&iocb->kiocb, &iocb->iters[i]);
++		revert_creds(save_cred);
++
+ 		if (status != -EIOCBQUEUED) {
+ 			if (unlikely(status >= 0 && status < iocb->iters[i].count))
+ 				force_done = true; /* Partial read */
+@@ -649,8 +648,6 @@ static void nfs_local_call_read(struct w
+ 			}
+ 		}
+ 	}
+-
+-	revert_creds(save_cred);
+ }
+ 
+ static int
+@@ -832,7 +829,6 @@ static void nfs_local_call_write(struct
+ 	int n_iters;
+ 
+ 	current->flags |= PF_LOCAL_THROTTLE | PF_MEMALLOC_NOIO;
+-	save_cred = override_creds(filp->f_cred);
+ 
+ 	file_start_write(filp);
+ 	n_iters = atomic_read(&iocb->n_iters);
+@@ -847,7 +843,10 @@ static void nfs_local_call_write(struct
+ 		} else
+ 			iocb->kiocb.ki_flags &= ~IOCB_DIRECT;
+ 
++		save_cred = override_creds(filp->f_cred);
+ 		status = filp->f_op->write_iter(&iocb->kiocb, &iocb->iters[i]);
++		revert_creds(save_cred);
++
+ 		if (status != -EIOCBQUEUED) {
+ 			if (unlikely(status >= 0 && status < iocb->iters[i].count))
+ 				force_done = true; /* Partial write */
+@@ -859,7 +858,6 @@ static void nfs_local_call_write(struct
+ 	}
+ 	file_end_write(filp);
+ 
+-	revert_creds(save_cred);
+ 	current->flags = old_flags;
+ }
+ 
 --- a/fs/nfs/namespace.c
 +++ b/fs/nfs/namespace.c
 @@ -149,6 +149,7 @@ struct vfsmount *nfs_d_automount(struct
@@ -41094,6 +41150,18 @@
  #include <linux/err.h>
  #include <linux/errno.h>
  #include <linux/types.h>
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -92,6 +92,9 @@ struct sched_domain {
+ 	unsigned int nr_balance_failed; /* initialise to 0 */
+ 
+ 	/* idle_balance() stats */
++	unsigned int newidle_call;
++	unsigned int newidle_success;
++	unsigned int newidle_ratio;
+ 	u64 max_newidle_lb_cost;
+ 	unsigned long last_decay_max_lb_cost;
+ 
 --- a/include/linux/slab.h
 +++ b/include/linux/slab.h
 @@ -1150,10 +1150,17 @@ static inline void kvfree_rcu_barrier(vo
@@ -43337,6 +43405,25 @@
  		/* Found a match, break */
  		if (is_type_match(p, flags, desc))
  			break;
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -121,6 +121,7 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_updat
+ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_compute_energy_tp);
+ 
+ DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
++DEFINE_PER_CPU(struct rnd_state, sched_rnd_state);
+ 
+ #ifdef CONFIG_SCHED_PROXY_EXEC
+ DEFINE_STATIC_KEY_TRUE(__sched_proxy_exec);
+@@ -8591,6 +8592,8 @@ void __init sched_init_smp(void)
+ {
+ 	sched_init_numa(NUMA_NO_NODE);
+ 
++	prandom_init_once(&sched_rnd_state);
++
+ 	/*
+ 	 * There's no userspace yet to cause hotplug operations; hence all the
+ 	 * CPU masks are stable and all blatant races in the below code cannot
 --- a/kernel/sched/cpudeadline.c
 +++ b/kernel/sched/cpudeadline.c
 @@ -166,12 +166,13 @@ int cpudl_find(struct cpudl *cp, struct
@@ -43756,15 +43843,15 @@
 -	}
 -	return min_vruntime;
 -}
-+	u64 vruntime = avg_vruntime(cfs_rq);
-+	s64 delta = (s64)(vruntime - cfs_rq->zero_vruntime);
- 
+-
 -static void update_min_vruntime(struct cfs_rq *cfs_rq)
 -{
 -	struct sched_entity *se = __pick_root_entity(cfs_rq);
 -	struct sched_entity *curr = cfs_rq->curr;
 -	u64 vruntime = cfs_rq->min_vruntime;
--
++	u64 vruntime = avg_vruntime(cfs_rq);
++	s64 delta = (s64)(vruntime - cfs_rq->zero_vruntime);
+ 
 -	if (curr) {
 -		if (curr->on_rq)
 -			vruntime = curr->vruntime;
@@ -43881,7 +43968,33 @@
  }
  
  static bool yield_to_task_fair(struct rq *rq, struct task_struct *p)
-@@ -12159,14 +12128,8 @@ static inline bool update_newidle_cost(s
+@@ -12153,30 +12122,43 @@ void update_max_interval(void)
+ 	max_load_balance_interval = HZ*num_online_cpus()/10;
+ }
+ 
+-static inline bool update_newidle_cost(struct sched_domain *sd, u64 cost)
++static inline void update_newidle_stats(struct sched_domain *sd, unsigned int success)
+ {
++	sd->newidle_call++;
++	sd->newidle_success += success;
++
++	if (sd->newidle_call >= 1024) {
++		sd->newidle_ratio = sd->newidle_success;
++		sd->newidle_call /= 2;
++		sd->newidle_success /= 2;
++	}
++}
++
++static inline bool
++update_newidle_cost(struct sched_domain *sd, u64 cost, unsigned int success)
++{
++	unsigned long next_decay = sd->last_decay_max_lb_cost + HZ;
++	unsigned long now = jiffies;
++
++	if (cost)
++		update_newidle_stats(sd, success);
++
+ 	if (cost > sd->max_newidle_lb_cost) {
  		/*
  		 * Track max cost of a domain to make sure to not delay the
  		 * next wakeup on the CPU.
@@ -43890,34 +44003,99 @@
 -		 * balance fails, and we don't want things to grow out of
 -		 * control.  Use the sysctl_sched_migration_cost as the upper
 -		 * limit, plus a litle extra to avoid off by ones.
- 		 */
+-		 */
 -		sd->max_newidle_lb_cost =
 -			min(cost, sysctl_sched_migration_cost + 200);
+-		sd->last_decay_max_lb_cost = jiffies;
+-	} else if (time_after(jiffies, sd->last_decay_max_lb_cost + HZ)) {
++		 */
 +		sd->max_newidle_lb_cost = cost;
- 		sd->last_decay_max_lb_cost = jiffies;
- 	} else if (time_after(jiffies, sd->last_decay_max_lb_cost + HZ)) {
- 		/*
-@@ -12858,17 +12821,10 @@ static int sched_balance_newidle(struct
- 
- 			t1 = sched_clock_cpu(this_cpu);
- 			domain_cost = t1 - t0;
-+			update_newidle_cost(sd, domain_cost);
++		sd->last_decay_max_lb_cost = now;
 +
- 			curr_cost += domain_cost;
- 			t0 = t1;
++	} else if (time_after(now, next_decay)) {
+ 		/*
+ 		 * Decay the newidle max times by ~1% per second to ensure that
+ 		 * it is not outdated and the current max cost is actually
+ 		 * shorter.
+ 		 */
+ 		sd->max_newidle_lb_cost = (sd->max_newidle_lb_cost * 253) / 256;
+-		sd->last_decay_max_lb_cost = jiffies;
 -
--			/*
++		sd->last_decay_max_lb_cost = now;
+ 		return true;
+ 	}
+ 
+@@ -12208,7 +12190,7 @@ static void sched_balance_domains(struct
+ 		 * Decay the newidle max times here because this is a regular
+ 		 * visit to all the domains.
+ 		 */
+-		need_decay = update_newidle_cost(sd, 0);
++		need_decay = update_newidle_cost(sd, 0, 0);
+ 		max_cost += sd->max_newidle_lb_cost;
+ 
+ 		/*
+@@ -12824,14 +12806,16 @@ static int sched_balance_newidle(struct
+ 
+ 	rcu_read_lock();
+ 	sd = rcu_dereference_check_sched_domain(this_rq->sd);
++	if (!sd) {
++		rcu_read_unlock();
++		goto out;
++	}
+ 
+ 	if (!get_rd_overloaded(this_rq->rd) ||
+-	    (sd && this_rq->avg_idle < sd->max_newidle_lb_cost)) {
++	    this_rq->avg_idle < sd->max_newidle_lb_cost) {
+ 
+-		if (sd)
+-			update_next_balance(sd, &next_balance);
++		update_next_balance(sd, &next_balance);
+ 		rcu_read_unlock();
+-
+ 		goto out;
+ 	}
+ 	rcu_read_unlock();
+@@ -12851,6 +12835,22 @@ static int sched_balance_newidle(struct
+ 			break;
+ 
+ 		if (sd->flags & SD_BALANCE_NEWIDLE) {
++			unsigned int weight = 1;
++
++			if (sched_feat(NI_RANDOM)) {
++				/*
++				 * Throw a 1k sided dice; and only run
++				 * newidle_balance according to the success
++				 * rate.
++				 */
++				u32 d1k = sched_rng() % 1024;
++				weight = 1 + sd->newidle_ratio;
++				if (d1k > weight) {
++					update_newidle_stats(sd, 0);
++					continue;
++				}
++				weight = (1024 + weight/2) / weight;
++			}
+ 
+ 			pulled_task = sched_balance_rq(this_cpu, this_rq,
+ 						   sd, CPU_NEWLY_IDLE,
+@@ -12862,13 +12862,10 @@ static int sched_balance_newidle(struct
+ 			t0 = t1;
+ 
+ 			/*
 -			 * Failing newidle means it is not effective;
 -			 * bump the cost so we end up doing less of it.
--			 */
++			 * Track max cost of a domain to make sure to not delay the
++			 * next wakeup on the CPU.
+ 			 */
 -			if (!pulled_task)
 -				domain_cost = (3 * sd->max_newidle_lb_cost) / 2;
 -
 -			update_newidle_cost(sd, domain_cost);
++			update_newidle_cost(sd, domain_cost, weight * !!pulled_task);
  		}
  
  		/*
-@@ -13012,7 +12968,170 @@ static inline void task_tick_core(struct
+@@ -13012,7 +13009,170 @@ static inline void task_tick_core(struct
  }
  
  /*
@@ -44089,7 +44267,7 @@
   */
  static void se_fi_update(const struct sched_entity *se, unsigned int fi_seq,
  			 bool forceidle)
-@@ -13026,7 +13145,7 @@ static void se_fi_update(const struct sc
+@@ -13026,7 +13186,7 @@ static void se_fi_update(const struct sc
  			cfs_rq->forceidle_seq = fi_seq;
  		}
  
@@ -44098,7 +44276,7 @@
  	}
  }
  
-@@ -13079,11 +13198,11 @@ bool cfs_prio_less(const struct task_str
+@@ -13079,11 +13239,11 @@ bool cfs_prio_less(const struct task_str
  
  	/*
  	 * Find delta after normalizing se's vruntime with its cfs_rq's
@@ -44112,7 +44290,7 @@
  
  	return delta > 0;
  }
-@@ -13319,7 +13438,7 @@ static void set_next_task_fair(struct rq
+@@ -13319,7 +13479,7 @@ static void set_next_task_fair(struct rq
  void init_cfs_rq(struct cfs_rq *cfs_rq)
  {
  	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
@@ -44121,6 +44299,17 @@
  	raw_spin_lock_init(&cfs_rq->removed.lock);
  }
  
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -121,3 +121,8 @@ SCHED_FEAT(WA_BIAS, true)
+ SCHED_FEAT(UTIL_EST, true)
+ 
+ SCHED_FEAT(LATENCY_WARN, false)
++
++/*
++ * Do newidle balancing proportional to its success rate using randomization.
++ */
++SCHED_FEAT(NI_RANDOM, true)
 --- a/kernel/sched/rt.c
 +++ b/kernel/sched/rt.c
 @@ -1490,7 +1490,7 @@ static void requeue_task_rt(struct rq *r
@@ -44134,7 +44323,15 @@
  static int find_lowest_rq(struct task_struct *task);
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -682,10 +682,10 @@ struct cfs_rq {
+@@ -5,6 +5,7 @@
+ #ifndef _KERNEL_SCHED_SCHED_H
+ #define _KERNEL_SCHED_SCHED_H
+ 
++#include <linux/prandom.h>
+ #include <linux/sched/affinity.h>
+ #include <linux/sched/autogroup.h>
+ #include <linux/sched/cpufreq.h>
+@@ -682,10 +683,10 @@ struct cfs_rq {
  	s64			avg_vruntime;
  	u64			avg_load;
  
@@ -44147,6 +44344,19 @@
  #endif
  
  	struct rb_root_cached	tasks_timeline;
+@@ -1349,6 +1350,12 @@ static inline bool is_migration_disabled
+ }
+ 
+ DECLARE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
++DECLARE_PER_CPU(struct rnd_state, sched_rnd_state);
++
++static inline u32 sched_rng(void)
++{
++	return prandom_u32_state(this_cpu_ptr(&sched_rnd_state));
++}
+ 
+ #define cpu_rq(cpu)		(&per_cpu(runqueues, (cpu)))
+ #define this_rq()		this_cpu_ptr(&runqueues)
 --- a/kernel/sched/stats.h
 +++ b/kernel/sched/stats.h
 @@ -180,8 +180,13 @@ static inline void psi_dequeue(struct ta
@@ -44190,6 +44400,21 @@
  
  again:
  		p_rq = task_rq(p);
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -1662,6 +1662,12 @@ sd_init(struct sched_domain_topology_lev
+ 
+ 		.last_balance		= jiffies,
+ 		.balance_interval	= sd_weight,
++
++		/* 50% success rate */
++		.newidle_call		= 512,
++		.newidle_success	= 256,
++		.newidle_ratio		= 512,
++
+ 		.max_newidle_lb_cost	= 0,
+ 		.last_decay_max_lb_cost	= jiffies,
+ 		.child			= child,
 --- a/kernel/scs.c
 +++ b/kernel/scs.c
 @@ -135,7 +135,7 @@ static void scs_check_usage(struct task_
@@ -46981,6 +47206,28 @@
  }
  
  static void __mptcp_subflow_push_pending(struct sock *sk, struct sock *ssk, bool first)
+@@ -2418,10 +2421,10 @@ bool __mptcp_retransmit_pending_data(str
+  */
+ static void __mptcp_subflow_disconnect(struct sock *ssk,
+ 				       struct mptcp_subflow_context *subflow,
+-				       unsigned int flags)
++				       bool fastclosing)
+ {
+ 	if (((1 << ssk->sk_state) & (TCPF_CLOSE | TCPF_LISTEN)) ||
+-	    subflow->send_fastclose) {
++	    fastclosing) {
+ 		/* The MPTCP code never wait on the subflow sockets, TCP-level
+ 		 * disconnect should never fail
+ 		 */
+@@ -2473,7 +2476,7 @@ static void __mptcp_close_ssk(struct soc
+ 
+ 	need_push = (flags & MPTCP_CF_PUSH) && __mptcp_retransmit_pending_data(sk);
+ 	if (!dispose_it) {
+-		__mptcp_subflow_disconnect(ssk, subflow, flags);
++		__mptcp_subflow_disconnect(ssk, subflow, msk->fastclosing);
+ 		release_sock(ssk);
+ 
+ 		goto out;
 @@ -2690,10 +2693,13 @@ static void __mptcp_retrans(struct sock
  
  			/*
@@ -46997,9 +47244,35 @@
  				spin_unlock_bh(&msk->fallback_lock);
  				release_sock(ssk);
  				goto clear_scheduled;
+@@ -2783,6 +2789,7 @@ static void mptcp_do_fastclose(struct so
+ 	struct mptcp_sock *msk = mptcp_sk(sk);
+ 
+ 	mptcp_set_state(sk, TCP_CLOSE);
++	msk->fastclosing = 1;
+ 
+ 	/* Explicitly send the fastclose reset as need */
+ 	if (__mptcp_check_fallback(msk))
+@@ -3293,6 +3300,7 @@ static int mptcp_disconnect(struct sock
+ 	msk->bytes_sent = 0;
+ 	msk->bytes_retrans = 0;
+ 	msk->rcvspace_init = 0;
++	msk->fastclosing = 0;
+ 
+ 	WRITE_ONCE(sk->sk_shutdown, 0);
+ 	sk_error_report(sk);
 --- a/net/mptcp/protocol.h
 +++ b/net/mptcp/protocol.h
-@@ -1293,10 +1293,8 @@ static inline bool subflow_simultaneous_
+@@ -321,7 +321,8 @@ struct mptcp_sock {
+ 			fastopening:1,
+ 			in_accept_queue:1,
+ 			free_first:1,
+-			rcvspace_init:1;
++			rcvspace_init:1,
++			fastclosing:1;
+ 	u32		notsent_lowat;
+ 	int		keepalive_cnt;
+ 	int		keepalive_idle;
+@@ -1293,10 +1294,8 @@ static inline bool subflow_simultaneous_
  {
  	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
  
