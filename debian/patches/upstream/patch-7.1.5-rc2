@@ -281,17 +281,6 @@
              vddrfacmn-supply = <&vreg_pmu_rfa_cmn_0p8>;
              vddwlcx-supply = <&vreg_pmu_wlcx_0p8>;
              vddwlmx-supply = <&vreg_pmu_wlmx_0p8>;
---- a/Documentation/devicetree/bindings/net/microchip,lan8650.yaml
-+++ b/Documentation/devicetree/bindings/net/microchip,lan8650.yaml
-@@ -67,7 +67,7 @@ examples:
-         pinctrl-names = "default";
-         pinctrl-0 = <&eth0_pins>;
-         interrupt-parent = <&gpio>;
--        interrupts = <6 IRQ_TYPE_EDGE_FALLING>;
-+        interrupts = <6 IRQ_TYPE_LEVEL_LOW>;
-         local-mac-address = [04 05 06 01 02 03];
-         spi-max-frequency = <15000000>;
-       };
 --- a/Documentation/devicetree/bindings/net/renesas,ether.yaml
 +++ b/Documentation/devicetree/bindings/net/renesas,ether.yaml
 @@ -121,8 +121,7 @@ examples:
@@ -698,7 +687,7 @@
 -SUBLEVEL = 4
 -EXTRAVERSION =
 +SUBLEVEL = 5
-+EXTRAVERSION = -rc1
++EXTRAVERSION = -rc2
  NAME = Baby Opossum Posse
  
  # *DOCUMENTATION*
@@ -16956,16 +16945,6 @@
  	if (header_size > count) {
  		info->header_size = header_size;
  		return -EAGAIN;
---- a/drivers/gpib/cb7210/cb7210.c
-+++ b/drivers/gpib/cb7210/cb7210.c
-@@ -1062,6 +1062,7 @@ static int cb_isa_attach(struct gpib_boa
- 	// install interrupt handler
- 	if (request_irq(config->ibirq, cb7210_interrupt, isr_flags, DRV_NAME, board)) {
- 		dev_err(board->gpib_dev, "failed to obtain IRQ %d\n", config->ibirq);
-+		release_region(nec7210_iobase(cb_priv), cb7210_iosize);
- 		return -EBUSY;
- 	}
- 	cb_priv->irq = config->ibirq;
 --- a/drivers/gpib/common/gpib_os.c
 +++ b/drivers/gpib/common/gpib_os.c
 @@ -613,7 +613,7 @@ long ibioctl(struct file *filep, unsigne
@@ -88172,7 +88151,7 @@
 +	 * whose priv is thread_runtime, not idle_thread_runtime — the cast
 +	 * below would read past the allocation.
 +	 */
-+	if (!sched->idle_hist || is_idle_sample(sample)) {
++	if (!sched->idle_hist || is_idle_sample(sample, evsel)) {
 +		if (!cpu_list || (sample->cpu < MAX_NR_CPUS &&
 +				 test_bit(sample->cpu, cpu_bitmap)))
  			timehist_update_runtime_stats(tr, t, tprev);
@@ -91388,6 +91367,98 @@
  	return param.retval;
  }
  
+--- a/tools/perf/util/sample.h
++++ b/tools/perf/util/sample.h
+@@ -158,6 +158,8 @@ struct perf_sample {
+ 	u64 code_page_size;
+ 	/** @cgroup: The sample event PERF_SAMPLE_CGROUP value. */
+ 	u64 cgroup;
++	/** @file_offset: Byte offset of this event in the perf.data file. */
++	u64 file_offset;
+ 	/** @flags: Extra flag data from auxiliary events like intel-pt. */
+ 	u32 flags;
+ 	/** @machine_pid: The guest machine pid derived from the sample id. */
+--- a/tools/perf/util/session.c
++++ b/tools/perf/util/session.c
+@@ -1352,6 +1352,7 @@ static int evlist__deliver_sample(struct
+ struct deferred_event {
+ 	struct list_head list;
+ 	union perf_event *event;
++	u64 file_offset;
+ };
+ 
+ /*
+@@ -1387,6 +1388,7 @@ static int evlist__deliver_deferred_call
+ 			perf_sample__exit(&orig_sample);
+ 			break;
+ 		}
++		orig_sample.file_offset = de->file_offset;
+ 
+ 		if (sample->tid != orig_sample.tid) {
+ 			perf_sample__exit(&orig_sample);
+@@ -1435,6 +1437,7 @@ static int session__flush_deferred_sampl
+ 			perf_sample__exit(&sample);
+ 			break;
+ 		}
++		sample.file_offset = de->file_offset;
+ 
+ 		sample.evsel = evlist__id2evsel(evlist, sample.id);
+ 		ret = evlist__deliver_sample(evlist, tool, de->event,
+@@ -1496,6 +1499,7 @@ static int machines__deliver_event(struc
+ 				return -ENOMEM;
+ 			}
+ 			memcpy(de->event, event, sz);
++			de->file_offset = sample->file_offset;
+ 			list_add_tail(&de->list, &evlist->deferred_samples);
+ 			return 0;
+ 		}
+@@ -1589,6 +1593,7 @@ static int perf_session__deliver_event(s
+ 		ret = 0;
+ 		goto out;
+ 	}
++	sample.file_offset = file_offset;
+ 
+ 	ret = machines__deliver_event(&session->machines, session->evlist,
+ 				      event, &sample, tool, file_offset, file_path);
+--- a/tools/perf/util/srcline.c
++++ b/tools/perf/util/srcline.c
+@@ -429,10 +429,13 @@ struct inline_node *dso__parse_addr_inli
+ 	return addr2inlines(dso_name, addr, dso, sym);
+ }
+ 
+-void inline_node__delete(struct inline_node *node)
++void inline_node__clear_frames(struct inline_node *node)
+ {
+ 	struct inline_list *ilist, *tmp;
+ 
++	if (node == NULL)
++		return;
++
+ 	list_for_each_entry_safe(ilist, tmp, &node->val, list) {
+ 		list_del_init(&ilist->list);
+ 		zfree_srcline(&ilist->srcline);
+@@ -441,7 +444,11 @@ void inline_node__delete(struct inline_n
+ 			symbol__delete(ilist->symbol);
+ 		free(ilist);
+ 	}
++}
+ 
++void inline_node__delete(struct inline_node *node)
++{
++	inline_node__clear_frames(node);
+ 	free(node);
+ }
+ 
+--- a/tools/perf/util/srcline.h
++++ b/tools/perf/util/srcline.h
+@@ -47,6 +47,7 @@ struct inline_node *dso__parse_addr_inli
+ 					    struct symbol *sym);
+ /* free resources associated to the inline node list */
+ void inline_node__delete(struct inline_node *node);
++void inline_node__clear_frames(struct inline_node *node);
+ 
+ /* insert the inline node list into the DSO, which will take ownership */
+ void inlines__tree_insert(struct rb_root_cached *tree,
 --- a/tools/perf/util/svghelper.c
 +++ b/tools/perf/util/svghelper.c
 @@ -47,13 +47,13 @@ static double cpu2slot(int cpu)
